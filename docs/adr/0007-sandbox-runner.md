@@ -293,3 +293,35 @@ memory miscompile 全部修。
 - wasmtime 44.0.1 升级留 v0.13(待 rust-toolchain 升 1.92)
 - 19 unmaintained warnings(gtk-rs / paste / unic-* / glib / rand):follow Tauri
   ecosystem upgrade,非 P1
+
+---
+
+## Amendment (2026-06-01) — O3: stdio upstream PATH resolution under env_clear
+
+**Status**: Implemented (Codex design ACCEPT, session 019e7f1e). Code review pending on next collaborative pass.
+
+### Context
+`§I-7.1` `apply_native_env_policy` does `env_clear()`, which strips `PATH`. `StdioUpstream::spawn`
+built `Command::new(&argv[0])` with a **bare** command (e.g. `node`/`npx`/`python`, the MCP
+ecosystem convention). On Unix, `std::process::Command` resolves a bare program name against the
+command's (now-empty) env → `Spawn(NotFound)`. Windows `CreateProcess` masks it via its own search
+order. Net effect: bare-command stdio upstreams failed on Linux/macOS.
+
+### Decision (O3 — resolve before clear)
+`StdioUpstream::spawn` now calls `resolve_program(&argv[0])` **before** building the `Command`,
+resolving the bare command to an **absolute path** using the **host (parent) PATH**
+(Unix: `X_OK`; Windows: `PATHEXT`). The child is then launched with `env_clear` as before.
+
+**§I-7.1 invariant preserved**: the child environment is still fully cleared (no `PATH` leaks to the
+child). Only *program location* uses the parent PATH, in the parent. `argv[1..]` is never resolved.
+`argv[0]` containing a path separator is treated as a path (canonicalize), not PATH-searched.
+Resolution failure returns the distinct `StdioError::ProgramNotFound` (fail-closed), not a generic
+`Spawn`.
+
+### Deferred (V1.1, requires Codex code review)
+Per Codex review, descriptor pinning / audit `command_hash` should be computed over the **resolved
+absolute path** (not the bare name) so that drift detection catches `node` resolving to a different
+binary, and the audit records the approved-bare → executed-absolute mapping. This is a drift
+state-machine semantic change (touches `compute_argv_hash` + drift tests) and is staged as a
+separate iteration. TOCTOU (resolve-time vs exec-time binary replacement) is out of scope for V1
+(no inode/hash pinning) per the same review.

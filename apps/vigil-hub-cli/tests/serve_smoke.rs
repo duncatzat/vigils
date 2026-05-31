@@ -258,20 +258,20 @@ fn b2_stage2_attach_real_stdio_upstream_via_node() {
     // Stage 2 端到端(在 Rust 测试内):用 Node 启 mock-mcp-server,验证 attach 全链路。
     // 若本机无 Node 则 skip(不阻塞 CI;Windows 开发机通常有)。
     //
-    // **node 必须用绝对路径**:Vigil stdio upstream spawn 走 `apply_native_env_policy`
-    // (ADR 0007 §I-7.1 `env_clear()`),PATH 被清空 —— 裸命令 "node" 在被清环境的子进程里
-    // 无法解析(Linux 上 NotFound)。用 node 自身的 `process.execPath` 取绝对路径,既验证
-    // node 可运行又拿到在 env_clear 下可直接 exec 的绝对路径,避免依赖 PATH。
-    let node_path = match std::process::Command::new("node")
-        .args(["-e", "process.stdout.write(process.execPath)"])
-        .output()
-    {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        _ => {
-            eprintln!("[b2-stage2] skip: node not runnable");
-            return;
-        }
-    };
+    // argv 用**裸命令 "node"**:O3(ADR 0007 §I-7.1 amendment)让 stdio upstream spawn 在
+    // env_clear 前用宿主 PATH 把裸命令解析为绝对路径,故裸 "node" 在 Linux/macOS 也能 spawn。
+    // 本测试同时端到端验证 `resolve_program`(裸命令 → 绝对路径)。
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !node_ok {
+        eprintln!("[b2-stage2] skip: node not runnable");
+        return;
+    }
     let mock_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/test-local/mock-mcp-server.mjs")
         .canonicalize()
@@ -281,7 +281,7 @@ fn b2_stage2_attach_real_stdio_upstream_via_node() {
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let cfg = json!({
         "upstreams": [
-            {"name": "mockup", "argv": [node_path, mock_script.to_string_lossy()]}
+            {"name": "mockup", "argv": ["node", mock_script.to_string_lossy()]}
         ]
     });
     writeln!(tmp.as_file(), "{}", serde_json::to_string(&cfg).unwrap()).unwrap();

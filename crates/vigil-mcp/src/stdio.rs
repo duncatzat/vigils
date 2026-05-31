@@ -46,12 +46,94 @@ pub enum StdioError {
     /// 进程启动失败
     #[error("failed to spawn upstream: {0}")]
     Spawn(std::io::Error),
+    /// argv[0] 程序无法在 PATH 中解析(O3 / ADR 0007 §I-7.1 amendment)。
+    ///
+    /// 因 spawn 走 `env_clear()` 清掉 PATH,裸命令需在 spawn 前用**宿主 PATH** 解析为绝对路径
+    /// (见 `resolve_program`)。解析失败时返回本变体而非笼统 `Spawn(NotFound)`,便于诊断。
+    #[error("upstream program not found on PATH: {program}")]
+    ProgramNotFound {
+        /// 未能解析的裸命令(argv[0])
+        program: String,
+    },
     /// 进程已经关闭
     #[error("upstream already closed")]
     Closed,
 }
 
 type PendingTable = Arc<Mutex<HashMap<String, Sender<Value>>>>;
+
+/// O3(ADR 0007 §I-7.1 amendment,Codex ACCEPT-design 2026-06-01):把 `argv[0]` 解析为
+/// **绝对路径**。
+///
+/// **为何需要**:`spawn` 经 `apply_native_env_policy` 做 `env_clear()`,子进程 env 无 PATH;
+/// 而 `std::process::Command` 在 Unix 按 command 自身 env 的 PATH 解析裸名 → 裸命令(`node`/
+/// `npx`/`python`,MCP 生态惯例)在被清环境里解析失败(`NotFound`)。本函数在 **spawn 前、
+/// 用宿主进程 PATH** 把裸名解析为绝对路径;随后 `Command::new(<absolute>)` + `env_clear` 即可
+/// —— **子进程 env 仍被完全清空**(§I-7.1 不变量保留),仅"程序定位"用了父进程 PATH。
+///
+/// 规则(Codex review 要求):
+/// - argv[0] 含路径分隔符 → 视为路径,`canonicalize` 校验存在并转绝对(**不**做 PATH 搜索)
+/// - 裸名 → 遍历宿主 `PATH`;Unix 要求可执行位(X_OK),Windows 叠加 `PATHEXT`
+/// - 找不到 → `ProgramNotFound`(fail-closed),不退化为笼统 `Spawn`
+///
+/// **未覆盖(V1.1 follow-up)**:把解析后绝对路径纳入 descriptor pinning / 审计的 command_hash
+/// (当前 pin 仍基于审批时的裸 argv)。这是 drift 状态机语义改动,单独迭代 + Codex code review。
+fn resolve_program(argv0: &str) -> Result<std::path::PathBuf, StdioError> {
+    let not_found = || StdioError::ProgramNotFound {
+        program: argv0.to_string(),
+    };
+    // 含路径分隔符 → 当作路径,直接 canonicalize(不 PATH 搜索)
+    let has_sep = argv0.contains('/') || (cfg!(windows) && argv0.contains('\\'));
+    if has_sep {
+        return std::path::Path::new(argv0)
+            .canonicalize()
+            .map_err(|_| not_found());
+    }
+    // 裸名 → 遍历宿主 PATH
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        // canonicalize 成功即返(转绝对 + 解 symlink,利于审计);失败则回落 join 后的绝对路径
+        let canon = |p: std::path::PathBuf| p.canonicalize().unwrap_or(p);
+
+        #[cfg(unix)]
+        {
+            let cand = dir.join(argv0);
+            if is_executable_file(&cand) {
+                return Ok(canon(cand));
+            }
+        }
+        #[cfg(windows)]
+        {
+            // 已带扩展名(含 '.')先试裸名本身;否则按 PATHEXT 逐个试
+            let direct = dir.join(argv0);
+            if argv0.contains('.') && direct.is_file() {
+                return Ok(canon(direct));
+            }
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            for ext in pathext.split(';').filter(|e| !e.is_empty()) {
+                let cand = dir.join(format!("{argv0}{ext}"));
+                if cand.is_file() {
+                    return Ok(canon(cand));
+                }
+            }
+        }
+    }
+    Err(not_found())
+}
+
+/// Unix:文件存在且 owner/group/other 任一有执行位(X_OK 近似)。
+#[cfg(unix)]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(p) {
+        Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
 
 /// 一个上游 stdio server 的连接。
 pub struct StdioUpstream {
@@ -90,7 +172,10 @@ impl StdioUpstream {
             )));
         }
 
-        let mut cmd = Command::new(&argv[0]);
+        // O3:env_clear 会清掉 PATH,故先用宿主 PATH 把裸 argv[0] 解析为绝对路径,
+        // 再建 Command —— 子进程 env 仍全清(§I-7.1 保留)。argv[1..] 不解析。
+        let program = resolve_program(&argv[0])?;
+        let mut cmd = Command::new(program);
         for a in &argv[1..] {
             cmd.arg(a);
         }
@@ -296,6 +381,10 @@ impl crate::upstream::McpUpstream for StdioUpstream {
             Err(StdioError::Protocol(_)) => Err(UpstreamError::TransportIo("stdio_protocol")),
             Err(StdioError::Closed) => Err(UpstreamError::TransportIo("stdio_closed")),
             Err(StdioError::Spawn(_)) => Err(UpstreamError::TransportIo("stdio_spawn_failed")),
+            // spawn 期错误,正常不会经 call_raw 流到此;为 exhaustive 完整性映射为 transport 失败
+            Err(StdioError::ProgramNotFound { .. }) => {
+                Err(UpstreamError::TransportIo("stdio_program_not_found"))
+            }
             Err(StdioError::LockPoisoned) => Err(UpstreamError::Internal("stdio_lock_poisoned")),
         }
     }
@@ -308,5 +397,62 @@ impl crate::upstream::McpUpstream for StdioUpstream {
 impl Drop for StdioUpstream {
     fn drop(&mut self) {
         self.shutdown_raw();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+mod resolve_program_tests {
+    use super::{resolve_program, StdioError};
+
+    /// 一个在测试平台上几乎必然存在于 PATH 的系统命令。
+    #[cfg(unix)]
+    const SYSTEM_CMD: &str = "sh";
+    #[cfg(windows)]
+    const SYSTEM_CMD: &str = "cmd";
+
+    #[test]
+    fn resolves_bare_system_command_to_absolute_existing_path() {
+        let resolved = resolve_program(SYSTEM_CMD)
+            .unwrap_or_else(|e| panic!("expected {SYSTEM_CMD} resolvable on PATH: {e:?}"));
+        assert!(
+            resolved.is_absolute(),
+            "resolved path must be absolute: {resolved:?}"
+        );
+        assert!(resolved.exists(), "resolved path must exist: {resolved:?}");
+    }
+
+    #[test]
+    fn bare_unknown_command_fails_closed_with_program_not_found() {
+        let err = resolve_program("vigil_definitely_not_a_real_command_xyz")
+            .expect_err("unknown bare command must not resolve");
+        assert!(
+            matches!(err, StdioError::ProgramNotFound { .. }),
+            "must be ProgramNotFound (fail-closed), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn path_with_separator_is_not_path_searched_and_fails_closed_when_missing() {
+        // 含分隔符 → 当作路径(不 PATH 搜索);不存在 → ProgramNotFound
+        let missing = if cfg!(windows) {
+            "C:\\vigil\\nope\\not_here.exe"
+        } else {
+            "/vigil/nope/not_here"
+        };
+        let err = resolve_program(missing).expect_err("missing explicit path must fail");
+        assert!(
+            matches!(err, StdioError::ProgramNotFound { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn absolute_path_to_existing_binary_resolves() {
+        // 先解析系统命令拿到一个真实绝对路径,再用该绝对路径走"含分隔符"分支
+        let abs = resolve_program(SYSTEM_CMD).expect("system cmd resolvable");
+        let again = resolve_program(&abs.to_string_lossy())
+            .expect("absolute path to existing binary must resolve");
+        assert!(again.is_absolute() && again.exists());
     }
 }
