@@ -111,15 +111,24 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev patchelf \
             libdbus-1-dev pkg-config libssl-dev
 
-      - name: Build desktop app + bundles
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 显式 cargo tauri build —— 不用 tauri-action 的前端自动探测(projectPath
+      # apps/desktop 无 package.json,前端在 ui/,自动 install 会失败)。
+      # beforeBuildCommand 已自包含(npm --prefix ui),tauri build 会调它构建前端。
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Build desktop bundles
+        working-directory: apps/desktop
+        run: cargo tauri build --features gui
+
+      - name: Upload desktop bundles
+        uses: softprops/action-gh-release@v2
         with:
-          projectPath: apps/desktop
-          # gui bin 走 feature gate;mainBinaryName=gui 已在 tauri.conf
-          args: --features gui
-          tagName: ${{ needs.create-release.outputs.tag }}
-          releaseName: Vigils ${{ needs.create-release.outputs.tag }}
-          releaseDraft: false
-          prerelease: false
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: |
+            target/release/bundle/**/*.msi
+            target/release/bundle/**/*.exe
+            target/release/bundle/**/*.dmg
+            target/release/bundle/**/*.deb
+            target/release/bundle/**/*.rpm
+            target/release/bundle/**/*.AppImage
