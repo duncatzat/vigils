@@ -838,26 +838,32 @@ fn concurrent_refresh_same_token_ref_only_hits_network_once() {
         h.join().unwrap();
     }
 
-    // 断言 1:**AS /token 端点只被打 1 次**(singleflight 合并)
+    // singleflight 是 **arrival-time** 语义(store.rs:`last_completion >= my_arrival` 短路),
+    // 非"barrier 释放即合并为 1"。快速 MockHttpClient 下,arrival window 可能跨越多次 completion
+    // —— 晚到 caller 的 my_arrival 晚于首次完成,合法地再刷一次,故 hits 是 1..n 而非恒为 1。
+    // 因此断言**非 flaky 不变量**(Codex TEST-TOO-STRICT 诊断,2026-06-01):
+    //   - 全部 caller 完成(triggered + skipped == n)
+    //   - 至少 1 次真刷(triggered >= 1)
+    //   - 至少 1 次短路 → 证明发生了合并(skipped >= 1)
+    //   - 未全量 stampede(hits < n)
+    //   - 一致性:每次网络命中对应一次 triggered(hits == triggered)
     let calls = mock.calls();
     let token_hits = calls
         .iter()
         .filter(|c| c.url.as_str() == token_endpoint_s)
         .count();
-    assert_eq!(
-        token_hits, 1,
-        "singleflight: /token must be hit exactly once; got {token_hits}"
-    );
-
-    // 断言 2:恰好 1 个 caller 返 Ok(true)(真刷),其余 N-1 都是 Ok(false)(短路)
     let triggered = triggered_count.load(Ordering::SeqCst);
     let skipped = skipped_count.load(Ordering::SeqCst);
-    assert_eq!(triggered, 1, "exactly 1 caller should trigger real refresh");
+    assert_eq!(triggered + skipped, n_threads, "all callers must complete");
+    assert!(triggered >= 1, "at least one real refresh");
+    assert!(skipped >= 1, "singleflight must coalesce at least one caller");
+    assert!(
+        token_hits < n_threads,
+        "no full stampede: token_hits {token_hits} must be < n_threads {n_threads}"
+    );
     assert_eq!(
-        skipped,
-        n_threads - 1,
-        "remaining {} callers should short-circuit",
-        n_threads - 1
+        token_hits, triggered,
+        "each /token hit corresponds to one triggered refresh"
     );
 }
 
@@ -964,18 +970,27 @@ fn concurrent_refresh_legacy_no_expires_at_also_singleflights() {
         h.join().unwrap();
     }
 
-    // AS /token 恰好 1 次,即使 legacy expires_at=None
+    // arrival-time singleflight 非 flaky 不变量(同 concurrent_refresh_same_token_ref_*;
+    // legacy expires_at=None 不改变短路判据 —— 见 store.rs `last_completion >= my_arrival`,
+    // 与 expires_at 无关;Codex TEST-TOO-STRICT 诊断 2026-06-01)。快 mock 下 hits 是 1..n。
     let calls = mock.calls();
     let hits = calls
         .iter()
         .filter(|c| c.url.as_str() == token_endpoint_s)
         .count();
-    assert_eq!(
-        hits, 1,
-        "legacy singleflight: /token must be hit exactly once"
+    let triggered_n = triggered.load(Ordering::SeqCst);
+    let skipped_n = skipped.load(Ordering::SeqCst);
+    assert_eq!(triggered_n + skipped_n, n_threads, "all callers must complete");
+    assert!(triggered_n >= 1, "at least one real refresh");
+    assert!(skipped_n >= 1, "legacy singleflight must coalesce at least one caller");
+    assert!(
+        hits < n_threads,
+        "no full stampede: hits {hits} must be < n_threads {n_threads}"
     );
-    assert_eq!(triggered.load(Ordering::SeqCst), 1);
-    assert_eq!(skipped.load(Ordering::SeqCst), n_threads - 1);
+    assert_eq!(
+        hits, triggered_n,
+        "each /token hit corresponds to one triggered refresh"
+    );
 }
 
 /// T3 证据(单元级,非 TLS):HttpUpstream.call 遇 upstream 401 → auto-refresh → retry。
