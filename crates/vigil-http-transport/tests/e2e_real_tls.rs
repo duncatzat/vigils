@@ -856,7 +856,10 @@ fn concurrent_refresh_same_token_ref_only_hits_network_once() {
     let skipped = skipped_count.load(Ordering::SeqCst);
     assert_eq!(triggered + skipped, n_threads, "all callers must complete");
     assert!(triggered >= 1, "at least one real refresh");
-    assert!(skipped >= 1, "singleflight must coalesce at least one caller");
+    assert!(
+        skipped >= 1,
+        "singleflight must coalesce at least one caller"
+    );
     assert!(
         token_hits < n_threads,
         "no full stampede: token_hits {token_hits} must be < n_threads {n_threads}"
@@ -980,9 +983,16 @@ fn concurrent_refresh_legacy_no_expires_at_also_singleflights() {
         .count();
     let triggered_n = triggered.load(Ordering::SeqCst);
     let skipped_n = skipped.load(Ordering::SeqCst);
-    assert_eq!(triggered_n + skipped_n, n_threads, "all callers must complete");
+    assert_eq!(
+        triggered_n + skipped_n,
+        n_threads,
+        "all callers must complete"
+    );
     assert!(triggered_n >= 1, "at least one real refresh");
-    assert!(skipped_n >= 1, "legacy singleflight must coalesce at least one caller");
+    assert!(
+        skipped_n >= 1,
+        "legacy singleflight must coalesce at least one caller"
+    );
     assert!(
         hits < n_threads,
         "no full stampede: hits {hits} must be < n_threads {n_threads}"
