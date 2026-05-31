@@ -86,7 +86,21 @@ fn setup() -> (Arc<LeaseBroker>, String, TempDir) {
 
 fn basic_plan(tmp: &TempDir) -> ExecutionPlan {
     let cwd: PathBuf = tmp.path().to_path_buf();
-    let profile = SandboxProfile::new("t", vec![cwd.clone()], vec![cwd.clone()], 5000);
+    // Linux Landlock 强制 FS 白名单(现代内核 ≥ 5.13 + LSM 启用):要 exec 一个系统二进制
+    // (`/bin/sh` / `/bin/sleep`),profile 必须允许读取该二进制 + 动态加载器 + 共享库所在目录。
+    // 旧内核不强制 Landlock 时这些测试"侥幸"通过;现代内核(GitHub ubuntu / 本地 dev box
+    // 均 6.8)强制后会以 `command_spawn_failed` 失败。这里把标准系统只读目录加入 read_dirs
+    // (仅加**存在**的目录 —— LandlockPolicy::from_dirs 对不存在路径返 PathOpenFailed)。
+    #[allow(unused_mut)] // 非 Linux 下不进入下方 cfg(linux) 追加块,mut 看似多余
+    let mut read = vec![cwd.clone()];
+    #[cfg(target_os = "linux")]
+    for d in ["/bin", "/usr/bin", "/lib", "/lib64", "/usr/lib"] {
+        let p = PathBuf::from(d);
+        if p.exists() {
+            read.push(p);
+        }
+    }
+    let profile = SandboxProfile::new("t", read, vec![cwd.clone()], 5000);
     let mut plan = ExecutionPlan::native_from_profile(&profile, cwd);
     plan.validate().unwrap();
     plan

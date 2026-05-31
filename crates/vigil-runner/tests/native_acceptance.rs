@@ -67,9 +67,22 @@ fn print_path_cmd() -> Vec<String> {
 
 fn basic_plan(tmp: &TempDir) -> ExecutionPlan {
     let cwd: PathBuf = tmp.path().to_path_buf();
+    // Linux Landlock 强制 FS 白名单:exec 系统二进制(/bin/sh 等)需 profile 允许读取
+    // 该二进制 + 动态加载器 + 共享库目录。加标准系统只读目录(仅存在者 —— from_dirs 对
+    // 不存在路径返 PathOpenFailed)。现代内核(≥5.13 + LSM)强制 Landlock 后必需;旧内核
+    // 不强制时这些测试曾"侥幸"通过。
+    #[allow(unused_mut)] // 非 Linux 下不进入下方 cfg(linux) 追加块,mut 看似多余
+    let mut read = vec![cwd.clone()];
+    #[cfg(target_os = "linux")]
+    for d in ["/bin", "/usr/bin", "/lib", "/lib64", "/usr/lib"] {
+        let p = PathBuf::from(d);
+        if p.exists() {
+            read.push(p);
+        }
+    }
     let profile = SandboxProfile::new(
         "test",
-        vec![cwd.clone()],
+        read,
         vec![cwd.clone()],
         5000, // 5s wall
     );
@@ -99,23 +112,32 @@ async fn native_spawn_env_is_cleared() {
     let (_l, broker, sid, tmp) = setup();
     let plan = basic_plan(&tmp);
     let prepared = empty_prepared(&broker, &sid);
-    let argv = print_path_cmd();
     let scrub = default_scrub();
-    let r = spawn_native(&plan, &argv, prepared, &scrub, &NullAuditSink)
-        .await
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&r.stdout);
-    // 期望:PATH= (后面空或 %PATH% 字面未展开)
+
     if cfg!(windows) {
-        // cmd /c 展开 %PATH% 时若变量不存在会输出字面 %PATH%
+        // Windows:cmd /c echo %PATH% —— env_clear 后变量不存在会输出字面 %PATH% 或为空。
+        let argv = print_path_cmd();
+        let r = spawn_native(&plan, &argv, prepared, &scrub, &NullAuditSink)
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&r.stdout);
         assert!(
             stdout.contains("PATH=%PATH%") || stdout.trim() == "PATH=",
             "Windows env_clear 后 PATH 应未展开或为空,实际: {stdout}"
         );
     } else {
+        // Unix:**直接** spawn `/usr/bin/env`(不经 shell)。经 `/bin/sh -c "echo $PATH"` 不可靠
+        // —— dash 等在 PATH 未设时会为 `$PATH` 设编译期默认值(`/usr/local/sbin:...:/bin`),
+        // 那是 shell 自己的默认,不代表 env_clear 失败。`env` 直接打印 environ:env_clear 后
+        // environ 为空 → 无输出,直接证明子进程未继承父进程环境。
+        let argv = vec!["/usr/bin/env".to_string()];
+        let r = spawn_native(&plan, &argv, prepared, &scrub, &NullAuditSink)
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&r.stdout);
         assert!(
-            stdout.trim() == "PATH=",
-            "Unix env_clear 后 PATH 应为空,实际: {stdout}"
+            stdout.trim().is_empty(),
+            "Unix env_clear 后 environ 应为空(env 无输出),实际: {stdout}"
         );
     }
 }
