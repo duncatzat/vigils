@@ -243,8 +243,12 @@ mod tests {
         let policy =
             LandlockPolicy::from_dirs(vec!["/definitely/does/not/exist/read"], Vec::<&str>::new());
         let mut cmd = std::process::Command::new("/bin/true");
-        let err = policy.install_into(&mut cmd).unwrap_err();
-        assert!(matches!(err, LandlockError::PathOpenFailed(_)));
+        // crate 级 clippy::unwrap_used = warn(CI -D warnings 升 deny);直接 matches! 断言 Err,
+        // 不用 unwrap_err。
+        assert!(matches!(
+            policy.install_into(&mut cmd),
+            Err(LandlockError::PathOpenFailed(_))
+        ));
     }
 
     #[test]
@@ -255,8 +259,8 @@ mod tests {
         let policy = LandlockPolicy::from_dirs(Vec::<&str>::new(), Vec::<&str>::new());
         let mut cmd = std::process::Command::new("/bin/true");
         assert!(matches!(
-            policy.install_into(&mut cmd).unwrap_err(),
-            LandlockError::NotSupported
+            policy.install_into(&mut cmd),
+            Err(LandlockError::NotSupported)
         ));
     }
 
