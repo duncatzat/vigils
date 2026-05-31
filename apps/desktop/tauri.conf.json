@@ -6,7 +6,7 @@
   "mainBinaryName": "gui",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm --prefix ui ci && npm --prefix ui run build",
+    "beforeBuildCommand": "",
     "devUrl": "http://localhost:1420",
     "frontendDist": "./ui/dist"
   },
@@ -31,7 +31,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["msi", "nsis", "deb", "rpm", "appimage", "dmg"],
+    "targets": ["nsis", "deb", "appimage", "dmg"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

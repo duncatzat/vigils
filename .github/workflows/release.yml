@@ -114,6 +114,10 @@ jobs:
       # 显式 cargo tauri build —— 不用 tauri-action 的前端自动探测(projectPath
       # apps/desktop 无 package.json,前端在 ui/,自动 install 会失败)。
       # beforeBuildCommand 已自包含(npm --prefix ui),tauri build 会调它构建前端。
+      - name: Build frontend (beforeBuildCommand is empty — build dist explicitly)
+        working-directory: apps/desktop/ui
+        run: npm ci && npm run build
+
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0" --locked
 
@@ -126,9 +130,7 @@ jobs:
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
           files: |
-            target/release/bundle/**/*.msi
-            target/release/bundle/**/*.exe
+            target/release/bundle/**/*-setup.exe
             target/release/bundle/**/*.dmg
             target/release/bundle/**/*.deb
-            target/release/bundle/**/*.rpm
             target/release/bundle/**/*.AppImage
