@@ -1,0 +1,118 @@
+name: Release
+
+# 推送 v* tag 时:创建 GitHub Release 并附带各平台产物
+# (CLI 二进制 + 桌面安装包)。使用内置 GITHUB_TOKEN,无需 PAT。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 1. 创建（或复用）Release ───────────────────────────────────────────
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve.outputs.tag }}
+          name: Vigils ${{ steps.resolve.outputs.tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          body: |
+            A local-first control plane for AI agents — see what they do, approve what matters, keep secrets out.
+
+            Artifacts below: CLI binaries (`vigil-hub`, `vigil-native-host`) and desktop installers for Windows / macOS / Linux. The Chrome MV3 extension lives in `extensions/chrome-mv3/`.
+
+            Early releases are unsigned; your OS may show a Gatekeeper / SmartScreen prompt on first run. Apache-2.0 · https://vigils.ai
+
+  # ── 2. CLI 二进制（3 平台）───────────────────────────────────────────
+  cli:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  suffix: "",     archive: tar.gz }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      suffix: "",     archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    suffix: ".exe", archive: zip }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI binaries
+        run: cargo build --release --bin vigil-hub -p vigil-hub-cli --bin vigil-native-host -p vigil-native-host
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          set -e
+          mkdir -p dist
+          tar -C target/release -czf "dist/vigils-cli-${{ matrix.target }}.tar.gz" vigil-hub vigil-native-host
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/vigil-hub.exe, target/release/vigil-native-host.exe -DestinationPath "dist/vigils-cli-${{ matrix.target }}.zip"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: dist/vigils-cli-${{ matrix.target }}.${{ matrix.archive }}
+
+  # ── 3. 桌面安装包（3 平台,Tauri bundle）─────────────────────────────
+  desktop:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux Tauri system deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Build desktop app + bundles
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          # gui bin 走 feature gate;mainBinaryName=gui 已在 tauri.conf
+          args: --features gui
+          tagName: ${{ needs.create-release.outputs.tag }}
+          releaseName: Vigils ${{ needs.create-release.outputs.tag }}
+          releaseDraft: false
+          prerelease: false
