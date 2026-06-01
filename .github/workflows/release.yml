@@ -28,29 +28,39 @@ jobs:
       - uses: actions/checkout@v4
       - id: resolve
         run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
-      # Release notes = this version's CHANGELOG section + a Downloads/footer block.
-      # Single source of truth: curated notes live in CHANGELOG.md, not duplicated here.
+      # Release notes = English CHANGELOG section + a clearly-separated Chinese section
+      # (never interleaved) + Downloads/footer. Single source of truth: the curated notes
+      # live in CHANGELOG.md / CHANGELOG.zh-CN.md, not duplicated here.
       - name: Build release notes from CHANGELOG
         id: notes
         shell: bash
         run: |
           tag="${{ steps.resolve.outputs.tag }}"
           notes="$(mktemp)"
-          # Print the section under "## [<tag>]" up to the next "---" or next "## [" heading.
+          # Extract the section under "## [<tag>]" up to the next "---" or next "## [" heading.
           # Literal index() matching avoids awk regex-metachar pitfalls with [ ] and dots.
-          awk -v tag="$tag" '
-            index($0, "## [" tag "]") == 1 { inblk=1; next }
-            inblk && ($0 == "---" || index($0, "## [") == 1) { exit }
-            inblk { print }
-          ' CHANGELOG.md > "$notes" || true
+          extract() {
+            awk -v tag="$tag" '
+              index($0, "## [" tag "]") == 1 { inblk=1; next }
+              inblk && ($0 == "---" || index($0, "## [") == 1) { exit }
+              inblk { print }
+            ' "$1"
+          }
+          # English body (authoritative).
+          extract CHANGELOG.md > "$notes" || true
           if [ ! -s "$notes" ]; then
             printf 'Vigils %s — a local-first control plane for AI agents.\n' "$tag" > "$notes"
+          fi
+          # Chinese as a clearly-separated section (never interleaved).
+          zh="$(extract CHANGELOG.zh-CN.md 2>/dev/null || true)"
+          if [ -n "$zh" ]; then
+            { printf '\n---\n\n## 中文\n\n'; printf '%s\n' "$zh"; } >> "$notes"
           fi
           {
             printf '\n---\n\n'
             printf '%s\n\n' '**Downloads.** Desktop installers (Windows `.exe` / `.msi`, macOS `.dmg`, Linux `.AppImage` / `.deb` / `.rpm`) and CLI binaries (`vigil-hub`, `vigil-native-host`) are attached below. The Chrome MV3 extension lives in `extensions/chrome-mv3/`.'
             printf '%s\n\n' 'Early releases are unsigned; your OS may show a Gatekeeper / SmartScreen prompt on first run.'
-            printf '%s\n' 'Apache-2.0 · https://vigils.ai'
+            printf '%s\n' 'Apache-2.0 · https://vigils.ai · [Full changelog](https://github.com/duncatzat/vigils/blob/main/CHANGELOG.md)'
           } >> "$notes"
           echo "path=$notes" >> "$GITHUB_OUTPUT"
 
