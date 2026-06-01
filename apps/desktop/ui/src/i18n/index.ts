@@ -12,9 +12,22 @@
  * - First cut(alpha.6):common + approval page 字符串
  * - 后续:activity / sessions / servers / privacy 逐页迁
  */
-import { createI18n } from "vue-i18n";
+import { createI18n, type MessageCompiler, type MessageContext } from "vue-i18n";
 import zhCN from "./locales/zh-CN.json";
 import enUS from "./locales/en-US.json";
+
+// CSP 安全的消息编译器:vue-i18n 默认编译器用 `new Function` 把消息字符串编译成渲染函数,
+// 在严格 CSP(`script-src 'self'`,无 'unsafe-eval')下被浏览器拦截 → 桌面 GUI(Tauri
+// WebView2)渲染时抛 EvalError、渲染中断 → 黑屏。本编译器只做纯字符串 `{named}` 插值,
+// 零 eval,完全 CSP 安全。本项目消息均为简单 UI 串(无 plural `|` / linked `@:` 语法),足够覆盖。
+const cspSafeMessageCompiler: MessageCompiler = (message) => {
+  const template = typeof message === "string" ? message : String(message);
+  return (ctx: MessageContext) =>
+    template.replace(/\{(\w+)\}/g, (_m, key: string) => {
+      const value = ctx.named(key);
+      return value === undefined || value === null ? `{${key}}` : String(value);
+    });
+};
 
 export type SupportedLocale = "zh-CN" | "en-US";
 
@@ -38,6 +51,8 @@ function detectInitialLocale(): SupportedLocale {
 
 export const i18n = createI18n({
   legacy: false,
+  // CSP 安全:用自定义编译器替代默认(默认走 new Function,违反 script-src 'self')
+  messageCompiler: cspSafeMessageCompiler,
   locale: detectInitialLocale(),
   fallbackLocale: "en-US",
   messages: {

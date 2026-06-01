@@ -7,6 +7,33 @@ All notable changes to Vigils are documented here. Versions follow
 
 ---
 
+## [v0.1.3] — 2026-06-01
+
+Desktop GUI rendering fix. The desktop app now actually renders its UI. v0.1.2 fixed the
+installer to bundle the GUI (not the CLI), but the GUI then opened a **blank / black
+window**: vue-i18n compiled locale messages at runtime with `new Function`, which the
+app's strict Content Security Policy (`script-src 'self'`, no `'unsafe-eval'`) blocks,
+aborting the render. 桌面 GUI 渲染修复 —— 桌面应用现在能真正渲染界面。v0.1.2 修好了"安装包
+装 GUI 而非 CLI",但 GUI 打开仍是**空白/黑屏**:vue-i18n 在运行时用 `new Function` 编译多语言
+消息,被应用的严格 CSP(`script-src 'self'`,无 `'unsafe-eval'`)拦截,导致渲染中断。
+
+### Fixed / 修复
+
+- **The desktop GUI no longer opens a blank/black window.** vue-i18n is given a CSP-safe
+  custom `messageCompiler` (plain `{named}` interpolation, no `eval` / `new Function`), so
+  the UI renders under the strict production CSP **without weakening it**. The bug only
+  affected built/installed apps — `tauri dev` runs under a relaxed CSP, so it went
+  unnoticed until v0.1.2 first made the GUI installable. 桌面 GUI 不再黑屏 —— 给 vue-i18n
+  注入 CSP 安全的自定义 `messageCompiler`(纯 `{named}` 插值,无 `eval` / `new Function`),
+  使 UI 在**不放宽**严格 CSP 的前提下正常渲染。此问题只影响打包/安装的应用(`tauri dev` 用
+  宽松 CSP),故在 v0.1.2 让 GUI 首次可安装前一直未暴露。
+
+### Changed / 变更
+
+- Workspace and desktop app version `0.1.2` → `0.1.3`.
+
+---
+
 ## [v0.1.2] — 2026-06-01
 
 Desktop bundle fix. The Windows / macOS / Linux desktop installers now contain the
