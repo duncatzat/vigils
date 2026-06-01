@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use vigil_hub_cli::inspect::{self, InspectArgs};
 use vigil_hub_cli::serve::{self, ServeArgs};
 use vigil_hub_cli::{add_remote, AddRemoteArgs};
 
@@ -30,6 +31,9 @@ enum Command {
     /// {"vigil": {"command": "vigil-hub", "args": ["serve", "--stdio", "--ledger", "C:\\Vigil\\ledger.sqlite"]}}
     /// ```
     Serve(CliServeArgs),
+    /// 命令行查询本地审计账本(activity / search / approvals / session / servers /
+    /// sandbox / verify-chain);stdout 为单行 JSON,便于 `| jq` 与脚本化。
+    Inspect(InspectArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -148,5 +152,7 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
+        // inspect 自行处理 ExitCode(0=ok / 1=dispatch err / 2=参数或 ledger 错误)
+        Some(Command::Inspect(args)) => inspect::run(args),
     }
 }

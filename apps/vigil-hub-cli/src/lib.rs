@@ -9,6 +9,7 @@
 #![allow(missing_docs)]
 
 pub mod add_remote;
+pub mod inspect;
 pub mod serve;
 
 use std::path::PathBuf;

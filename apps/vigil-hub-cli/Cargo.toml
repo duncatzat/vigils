@@ -32,6 +32,11 @@ vigil-http-transport = { path = "../../crates/vigil-http-transport" }
 vigil-firewall = { path = "../../crates/vigil-firewall" }
 vigil-policy = { path = "../../crates/vigil-policy" }
 vigil-types = { path = "../../crates/vigil-types" }
+# v0.1.2:`inspect` 子命令复用 desktop lib 的 Ledger dispatch/render(无 gui feature,
+# 仅 lib);承接原 `vigil-desktop` CLI bin 的"命令行查账本"能力。
+vigil-desktop = { path = "../desktop", default-features = false }
+vigil-ui-protocol = { path = "../../crates/vigil-ui-protocol" }
+vigil-runner = { path = "../../crates/vigil-runner", default-features = false }
 # ISS-008 Phase 2 T5:ServeError::PrivacyFilterInit 透传 EngineError;feature 注入走
 # vigil-firewall/ort,本依赖默认 0 features(--features ort 时由 vigil-firewall 透传打开)。
 vigil-redaction = { path = "../../crates/vigil-redaction" }

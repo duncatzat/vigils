@@ -1,11 +1,17 @@
-//! vigil-desktop CLI(I08a,ADR 0008)。
+//! `vigil-hub inspect` —— 命令行查询本地审计账本(activity / search / approvals /
+//! session / servers / sandbox / verify-chain)。
 //!
-//! Subcommand 一对一映射到 `UiCommand`;Ledger 由 `--db-path` 或默认内存打开。
-//! stdout = 单行 JSON response;stderr = 错误 JSON。
+//! 由 v0.1.1 的 `vigil-desktop` 调试 CLI(I08a)整合而来:原 CLI 是 `apps/desktop` 包的
+//! 第二个 `[[bin]]`,会被 `cargo tauri build` 误打进桌面安装包(替换掉真正的 GUI)。
+//! v0.1.2 起把该 bin 从 desktop 包移除,能力以子命令形式归入产品主 CLI `vigil-hub`,
+//! 复用 `vigil_desktop::{dispatch, render}` 同一套 Ledger 消费逻辑。
+//!
+//! 约定(沿用 I08a):stdout = 单行 JSON response;stderr = 错误 JSON;
+//! 退出码 0=成功 / 1=dispatch 错误 / 2=参数或 ledger 打开失败。
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Subcommand};
 use vigil_audit::Ledger;
 use vigil_desktop::dispatch;
 use vigil_desktop::render::{print_error, print_response};
@@ -19,9 +25,9 @@ use vigil_ui_protocol::{
     ResolveApprovalReq, UiCommand, UpsertSandboxProfileReq,
 };
 
-#[derive(Debug, Parser)]
-#[command(name = "vigil-desktop", about = "Vigil local control plane CLI (I08a)")]
-struct Cli {
+/// `vigil-hub inspect` 子命令参数。`--db-path` / `--capability` 对内层子命令全局可见。
+#[derive(Debug, Args)]
+pub struct InspectArgs {
     /// SQLite DB path(省略 = in-memory,仅本进程可见)
     #[arg(long, global = true)]
     db_path: Option<String>,
@@ -31,7 +37,7 @@ struct Cli {
     capability: CapArg,
 
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: InspectCmd,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -50,7 +56,7 @@ impl From<CapArg> for Capability {
 }
 
 #[derive(Debug, Subcommand)]
-enum Cmd {
+enum InspectCmd {
     /// Activity Feed:列最近事件
     Activity {
         /// 只看某 session
@@ -152,7 +158,7 @@ enum SessionOp {
 enum ServersOp {
     /// 列所有已登记 servers
     List,
-    /// 展示某 server 的 onboarding 数据(**exact argv 可见 §4.7**)
+    /// 展示某 server 的 onboarding 数据(exact argv 可见)
     Show { server_id: String },
     /// 列 pending tool 审批
     PendingTools,
@@ -211,9 +217,9 @@ fn parse_scope(s: &str) -> Result<ApprovalScope, String> {
     }
 }
 
-fn build_command(cmd: Cmd) -> Result<UiCommand, String> {
+fn build_command(cmd: InspectCmd) -> Result<UiCommand, String> {
     Ok(match cmd {
-        Cmd::Activity {
+        InspectCmd::Activity {
             session,
             event_type,
             limit,
@@ -226,9 +232,9 @@ fn build_command(cmd: Cmd) -> Result<UiCommand, String> {
             },
             limit,
         }),
-        Cmd::Event { id } => UiCommand::GetEventDetail(GetEventDetailReq { event_id: id }),
-        Cmd::Search { query, limit } => UiCommand::FtsSearch(FtsSearchReq { query, limit }),
-        Cmd::Approvals { op } => match op {
+        InspectCmd::Event { id } => UiCommand::GetEventDetail(GetEventDetailReq { event_id: id }),
+        InspectCmd::Search { query, limit } => UiCommand::FtsSearch(FtsSearchReq { query, limit }),
+        InspectCmd::Approvals { op } => match op {
             ApprovalsOp::List { session } => {
                 UiCommand::ListPendingApprovals(ListPendingApprovalsReq {
                     session_id: session,
@@ -265,7 +271,7 @@ fn build_command(cmd: Cmd) -> Result<UiCommand, String> {
                 })
             }
         },
-        Cmd::Session { op } => match op {
+        InspectCmd::Session { op } => match op {
             SessionOp::List { source, limit } => {
                 UiCommand::ListSessions(ListSessionsReq { source, limit })
             }
@@ -273,7 +279,7 @@ fn build_command(cmd: Cmd) -> Result<UiCommand, String> {
                 UiCommand::ReplaySession(ReplaySessionReq { session_id, verify })
             }
         },
-        Cmd::Servers { op } => match op {
+        InspectCmd::Servers { op } => match op {
             ServersOp::List => UiCommand::ListServers,
             ServersOp::Show { server_id } => {
                 UiCommand::GetServerOnboarding(GetServerOnboardingReq { server_id })
@@ -311,7 +317,7 @@ fn build_command(cmd: Cmd) -> Result<UiCommand, String> {
                 UiCommand::RejectServerCommandDrift(RejectServerCommandDriftReq { server_id })
             }
         },
-        Cmd::Sandbox { op } => match op {
+        InspectCmd::Sandbox { op } => match op {
             SandboxOp::List => UiCommand::ListSandboxProfiles,
             SandboxOp::Show { profile_id } => {
                 UiCommand::GetSandboxProfile(GetSandboxProfileReq { profile_id })
@@ -346,23 +352,22 @@ fn build_command(cmd: Cmd) -> Result<UiCommand, String> {
                 },
             }),
         },
-        Cmd::VerifyChain => UiCommand::VerifyChain,
+        InspectCmd::VerifyChain => UiCommand::VerifyChain,
     })
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-
-    // 打开 Ledger
-    let ledger = match &cli.db_path {
+/// 执行 `vigil-hub inspect <cmd>`:打开 ledger → 构造 UiCommand → dispatch → 渲染 JSON。
+pub fn run(args: InspectArgs) -> ExitCode {
+    // 打开 Ledger(--db-path 或默认内存)
+    let ledger = match &args.db_path {
         Some(p) => Ledger::open(p),
         None => Ledger::open_in_memory(),
     };
     let ledger = match ledger {
         Ok(l) => l,
         Err(_e) => {
-            // Codex R1 MUST-FIX:不把 ledger 底层错误原文(可能含 SQL / 路径 / secret)入 stderr。
-            // 只回传稳定 reason_code。开发者可用 RUST_LOG= + tracing 看底层。
+            // 不把 ledger 底层错误原文(可能含 SQL / 路径 / secret)入 stderr;
+            // 只回稳定 reason_code。开发者可用 RUST_LOG= + tracing 看底层。
             eprintln!(
                 r#"{{"kind":"LedgerError","detail":{{"reason_code":"ledger_open_failed"}}}}"#
             );
@@ -370,7 +375,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let ui_cmd = match build_command(cli.cmd) {
+    let ui_cmd = match build_command(args.cmd) {
         Ok(c) => c,
         Err(msg) => {
             eprintln!(
@@ -381,7 +386,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match dispatch(ui_cmd, &ledger, cli.capability.into()) {
+    match dispatch(ui_cmd, &ledger, args.capability.into()) {
         Ok(resp) => {
             let mut out = std::io::stdout().lock();
             let _ = print_response(&mut out, &resp);

@@ -5,21 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-# Tauri/WiX 把"包主二进制"用作 MSI 主组件;默认按包名取 `vigil-desktop`(CLI),
-# 与 tauri.conf.json `mainBinaryName: "gui"` 不一致,导致 gui.exe 被 Path + gui
-# 两个组件重复安装(WiX ICE30)。显式声明默认运行目标为 gui,使二者一致。
-# 仅影响 `cargo run` 无参时的目标选择;默认(无 gui feature)构建/测试不受影响。
+# 包内唯一 bin 是 gui;default-run 让裸 `cargo run` 指向它,明确"主二进制 = gui"。
+# (v0.1.1 曾用此修 WiX ICE30 多-bin 重复组件;v0.1.2 移除 CLI bin 后包内仅 1 bin,保留更清晰。)
 default-run = "gui"
 
 [lints]
 workspace = true
 
-# I08a CLI bin(默认一直可用)
-[[bin]]
-name = "vigil-desktop"
-path = "src/main.rs"
-
-# I08b GUI bin(Tauri;feature 门控,默认关闭 —— `cargo test --workspace` 不编)
+# 包内唯一 bin = GUI(Tauri;feature `gui` 门控,默认关闭 —— `cargo test --workspace` 不编)。
+# v0.1.2:原 `vigil-desktop` CLI bin(src/main.rs)已移除,"命令行查账本"能力整合进
+# `vigil-hub inspect`。原因:desktop 包含第二个 bin 时,`cargo tauri build`(内部
+# `cargo build --bins`)会把它误打进安装包替换真正的 GUI(v0.1.0/v0.1.1 桌面包损坏根因)。
 # v0.11 ISS-102/103/104:bin name="gui" 对齐 path basename,Tauri v2 bundle 默认查
 # `target/release/<path-basename>` 复制 binary;改名让 bundle 找得到。原 release.yml
 # raw build 仍可用 `--bin gui --features gui` 路径。
@@ -32,8 +28,8 @@ required-features = ["gui"]
 name = "vigil_desktop"
 path = "src/lib.rs"
 
-# I08b feature matrix:
-# - 默认(无 feature):纯 CLI,零 Tauri 依赖,cargo test --workspace 零 regression
+# feature matrix:
+# - 默认(无 feature):仅 lib(CLI dispatch/render 消费层),零 Tauri 依赖,cargo test --workspace 零 regression
 # - `gui`:启用 Tauri 2 GUI binary(拉 ~200 transitive crates,仅 `cargo tauri dev` 或
 #   `cargo build --features gui` 时触发);v0.5 P1 ADR 0014 α1 起额外拉 vigil-mcp /
 #   vigil-firewall / vigil-policy(embed Hub 骨架)。三者全部 optional + dep:* 门控,

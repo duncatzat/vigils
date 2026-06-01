@@ -7,12 +7,15 @@ Vigil 本地控制面的 Desktop 层(ADR 0008)。
 - **I08a (已 Accepted)**:Rust CLI (`vigil-desktop` binary),完整 UiCommand dispatch → Ledger
 - **I08b-α1 (本轮)**:Tauri 2 + Vue 3 GUI 脚手架(feature `gui`,默认关闭),smoke test
 
-## CLI(I08a,默认可用)
+## CLI:命令行查账本(`vigil-hub inspect`)
+
+I08a 的 `vigil-desktop` 调试 CLI 已于 v0.1.2 整合进产品主 CLI `vigil-hub`(本 crate 的
+lib 层 dispatch/render 消费逻辑保留,由 `vigil-hub inspect` 复用):
 
 ```bash
-cargo run -p vigil-desktop -- session list
-cargo run -p vigil-desktop -- approvals list
-# ... 详见 `cargo run -p vigil-desktop -- --help`
+vigil-hub inspect --db-path ./vigil.db session list
+vigil-hub inspect --db-path ./vigil.db approvals list
+# ... 详见 `vigil-hub inspect --help`
 ```
 
 ## GUI(I08b-α1,需 feature + 环境就绪)
@@ -93,9 +96,10 @@ apps/desktop/
 
 | 场景 | 命令 | 编译的 binary | 触发 tauri deps? |
 |------|-----|--------------|------------------|
-| workspace CI | `cargo test --workspace` | 仅 `vigil-desktop` CLI | ❌ 零拉取 |
-| GUI 开发 | `cargo tauri dev --features gui` | `vigil-desktop-gui` + CLI | ✅ |
-| GUI 发行 | `cargo tauri build --features gui` | 同上 | ✅ |
+| workspace CI | `cargo test --workspace` | 仅 lib | ❌ 零拉取 |
+| 查账本 CLI | `vigil-hub inspect …` | `vigil-hub`(另一 crate) | ❌ 零拉取 |
+| GUI 开发 | `cargo tauri dev --features gui` | 仅 `gui` | ✅ |
+| GUI 发行 | `cargo tauri build --features gui` | 仅 `gui`(包内唯一 bin) | ✅ |
 
 ## 安全不变量(I08b α1-β1 累计守门)
 

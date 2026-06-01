@@ -7,6 +7,36 @@ All notable changes to Vigils are documented here. Versions follow
 
 ---
 
+## [v0.1.2] — 2026-06-01
+
+Desktop bundle fix. The Windows / macOS / Linux desktop installers now contain the
+actual **GUI** application. The v0.1.0 and v0.1.1 desktop installers mistakenly bundled
+the headless CLI binary in its place — double-clicking the installed app flashed a
+console and exited instead of opening the window. 桌面安装包修复 —— 三平台安装包现在装
+的是真正的 **GUI**;v0.1.0 / v0.1.1 安装包误打入了无窗口的 CLI 二进制(双击只闪一下控制台
+即退出,GUI 打不开)。CLI 二进制本身正常,仅桌面安装包受影响。
+
+### Fixed / 修复
+
+- **Desktop installers now ship the GUI, not the CLI.** `apps/desktop` exposed a second
+  `[[bin]]` (the `vigil-desktop` debug CLI); `cargo tauri build` builds every binary
+  (`cargo build --bins`) and bundled the wrong one as the app executable. The desktop
+  crate now has a single `gui` binary, so the bundlers can only package the GUI.
+  桌面安装包现在装 GUI 而非 CLI —— desktop crate 原有第二个 `[[bin]]`(`vigil-desktop`
+  调试 CLI),`cargo tauri build` 会构建全部二进制并把错误的那个打成应用主程序;现 desktop
+  crate 仅保留 `gui` 一个二进制,打包器只能打 GUI。
+
+### Changed / 变更
+
+- The `vigil-desktop` debug CLI is removed; its ledger-inspection capability is now part
+  of the main `vigil-hub` CLI as **`vigil-hub inspect`** (`activity` / `search` /
+  `approvals` / `session` / `servers` / `sandbox` / `verify-chain`; one-line JSON output
+  for scripting). `vigil-desktop` 调试 CLI 移除;查账本能力整合进主 CLI 的
+  **`vigil-hub inspect`** 子命令。
+- Workspace and desktop app version `0.1.1` → `0.1.2`.
+
+---
+
 ## [v0.1.1] — 2026-06-01
 
 Packaging-completeness release. Adds Windows **MSI** and Linux **RPM** installers
