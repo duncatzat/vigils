@@ -7,6 +7,28 @@ All notable changes to Vigils are documented here. Versions follow
 
 ---
 
+## [v0.1.1] — 2026-06-01
+
+Packaging-completeness release. Adds Windows **MSI** and Linux **RPM** installers
+alongside the existing NSIS / DMG / DEB / AppImage bundles, and aligns the workspace
+and desktop app version with the public release line. No library or runtime behavior
+changes. 打包补全版本 —— 在既有 NSIS/DMG/DEB/AppImage 之外新增 Windows **MSI** 与
+Linux **RPM** 安装包,并将 workspace/桌面应用版本号对齐公开发布线;无库或运行时行为变更。
+
+### Added / 新增
+
+- Windows **MSI** installer and Linux **RPM** package are now produced and attached to
+  the release. Windows **MSI** 安装包与 Linux **RPM** 包纳入发布产物。
+
+### Changed / 变更
+
+- Workspace and desktop app version `0.0.1` → `0.1.1`, aligning the crate/app version
+  with the public release tag. Cargo workspace 与桌面应用版本 `0.0.1` → `0.1.1`,对齐公开发布号。
+- README installation table now lists the complete installer set per platform.
+  README 安装表补全各平台完整安装包清单。
+
+---
+
 ## [v0.1.0] — 2026-06-01
 
 First public release of Vigils — a local control plane for AI agents.

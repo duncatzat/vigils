@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Tauri/WiX 把"包主二进制"用作 MSI 主组件;默认按包名取 `vigil-desktop`(CLI),
+# 与 tauri.conf.json `mainBinaryName: "gui"` 不一致,导致 gui.exe 被 Path + gui
+# 两个组件重复安装(WiX ICE30)。显式声明默认运行目标为 gui,使二者一致。
+# 仅影响 `cargo run` 无参时的目标选择;默认(无 gui feature)构建/测试不受影响。
+default-run = "gui"
 
 [lints]
 workspace = true

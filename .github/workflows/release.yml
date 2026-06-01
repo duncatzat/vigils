@@ -125,12 +125,17 @@ jobs:
         working-directory: apps/desktop
         run: cargo tauri build --features gui
 
+      # always(): 单个 bundle target(如某平台 rpm)失败不应拖垮整步,
+      # 让已成功产出的其他安装包仍能上传(matrix 已 fail-fast: false)。
       - name: Upload desktop bundles
+        if: always()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
           files: |
             target/release/bundle/**/*-setup.exe
+            target/release/bundle/**/*.msi
             target/release/bundle/**/*.dmg
             target/release/bundle/**/*.deb
+            target/release/bundle/**/*.rpm
             target/release/bundle/**/*.AppImage
