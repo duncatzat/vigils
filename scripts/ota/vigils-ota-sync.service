@@ -1,0 +1,9 @@
+[Unit]
+Description=Sync Vigils desktop OTA manifests from the latest GitHub release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vigils-ota-sync.sh
+# Runs as root (oneshot) so it can write the www-data-owned docroot and re-chown.

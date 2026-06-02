@@ -124,8 +124,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - { os: ubuntu-latest,  plat: linux-x86_64 }
+          - { os: macos-latest,   plat: darwin-aarch64 }
+          - { os: windows-latest, plat: windows-x86_64 }
     runs-on: ${{ matrix.os }}
+    # OTA updater signing — set repo secret TAURI_SIGNING_PRIVATE_KEY (content of the
+    # Tauri minisign private key) to produce signed updater artifacts + per-platform
+    # manifests. Absent → plain installers, no OTA; the release still succeeds (the
+    # updater steps below are guarded on the key being present).
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -152,7 +162,17 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0" --locked
 
-      - name: Build desktop bundles
+      # createUpdaterArtifacts is enabled ONLY when the signing key is present (otherwise
+      # the build would fail demanding a key). Two guarded steps keep no-secret releases
+      # working unchanged. shell: bash for uniform --config JSON quoting across OSes.
+      - name: Build desktop bundles (signed + updater artifacts)
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        working-directory: apps/desktop
+        shell: bash
+        run: cargo tauri build --features gui --config '{"bundle":{"createUpdaterArtifacts":true}}'
+
+      - name: Build desktop bundles (no signing key — plain installers)
+        if: env.TAURI_SIGNING_PRIVATE_KEY == ''
         working-directory: apps/desktop
         run: cargo tauri build --features gui
 
@@ -165,8 +185,29 @@ jobs:
           tag_name: ${{ needs.create-release.outputs.tag }}
           files: |
             target/release/bundle/**/*-setup.exe
+            target/release/bundle/**/*-setup.exe.sig
             target/release/bundle/**/*.msi
             target/release/bundle/**/*.dmg
+            target/release/bundle/**/*.app.tar.gz
+            target/release/bundle/**/*.app.tar.gz.sig
             target/release/bundle/**/*.deb
             target/release/bundle/**/*.rpm
             target/release/bundle/**/*.AppImage
+            target/release/bundle/**/*.AppImage.sig
+            target/release/bundle/**/*.AppImage.tar.gz
+            target/release/bundle/**/*.AppImage.tar.gz.sig
+
+      # OTA: generate this platform's updater manifest (latest-<plat>.json) pointing at the
+      # signed artifact's GitHub release URL, then upload it as a release asset. The
+      # vigils.ai mirror's ota-sync pulls these → /desktop-updates/<plat>/latest.json.
+      - name: Generate OTA updater manifest
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        shell: bash
+        run: node scripts/gen-updater-manifest.mjs "${{ needs.create-release.outputs.tag }}" "${{ matrix.plat }}" target/release/bundle "${{ github.repository }}" "Vigils ${{ needs.create-release.outputs.tag }}"
+
+      - name: Upload OTA updater manifest
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: latest-${{ matrix.plat }}.json
