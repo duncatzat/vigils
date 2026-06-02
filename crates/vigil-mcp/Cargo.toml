@@ -7,26 +7,26 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "MCP (Model Context Protocol) hub for Vigil — server registry, descriptor pinning, outbox, drift state machine"
-keywords = ["vigil", "mcp", "model-context-protocol", "registry"]
+keywords = ["vigil", "mcp", "gateway", "registry"]
 categories = ["network-programming", "api-bindings"]
 
 [lints]
 workspace = true
 
 [dependencies]
-vigil-types = { path = "../vigil-types" }
-vigil-audit = { path = "../vigil-audit" }
-vigil-firewall = { path = "../vigil-firewall" }
-vigil-redaction = { path = "../vigil-redaction" }
+vigil-types = { path = "../vigil-types", version = "0.1.0" }
+vigil-audit = { path = "../vigil-audit", version = "0.1.0" }
+vigil-firewall = { path = "../vigil-firewall", version = "0.1.0" }
+vigil-redaction = { path = "../vigil-redaction", version = "0.1.0" }
 # I07.5+ (ADR 0007 §I-7.1):共享 Native spawn env 政策 helper(apply_native_env_policy)。
 # ADR 0018 v0.13 split:改依赖 vigil-runner-types(pure types + env policy,0 vigil
 # deps,unblock SDK publish chain),不再拉 vigil-runner concrete impl(wasmtime 等)。
-vigil-runner-types = { path = "../vigil-runner-types" }
+vigil-runner-types = { path = "../vigil-runner-types", version = "0.1.0" }
 # v0.5 P1 ADR 0014 α2:`pub fn Hub::resolve_approval` 用到的 typed 协议结构
 # (ResolveApprovalReq / ApprovalAction / ApprovalResolutionDto)。
 # vigil-ui-protocol 自身只依赖 vigil-types / vigil-audit / vigil-runner,
 # 与 vigil-mcp 现有 deps 无循环。
-vigil-ui-protocol = { path = "../vigil-ui-protocol" }
+vigil-ui-protocol = { path = "../vigil-ui-protocol", version = "0.1.0" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -41,7 +41,7 @@ once_cell = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 rusqlite = { workspace = true }
-vigil-policy = { path = "../vigil-policy" }
+vigil-policy = { path = "../vigil-policy", version = "0.1.0" }
 # α2 集成测试 `tests/resolve_approval.rs` 用 Ledger 真实建 approval + 调
 # `Hub::resolve_approval` 全链路验证 approve / deny / cancel(已是 main dep,
 # 此处显式声明仅为 IDE / `cargo metadata` 可读性)。

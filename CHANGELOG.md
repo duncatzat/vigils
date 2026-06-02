@@ -8,6 +8,42 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.4] — 2026-06-02
+
+First crate-line release. Earlier 0.1.x releases were desktop packaging fixes; this one
+publishes the embeddable SDK (`vigil-sdk`) to crates.io, adds a second drift dimension to the
+MCP gateway, and brings every crate, the desktop app, and the published SDK onto a single
+0.1.4 version.
+
+### Added
+
+- **`vigil-sdk` embedding facade.** `FirewallBuilder` assembles a working firewall (audit
+  ledger + policy engine + default rule set) in a single call and is fail-closed by default —
+  an unconfigured tool is never blanket-allowed. `SdkFirewall::decide` / `decide_call` provide
+  a one-call decision API for embedding Vigil's safety runtime in a host application. The SDK
+  and its dependency crates are published on crates.io.
+- **Resolved-program drift detection for stdio MCP servers.** A pinned server's *resolved
+  executable path* is now a tracked dimension, orthogonal to argument drift: if it changes,
+  the gateway refuses to spawn the server until the change is reviewed and approved. The check
+  runs before spawn (fail-closed), is serialized against concurrent attaches, and is recorded
+  in the audit ledger as a reviewable drift event.
+
+### Changed
+
+- The privacy-filter model now downloads from the public Hugging Face endpoint
+  (`huggingface.co/openai/privacy-filter`, Apache-2.0); set `VIGIL_MODEL_MIRROR` to point at
+  your own mirror. File sizes and SHA-256 digests are unchanged (byte-identical to the
+  previous source).
+- Workspace, desktop app, and published SDK versions aligned to `0.1.4`. The desktop build
+  picks up the MCP drift hardening through its backend crates; there are no desktop-UI changes
+  in this release.
+
+### Security
+
+- Wasmtime updated `44.0.1` → `44.0.2`, clearing sandbox advisory RUSTSEC-2026-0149.
+
+---
+
 ## [v0.1.3] — 2026-06-01
 
 Desktop GUI rendering fix. The desktop app now actually renders its UI. v0.1.2 fixed the

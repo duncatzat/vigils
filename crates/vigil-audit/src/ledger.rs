@@ -44,6 +44,10 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     // "issuer_missing_legacy_row")。**不得**改为 NOT NULL —— ADD COLUMN 对非空
     // 表加 NOT NULL 无默认值会失败,破坏迁移幂等性。
     ("oauth_token_metadata", "issuer", "TEXT"),
+    // V1.1(ADR 0007 §I-7.1 / ADR 0005 第二独立 drift 维度):裸命令解析后绝对路径 pin。
+    // nullable —— legacy 行(列新增前的审批)NULL,首次本机 spawn 建立基线(见 §3.2 4 护栏)。
+    ("server_profiles", "resolved_program_path", "TEXT"),
+    ("server_profiles", "pending_resolved_program_path", "TEXT"),
 ];
 
 fn apply_column_migrations(conn: &Connection) -> Result<()> {

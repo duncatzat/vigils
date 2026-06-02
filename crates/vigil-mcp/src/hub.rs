@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use vigil_audit::Ledger;
+use vigil_audit::{Ledger, ResolvedProgramOutcome};
 use vigil_firewall::scorer::DescriptorOracle;
 use vigil_firewall::{Firewall, FirewallOutcome, OAuthScopeContext};
 use vigil_types::{
@@ -29,6 +29,7 @@ use vigil_ui_protocol::{ApprovalAction, ApprovalResolutionDto, ResolveApprovalRe
 
 use crate::namespace::{self, ToolRouter};
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use crate::stdio::{resolve_program, StdioError, StdioUpstream};
 use crate::upstream::{McpUpstream, UpstreamError};
 
 /// Hub 错误。
@@ -66,6 +67,23 @@ pub enum HubError {
         /// 本次 spawn 检测到的新 hash
         new_hash: String,
     },
+    /// V1.1(ADR 0007 §I-7.1 / ADR 0005 第二独立维度):上游裸命令**解析后绝对路径**与已 pin
+    /// 基线漂移,拒绝启动。与 `CommandDrift`(argv 文本)正交 —— argv 不变但解析二进制变
+    /// (PATH shadow / 重定位)。caller 须先 `Ledger::approve_server_resolved_program_drift`。
+    #[error("server `{server_id}` resolved-program drift: old={old} new={new}")]
+    ResolvedProgramDrift {
+        /// drift 的 server id
+        server_id: String,
+        /// 已 pin 的旧解析路径
+        old: String,
+        /// 本次解析出的新路径
+        new: String,
+    },
+    /// V1.1:Hub-owned stdio spawn 路径(`spawn_attach_stdio_upstream`)的 resolve / spawn
+    /// 阶段失败。**与请求期的 `Upstream(UpstreamError)` 通道区分** —— 本变体只在 attach 时
+    /// 一次性 spawn 出现(resolve PATH 失败 = `StdioError::ProgramNotFound` / 起进程失败 = `Spawn`)。
+    #[error("stdio spawn: {0}")]
+    StdioSpawn(#[source] StdioError),
     /// v0.5 P1 ADR 0014 α2:caller 传入参数语义不合法(例如 `Hub::resolve_approval`
     /// 在 `ApprovalAction::Approve` 路径上未提供 `scope`)。**仅承载短文本,不含
     /// secret / PII / DB 行内容**(与 `UiError::Invalid` 同语义层级)。
@@ -118,6 +136,11 @@ pub struct Hub {
     oracle: Arc<dyn DescriptorOracle>,
     router: Mutex<ToolRouter>,
     upstreams: Mutex<HashMap<String, Arc<dyn McpUpstream>>>,
+    /// V1.1(Codex code R2):**序列化所有 stdio attach**。`spawn_attach_stdio_upstream` 全程持有,
+    /// 让"早 dup 检查 → spawn → insert"对同一/不同 server_id 的并发 attach 串行 —— 杜绝两并发同名
+    /// 调用都过早检查后各 spawn 一个进程再 drop 的副作用泄漏。**不**阻塞请求热路径(请求只锁
+    /// `upstreams` map,与本锁无关);attach 是启动/低频操作,串行可接受。
+    attach_lock: Mutex<()>,
     config: HubConfig,
     session_id: Mutex<Option<String>>,
     /// ISS-016:本进程生命周期内 upstream response 扫到 secret leak 的累计次数。
@@ -182,6 +205,7 @@ impl Hub {
             oracle,
             router: Mutex::new(ToolRouter::default()),
             upstreams: Mutex::new(HashMap::new()),
+            attach_lock: Mutex::new(()),
             config,
             session_id: Mutex::new(None),
             leak_detected_count: AtomicU64::new(0),
@@ -321,6 +345,110 @@ impl Hub {
             ));
         }
         g.insert(server_id.to_string(), upstream);
+        Ok(())
+    }
+
+    /// V1.1:检查上游裸命令**解析后绝对路径**是否漂移(在 spawn **之前**调用)。
+    /// - 首见 → 建立本机基线 pin + 写 `server.program_pinned` 审计(bare→resolved 映射)
+    /// - 漂移 → 写 `server.resolved_program_drifted` 审计 + 返 `Err(ResolvedProgramDrift)`(fail-closed)
+    ///
+    /// `bare_program` = `argv[0]`(供审计映射);`resolved` = 宿主 PATH 解析后的本机绝对路径。
+    fn check_upstream_resolved_program_drift(
+        &self,
+        server_id: &str,
+        bare_program: &str,
+        resolved: &str,
+    ) -> Result<(), HubError> {
+        match self
+            .ledger
+            .check_server_resolved_program_drift(server_id, resolved)?
+        {
+            ResolvedProgramOutcome::Unchanged => Ok(()),
+            ResolvedProgramOutcome::Pinned { resolved } => {
+                let _ = self.ledger.append_event(
+                    &self.current_session_id()?,
+                    "server.program_pinned",
+                    &json!({
+                        "server_id": server_id,
+                        "bare": bare_program,
+                        "resolved": resolved,
+                    }),
+                    Some(&format!("program_pinned server:{server_id}")),
+                );
+                Ok(())
+            }
+            ResolvedProgramOutcome::Drifted(d) => {
+                let _ = self.ledger.append_event(
+                    &self.current_session_id()?,
+                    "server.resolved_program_drifted",
+                    &json!({
+                        "server_id": server_id,
+                        "old_resolved": d.old,
+                        "new_resolved": d.new,
+                    }),
+                    Some(&format!("resolved_program_drift server:{server_id}")),
+                );
+                Err(HubError::ResolvedProgramDrift {
+                    server_id: server_id.to_string(),
+                    old: d.old,
+                    new: d.new,
+                })
+            }
+        }
+    }
+
+    /// V1.1(ADR 0007 §I-7.1 / ADR 0005,Codex R2 ACCEPT):Hub-owned stdio upstream 启动 ——
+    /// **唯一**带 gate 的 stdio spawn 路径。顺序(Codex R2 实施铁律):
+    /// `resolve → argv-drift 检查 → resolved-program-drift 检查 → **才** spawn → attach`。
+    /// 进程在**双 gate 通过之前绝不 spawn**;`StdioUpstream::spawn_resolved` 已 `pub(crate)` 化,
+    /// 外部 caller 无 public 裸 argv 旁路。caller(`serve.rs` / I08 UI)用本方法替代旧的
+    /// `StdioUpstream::spawn` + `attach_upstream` 两步。
+    pub fn spawn_attach_stdio_upstream(
+        &self,
+        server_id: &str,
+        argv: &[String],
+        env: &[(String, String)],
+    ) -> Result<(), HubError> {
+        namespace::validate_server_id(server_id).map_err(HubError::Namespace)?;
+        if argv.is_empty() {
+            return Err(HubError::Invalid("argv is empty".to_string()));
+        }
+        // 0. 序列化所有 stdio attach(Codex code R2):全程持有 attach_lock,让"dup 检查 → spawn →
+        //    insert"对并发 attach 串行 —— 杜绝两并发同名调用都过 dup 检查后各 spawn 一个进程再 drop
+        //    的副作用泄漏。本锁不阻塞请求热路径(请求只锁 upstreams map)。
+        let _attach_guard = self
+            .attach_lock
+            .lock()
+            .map_err(|_| HubError::LockPoisoned)?;
+        // 1. dup 检查(在 attach_lock 串行下,这里读 upstreams 即可定论):重复 server_id 必须在
+        //    **任何 resolve / gate / spawn 副作用之前**拒绝。短路返回,不触碰 drift 状态机、不 spawn。
+        {
+            let g = self.upstreams.lock().map_err(|_| HubError::LockPoisoned)?;
+            if g.contains_key(server_id) {
+                return Err(HubError::Namespace(
+                    crate::namespace::NamespaceError::Duplicate(server_id.to_string()),
+                ));
+            }
+        }
+        // 2. resolve(spawn 之前):用宿主 PATH 把裸 argv[0] 解析为本机绝对路径
+        let resolved = resolve_program(&argv[0]).map_err(HubError::StdioSpawn)?;
+        let resolved_str = resolved.to_string_lossy().to_string();
+        // 3. argv drift gate(spawn 之前;既有 ADR 0005 §D5 闭环复用)
+        self.check_upstream_command_drift(server_id, argv)?;
+        // 4. resolved-program drift gate(spawn 之前;首见建基线 / 漂移 fail-closed)
+        self.check_upstream_resolved_program_drift(server_id, &argv[0], &resolved_str)?;
+        // 5. 双 gate 通过 → 才用已解析路径 spawn(子进程 env 仍 env_clear,§I-7.1 保留)
+        let upstream = StdioUpstream::spawn_resolved(server_id, resolved, &argv[1..], env)
+            .map_err(HubError::StdioSpawn)?;
+        // 6. attach:attach_lock 串行下 step 1 的 dup 判定仍成立(无并发同名插入),直接 insert。
+        //    再查一次 contains_key 仅为防御 attach_upstream(mock/HTTP,不走本锁)的极端交叉。
+        let mut g = self.upstreams.lock().map_err(|_| HubError::LockPoisoned)?;
+        if g.contains_key(server_id) {
+            return Err(HubError::Namespace(
+                crate::namespace::NamespaceError::Duplicate(server_id.to_string()),
+            ));
+        }
+        g.insert(server_id.to_string(), Arc::new(upstream));
         Ok(())
     }
 

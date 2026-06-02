@@ -20,7 +20,7 @@
 //! - ✓ 审计事件写入指定 Ledger(支持跨 session 持久化)
 //! - ✓ **Stage 2**:`--upstream-config` 自动化 onboarding —— 对每个 upstream
 //!   `ServerProfile` → `Ledger::register_server`(幂等)→ `approve_server(Limited)`
-//!   → `StdioUpstream::spawn` → `Hub::attach_upstream`(drift-check 闭环)
+//!   → `Hub::spawn_attach_stdio_upstream`(V1.1 gate-before-spawn:argv + resolved-program 双 drift 闭环)
 //!
 //! # 非目标
 //!
@@ -42,7 +42,6 @@ use vigil_audit::Ledger;
 use vigil_firewall::scorer::{DescriptorOracle, DescriptorStatus, StaticDescriptorOracle};
 use vigil_firewall::{Firewall, FirewallConfig};
 use vigil_mcp::protocol::{read_message, write_message, ProtocolError};
-use vigil_mcp::stdio::StdioUpstream;
 use vigil_mcp::{compute_argv_hash, Hub, HubConfig, HubError, JsonRpcRequest};
 use vigil_policy::{defaults::default_ruleset, PolicyAction, PolicyEngine, PolicyRule};
 use vigil_types::{ServerProfile, TransportKind, TrustLevel};
@@ -129,15 +128,8 @@ pub enum ServeError {
     /// JSON 解析(config / JSON-RPC payload)
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
-    /// Stdio upstream 启动 / 连接失败
-    #[error("stdio upstream `{server_id}` spawn: {source}")]
-    StdioSpawn {
-        /// 名字便于定位
-        server_id: String,
-        /// 底层错误
-        #[source]
-        source: vigil_mcp::stdio::StdioError,
-    },
+    // V1.1:stdio spawn 失败现统一经 `Hub::spawn_attach_stdio_upstream` → `HubError::StdioSpawn`
+    //       → `ServeError::Hub` 投影,移除冗余的 `ServeError::StdioSpawn` 变体。
     /// Upstream entry 配置非法(argv 空 / name 空等)
     #[error("upstream entry `{name}` invalid: {reason}")]
     InvalidUpstream {
@@ -293,9 +285,9 @@ pub fn build_hub(args: &ServeArgs) -> Result<(Arc<Hub>, Arc<Ledger>), ServeError
 /// 1. 构造 `ServerProfile` + `Ledger::register_server`(幂等;already-exists 视为 OK)
 /// 2. `Ledger::approve_server(server_id, TrustLevel::Limited)` —— serve 模式下
 ///    所有 config 里的 upstream 都是用户显式声明要信任的(否则用户不会写到 config)
-/// 3. `StdioUpstream::spawn(name, argv, [])` 启子进程
-/// 4. `Hub::attach_upstream(name, argv, Arc<dyn McpUpstream>)` —— 内部会再次
-///    `check_upstream_command_drift`,`command_hash` 必须与第 1 步算出一致
+/// 3. `Hub::spawn_attach_stdio_upstream(name, argv, [])`(V1.1)—— Hub-owned 单一路径:
+///    resolve → argv-drift → resolved-program-drift 双 gate → **才** spawn 子进程 → attach。
+///    进程在双 gate 通过之前绝不 spawn;`command_hash` 必须与第 1 步算出一致。
 ///
 /// 任一失败即返 Err,caller 决定是否 abort 整个 serve。
 pub fn attach_stdio_upstream(
@@ -342,14 +334,10 @@ pub fn attach_stdio_upstream(
     // 3. approve 到 Limited(serve 模式:config 里声明 = 用户信任)
     ledger.approve_server(&entry.name, TrustLevel::Limited)?;
 
-    // 4. spawn + attach
-    let upstream = StdioUpstream::spawn(&entry.name, &entry.argv, &[]).map_err(|e| {
-        ServeError::StdioSpawn {
-            server_id: entry.name.clone(),
-            source: e,
-        }
-    })?;
-    hub.attach_upstream(&entry.name, &entry.argv, Arc::new(upstream))?;
+    // 4. Hub-owned gate-before-spawn(V1.1):resolve → argv-drift → resolved-program-drift → spawn → attach
+    //    单一路径替代旧的 StdioUpstream::spawn + attach_upstream 两步,确保进程在双 drift gate
+    //    通过**之前绝不 spawn**(封死 public 裸 argv spawn 旁路)。
+    hub.spawn_attach_stdio_upstream(&entry.name, &entry.argv, &[])?;
 
     Ok(())
 }

@@ -1,5 +1,6 @@
 [package]
 name = "vigil-sdk"
+# 0.1.4:全员对齐 workspace(crates.io + 公开 vigils 仓统一版本线)。
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,7 +23,15 @@ ort = ["vigil-firewall/ort", "vigil-redaction/ort"]
 
 [dependencies]
 # Stable SDK re-exports;path-dep,locked to workspace version
-vigil-types = { path = "../vigil-types" }
-vigil-firewall = { path = "../vigil-firewall" }
-vigil-redaction = { path = "../vigil-redaction" }
-vigil-mcp = { path = "../vigil-mcp" }
+vigil-types = { path = "../vigil-types", version = "0.1.0" }
+vigil-firewall = { path = "../vigil-firewall", version = "0.1.0" }
+vigil-redaction = { path = "../vigil-redaction", version = "0.1.0" }
+vigil-mcp = { path = "../vigil-mcp", version = "0.1.0" }
+# v0.16 FirewallBuilder facade:内部装配用(Ledger / PolicyEngine + default_ruleset)。
+# **不** re-export —— 仅 firewall_builder 内化使用,守 SDK 边界。
+vigil-audit = { path = "../vigil-audit", version = "0.1.0" }
+vigil-policy = { path = "../vigil-policy", version = "0.1.0" }
+# decide_call 便捷方法生成 invocation_id(UUIDv4);内部用,不进 SDK public API。
+uuid = { workspace = true }
+# decide_call 的 args 形参类型(serde_json::Value 已是 ToolInvocation.args 的公开类型,不扩面)。
+serde_json = { workspace = true }

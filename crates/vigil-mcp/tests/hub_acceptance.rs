@@ -25,10 +25,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{json, Value};
 use vigil_audit::Ledger;
 use vigil_firewall::{scorer::StaticDescriptorOracle, Firewall, FirewallConfig};
 use vigil_mcp::protocol::{JsonRpcError, JsonRpcRequest};
+use vigil_mcp::upstream::{McpUpstream, UpstreamError};
 use vigil_mcp::{Hub, HubConfig};
 use vigil_policy::{defaults::default_ruleset, PolicyEngine};
 use vigil_types::{ApprovalScope, ServerProfile, TransportKind, TrustLevel};
@@ -482,4 +483,161 @@ fn f1_session_scope_short_circuits_firewall() {
         .unwrap();
     assert!(hit.is_some(), "F1 scope 消费应命中");
     assert_eq!(hit.unwrap().scope, Some(ApprovalScope::ThisSession));
+}
+
+// ===================== V1.1 gate-before-spawn(ADR 0007 §I-7.1 / ADR 0005)=====================
+
+/// 注册 + 批准一个 stdio server,command_hash = 真 argv hash(避免 argv drift 先触发)。
+fn register_approve_stdio(l: &Ledger, server_id: &str, argv: &[String]) {
+    let p = ServerProfile {
+        server_id: server_id.into(),
+        transport: TransportKind::Stdio,
+        command: Some(argv.to_vec()),
+        url: None,
+        first_seen_at: 0,
+        command_hash: Some(vigil_audit::argv_hash(argv)),
+        descriptor_hash: None,
+        trust_level: TrustLevel::Untrusted,
+        sandbox_profile_id: None,
+    };
+    l.register_server(&p).unwrap();
+    l.approve_server(server_id, TrustLevel::Limited).unwrap();
+}
+
+/// V1.1:resolved-program drift 必须在 spawn **之前**拦截(Codex R2 实施铁律)。
+/// 返回 `ResolvedProgramDrift` —— 因 drift 检查是 spawn_attach 第 3 步、spawn 是第 4 步,
+/// 返回该错误即结构性证明"进程未 spawn / upstream 未 attach"。
+#[test]
+fn v11_resolved_program_drift_blocks_before_spawn() {
+    let (l, hub) = setup_hub();
+    init_hub(&hub);
+
+    // 跨平台可解析的裸命令
+    #[cfg(windows)]
+    let bare = "cmd";
+    #[cfg(not(windows))]
+    let bare = "sh";
+    let argv = vec![bare.to_string()];
+    register_approve_stdio(&l, "shadow", &argv);
+
+    // 预 pin 一个伪基线 → 真实解析路径必 ≠ 它 → 触发 resolved-program drift
+    l.check_server_resolved_program_drift("shadow", "/__vigil_bogus_baseline__")
+        .unwrap();
+
+    let err = hub
+        .spawn_attach_stdio_upstream("shadow", &argv, &[])
+        .expect_err("resolved-program drift 必须在 spawn 前拦截");
+    assert!(
+        matches!(
+            err,
+            vigil_mcp::HubError::ResolvedProgramDrift { ref server_id, .. } if server_id == "shadow"
+        ),
+        "期望 ResolvedProgramDrift(gate-before-spawn),得到 {err:?}"
+    );
+}
+
+/// V1.1:无法解析的裸命令 → fail-closed `StdioSpawn`(resolve 在 spawn 前,且不退化为笼统错)。
+#[test]
+fn v11_unresolvable_program_fails_closed_before_spawn() {
+    let (l, hub) = setup_hub();
+    init_hub(&hub);
+    let argv = vec!["__vigil_definitely_not_a_real_cmd_zzz__".to_string()];
+    register_approve_stdio(&l, "noexist", &argv);
+
+    let err = hub
+        .spawn_attach_stdio_upstream("noexist", &argv, &[])
+        .expect_err("无法解析的命令必须 fail-closed");
+    assert!(
+        matches!(err, vigil_mcp::HubError::StdioSpawn(_)),
+        "期望 StdioSpawn(ProgramNotFound),得到 {err:?}"
+    );
+}
+
+#[derive(Debug)]
+struct NoopUpstream(String);
+impl McpUpstream for NoopUpstream {
+    fn server_id(&self) -> &str {
+        &self.0
+    }
+    fn transport(&self) -> TransportKind {
+        TransportKind::Stdio
+    }
+    fn call(&self, _m: &str, _p: Option<Value>, _t: Duration) -> Result<Value, UpstreamError> {
+        Ok(json!({}))
+    }
+    fn shutdown(&self) {}
+}
+
+/// V1.1(Codex code R1 BLOCKER):重复 server_id 必须在 **spawn 之前**短路拒绝。
+/// 先用 mock attach 占住 "dup",再 spawn_attach 同名但传一个**无法解析**的命令:
+/// 若早 dup 检查生效 → 返 `Duplicate`(根本没走到 resolve);若缺早检查 → 会先 resolve
+/// 失败返 `StdioSpawn`。断言 `Duplicate` 即证明"重复不 spawn / 不触碰 resolve"。
+#[test]
+fn v11_duplicate_attach_short_circuits_before_spawn() {
+    let (l, hub) = setup_hub();
+    init_hub(&hub);
+    let argv = vec!["mock".to_string()];
+    register_approve_stdio(&l, "dup", &argv);
+    // 先占位(mock,非真进程)
+    hub.attach_upstream("dup", &argv, Arc::new(NoopUpstream("dup".into())))
+        .unwrap();
+    // 重复 attach,故意传无法解析的命令 —— 若走到 resolve 必报 StdioSpawn
+    let err = hub
+        .spawn_attach_stdio_upstream("dup", &["__nonexistent_cmd_zzz__".to_string()], &[])
+        .expect_err("重复 server_id 必须拒绝");
+    assert!(
+        matches!(
+            err,
+            vigil_mcp::HubError::Namespace(vigil_mcp::namespace::NamespaceError::Duplicate(_))
+        ),
+        "期望 Duplicate(早 dup 短路,未走 resolve/spawn),得到 {err:?}"
+    );
+}
+
+/// V1.1(Codex code R2):**并发**同名 attach 必须由 `attach_lock` 串行 —— 恰一个成功、一个
+/// `Duplicate`,且失败者**不 spawn**(串行下它在 dup 检查处即返回)。结论不依赖线程调度时序
+/// (attach_lock 互斥保证),故确定性而非 flaky。胜者 spawn 一个真进程(`sh`/`cmd`),Hub drop
+/// 时关 stdin → 子进程收 EOF 自退。
+#[test]
+fn v11_concurrent_duplicate_attach_serialized_exactly_one_wins() {
+    use std::sync::Barrier;
+    let (l, hub) = setup_hub();
+    init_hub(&hub);
+
+    #[cfg(windows)]
+    let bare = "cmd";
+    #[cfg(not(windows))]
+    let bare = "sh";
+    let argv = vec![bare.to_string()];
+    register_approve_stdio(&l, "racer", &argv);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let hub_c = Arc::clone(&hub);
+        let argv_c = argv.clone();
+        let bar_c = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            bar_c.wait(); // 尽量让两线程同时冲 attach_lock
+            hub_c.spawn_attach_stdio_upstream("racer", &argv_c, &[])
+        }));
+    }
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    let dup = results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                Err(vigil_mcp::HubError::Namespace(
+                    vigil_mcp::namespace::NamespaceError::Duplicate(_)
+                ))
+            )
+        })
+        .count();
+    assert_eq!(ok, 1, "恰一个成功,得到 {results:?}");
+    assert_eq!(
+        dup, 1,
+        "恰一个 Duplicate(串行,失败者不 spawn),得到 {results:?}"
+    );
 }

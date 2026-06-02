@@ -76,9 +76,11 @@ type PendingTable = Arc<Mutex<HashMap<String, Sender<Value>>>>;
 /// - 裸名 → 遍历宿主 `PATH`;Unix 要求可执行位(X_OK),Windows 叠加 `PATHEXT`
 /// - 找不到 → `ProgramNotFound`(fail-closed),不退化为笼统 `Spawn`
 ///
-/// **未覆盖(V1.1 follow-up)**:把解析后绝对路径纳入 descriptor pinning / 审计的 command_hash
-/// (当前 pin 仍基于审批时的裸 argv)。这是 drift 状态机语义改动,单独迭代 + Codex code review。
-fn resolve_program(argv0: &str) -> Result<std::path::PathBuf, StdioError> {
+/// **V1.1(已实现,Codex Design R2 ACCEPT)**:解析后绝对路径现由 `Hub::spawn_attach_stdio_upstream`
+/// 在 spawn **之前**纳入 server command pinning 的第二独立维度(列 `resolved_program_path` 与审计
+/// `server.resolved_program_drifted`),抓"裸 `node` 解析到不同二进制"。TOCTOU(解析时刻 vs exec
+/// 时刻二进制替换)仍 O-D 超范围(无 inode/content pinning)。`pub(crate)` 供 Hub 调用。
+pub(crate) fn resolve_program(argv0: &str) -> Result<std::path::PathBuf, StdioError> {
     let not_found = || StdioError::ProgramNotFound {
         program: argv0.to_string(),
     };
@@ -152,31 +154,31 @@ impl std::fmt::Debug for StdioUpstream {
 }
 
 impl StdioUpstream {
-    /// 启动一个 stdio 上游。argv 必须已由 caller 审批(UI 展示过 exact command)。
+    /// 启动一个 stdio 上游(V1.1,ADR 0007 §I-7.1 / ADR 0005,Codex R2 ACCEPT)。
     ///
-    /// - `env` 是**将要注入**的环境变量。进程先 `env_clear()`,然后:
+    /// **唯一** stdio 构造路径,接收已由 `Hub::spawn_attach_stdio_upstream` 解析 + 双 drift gate
+    /// (argv + resolved-program)通过的绝对路径 `program`。`pub(crate)` —— 外部 caller 不得绕过
+    /// Hub gate 直接起进程(封死历史的 public 裸 argv `spawn` 旁路;Codex R2 实施铁律)。
+    ///
+    /// 参数:
+    ///
+    /// - `program`:Hub 用宿主 PATH 解析出的绝对路径(`resolve_program`);argv 已由 caller 审批
+    /// - `argv_tail`:`argv[1..]`(参数,不参与解析)
+    /// - `env`:批准注入的环境变量。进程先 `env_clear()`(§I-7.1 不变量保留),然后:
     ///   - **Windows**:注入 `RESERVED_SYSTEM_ENV_KEYS`(SystemRoot 等,让 cmd.exe / ping
     ///     等系统命令能解析 System32 DLL;见 ADR 0007 §I-7.1 helper)
     ///   - 最后注入 caller 批准的 `env`(优先级最高,覆盖同名 system 保留键)
-    /// - env 政策全路径由 `vigil_runner_types::apply_native_env_policy` 统一实现,与
-    ///   `spawn_native` 共享,消除跨 crate 漂移(I07.5+ / ADR 0007 §I-7.1 / ADR 0018)。
-    pub fn spawn(
+    ///
+    /// env 政策全路径由 `vigil_runner_types::apply_native_env_policy` 统一实现,与 `spawn_native`
+    /// 共享,消除跨 crate 漂移(I07.5+ / ADR 0007 §I-7.1 / ADR 0018);仅"程序定位"用了父 PATH。
+    pub(crate) fn spawn_resolved(
         server_id: impl Into<String>,
-        argv: &[String],
+        program: std::path::PathBuf,
+        argv_tail: &[String],
         env: &[(String, String)],
     ) -> Result<Self, StdioError> {
-        if argv.is_empty() {
-            return Err(StdioError::Spawn(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "empty argv",
-            )));
-        }
-
-        // O3:env_clear 会清掉 PATH,故先用宿主 PATH 把裸 argv[0] 解析为绝对路径,
-        // 再建 Command —— 子进程 env 仍全清(§I-7.1 保留)。argv[1..] 不解析。
-        let program = resolve_program(&argv[0])?;
         let mut cmd = Command::new(program);
-        for a in &argv[1..] {
+        for a in argv_tail {
             cmd.arg(a);
         }
         // I07.5+ (ADR 0007 §I-7.1):与 vigil-runner::spawn_native 共享 env 政策 helper,

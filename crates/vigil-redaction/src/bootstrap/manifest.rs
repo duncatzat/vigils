@@ -157,10 +157,11 @@ impl ModelPaths {
 /// **不**写成 `const`:Manifest 含 `String` / `Vec<String>` 字段,常量构造受限;
 /// 函数返回值同样支持调用点 grep `<placeholder-v0.5.1>` 一次性替换。
 ///
-/// v0.6+ 注入(2026-04-22 commit `73961cb` + 后续):placeholder 真值已替换完成 ——
-/// Vigil mirror primary + HF CDN fallback + 真 sha256 + 真 size_bytes,for 4 个
-/// model files(`model_q4f16.onnx` + `model_q4f16.onnx_data` + tokenizer + config)。
-/// `<placeholder-v0.5.1>` 标签留作 grep anchor 给后续 release 流水线检测注入完整性。
+/// v0.15(2026-06-02):公开 crates.io 发布 scrub —— primary_url 从内部 mirror 切到
+/// **官方 HuggingFace 公开端点** `huggingface.co/openai/privacy-filter`(OpenAI Privacy Filter,
+/// Apache 2.0;4 文件 sha256/size 实测与本 manifest 字节一致)。无 fallback(HF CDN/xet 可靠;
+/// 用户可经 `VIGIL_MODEL_MIRROR` env 覆盖为自有镜像)。真 sha256 + 真 size_bytes for 4 个 model
+/// files(`model_q4f16.onnx` + `model_q4f16.onnx_data` + tokenizer + config)。
 ///
 /// 测试场景由 tests.rs 自构 Manifest 覆盖(独立 fixture,不依赖本函数真值)。
 pub fn placeholder_manifest() -> Manifest {
@@ -184,8 +185,8 @@ pub fn placeholder_manifest() -> Manifest {
                 name: "model_q4f16.onnx".to_string(),
                 size_bytes: 165744,
                 sha256: "eaae4e83cf1345a60abe333ed882b55fe5775d1dfbf34b9b269e5e5416f45e5b".to_string(),
-                primary_url: "https://vigils.ai/privacy-filter/v1/model_q4f16.onnx".to_string(),
-                fallback_urls: vec!["https://huggingface.co/openai/privacy-filter/resolve/main/onnx/model_q4f16.onnx".to_string()],
+                primary_url: "https://huggingface.co/openai/privacy-filter/resolve/main/onnx/model_q4f16.onnx".to_string(),
+                fallback_urls: vec![],
             },
             // ONNX external-data weights(~ 772 MB);ORT 加载 model.onnx 时
             // 同目录自动找此文件;manifest 需独立列出确保 bootstrap 下载完整
@@ -193,22 +194,22 @@ pub fn placeholder_manifest() -> Manifest {
                 name: "model_q4f16.onnx_data".to_string(),
                 size_bytes: 809061992,
                 sha256: "6d4dde787e03ace283c45d4e32a94eec32b6cfcc242e7219bea96f5b4c13569d".to_string(),
-                primary_url: "https://vigils.ai/privacy-filter/v1/model_q4f16.onnx_data".to_string(),
-                fallback_urls: vec!["https://huggingface.co/openai/privacy-filter/resolve/main/onnx/model_q4f16.onnx_data".to_string()],
+                primary_url: "https://huggingface.co/openai/privacy-filter/resolve/main/onnx/model_q4f16.onnx_data".to_string(),
+                fallback_urls: vec![],
             },
             ManifestFile {
                 name: "tokenizer.json".to_string(),
                 size_bytes: 27868174,
                 sha256: "0614fe83cadab421296e664e1f48f4261fa8fef6e03e63bb75c20f38e37d07d3".to_string(),
-                primary_url: "https://vigils.ai/privacy-filter/v1/tokenizer.json".to_string(),
-                fallback_urls: vec!["https://huggingface.co/openai/privacy-filter/resolve/main/tokenizer.json".to_string()],
+                primary_url: "https://huggingface.co/openai/privacy-filter/resolve/main/tokenizer.json".to_string(),
+                fallback_urls: vec![],
             },
             ManifestFile {
                 name: "config.json".to_string(),
                 size_bytes: 3039,
                 sha256: "b2b26a4a4a000639ad30b0c264adbefe365bdb567fbd7bb27303b8c438375bd1".to_string(),
-                primary_url: "https://vigils.ai/privacy-filter/v1/config.json".to_string(),
-                fallback_urls: vec!["https://huggingface.co/openai/privacy-filter/resolve/main/config.json".to_string()],
+                primary_url: "https://huggingface.co/openai/privacy-filter/resolve/main/config.json".to_string(),
+                fallback_urls: vec![],
             },
         ],
     }

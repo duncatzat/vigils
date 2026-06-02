@@ -17,7 +17,10 @@
     clippy::panic
 )]
 
-use vigil_audit::{argv_hash, AuditError, CommandDrift, Ledger, PinOutcome};
+use vigil_audit::{
+    argv_hash, AuditError, CommandDrift, Ledger, PinOutcome, ResolvedProgramDrift,
+    ResolvedProgramOutcome,
+};
 use vigil_types::{ServerProfile, TransportKind, TrustLevel};
 
 fn setup() -> Ledger {
@@ -344,4 +347,201 @@ fn register_server_rejects_stdio_without_command_hash() {
         sandbox_profile_id: None,
     });
     assert!(matches!(err2, Err(AuditError::InvalidInput { .. })));
+}
+
+// ===================== V1.1 resolved-program drift(ADR 0007 §I-7.1 / ADR 0005)=====================
+// 与 argv command drift 正交的第二独立状态机:argv 不变但裸命令解析后绝对路径变(PATH shadow /
+// 重定位)时触发。覆盖 spike §6 收敛判据 2/3/6 + 护栏 1。
+
+fn register_http_server(l: &Ledger) {
+    // Http server:无 command / command_hash(resolved-program drift 不适用)
+    l.register_server(&ServerProfile {
+        server_id: "remote".into(),
+        transport: TransportKind::Http,
+        command: None,
+        url: Some("https://mcp.example.com".into()),
+        first_seen_at: 0,
+        command_hash: None,
+        descriptor_hash: None,
+        trust_level: TrustLevel::Untrusted,
+        sandbox_profile_id: None,
+    })
+    .unwrap();
+}
+
+/// 判据 2:首见建立本机基线 pin(不报 drift);再次同路径 → Unchanged。
+#[test]
+fn resolved_program_first_seen_pins_then_unchanged() {
+    let l = setup();
+    register_fs_server(&l);
+    let o1 = l
+        .check_server_resolved_program_drift("fs", "/usr/bin/node")
+        .unwrap();
+    assert!(
+        matches!(o1, ResolvedProgramOutcome::Pinned { ref resolved } if resolved == "/usr/bin/node"),
+        "首见必须 Pinned 建立基线,got {o1:?}"
+    );
+    let o2 = l
+        .check_server_resolved_program_drift("fs", "/usr/bin/node")
+        .unwrap();
+    assert!(
+        matches!(o2, ResolvedProgramOutcome::Unchanged),
+        "同路径再查必须 Unchanged,got {o2:?}"
+    );
+}
+
+/// 判据 3:argv 不变但解析路径变 → Drifted(fail-closed);approve 后新路径成基线。
+#[test]
+fn resolved_program_drift_detected_then_approve() {
+    let l = setup();
+    register_fs_server(&l);
+    // 建立基线
+    l.check_server_resolved_program_drift("fs", "/usr/bin/node")
+        .unwrap();
+    // PATH shadow:同 argv,解析到 /tmp/evil/node
+    let d = l
+        .check_server_resolved_program_drift("fs", "/tmp/evil/node")
+        .unwrap();
+    assert!(
+        matches!(
+            d,
+            ResolvedProgramOutcome::Drifted(ResolvedProgramDrift { ref old, ref new })
+                if old == "/usr/bin/node" && new == "/tmp/evil/node"
+        ),
+        "解析路径变必须 Drifted{{old,new}},got {d:?}"
+    );
+    // 批准 drift:pending → 新基线
+    l.approve_server_resolved_program_drift("fs").unwrap();
+    let o = l
+        .check_server_resolved_program_drift("fs", "/tmp/evil/node")
+        .unwrap();
+    assert!(
+        matches!(o, ResolvedProgramOutcome::Unchanged),
+        "批准后新路径成基线,再查必须 Unchanged,got {o:?}"
+    );
+}
+
+/// reject 保留旧基线:drift 后 reject,旧路径仍是基线,新路径再查仍 Drifted。
+#[test]
+fn resolved_program_drift_reject_keeps_baseline() {
+    let l = setup();
+    register_fs_server(&l);
+    l.check_server_resolved_program_drift("fs", "/usr/bin/node")
+        .unwrap();
+    let d = l
+        .check_server_resolved_program_drift("fs", "/opt/node/bin/node")
+        .unwrap();
+    assert!(matches!(d, ResolvedProgramOutcome::Drifted(_)));
+    l.reject_server_resolved_program_drift("fs").unwrap();
+    // 旧基线保留:原路径 Unchanged
+    let o = l
+        .check_server_resolved_program_drift("fs", "/usr/bin/node")
+        .unwrap();
+    assert!(matches!(o, ResolvedProgramOutcome::Unchanged));
+    // 新路径仍 Drifted(基线未变)
+    let d2 = l
+        .check_server_resolved_program_drift("fs", "/opt/node/bin/node")
+        .unwrap();
+    assert!(matches!(d2, ResolvedProgramOutcome::Drifted(_)));
+}
+
+/// 回退到已 pin 路径自愈 pending:drift 写 pending 后,回退到基线 → Unchanged + pending 清零
+/// (清零通过"随后 approve 报无 pending"间接证明,镜像 command drift 自愈语义)。
+#[test]
+fn resolved_program_revert_to_baseline_self_heals_pending() {
+    let l = setup();
+    register_fs_server(&l);
+    l.check_server_resolved_program_drift("fs", "/usr/bin/node")
+        .unwrap();
+    // drift → 写 pending
+    let d = l
+        .check_server_resolved_program_drift("fs", "/tmp/evil/node")
+        .unwrap();
+    assert!(matches!(d, ResolvedProgramOutcome::Drifted(_)));
+    // 回退到基线 → Unchanged + 清 pending
+    let o = l
+        .check_server_resolved_program_drift("fs", "/usr/bin/node")
+        .unwrap();
+    assert!(matches!(o, ResolvedProgramOutcome::Unchanged));
+    // pending 已清:approve 应报"无 pending"
+    let err = l.approve_server_resolved_program_drift("fs");
+    assert!(
+        matches!(err, Err(AuditError::InvalidInput { .. })),
+        "pending 已自愈清零,approve 必须报无 pending,got {err:?}"
+    );
+}
+
+/// 护栏 1:Http server(无 command_hash)resolved-program drift 不适用 → 永远 Unchanged,
+/// 且不建立基线(第二个不同路径仍 Unchanged,证明未 pin)。
+#[test]
+fn resolved_program_not_applicable_for_http_server() {
+    let l = setup();
+    register_http_server(&l);
+    let o1 = l
+        .check_server_resolved_program_drift("remote", "/usr/bin/whatever")
+        .unwrap();
+    assert!(matches!(o1, ResolvedProgramOutcome::Unchanged));
+    // 未建立基线:不同路径仍 Unchanged(若误 pin 了第一个,这里会 Drifted)
+    let o2 = l
+        .check_server_resolved_program_drift("remote", "/totally/different")
+        .unwrap();
+    assert!(
+        matches!(o2, ResolvedProgramOutcome::Unchanged),
+        "Http server 不应建立 resolved 基线,got {o2:?}"
+    );
+}
+
+/// 未登记 server → Unchanged(不报错,交由 register 常规路径)。
+#[test]
+fn resolved_program_drift_on_unknown_server_unchanged() {
+    let l = setup();
+    let o = l
+        .check_server_resolved_program_drift("ghost", "/usr/bin/node")
+        .unwrap();
+    assert!(matches!(o, ResolvedProgramOutcome::Unchanged));
+}
+
+/// approve / reject 无 pending 时报错(第二状态机的护栏)。
+#[test]
+fn resolved_program_approve_reject_without_pending_errors() {
+    let l = setup();
+    register_fs_server(&l);
+    l.check_server_resolved_program_drift("fs", "/usr/bin/node")
+        .unwrap();
+    assert!(matches!(
+        l.approve_server_resolved_program_drift("fs"),
+        Err(AuditError::InvalidInput { .. })
+    ));
+    assert!(matches!(
+        l.reject_server_resolved_program_drift("fs"),
+        Err(AuditError::InvalidInput { .. })
+    ));
+}
+
+/// 正交性:command drift 与 resolved-program drift 互不干扰(两个独立状态机,
+/// 不 overload pending_command_hash —— Codex R1 ADR 0005 边界)。
+#[test]
+fn command_drift_and_resolved_program_drift_are_orthogonal() {
+    let l = setup();
+    register_fs_server(&l);
+    // 建立 resolved 基线
+    l.check_server_resolved_program_drift("fs", "/usr/bin/node")
+        .unwrap();
+    // 触发 argv command drift(独立维度)
+    let v2 = argv_v2();
+    let h2 = argv_hash(&v2);
+    let cd = l.check_server_command_drift("fs", &v2, &h2).unwrap();
+    assert!(matches!(cd, Some(CommandDrift { .. })));
+    assert_eq!(l.list_drifted_servers().unwrap().len(), 1);
+    // resolved-program 维度不受 command drift 影响:同路径仍 Unchanged
+    let rp = l
+        .check_server_resolved_program_drift("fs", "/usr/bin/node")
+        .unwrap();
+    assert!(matches!(rp, ResolvedProgramOutcome::Unchanged));
+    // 批准 command drift 不应碰 resolved pending;批准 resolved 应报无 pending
+    l.approve_server_command_drift("fs").unwrap();
+    assert!(matches!(
+        l.approve_server_resolved_program_drift("fs"),
+        Err(AuditError::InvalidInput { .. })
+    ));
 }

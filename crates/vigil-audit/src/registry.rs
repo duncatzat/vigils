@@ -87,6 +87,31 @@ pub struct CommandDrift {
     pub new: String,
 }
 
+/// V1.1:server 裸命令**解析后绝对路径**的 drift 漂移记录(ADR 0007 §I-7.1 / ADR 0005)。
+/// 与 [`CommandDrift`](argv 文本 drift)**正交** —— argv 不变但解析二进制变(PATH shadow /
+/// 重定位)。`old`/`new` 均为**本机绝对路径**(per-machine,非可移植)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProgramDrift {
+    /// 已 pin 的旧解析路径
+    pub old: String,
+    /// 本次 spawn 解析出的新路径
+    pub new: String,
+}
+
+/// V1.1:`check_server_resolved_program_drift` 的三态结果。caller(Hub)据此发不同审计事件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedProgramOutcome {
+    /// 解析路径与已 pin 基线一致;**或**本 server 不适用(非 Stdio / 无 `command_hash`)。无需事件。
+    Unchanged,
+    /// 首见:已建立本机基线 pin(不报 drift)。caller 发 `server.program_pinned` 审计。
+    Pinned {
+        /// 刚 pin 的本机解析路径
+        resolved: String,
+    },
+    /// 解析路径与已 pin 基线不等 → 已写 pending,fail-closed。caller 发 `server.resolved_program_drifted`。
+    Drifted(ResolvedProgramDrift),
+}
+
 /// Registry 专用错误(与 AuditError 分开以便 caller 精细分支)。
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -692,6 +717,134 @@ impl Ledger {
             "server.command_drift_rejected",
             &serde_json::json!({"server_id": server_id}),
             Some(&format!("server command_drift_rejected {server_id}")),
+        );
+        Ok(())
+    }
+
+    // -------- V1.1 resolved-program drift(ADR 0007 §I-7.1 / ADR 0005 第二独立维度)--------
+
+    /// V1.1:检查 server 裸命令**解析后绝对路径**是否漂移。与 [`check_server_command_drift`]
+    /// (argv 文本)正交:argv 不变但解析二进制变(PATH shadow / 重定位)时触发。
+    ///
+    /// **护栏**(spike §3.2,Codex R1 §4 答 2):
+    /// - 仅对**已有有效 `command_hash` 的 Stdio 行**建立/比较 resolved 基线(Http / 无 argv pin 不适用)
+    /// - 未 pin(`resolved_program_path IS NULL`,legacy 或首见)→ **建立本机基线**(不报 drift),
+    ///   caller(Hub)须保证本调用在 spawn **之前**(护栏 2)
+    /// - 已 pin 且一致 → `Unchanged`(若有残留 pending 则清,镜像 command drift 回退语义)
+    /// - 已 pin 且不等 → 写 `pending_resolved_program_path` + 返 `Drifted`(fail-closed)
+    ///
+    /// `resolved_path` 须是 caller 用宿主 PATH 解析出的**本机绝对路径**(per-machine,非可移植)。
+    pub fn check_server_resolved_program_drift(
+        &self,
+        server_id: &str,
+        resolved_path: &str,
+    ) -> Result<ResolvedProgramOutcome> {
+        let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
+        let existing: Option<(Option<String>, Option<String>, Option<String>)> = guard
+            .query_row(
+                "SELECT command_hash, resolved_program_path, pending_resolved_program_path
+                 FROM server_profiles WHERE server_id = ?1",
+                rusqlite::params![server_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((command_hash, pinned, prev_pending)) = existing else {
+            return Ok(ResolvedProgramOutcome::Unchanged); // 未登记 → 不适用
+        };
+        // 护栏 1:仅对有有效 command_hash 的 Stdio 行建立/比较 resolved 基线
+        if command_hash.is_none() {
+            return Ok(ResolvedProgramOutcome::Unchanged); // Http / 无 argv pin → 不适用
+        }
+        match pinned {
+            None => {
+                // 首见:建立本机基线 pin(护栏 2:caller 保证在 spawn 之前)
+                guard.execute(
+                    "UPDATE server_profiles SET resolved_program_path = ?1 WHERE server_id = ?2",
+                    rusqlite::params![resolved_path, server_id],
+                )?;
+                Ok(ResolvedProgramOutcome::Pinned {
+                    resolved: resolved_path.to_string(),
+                })
+            }
+            Some(p) if p == resolved_path => {
+                // 回退到已 pin 路径:清残留 pending(镜像 command drift 回退清 pending 语义)
+                if prev_pending.is_some() {
+                    guard.execute(
+                        "UPDATE server_profiles SET pending_resolved_program_path = NULL
+                         WHERE server_id = ?1",
+                        rusqlite::params![server_id],
+                    )?;
+                }
+                Ok(ResolvedProgramOutcome::Unchanged)
+            }
+            Some(p) => {
+                guard.execute(
+                    "UPDATE server_profiles SET pending_resolved_program_path = ?1
+                     WHERE server_id = ?2",
+                    rusqlite::params![resolved_path, server_id],
+                )?;
+                Ok(ResolvedProgramOutcome::Drifted(ResolvedProgramDrift {
+                    old: p,
+                    new: resolved_path.to_string(),
+                }))
+            }
+        }
+    }
+
+    /// V1.1:接受 resolved-program drift(pending 解析路径 → `resolved_program_path` 基线)。
+    pub fn approve_server_resolved_program_drift(&self, server_id: &str) -> Result<()> {
+        {
+            let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
+            let n = guard.execute(
+                "UPDATE server_profiles
+                 SET resolved_program_path = pending_resolved_program_path,
+                     pending_resolved_program_path = NULL
+                 WHERE server_id = ?1 AND pending_resolved_program_path IS NOT NULL",
+                rusqlite::params![server_id],
+            )?;
+            if n == 0 {
+                return Err(AuditError::InvalidInput {
+                    reason: "server has no pending resolved-program drift",
+                });
+            }
+        }
+        let _ = self.append_event_internal(
+            "system",
+            "server.resolved_program_re_approved",
+            &serde_json::json!({"server_id": server_id}),
+            Some(&format!("server resolved_program_re_approved {server_id}")),
+        );
+        Ok(())
+    }
+
+    /// V1.1:拒绝 resolved-program drift(保留旧基线,清 pending)。
+    pub fn reject_server_resolved_program_drift(&self, server_id: &str) -> Result<()> {
+        {
+            let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
+            let n = guard.execute(
+                "UPDATE server_profiles SET pending_resolved_program_path = NULL
+                 WHERE server_id = ?1 AND pending_resolved_program_path IS NOT NULL",
+                rusqlite::params![server_id],
+            )?;
+            if n == 0 {
+                return Err(AuditError::InvalidInput {
+                    reason: "server has no pending resolved-program drift",
+                });
+            }
+        }
+        let _ = self.append_event_internal(
+            "system",
+            "server.resolved_program_drift_rejected",
+            &serde_json::json!({"server_id": server_id}),
+            Some(&format!(
+                "server resolved_program_drift_rejected {server_id}"
+            )),
         );
         Ok(())
     }

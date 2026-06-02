@@ -120,12 +120,21 @@ CREATE TABLE IF NOT EXISTS server_profiles (
   last_drift_at        INTEGER,
   -- I08 新增(Codex R1 BLOCKER):drift 批准后必须能让 UI 展示新 argv 文本,
   -- 仅有 hash 会让 §4.7 "exact argv 可见" 失真。Caller(Hub)写 drift 时同时传 argv JSON。
-  pending_command_json TEXT
+  pending_command_json TEXT,
+  -- V1.1 新增(ADR 0007 §I-7.1 / ADR 0005 第二独立 drift 维度):裸 argv[0] 经宿主 PATH
+  -- 解析后的**本机绝对路径**。与 command_hash(argv 文本)正交 —— argv 不变但解析二进制变
+  -- (PATH shadow / 重定位)时由本列检测。per-machine 本地基线,非可移植 descriptor identity。
+  resolved_program_path         TEXT,    -- 已 pin 的本机解析路径(首见即信任建立基线)
+  pending_resolved_program_path TEXT      -- 与 resolved_program_path 不等的新解析路径(待审批)
 );
 
 CREATE INDEX IF NOT EXISTS idx_server_trust ON server_profiles(trust_level);
 CREATE INDEX IF NOT EXISTS idx_server_drift
   ON server_profiles(pending_command_hash) WHERE pending_command_hash IS NOT NULL;
+-- V1.1 注:不在此为 pending_resolved_program_path 建索引 —— 该列经 COLUMN_MIGRATIONS 添加,
+-- 而 SCHEMA_SQL(含 CREATE INDEX)在 ledger.rs:217 先于迁移(:222)执行,旧库升级时列尚不存在
+-- 会 "no such column" 失败(同理 pending_command_json 也无索引)。当前无 list_resolved_drifted
+-- 查询消费该索引(YAGNI);未来若加 list API,改在迁移后以编程方式建索引。
 
 -- I04 per-tool descriptor pinning(ADR 0004 §D6)+ I05 drift 状态机(ADR 0005 §D1)
 CREATE TABLE IF NOT EXISTS tool_descriptors (

@@ -32,8 +32,9 @@ pub use ledger::{
 pub use outbox::{OutboxItem, OutboxKind, OutboxStatus};
 pub use registry::{
     argv_hash, is_reserved_env_key_name, secret_ref_fingerprint, vigil_http_auth_metadata,
-    CommandDrift, PinOutcome, RegistryError, SandboxProfileRow, SandboxProfileUpsertResult,
-    SecretRefEntry, ServerOnboardingData, StoredServerProfile, ToolApprovalCard, ToolSecretBinding,
+    CommandDrift, PinOutcome, RegistryError, ResolvedProgramDrift, ResolvedProgramOutcome,
+    SandboxProfileRow, SandboxProfileUpsertResult, SecretRefEntry, ServerOnboardingData,
+    StoredServerProfile, ToolApprovalCard, ToolSecretBinding,
 };
 pub use span::{Decided, Opened, ToolCallSpan};
 

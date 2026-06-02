@@ -73,7 +73,7 @@ cargo audit  # 仍报全部,不 fail
 
 - `deny.toml [advisories] ignore = [...]`(20 entries with reason)
 - 本 ADR 文档化
-- 后续:加入 ci.yml 跑 `cargo deny check`(若 Gitea Actions live 后)
+- 后续:加入 ci.yml 跑 `cargo deny check`(随 CI 工作流上线)
 
 ## 8. Verification
 

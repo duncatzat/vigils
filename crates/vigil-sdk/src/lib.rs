@@ -1,12 +1,12 @@
 //! # vigil-sdk
 //!
-//! v0.7-α Phase 1 — minimal stable SDK facade for embedding Vigil's local AI
-//! safety runtime into 3rd-party tools.
+//! Minimal stable SDK facade for embedding Vigil's local AI safety runtime into
+//! 3rd-party tools. Published on crates.io as `vigil-sdk` (Apache-2.0).
 //!
 //! ## Status
 //!
-//! **Alpha**(2026-05-01,Codex ACCEPT 决策见 [v0.7 brainstorm][bs])。
-//! 当前 phase 1 暴露的是**最小核心**:typed decisions/audit records + high-level
+//! **已发布 0.1.0**(crates.io)。SDK pub surface 经 Codex review 守门。
+//! 当前暴露的是**最小核心**:typed decisions/audit records + high-level
 //! firewall execution + high-level redaction scanning。
 //!
 //! 显式**不在** SDK 中:server runtime(Hub / oracle)/ 运行时 backend(NoopEngine /
@@ -37,11 +37,11 @@
 //! 3. **DecisionRecord 强制**:任何 effect 触发(tool invocation / approval / etc)
 //!    必须 first 产出 [`DecisionRecord`]。**不存在** SDK API 让 consumer 跳过这步。
 //! 4. **接口稳定**:SDK pub items 在 0.x 阶段允许小改进,但**移除**视为 breaking change;
-//!    v1.0 freeze 后**仅可加,不可删**。具体语义由 [v0.7 不变量 #12][inv12] 守门。
+//!    v1.0 freeze 后**仅可加,不可删**(SDK SemVer 政策守门,见下)。
 //!
 //! ## SemVer 政策
 //!
-//! - 当前在 0.0.x:可能小改 SDK item 签名(必经 codex review + ADR)
+//! - 当前在 0.1.x:可能小改 SDK item 签名(必经 codex review + ADR)
 //! - v1.0 之后:freeze SDK pub items;新加项允许,删除/改签名禁止
 //! - **non-SDK** crate(vigil-policy 等)仍可独立演进,与 SDK 解耦
 //!
@@ -52,8 +52,7 @@
 //!
 //! ## 引用
 //!
-//! [bs]: <https://gitea/vigil-dev/vigil/blob/master/docs/sessions/2026-05-01-v0.7-brainstorm.md>
-//! [inv12]: <https://gitea/vigil-dev/vigil/blob/master/docs/roadmap-v0.7.md>
+//! - 项目仓库:<https://github.com/duncatzat/vigils>
 
 #![deny(unsafe_code)]
 // v0.13.1 C5(2026-05-15):SDK 公开 surface 100% rustdoc coverage gate。
@@ -106,6 +105,14 @@ pub use vigil_redaction::{
 
 // vigil-mcp: descriptor hash(用于 audit 关联,不暴露 router/upstream/server 内部)
 pub use vigil_mcp::descriptor_hash;
+
+// ─────────────── v0.16 — high-level firewall facade(SDK-owned builder)───────────────
+//
+// 补全 SDK "firewall execution" 卖点:消费者只用 vigil-sdk 即可起 firewall 跑决策,
+// 不暴露 Ledger / PolicyEngine / DescriptorOracle(内化,守 SDK 边界)。
+// 设计 + Codex review trajectory:docs/operations/sdk-firewall-builder/spike.md。
+pub mod firewall_builder;
+pub use firewall_builder::{FirewallBuildError, FirewallBuilder, SdkFirewall};
 
 // ─────────────── v0.8 Sprint 4 P3.1 — ensemble 浅级暴露(opt-in `ort` feature)───────────────
 //
@@ -277,8 +284,9 @@ pub mod prelude {
     pub use crate::{
         scan_text, ApprovalRequest, ApprovalResolution, ApprovalScope, ApprovalStatus, AuditEvent,
         DecisionKind, DecisionRecord, EffectKind, EffectVector, Finding, FindingSource, Firewall,
-        FirewallConfig, FirewallError, FirewallOutcome, OAuthScopeContext, PiiScanner,
-        PrivacyLabel, RedactionResult, RiskSignals, ScanError, ToolInvocation,
+        FirewallBuildError, FirewallBuilder, FirewallConfig, FirewallError, FirewallOutcome,
+        OAuthScopeContext, PiiScanner, PrivacyLabel, RedactionResult, RiskSignals, ScanError,
+        SdkFirewall, ToolInvocation,
     };
 }
 

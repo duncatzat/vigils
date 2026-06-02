@@ -22,7 +22,7 @@ This crate is the **minimal stable SDK** for 3rd-party tools to embed Vigil's sa
 
 ```toml
 [dependencies]
-vigil-sdk = "0.11"
+vigil-sdk = "0.1"
 ```
 
 ```rust
@@ -33,6 +33,9 @@ let token = "ghp_0123456789abcdefghijklmnopqrstuvwxyz12";
 let result: RedactionResult = scan_text(token).unwrap();
 assert!(result.findings.iter().any(|f| f.kind == "github_token"));
 ```
+
+> Verified against the published `vigil-sdk = "0.1.0"` from crates.io by a standalone
+> downstream consumer (see the crate-level rustdoc Quickstart, which is a compile-checked doctest).
 
 ## Invariants (SDK consumer 必守)
 
