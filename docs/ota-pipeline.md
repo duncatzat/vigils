@@ -60,11 +60,18 @@ every 15 min, pulls the latest release's `latest-<plat>.json` assets into the do
 
 ## Verifying a release
 
-`scripts/` ships no test, but the updater chain can be checked end-to-end (manifest fetch →
-semver gate → artifact download → signature verify, with a tampering negative-control)
-without installing anything — see the standalone verifier used during the v0.1.4 rollout.
-The decisive check is that the artifact's signature validates against the `tauri.conf.json`
-pubkey; if it does, the updater will accept it.
+The updater chain can be checked end-to-end without installing anything:
+
+```bash
+PUBKEY=$(node -e 'console.log(require("./apps/desktop/tauri.conf.json").plugins.updater.pubkey)')
+node scripts/verify-ota.mjs https://vigils.ai/desktop-updates/windows-x86_64/0.1.3.json 0.1.3 "$PUBKEY"
+```
+
+`scripts/verify-ota.mjs` faithfully reproduces the updater's checks — manifest fetch → semver
+gate → artifact download → minisign signature verify — plus a tampering negative-control (a
+flipped byte must be rejected, proving the verifier isn't a no-op). The decisive check is that
+the artifact's signature validates against the `tauri.conf.json` pubkey; if it does, the
+updater will accept it.
 
 ## Notes
 
