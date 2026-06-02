@@ -26,5 +26,6 @@ cargo tauri build --features gui --bundles msi,nsis
 
 ## Bin layout(per ADR 0018)
 
-`apps/desktop/Cargo.toml`:`[[bin]] name = "gui" path = "src/bin/gui.rs"` —
-对齐 Tauri v2 bundle 默认查 path basename。
+`apps/desktop/Cargo.toml`:`[[bin]] name = "vigils" path = "src/bin/vigils.rs"` —
+对齐 Tauri v2 bundle 默认查 path basename(name == path basename == `mainBinaryName`)。
+安装后可执行文件为 `vigils.exe`(v0.1.5 起;此前为 `gui`)。

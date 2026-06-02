@@ -8,6 +8,28 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.5] — 2026-06-03
+
+Desktop executable naming fix. The installed desktop program is now `vigils` instead of the
+opaque `gui` — the process and on-disk executable were named `gui.exe` / `gui`, which gave no
+hint of what the program was. The window, install folder, and macOS app bundle were already
+"Vigils"; only the binary lagged.
+
+### Changed
+
+- The desktop binary is renamed `gui` → `vigils` (`mainBinaryName`, Cargo bin, and source
+  file). Installed layout is now `Vigils/vigils.exe` on Windows, `vigils` on Linux, and
+  `Vigils.app/Contents/MacOS/vigils` on macOS; the process shows as `vigils`. The product name
+  ("Vigils"), installer filenames, and updater flow are unchanged — existing installs
+  auto-update to the renamed binary.
+
+### Fixed
+
+- User-guide docs referenced a `vigil-desktop-gui.exe` binary that has not existed since the
+  v0.1.2 single-binary fix; they now point at `vigils.exe`.
+
+---
+
 ## [v0.1.4] — 2026-06-02
 
 First crate-line release. Earlier 0.1.x releases were desktop packaging fixes; this one

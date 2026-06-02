@@ -1,9 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Vigils",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "identifier": "ai.vigils.desktop",
-  "mainBinaryName": "gui",
+  "mainBinaryName": "vigils",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "",

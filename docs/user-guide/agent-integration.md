@@ -142,7 +142,7 @@ mcpServers:
 1. **查进程**:任务管理器 / `ps aux | grep vigil-hub`,应看到 agent 作为父进程派生的 `vigil-hub serve --stdio` 子进程
 2. **stderr 日志**:agent 通常会在日志/控制台显示 `vigil-hub serve: started stdio MCP server (PID ...)`(来自 vigil-hub 启动 banner)
 3. **查工具列表**:agent 的"tools / MCP server"面板应显示 `vigil` 已连接,工具列表(Stage 1 为空)
-4. **查审计**:打开 Vigil Desktop GUI(`vigil-desktop-gui.exe`)→ Activity Feed 应看到 `session.started` event(source = `vigil-hub-serve`)
+4. **查审计**:打开 **Vigils** 桌面应用(`vigils.exe`)→ Activity Feed 应看到 `session.started` event(source = `vigil-hub-serve`)
 
 ## 故障排查
 

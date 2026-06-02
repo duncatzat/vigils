@@ -7,7 +7,7 @@
 // 2. `apps/desktop/capabilities/default.json` → 引用 `allow-{slugified}` 把命令纳入
 //    主窗口 capability(无前缀 = APP_ACL_KEY,tauri-utils::resolved.rs L344 语义)
 //
-// 本列表必须与 `apps/desktop/src/bin/gui.rs` 的 `tauri::generate_handler![...]` 严格一致。
+// 本列表必须与 `apps/desktop/src/bin/vigils.rs` 的 `tauri::generate_handler![...]` 严格一致。
 // 若新增/删除 handler,三处(本文件 + capabilities/default.json + generate_handler!)必须
 // 同步更新。`invoke_commands_count_in_sync` 测试作为最小守门(count 漂移即失败)。
 //
@@ -71,7 +71,7 @@ mod tests {
             21,
             "INVOKE_COMMANDS 漂移 —— 新增/删除 handler 时必须同步:\n\
              1) 本文件 `apps/desktop/src/commands.rs`\n\
-             2) `apps/desktop/src/bin/gui.rs` 的 `tauri::generate_handler!` 列表\n\
+             2) `apps/desktop/src/bin/vigils.rs` 的 `tauri::generate_handler!` 列表\n\
              3) `apps/desktop/capabilities/default.json` 的 `allow-$cmd` permission 清单"
         );
     }

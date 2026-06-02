@@ -1,6 +1,6 @@
 # Getting Started — 5 分钟跑通 Vigil
 
-假设你已按 [installation.md](installation.md) 装好:`vigil-desktop-gui.exe`(GUI,`-gui` 后缀)可双击启动,Chrome 扩展已加载并注册 Native Host。
+假设你已按 [installation.md](installation.md) 装好:**Vigils** 桌面应用(可执行文件 `vigils.exe`)可双击启动,Chrome 扩展已加载并注册 Native Host。
 
 ## 场景 1:粘贴 token 被拦截(最直观)
 
@@ -25,7 +25,7 @@
 
 ### 步骤
 
-1. 启动 `vigil-desktop-gui.exe`(Windows;**是 `-gui` 后缀的才是真 GUI**,`vigil-desktop.exe` 是 CLI)
+1. 启动 **Vigils** 桌面应用(Windows 上可执行文件为 `vigils.exe`)
 2. 左侧 4 Tab:
    - **Activity Feed**:刚才场景 1 的粘贴事件应在列表里(event_type = `browser.paste.redacted`,findings = `[github_token]`)
    - **Approval Queue**:v0.2 仅 Desktop 内 UI;若 agent 调未批工具会进这里(需要场景 3)
@@ -65,7 +65,7 @@ vigil-hub serve: started stdio MCP server (PID 12345)
 
 ### 3.3 在 Desktop UI 看到 session
 
-启动 `vigil-desktop-gui.exe`(**注意:v0.2 起真正的 GUI binary 是 `vigil-desktop-gui`,不是 `vigil-desktop`**,后者是 CLI):
+启动 **Vigils** 桌面应用(`vigils.exe`):
 - Activity Feed 应有 `session.started` 事件(source = `vigil-hub-serve`)
 
 ### 3.4 Stage 1 边界说明

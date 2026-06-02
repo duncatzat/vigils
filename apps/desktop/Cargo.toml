@@ -5,9 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-# 包内唯一 bin 是 gui;default-run 让裸 `cargo run` 指向它,明确"主二进制 = gui"。
+# 包内唯一 bin 是 vigils;default-run 让裸 `cargo run` 指向它,明确"主二进制 = vigils"。
 # (v0.1.1 曾用此修 WiX ICE30 多-bin 重复组件;v0.1.2 移除 CLI bin 后包内仅 1 bin,保留更清晰。)
-default-run = "gui"
+# v0.1.5:bin 由 `gui` 改名 `vigils` —— 安装后可执行文件/进程名从不知所云的 `gui.exe`
+# 变为品牌一致的 `vigils.exe`(productName 仍 "Vigils";macOS 仍 Vigils.app)。
+default-run = "vigils"
 
 [lints]
 workspace = true
@@ -16,12 +18,12 @@ workspace = true
 # v0.1.2:原 `vigil-desktop` CLI bin(src/main.rs)已移除,"命令行查账本"能力整合进
 # `vigil-hub inspect`。原因:desktop 包含第二个 bin 时,`cargo tauri build`(内部
 # `cargo build --bins`)会把它误打进安装包替换真正的 GUI(v0.1.0/v0.1.1 桌面包损坏根因)。
-# v0.11 ISS-102/103/104:bin name="gui" 对齐 path basename,Tauri v2 bundle 默认查
-# `target/release/<path-basename>` 复制 binary;改名让 bundle 找得到。原 release.yml
-# raw build 仍可用 `--bin gui --features gui` 路径。
+# v0.11 ISS-102/103/104:bin name 对齐 path basename,Tauri v2 bundle 默认查
+# `target/release/<path-basename>` 复制 binary;name == path basename == mainBinaryName
+# 三者一致(均 `vigils`)让 bundle 找得到。raw build 用 `--bin vigils --features gui`。
 [[bin]]
-name = "gui"
-path = "src/bin/gui.rs"
+name = "vigils"
+path = "src/bin/vigils.rs"
 required-features = ["gui"]
 
 [lib]

@@ -10,7 +10,7 @@
 //! - **不**改 ApprovalBroker 路径(继续 ISS-019 Phase 1 短轮询 fallback,
 //!   `crates/vigil-audit/src/approvals.rs::wait_for_resolution` 0 触碰)
 //! - **不**复用 `apps/vigil-hub-cli/src/serve.rs::build_hub`,因为它内部 `Ledger::open`
-//!   会与 `apps/desktop/src/bin/gui.rs` 已经 single-open 的 ledger 冲突
+//!   会与 `apps/desktop/src/bin/vigils.rs` 已经 single-open 的 ledger 冲突
 //!
 //! # ADR 0014 §3.4 fail-closed 不变量
 //!
