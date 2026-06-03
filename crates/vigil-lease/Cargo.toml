@@ -20,8 +20,8 @@ default = []
 os-keychain = ["dep:keyring"]
 
 [dependencies]
-vigil-types = { path = "../vigil-types" }
-vigil-audit = { path = "../vigil-audit" }
+vigil-types = { path = "../vigil-types", version = "0.1.0" }
+vigil-audit = { path = "../vigil-audit", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
