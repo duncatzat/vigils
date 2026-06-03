@@ -619,8 +619,9 @@ fn legacy_v1_event_and_mixed_chain_verify() {
 
     // 混合 v1->v2 链整体可验证
     let l = Ledger::open(&path).unwrap();
-    l.verify_chain()
-        .expect("mixed v1(genesis) -> v2 chain must verify (versioned dispatch, no historical break)");
+    l.verify_chain().expect(
+        "mixed v1(genesis) -> v2 chain must verify (versioned dispatch, no historical break)",
+    );
 }
 
 /// (14.7) VIGIL-SEC-001 R1(Codex BLOCKER):chain_version 必须单调非降。v2 事件之后

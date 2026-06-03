@@ -319,8 +319,14 @@ impl Ledger {
             .unwrap_or_default(); // 表空 → genesis("")
 
         // VIGIL-SEC-001:新事件用 v2 摘要(额外绑定 session_id/event_type/redacted_text)。
-        let event_hash =
-            compute_event_hash_v2(&prev_hash, payload, now, session_id, event_type, redacted_text)?;
+        let event_hash = compute_event_hash_v2(
+            &prev_hash,
+            payload,
+            now,
+            session_id,
+            event_type,
+            redacted_text,
+        )?;
 
         tx.execute(
             "INSERT INTO events (session_id, event_type, payload_json, redacted_text, prev_hash, event_hash, created_at, chain_version)
@@ -415,8 +421,17 @@ impl Ledger {
         // 版本,后续出现更低版本即 ChainBroken。
         let mut min_version: i64 = 1;
         for r in rows {
-            let (event_id, payload_json, prev_hash, event_hash, created_at, session_id, event_type, redacted_text, chain_version) =
-                r?;
+            let (
+                event_id,
+                payload_json,
+                prev_hash,
+                event_hash,
+                created_at,
+                session_id,
+                event_type,
+                redacted_text,
+                chain_version,
+            ) = r?;
             if prev_hash != expected_prev {
                 return Err(AuditError::ChainBroken { event_id });
             }

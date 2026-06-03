@@ -81,15 +81,15 @@ mod tests {
         ));
         // VIGIL-SEC-004:空 / 哨兵 / 截断 / 非 hex / 超长 全部拒(→ 调用方判 FirstSeen)
         assert!(!is_valid_descriptor_hash(""), "empty");
-        assert!(!is_valid_descriptor_hash("sdk-decide-call:uuid"), "sentinel");
+        assert!(
+            !is_valid_descriptor_hash("sdk-decide-call:uuid"),
+            "sentinel"
+        );
         assert!(!is_valid_descriptor_hash("abc"), "too short");
         assert!(
             !is_valid_descriptor_hash(&"g".repeat(64)),
             "64 chars but non-hex"
         );
-        assert!(
-            !is_valid_descriptor_hash(&"a".repeat(65)),
-            "too long"
-        );
+        assert!(!is_valid_descriptor_hash(&"a".repeat(65)), "too long");
     }
 }

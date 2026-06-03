@@ -195,8 +195,10 @@ mod tests {
     fn v2_is_deterministic_and_distinct_from_v1() {
         let p = json!({"a": 1});
         let v1 = compute_event_hash("", &p, 1700000000).unwrap();
-        let v2a = compute_event_hash_v2("", &p, 1700000000, "sess-1", "tool_call.opened", None).unwrap();
-        let v2b = compute_event_hash_v2("", &p, 1700000000, "sess-1", "tool_call.opened", None).unwrap();
+        let v2a =
+            compute_event_hash_v2("", &p, 1700000000, "sess-1", "tool_call.opened", None).unwrap();
+        let v2b =
+            compute_event_hash_v2("", &p, 1700000000, "sess-1", "tool_call.opened", None).unwrap();
         assert_eq!(v2a, v2b, "v2 deterministic");
         assert_ne!(v1, v2a, "v1 / v2 domain-separated, never collide");
     }
@@ -223,7 +225,10 @@ mod tests {
         let none = compute_event_hash_v2("", &p, 1, "s", "e", None).unwrap();
         let empty = compute_event_hash_v2("", &p, 1, "s", "e", Some("")).unwrap();
         let some = compute_event_hash_v2("", &p, 1, "s", "e", Some("redacted")).unwrap();
-        assert_ne!(none, empty, "None must differ from Some(\"\") (presence tag)");
+        assert_ne!(
+            none, empty,
+            "None must differ from Some(\"\") (presence tag)"
+        );
         assert_ne!(empty, some, "redacted_text content is bound");
         assert_ne!(none, some);
     }
