@@ -16,7 +16,7 @@ through redaction + policy + audit + approval — and everything stays on your m
 
 | Dimension | State |
 |---|---|
-| Latest release | **v0.1.6** — 3-platform signed installers + auto-update (OTA) |
+| Releases | 3-platform signed installers + auto-update (OTA) — [latest release](https://github.com/duncatzat/vigils/releases/latest) |
 | Rust SDK | [`vigil-sdk`](https://crates.io/crates/vigil-sdk) published to crates.io |
 | Security | Comprehensive audit (OWASP + STRIDE + supply chain) — **9.9 / 10, 0 critical / high** |
 | Maturity | Core safety claims proven-safe with code + test evidence; all sandbox / SDK / audit changes reviewed |

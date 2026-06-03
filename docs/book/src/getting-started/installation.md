@@ -2,7 +2,7 @@
 
 Download the latest installers from the
 [**Releases page**](https://github.com/duncatzat/vigils/releases/latest). Replace
-`<version>` below with the release you downloaded (e.g. `0.1.6`).
+`<version>` below with the release you downloaded (e.g. `0.1.7`).
 
 > Early releases are unsigned; your OS may show a Gatekeeper / SmartScreen prompt on first run.
 
