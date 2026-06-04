@@ -313,3 +313,99 @@ fn b2_stage2_attach_real_stdio_upstream_via_node() {
     // firewall 拦截 + ledger)。此处只验 build_hub 成功 + Ledger 登记持久化,已充分。
     drop(hub);
 }
+
+/// 严格 MCP 生命周期回归门(Codex review SHOULD-FIX,2026-06-04)。
+///
+/// 证明"attach 上游时执行了 MCP `initialize` 握手"这一修复**真生效**,而非仅缩短了 dummy 超时。
+/// 用 `strict-mcp-server.mjs`:它在 `initialize`(+ `notifications/initialized`)完成**之前**对
+/// `tools/list` 返 `-32002 not initialized` —— 这是 @modelcontextprotocol 官方 SDK server
+/// (filesystem 等)的真实行为。
+///
+/// 为何此前的宽松 mock 测不出:`mock-mcp-server.mjs` 无论是否握手都回 tools 列表,掩盖了
+/// "Hub 从不 initialize 上游"的 bug(被真 Codex E2E 抓到:vigil 是个 0 工具 server)。
+///
+/// 关键不变量:`initialize_handshake` 是**同步**的,`build_hub` 会阻塞到上游应答 `initialize`,
+/// 故 build_hub 返回时严格 server 已 operational —— 消除了上面 node-e2e 注释提到的时序不稳。
+///
+/// 回归语义:若有人移除 attach 时的握手,严格 server 会拒绝 `tools/list` → Hub 聚合 0 工具 →
+/// 本测试断言失败。同时锁定 `__` 双下划线 namespacing 记法(`strictup__strict_tool`)。
+#[test]
+fn b2_stage2_strict_upstream_requires_handshake_regression() {
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !node_ok {
+        eprintln!("[b2-stage2-strict] skip: node not runnable");
+        return;
+    }
+    let mock_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/test-local/strict-mcp-server.mjs")
+        .canonicalize()
+        .expect("strict-mcp-server.mjs path");
+    // Windows `canonicalize` 产出 `\\?\` 扩展长度前缀,node 把它当 argv 脚本路径时会被绊住
+    // (报 lstat 'D:' EISDIR);剥掉前缀给 node 一个普通绝对路径(非 Windows 上 strip 为 no-op)。
+    // 仅测试 harness 需要 —— 真实用户配置里写的是普通路径,不经 canonicalize。
+    let script_str = mock_script.to_string_lossy();
+    let script = script_str.strip_prefix(r"\\?\").unwrap_or(&script_str);
+
+    use std::io::Write as _;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let cfg = json!({
+        "upstreams": [
+            {"name": "strictup", "argv": ["node", script]}
+        ]
+    });
+    writeln!(tmp.as_file(), "{}", serde_json::to_string(&cfg).unwrap()).unwrap();
+
+    let args = ServeArgs {
+        ledger_path: None, // in-memory
+        upstreams_config: Some(tmp.path().to_path_buf()),
+        auto_approve_first_seen: true, // dev:首见 descriptor 自动批准,让工具能浮现
+        dev_permissive_firewall: false,
+        enable_privacy_filter: false,
+    };
+
+    // build_hub 同步执行 initialize 握手:返回时严格 server 已 operational。
+    let (hub, _ledger) = build_hub(&args).expect("build_hub with strict upstream");
+
+    // 走 Hub 真 stdio 循环要 tools/list;Hub 会把它转发给上游聚合。
+    let input = ndjson(&[
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "vigil-hub-cli-test", "version": "0.0.1"}
+            }
+        }),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    ]);
+    let mut reader = Cursor::new(input);
+    let mut writer: Vec<u8> = Vec::new();
+    run_stdio_loop(&hub, &mut reader, &mut writer).expect("loop should exit cleanly on EOF");
+
+    let responses = parse_ndjson(&writer);
+    let list = responses
+        .iter()
+        .find(|r| r["id"] == 2)
+        .expect("tools/list response present");
+    let tools = list["result"]["tools"]
+        .as_array()
+        .expect("tools/list result.tools must be an array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+
+    // 核心断言:严格上游的工具浮现 → 证明 attach 时握手真发生。
+    // 若握手回归(被移除),严格 server 拒 tools/list,这里会是空数组 → 失败。
+    assert!(
+        names.contains(&"strictup__strict_tool"),
+        "严格上游的工具未浮现 —— attach 时的 MCP initialize 握手可能回归了。\
+         实际 tools={names:?},原始 tools/list 响应={list:?}"
+    );
+    drop(hub);
+}

@@ -55,6 +55,9 @@ fn setup_hub() -> (Arc<Ledger>, Arc<Hub>) {
         oracle,
         HubConfig {
             approval_wait: Duration::from_millis(200),
+            // 测试的 spawn_attach 上游用 dummy(`cmd`/`sh`,不说 MCP);短 upstream_call_timeout
+            // 让其 initialize 握手(非致命)快速超时,避免测试卡默认 30s。
+            upstream_call_timeout: Duration::from_millis(500),
             ..Default::default()
         },
     ));

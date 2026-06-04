@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -58,9 +58,25 @@ pub enum StdioError {
     /// 进程已经关闭
     #[error("upstream already closed")]
     Closed,
+    /// `initialize` 响应里 server 协商出我们不支持的 MCP 协议版本(不在
+    /// `SUPPORTED_PROTOCOL_VERSIONS`)。按 MCP spec 客户端遇此应断开 → fail-closed
+    /// (Codex review SHOULD-FIX:此前硬编码版本且忽略协商结果,对仅支持旧版/未来漂移的
+    /// server 有互操作风险)。
+    #[error("upstream negotiated unsupported MCP protocol version: {negotiated}")]
+    ProtocolVersionUnsupported {
+        /// server 在 `initialize` 响应里回的版本
+        negotiated: String,
+    },
 }
 
 type PendingTable = Arc<Mutex<HashMap<String, Sender<Value>>>>;
+
+/// 客户端支持的 MCP 协议版本集(新→旧)。`initialize` 以 `[0]`(最新)发起提议;server 可在
+/// 响应里协商回另一受支持版本(MCP 生命周期),收到后用本集合核对 —— 不在集合内即 fail-closed
+/// (`ProtocolVersionUnsupported`)。
+///
+/// 版本来源:MCP spec 历次修订(modelcontextprotocol.io/specification)。新增协议修订时在此登记。
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// O3(ADR 0007 §I-7.1 amendment,Codex ACCEPT-design 2026-06-01):把 `argv[0]` 解析为
 /// **绝对路径**。
@@ -337,6 +353,53 @@ impl StdioUpstream {
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// 发一条 JSON-RPC **notification**(无 `id`,不注册 pending、不等响应)。
+    ///
+    /// 用于 MCP 客户端生命周期的 `notifications/initialized`:server 在收到此通知前不进入
+    /// operational 状态(spec 要求)。
+    pub(crate) fn notify_raw(&self, method: &str, params: Option<Value>) -> Result<(), StdioError> {
+        let mut notif = json!({ "jsonrpc": "2.0", "method": method });
+        if let Some(p) = params {
+            notif["params"] = p;
+        }
+        let mut g = self.stdin.lock().map_err(|_| StdioError::LockPoisoned)?;
+        let stdin = g.as_mut().ok_or(StdioError::Closed)?;
+        write_message(stdin, &notif).map_err(StdioError::Protocol)
+    }
+
+    /// MCP 客户端生命周期握手:`initialize` 请求 →(等响应)→ `notifications/initialized` 通知。
+    ///
+    /// **必须在任何 `tools/list` / `tools/call` 之前完成** —— MCP SDK server(filesystem / github
+    /// 等官方 server)在 initialize 握手完成前会**拒绝**普通请求,导致 Hub 聚合不到任何工具
+    /// (Codex E2E 实测发现:vigil spawn 了 upstream 但 tools/list 始终空)。
+    ///
+    /// `timeout` 给 server 冷启动留余量(npx/uvx server 首跑可能较慢;真正的慢冷启动建议预装
+    /// server 二进制避免 `npx -y` 每次重解析)。失败(timeout / server error)即返 Err,
+    /// caller(`spawn_attach_stdio_upstream`)fail-closed 不 attach 未初始化的上游。
+    pub(crate) fn initialize_handshake(&self, timeout: Duration) -> Result<(), StdioError> {
+        // 提议最新支持版本;server 可在响应里回另一受支持版本(MCP 版本协商)
+        let params = json!({
+            "protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0],
+            "capabilities": {},
+            "clientInfo": { "name": "vigil-hub", "version": env!("CARGO_PKG_VERSION") },
+        });
+        // initialize 请求:等响应 = 确认 server 就绪 + 完成协议协商
+        let result = self.call_raw("initialize", Some(params), timeout)?;
+        // 版本协商核对(Codex review SHOULD-FIX):server 在响应里回它选定的版本;若回的版本不在
+        // 我们支持集内,按 MCP spec 客户端应断开 → fail-closed 返 Err(caller NON-FATAL:log +
+        // attach 但其 tools 不可用,避免"以为协商成功却跑在不兼容协议上")。
+        // server 省略 protocolVersion 时宽容放行(部分实现不回显;保持此前行为)。
+        if let Some(neg) = result.get("protocolVersion").and_then(Value::as_str) {
+            if !SUPPORTED_PROTOCOL_VERSIONS.contains(&neg) {
+                return Err(StdioError::ProtocolVersionUnsupported {
+                    negotiated: neg.to_string(),
+                });
+            }
+        }
+        // initialized 通知:无此通知 server 不进入 operational 状态(MCP 生命周期)
+        self.notify_raw("notifications/initialized", None)
+    }
+
     /// 关闭 stdin 并等待子进程终止。best-effort,不抛异常。
     /// I10b-α1 代码 R1 MUST-FIX:改 `pub(crate)`;外部走 trait method `McpUpstream::shutdown`。
     pub(crate) fn shutdown_raw(&self) {
@@ -387,6 +450,10 @@ impl crate::upstream::McpUpstream for StdioUpstream {
             Err(StdioError::ProgramNotFound { .. }) => {
                 Err(UpstreamError::TransportIo("stdio_program_not_found"))
             }
+            // 仅 initialize_handshake 路径产生(不经 trait `call`);exhaustive 完整性映射为 transport 失败
+            Err(StdioError::ProtocolVersionUnsupported { .. }) => Err(UpstreamError::TransportIo(
+                "stdio_protocol_version_unsupported",
+            )),
             Err(StdioError::LockPoisoned) => Err(UpstreamError::Internal("stdio_lock_poisoned")),
         }
     }

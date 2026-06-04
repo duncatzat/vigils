@@ -440,6 +440,19 @@ impl Hub {
         // 5. 双 gate 通过 → 才用已解析路径 spawn(子进程 env 仍 env_clear,§I-7.1 保留)
         let upstream = StdioUpstream::spawn_resolved(server_id, resolved, &argv[1..], env)
             .map_err(HubError::StdioSpawn)?;
+        // 5.5. MCP 客户端生命周期握手(initialize → initialized)。
+        //      MCP SDK server(filesystem / github 等官方 server)在 initialize 握手完成前会
+        //      **拒绝** tools/list,导致 Hub 聚合不到任何工具(Codex E2E 实测:vigil spawn 了
+        //      upstream 但 tools/list 始终空)。
+        //      **非致命**:握手失败(server 不说 MCP / 启动超时)→ 记日志仍 attach,优雅降级
+        //      —— 一个坏/慢上游不拖垮整个网关;它的工具不会出现在 tools/list(因 tools/list
+        //      对它的调用同样失败被跳过),tools/call 也无从路由到它,故无害。
+        if let Err(e) = upstream.initialize_handshake(self.config.upstream_call_timeout) {
+            eprintln!(
+                "[vigil-hub] upstream '{server_id}' MCP initialize handshake failed: {e} \
+                 (attached anyway; its tools will be unavailable until it initializes)"
+            );
+        }
         // 6. attach:attach_lock 串行下 step 1 的 dup 判定仍成立(无并发同名插入),直接 insert。
         //    再查一次 contains_key 仅为防御 attach_upstream(mock/HTTP,不走本锁)的极端交叉。
         let mut g = self.upstreams.lock().map_err(|_| HubError::LockPoisoned)?;
