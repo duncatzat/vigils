@@ -76,7 +76,8 @@ struct CliServeArgs {
     #[arg(long)]
     ledger: Option<PathBuf>,
     /// Upstream MCP server 配置 JSON。schema:`{"upstreams":[{"name":..., "argv":[...]}]}`。
-    /// Stage 1 仅校验 JSON 格式,实际 attach 留 Stage 2 完成 register_server + approve_server。
+    /// 每个 upstream 经 register_server + approve_server(Limited) + gate-before-spawn
+    /// (argv + resolved-program drift)后 attach,工具命名空间化聚合进 tools/list。
     #[arg(long = "upstream-config")]
     upstream_config: Option<PathBuf>,
     /// 开发模式:tools/list 首次见到的 descriptor 自动批准(生产务必保持 false)。

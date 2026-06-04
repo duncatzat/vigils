@@ -115,7 +115,7 @@ Linux** 的预构建安装包与二进制:
 
 ```bash
 # 作为 MCP endpoint 供你的 agent 连接(stdio)
-vigil-hub serve --stdio --upstreams ./upstreams.json
+vigil-hub serve --stdio --upstream-config ./upstreams.json
 
 # upstreams.json —— 裸命令自动经 PATH 解析
 # { "upstreams": [ { "name": "fs", "argv": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/data"] } ] }

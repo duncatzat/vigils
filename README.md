@@ -118,7 +118,7 @@ Put Vigils in front of your MCP servers so every tool call is firewalled, approv
 
 ```bash
 # Serve as an MCP endpoint your agent connects to (stdio)
-vigil-hub serve --stdio --upstreams ./upstreams.json
+vigil-hub serve --stdio --upstream-config ./upstreams.json
 
 # upstreams.json — bare commands resolve via PATH automatically
 # { "upstreams": [ { "name": "fs", "argv": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/data"] } ] }

@@ -1,109 +1,155 @@
-# CLI Agent 集成指南
+# Agent Integration & Test Guide
 
-把 Vigil 作为 MCP 代理插在你的 AI agent 工具(Claude Code / Codex / OpenCode / Cursor / Zed / 任何支持 MCP 的工具)和底层 MCP server 之间,审批 + 审计 + 脱敏 + 沙箱全套策略生效。
+Put **Vigils** in front of your AI agent's tools, so every tool call your agent makes is
+**firewalled** (default-deny), **audited** (tamper-evident hash chain), **redacted** (secrets /
+PII), and — when risky — sent to **approval**. Everything runs locally; nothing leaves your
+machine.
 
-## 架构(一眼懂)
+Works with any MCP-capable agent: **Claude Code**, **Codex**, **Cursor**, **Zed**, OpenCode,
+Continue, and more.
+
+## How it works
+
+Vigils runs as an MCP **gateway**: your agent connects to `vigil-hub` over stdio, and `vigil-hub`
+proxies your real MCP tool servers ("upstreams"), gating every call.
 
 ```
-┌──────────────────┐   stdio JSON-RPC   ┌─────────────────┐
-│  Agent 工具       │◄──────────────────►│   vigil-hub     │
-│  Claude Code /    │                    │   serve --stdio │
-│  Codex / Cursor / │                    └───┬──────┬──────┘
-│  Zed / ...        │                        │      │
-└──────────────────┘                         │      │
-                                             ▼      ▼
-                                        Firewall  Upstream MCP
-                                        Audit     (stdio/http;Stage 2)
-                                        Lease
-                                        Sandbox
+┌──────────────────┐   stdio JSON-RPC   ┌────────────────────┐      ┌──────────────────┐
+│  Your agent      │◄──────────────────►│  vigil-hub serve   │─────►│ Upstream MCP      │
+│  Claude Code /   │                    │   --stdio          │      │ servers           │
+│  Codex / Cursor /│                    │  ┌──────────────┐  │      │ (filesystem,      │
+│  Zed / ...       │                    │  │ Firewall     │  │      │  github, db, ...) │
+└──────────────────┘                    │  │ Audit ledger │  │      └──────────────────┘
+                                        │  │ Redaction    │  │
+                                        │  │ Approval     │  │
+                                        │  └──────────────┘  │
+                                        └────────────────────┘
 ```
 
-**现状(v0.3 Stage 1)**:agent 能**连上** vigil-hub 并完成 MCP 协议握手(initialize / ping / tools/list);`tools/list` 返空数组(零 upstream attach)。**实际 tool 调用转发到上游 MCP server 的能力留 Stage 2**。
+Each upstream's tools are namespaced (`fs/read_file`, `github/create_issue`) and aggregated
+into the `tools/list` your agent sees. When the agent calls one, Vigils evaluates it against the
+firewall **before** forwarding, records a decision in the audit ledger, and either allows it,
+denies it, or queues it for your approval.
 
-## 通用配置模板
+## Prerequisites
 
-所有支持 MCP 的 agent 都遵循同一套配置形式:`command` + `args` 指向 `vigil-hub serve --stdio`。以下命令在三平台(Windows / Linux / macOS)用对应的 binary 路径替换。
+Install the CLI gateway, `vigil-hub`:
 
-**Windows**:
+- **Prebuilt**: download `vigils-cli-<target>.tar.gz` (`.zip` on Windows) from the
+  [latest release](https://github.com/duncatzat/vigils/releases/latest) — it contains `vigil-hub`
+  and `vigil-native-host`. Put `vigil-hub` on your `PATH`.
+- **From source**: `cargo install --path apps/vigil-hub-cli`
+
+Verify: `vigil-hub --help`
+
+## Step 1 — Smoke-test `vigil-hub` (30s, no agent needed)
+
+Confirm the gateway speaks MCP before wiring any agent. Pipe an `initialize` + `tools/list` into
+it (MCP stdio is newline-delimited JSON-RPC):
+
+```bash
+printf '%s\n' \
+ '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}' \
+ '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+ | vigil-hub serve --stdio --ledger ./vigil.db
+```
+
+Expected stdout (two JSON-RPC responses):
+
 ```json
-{"command": "C:\\Vigil\\vigil-hub.exe", "args": ["serve", "--stdio", "--ledger", "C:\\Vigil\\ledger.sqlite"]}
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{"listChanged":false}},"protocolVersion":"2025-06-18","serverInfo":{"name":"vigil-hub","version":"0.1.7"}}}
+{"id":2,"jsonrpc":"2.0","result":{"tools":[]}}
 ```
 
-**Linux / macOS**:
+`tools/list` is empty because no upstreams are configured yet (next step). Startup banners go to
+**stderr** (stdout is reserved for the protocol):
+
+```
+vigil-hub serve: started stdio MCP server (PID …)
+vigil-hub serve: PiiScanner = noop (default; pass --enable-privacy-filter + build with --features ort to activate)
+```
+
+## Step 2 — Declare your tool servers (`upstreams.json`)
+
+List the MCP servers you want Vigils to proxy. Bare commands resolve via `PATH`.
+
 ```json
-{"command": "/usr/local/bin/vigil-hub", "args": ["serve", "--stdio", "--ledger", "~/.local/share/Vigil/ledger.sqlite"]}
+{
+  "upstreams": [
+    { "name": "fs",     "argv": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/data"] },
+    { "name": "github", "argv": ["npx", "-y", "@modelcontextprotocol/server-github"] }
+  ]
+}
 ```
 
-### 可选参数
+Pass it to `serve`:
 
-| 参数 | 作用 |
-|---|---|
-| `--stdio` | **必需**。当前 Stage 1 唯一支持的 transport。 |
-| `--ledger <path>` | 审计链 SQLite 路径;省略 = 内存(重启丢失) |
-| `--upstream-config <path>` | 上游 MCP 配置 JSON(Stage 2 启用,目前声明会报 `UpstreamNotImplemented`) |
-| `--auto-approve-first-seen` | 开发模式:首次见到的工具自动批准(生产务必 **false**) |
+```bash
+vigil-hub serve --stdio --ledger ./vigil.db --upstream-config ./upstreams.json
+```
 
----
+For each entry Vigils registers the server, pins its launch command, and runs a
+**gate-before-spawn** check (argv + resolved-program drift) *before* starting the child process —
+then namespaces its tools (`fs/…`, `github/…`) into `tools/list`.
 
-## Claude Code(Anthropic 官方 CLI)
+> **HTTP/remote MCP servers** use OAuth onboarding instead:
+> `vigil-hub add-remote-mcp --url https://mcp.example.com/ --client-id <id> --scopes mcp:tools.read`
 
-配置文件:项目根 `.mcp.json` 或用户级 `~/.claude/mcp.json`。
+## Step 3 — Point your agent at `vigil-hub`
+
+Use a shared **ledger path** so the desktop app and CLI see the same audit trail. The desktop app
+reads `data_local_dir()/Vigil/ledger.sqlite`:
+- Windows: `%LOCALAPPDATA%\Vigil\ledger.sqlite`
+- Linux: `~/.local/share/Vigil/ledger.sqlite`
+- macOS: `~/Library/Application Support/Vigil/ledger.sqlite`
+
+In the snippets below, replace the `--ledger` / `--upstream-config` paths and the `vigil-hub`
+path (use the absolute `.exe` path on Windows, e.g. `C:\\Vigil\\vigil-hub.exe`).
+
+### Claude Code
+
+Project `.mcp.json` (or user-level `~/.claude.json` → `mcpServers`):
 
 ```json
 {
   "mcpServers": {
     "vigil": {
-      "command": "C:\\Vigil\\vigil-hub.exe",
-      "args": ["serve", "--stdio", "--ledger", "C:\\Vigil\\ledger.sqlite"]
+      "command": "vigil-hub",
+      "args": ["serve", "--stdio", "--ledger", "~/.local/share/Vigil/ledger.sqlite", "--upstream-config", "./upstreams.json"]
     }
   }
 }
 ```
 
-启动 Claude Code 后,`/mcp` 命令应显示 `vigil` 为已连接。因为 Stage 1 无 upstream,`/mcp list-tools` 会返空。
+Then run `/mcp` in Claude Code — `vigil` should show **connected**, and your upstream tools appear
+under it.
 
-## Codex(OpenAI Codex CLI)
+### Codex (OpenAI Codex CLI)
 
-配置:`~/.codex/config.toml`(或项目级 `.codex/config.toml`)。
+`~/.codex/config.toml` (or project `.codex/config.toml`):
 
 ```toml
 [mcp_servers.vigil]
-command = "C:\\Vigil\\vigil-hub.exe"
-args = ["serve", "--stdio", "--ledger", "C:\\Vigil\\ledger.sqlite"]
+command = "vigil-hub"
+args = ["serve", "--stdio", "--ledger", "~/.local/share/Vigil/ledger.sqlite", "--upstream-config", "./upstreams.json"]
 ```
 
-## OpenCode(opencode.ai / sst/opencode)
+### Cursor
 
-项目根 `opencode.json`:
-
-```json
-{
-  "mcp": {
-    "vigil": {
-      "type": "local",
-      "command": ["C:\\Vigil\\vigil-hub.exe", "serve", "--stdio"],
-      "enabled": true
-    }
-  }
-}
-```
-
-## Cursor
-
-`~/.cursor/mcp.json` 或 `<project>/.cursor/mcp.json`:
+`~/.cursor/mcp.json` (or project `.cursor/mcp.json`):
 
 ```json
 {
   "mcpServers": {
     "vigil": {
-      "command": "C:\\Vigil\\vigil-hub.exe",
-      "args": ["serve", "--stdio"]
+      "command": "vigil-hub",
+      "args": ["serve", "--stdio", "--upstream-config", "./upstreams.json"]
     }
   }
 }
 ```
 
-## Zed
+### Zed
 
 `~/.config/zed/settings.json`:
 
@@ -111,76 +157,101 @@ args = ["serve", "--stdio", "--ledger", "C:\\Vigil\\ledger.sqlite"]
 {
   "context_servers": {
     "vigil": {
-      "command": {
-        "path": "/usr/local/bin/vigil-hub",
-        "args": ["serve", "--stdio"]
-      }
+      "command": { "path": "vigil-hub", "args": ["serve", "--stdio", "--upstream-config", "./upstreams.json"] }
     }
   }
 }
 ```
 
-## Continue(VS Code / JetBrains)
+### OpenCode
+
+Project `opencode.json`:
+
+```json
+{
+  "mcp": {
+    "vigil": {
+      "type": "local",
+      "command": ["vigil-hub", "serve", "--stdio", "--upstream-config", "./upstreams.json"],
+      "enabled": true
+    }
+  }
+}
+```
+
+### Continue (VS Code / JetBrains)
 
 `~/.continue/config.yaml`:
 
 ```yaml
 mcpServers:
   - name: vigil
-    command: /usr/local/bin/vigil-hub
-    args:
-      - serve
-      - --stdio
+    command: vigil-hub
+    args: ["serve", "--stdio", "--upstream-config", "./upstreams.json"]
 ```
 
----
+## Step 4 — Verify it's actually gating
 
-## 验证 agent 已连上 vigil-hub(无论哪个工具)
+After your agent runs a tool call (or trigger one yourself), inspect the local ledger. `inspect`
+prints single-line JSON — pipe to `jq`:
 
-启动 agent 后:
+```bash
+# Recent events (decisions, approvals, tool calls)
+vigil-hub inspect --db-path ./vigil.db activity --limit 20
 
-1. **查进程**:任务管理器 / `ps aux | grep vigil-hub`,应看到 agent 作为父进程派生的 `vigil-hub serve --stdio` 子进程
-2. **stderr 日志**:agent 通常会在日志/控制台显示 `vigil-hub serve: started stdio MCP server (PID ...)`(来自 vigil-hub 启动 banner)
-3. **查工具列表**:agent 的"tools / MCP server"面板应显示 `vigil` 已连接,工具列表(Stage 1 为空)
-4. **查审计**:打开 **Vigils** 桌面应用(`vigils.exe`)→ Activity Feed 应看到 `session.started` event(source = `vigil-hub-serve`)
+# Full-text search the audit trail
+vigil-hub inspect --db-path ./vigil.db search "read_file"
 
-## 故障排查
+# Pending approvals (risky calls waiting on you)
+vigil-hub inspect --db-path ./vigil.db approvals list
 
-### "connection refused" / "command not found"
+# Confirm the audit hash chain is intact (tamper-evident)
+vigil-hub inspect --db-path ./vigil.db verify-chain
+# → {"kind":"ChainVerification","data":{"ok":true,"broken_at_event_id":null,"message":null}}
+```
 
-- 确认 `vigil-hub.exe`(Windows)或 `vigil-hub`(Linux/macOS)在 PATH 或配置中路径绝对正确
-- 跑 `vigil-hub --version` 验证可执行
+Or open the **Vigils desktop app** for a live view: **Activity Feed**, **Approval Queue** (approve
+/ deny), **Server Registry**, **Session Replay**, and **Privacy Findings**.
 
-### agent 连上但 tools 空
+**What "gating" looks like:** with the default firewall (deny-by-default), a risky tool call is
+either denied outright or surfaced in the Approval Queue — your agent's call blocks until you
+approve. You'll see the decision recorded in `activity`.
 
-**预期**(Stage 1)。Stage 2 加 upstream 配置后会有工具。
+## Optional — turn on the ML privacy filter
 
-### `"upstream onboarding not implemented in Stage 1 (upstream '<name>')"`
+By default Vigils uses fast hard-fingerprint rules (no ML). To add the ONNX PII scanner, build the
+CLI with the `ort` feature and pass `--enable-privacy-filter`:
 
-配置里用了 `--upstream-config` + 真实 upstream 条目。Stage 1 只校验 JSON 格式,不实际 attach。移除 `--upstream-config` 或空列表 `{"upstreams":[]}`。
+```bash
+cargo install --path apps/vigil-hub-cli --features ort
+vigil-hub serve --stdio --upstream-config ./upstreams.json --enable-privacy-filter
+```
 
-### Desktop Activity Feed 不显示 session.started
+If the flag is set but the binary wasn't built with `--features ort`, startup **fails closed**
+(it never silently runs without the filter you asked for).
 
-确认 `--ledger` 路径 agent 子进程可写。Windows:`%APPDATA%\Vigil\ledger.sqlite`;Linux:`~/.local/share/Vigil/ledger.sqlite`;macOS:`~/Library/Application Support/Vigil/ledger.sqlite`。Desktop GUI 默认也读这个路径(`dirs::data_local_dir`)。
+## Troubleshooting
 
-### agent 日志里有乱字节
+**`command not found` / agent can't start vigil-hub** — use the absolute path to `vigil-hub`
+(`vigil-hub.exe` on Windows) in the config; verify with `vigil-hub --version`.
 
-**不得向 stdout 打印任何非 JSON-RPC 内容** — vigil-hub serve 严格遵守这一点(所有启动 banner 走 stderr)。如果你看到 stdout 被污染,排查是不是 shell 配置(如 zsh 加 echo)插入了字符。
+**Agent connects but no tools** — you haven't passed `--upstream-config`, or the file lists no
+upstreams. Add your `upstreams.json`.
 
-## Stage 2 预告(非本轮交付)
+**An upstream fails to start** — Vigils gate-checks and spawns each upstream's `argv`. Make sure
+the command runs standalone (e.g. `npx -y @modelcontextprotocol/server-filesystem /data`) and that
+`npx`/`node` (or whatever the server needs) is on `PATH`.
 
-Stage 2 将:
-1. 实装 `--upstream-config` 的真实 attach(register_server + approve_server + command hash drift 检查全自动)
-2. 支持 HTTP upstream(复用 I10b-β 的 `add-remote-mcp` 流程)
-3. 提供 `vigil-hub add-local-mcp` 子命令,把一个 stdio server 加到本地 upstream 白名单
-4. Desktop UI 的 Server Registry 页面能显示 serve 子进程当前挂载的 upstream
+**Desktop app doesn't show the events** — point `--ledger` at the same path the desktop app uses
+(see Step 3), and make sure the agent's child process can write it.
 
-这样 agent 就能**透过 vigil** 调真实工具,而不仅仅是连上 vigil。
+**Garbled bytes in the agent log** — nothing but JSON-RPC may go to stdout. `vigil-hub` keeps all
+banners on stderr; if stdout is polluted, check your shell profile isn't echoing into the pipe.
 
----
+## References
 
-**参考**:
-- `docs/adr/0004-mcp-hub-and-outbox.md` — Hub 架构
-- `docs/adr/0005-descriptor-pinning-and-drift.md` — upstream drift 检查
-- `docs/adr/0010-http-mcp-auth.md` — HTTP MCP OAuth
-- `apps/vigil-hub-cli/src/serve.rs` — serve 实现
+- [Architecture](https://duncatzat.github.io/vigils/concepts/architecture.html) ·
+  [MCP Hub](https://duncatzat.github.io/vigils/concepts/mcp-hub.html) ·
+  [Action Firewall](https://duncatzat.github.io/vigils/concepts/firewall.html)
+- `apps/vigil-hub-cli/src/serve.rs` — the `serve` implementation
+- ADR 0004 (MCP hub), ADR 0005 (descriptor pinning + drift), ADR 0010/0011 (HTTP MCP auth)
