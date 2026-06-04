@@ -198,7 +198,7 @@ pub fn run(args: &DemoArgs) -> Result<(), DemoError> {
             "expected raw secret to be DENIED, but it was allowed".into(),
         ));
     }
-    println!("    → Vigil refuses to forward a raw secret to a tool/upstream.\n");
+    println!("    -> Vigil refuses to forward a raw secret to a tool/upstream.\n");
 
     // ── [2] Vigil 之道:agent 改传**占位符** secret://github_pat ──
     section("[2] the Vigil way: the agent passes a PLACEHOLDER instead");
@@ -235,7 +235,7 @@ pub fn run(args: &DemoArgs) -> Result<(), DemoError> {
         remote_model_payload,
         &demo_secret,
     );
-    println!("      [no LLM is contacted in this demo — this is the exact payload Vigil would forward]\n");
+    println!("      [no LLM is contacted in this demo - this is the exact payload Vigil would forward]\n");
 
     println!("    What the LOCAL TOOL received (detokenized, in-memory only):");
     println!("      {}", compact(&local_tool_invocation));
@@ -285,7 +285,7 @@ pub fn run(args: &DemoArgs) -> Result<(), DemoError> {
 
     // ── [4] 可证伪:篡改账本 → 真 verify 失败 ──
     if args.tamper {
-        section("[4] prove it's real — tamper with the ledger and re-verify");
+        section("[4] prove it's real - tamper with the ledger and re-verify");
         run_tamper_proof()?;
         println!();
     } else {
@@ -327,7 +327,7 @@ fn seed_one_time_approval(
         ctx,
     )?;
     ledger.approve(&prev.approval_id, ApprovalScope::ThisSession, Some("you"))?;
-    println!("    firewall: needs approval → [you approve once] → ALLOW");
+    println!("    firewall: needs approval -> [you approve once] -> ALLOW");
     Ok(())
 }
 
@@ -354,7 +354,7 @@ fn run_tamper_proof() -> Result<(), DemoError> {
             Some("another row"),
         )?;
         ledger.verify_chain()?;
-        println!("    wrote 2 audit rows → hash chain valid: YES");
+        println!("    wrote 2 audit rows -> hash chain valid: YES");
 
         // 直接改一行的 redacted_text(不更新其 event_hash)→ 链断裂
         let conn =
@@ -377,7 +377,9 @@ fn run_tamper_proof() -> Result<(), DemoError> {
                 "INVARIANT VIOLATED: ledger tamper was NOT detected".into(),
             )),
             Err(_) => {
-                println!("    re-verify after tamper → hash chain valid: NO  ✗  tamper DETECTED");
+                println!(
+                    "    re-verify after tamper -> hash chain valid: NO  [x]  tamper DETECTED"
+                );
                 Ok(())
             }
         }
@@ -415,16 +417,16 @@ fn self_check(
 // ── 打印 helpers ──
 fn banner() {
     println!();
-    println!("  ┌──────────────────────────────────────────────────────────────────┐");
-    println!("  │  VIGIL DEMO — in-memory, planted scenario, NOT guarding real yet    │");
-    println!("  └──────────────────────────────────────────────────────────────────┘");
-    println!("  Real Vigil runtime code paths (firewall · redaction · audit).");
-    println!("  Only the external model/tool provider is simulated — no LLM is contacted.\n");
+    println!("  ============================================================");
+    println!("  VIGIL DEMO - in-memory, planted scenario, NOT guarding real yet");
+    println!("  ============================================================");
+    println!("  Real Vigil runtime code paths (firewall / redaction / audit).");
+    println!("  Only the external model/tool provider is simulated - no LLM is contacted.\n");
 }
 
 fn teaching_moment(secret: &str) {
     println!(
-        "  A demo secret — freshly generated locally for this run (never leaves this process):"
+        "  A demo secret - freshly generated locally for this run (never leaves this process):"
     );
     println!("    github_pat = {}", secret);
     println!("  Watch: it reaches the tool, but the model & audit never see it.\n");
@@ -450,13 +452,13 @@ fn print_decision(resp: &JsonRpcResponse, label: &str, _secret: &str) -> Result<
                 .and_then(Value::as_str)
                 .unwrap_or("-");
             println!(
-                "    tool={}  → Vigil firewall: DENY  (rule={})  decision_id={}",
+                "    tool={}  -> Vigil firewall: DENY  (rule={})  decision_id={}",
                 label,
                 rule,
                 short(decision_id)
             );
         }
-        None => println!("    tool={}  → ALLOW", label),
+        None => println!("    tool={}  -> ALLOW", label),
     }
     Ok(())
 }
@@ -478,23 +480,23 @@ fn print_ledger(events: &[ReplayEvent]) {
 }
 
 fn ending_screen() {
-    println!("  ┌──────────────────────────────────────────────────────────────────┐");
-    println!("  │  What just happened                                                │");
-    println!("  └──────────────────────────────────────────────────────────────────┘");
+    println!("  ============================================================");
+    println!("  What just happened");
+    println!("  ============================================================");
     println!("    Remote model saw:     secret://github_pat");
     println!("    Local tool received:  the real secret, only at the execution boundary");
     println!("    Tool result returned: re-redacted (no secret back to the model)");
     println!("    Firewall:             default-deny + explicit approval");
     println!("    Audit ledger:         hash-chain valid, no plaintext secrets");
     println!();
-    println!("    The agent did useful work with a real secret — while the model,");
+    println!("    The agent did useful work with a real secret - while the model,");
     println!("    logs, and audit never received the real value.");
     println!();
-    println!("    Philosophy:  local control plane · no token passthrough · fail-closed");
-    println!("                 · audit everything · you stay in control");
+    println!("    Philosophy:  local control plane / no token passthrough / fail-closed");
+    println!("                 / audit everything / you stay in control");
     println!();
     println!("    This was a planted scenario with a locally-generated fixture. The redaction,");
-    println!("    firewall, and audit above are Vigil's real runtime code — only the model/tool");
+    println!("    firewall, and audit above are Vigil's real runtime code - only the model/tool");
     println!("    provider was simulated.");
     println!();
     println!("    Protect your real agent:");

@@ -8,6 +8,23 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.11] — 2026-06-05
+
+A quality patch: the desktop app no longer re-prompts to update, and `vigil-hub demo` renders
+cleanly on every terminal. No functional change to the firewall, redaction, or audit core.
+
+### Fixed
+
+- **Desktop auto-updater no longer loops.** The bundled app version had drifted behind the
+  published release, so an installed desktop saw the update manifest as "newer than itself" on
+  every poll and re-downloaded the same version indefinitely. The app version is now pinned to the
+  release version, so the updater settles once the install is current.
+- **`vigil-hub demo` renders on every terminal.** The demo's framing and status glyphs used
+  box-drawing / arrow / dash / cross characters that garble on non-UTF-8 consoles (e.g.
+  Chinese-Windows cp936, legacy cp437). They are now ASCII, so the first-run experience is clean
+  everywhere. Display-only change — the demo still drives the real runtime code and its invariant
+  self-check is unchanged (both smoke tests still pass).
+
 ## [v0.1.10] — 2026-06-05
 
 A zero-setup `vigil-hub demo` first-run experience, plus reversible secret redaction at the
