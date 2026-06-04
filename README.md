@@ -126,7 +126,23 @@ vigil-hub demo --tamper   # also: alter the audit ledger and watch verify-chain 
 > **The aha:** the agent did useful work with a real secret — while the model, logs, and audit never
 > received the real value. It's a planted scenario with a freshly-generated local fixture; the
 > firewall, redaction, and audit are Vigils' real code, only the model/tool provider is simulated.
-> Then protect your real agent with `vigil-hub serve --stdio`.
+
+### Protect Claude Code in one command (turnkey)
+
+Download the release, then run **one command**. Vigils registers itself as a Claude Code
+`PreToolUse` hook, so **every tool call** (Bash, Edit, Write, Read, MCP tools, …) is checked
+before it runs: a real credential heading into a tool is **blocked fail-closed** and recorded in
+your local, tamper-evident audit ledger. No manual config editing — your existing settings are
+backed up and only Vigils' own entry is added.
+
+```bash
+vigil-hub setup             # detect Claude Code → register the guard (backs up ~/.claude/settings.json)
+vigil-hub setup --status    # verify protection is ACTIVE + run a built-in self-test
+vigil-hub setup --uninstall # cleanly remove (only Vigils' own entry; your hooks untouched)
+```
+
+Restart Claude Code (or start a new session) and your agent's native tool calls are guarded.
+This is the fastest path from a GitHub download to real protection.
 
 ### As an MCP gateway (CLI)
 

@@ -8,6 +8,35 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.12] — 2026-06-05
+
+一键保护:下载 release,跑一条命令,你的 Claude Code 工具调用就受保护。这是从 GitHub 下载到真实防护的最快路径。
+
+### 新增
+
+- **`vigil-hub setup` —— 一键 turnkey 保护 Claude Code。** 检测 Claude Code 并把 Vigils 注册为
+  `PreToolUse` hook(覆盖全工具,含 `mcp__*`)写入 `~/.claude/settings.json`,无需手动改配置。
+  天生安全:读 → 解析 → 幂等合并 → 原子写 + 备份;遇到非法 / 形状异常的配置宁可 abort 也不动它;
+  只管自己的条目(用专属 `--vigil-managed` 标记识别),你其它的 hook/设置不受影响。`--status` 诚实
+  报告保护状态(active / stale / 未安装)并跑内置自检;`--uninstall` 只干净移除 Vigils 自己的条目;
+  `--dry-run` 只预览不写盘。含 shell 元字符 / 形状异常的路径会被拒绝以防命令注入。
+- **`vigil-hub hook` —— Claude Code PreToolUse adapter(原生工具 secret 守门)。** 拦截裸凭据与未解析的
+  `secret://` / `vigil://` 占位符流入 Claude Code 的原生工具调用(Bash/Edit/Write/Read/Grep)并审计每次
+  拦截,fail-closed by construction(deny=硬拦截;任何 读/解析/内部错误都拒)。裸 secret 在 MCP 工具里
+  也拦(纵深防御);MCP 工具里的占位符交给 MCP 网关。错误与审计**绝不回显** secret。
+
+### 修复
+
+- **`vigil-hub inspect` 恢复。** 命令行查审计账本(`activity`、`search`、`approvals`、`verify-chain`……)——
+  文档里到处引用——在 v0.1.10 移植时从 CLI 二进制里掉了(变成无人引用的孤儿源文件),现已重新接上。
+  复用 desktop 的 dispatch/render 逻辑,**不**拉 GUI/Tauri 依赖。
+
+### 变更
+
+- `serde_json` 现保留对象键顺序(`preserve_order`),让 `vigil-hub setup` 不重排你 `settings.json` 的键。
+  审计哈希不受影响(走 JCS 规范化)。
+- README 顶部新增 **"一键保护 Claude Code"** 区。
+
 ## [v0.1.11] — 2026-06-05
 
 质量补丁:桌面应用不再反复提示更新,`vigil-hub demo` 在所有终端都能正常显示。防火墙、脱敏、审计核心无功能变更。

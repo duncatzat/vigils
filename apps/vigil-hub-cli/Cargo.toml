@@ -50,6 +50,13 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 getrandom = { workspace = true }
 rusqlite = { workspace = true }
+# `vigil-hub setup` 一键接入:跨平台定位用户 agent 配置目录(~/.claude 等)。
+dirs = "6"
+# `vigil-hub inspect` 命令行查审计账本:复用 desktop 的 dispatch/render(default-features=false,
+# **不**拉 gui/tauri),+ runner(SandboxProfile)+ ui-protocol(Req 类型)。
+vigil-desktop = { path = "../desktop", default-features = false }
+vigil-runner = { path = "../../crates/vigil-runner" }
+vigil-ui-protocol = { path = "../../crates/vigil-ui-protocol" }
 
 [dev-dependencies]
 # CLI 级集成测试用(β R1 MUST-FIX 4):InMemorySecretStore 注入 + mock AS

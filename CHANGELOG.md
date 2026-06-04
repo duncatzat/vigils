@@ -8,6 +8,42 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.12] — 2026-06-05
+
+Turnkey protection: download the release, run one command, and your Claude Code tool calls are
+guarded. This is the fastest path from a GitHub download to real protection.
+
+### Added
+
+- **`vigil-hub setup` — one-command turnkey protection for Claude Code.** Detects Claude Code and
+  registers Vigils as a `PreToolUse` hook (covering all tools, including `mcp__*`) in
+  `~/.claude/settings.json`, with no manual config editing. Safe by construction: it reads → parses
+  → idempotently merges → atomically writes with a backup; it aborts rather than touch a malformed
+  or unexpectedly-shaped config; it only manages its own entry (detected by a dedicated
+  `--vigil-managed` marker), so your other hooks/settings are untouched. `--status` reports honest
+  protection state (active / stale / not-installed) and runs a built-in self-test; `--uninstall`
+  cleanly removes only Vigils' entry; `--dry-run` previews without writing. Shell-metacharacter and
+  unexpected-shape paths are rejected to avoid command injection.
+- **`vigil-hub hook` — Claude Code PreToolUse adapter (native-tool secret guard).** Blocks raw
+  credentials and unresolved `secret://` / `vigil://` placeholders from Claude Code's native tool
+  calls (Bash/Edit/Write/Read/Grep) and audits every block, fail-closed by construction (a deny is
+  a hard block; any read/parse/internal error denies). Raw secrets are blocked in MCP tools too
+  (defense in depth); placeholders in MCP tools defer to the MCP gateway. Never echoes a secret
+  into an error or the audit log.
+
+### Fixed
+
+- **`vigil-hub inspect` restored.** The command-line audit-ledger query (`activity`, `search`,
+  `approvals`, `verify-chain`, …) — referenced throughout the docs — had been dropped from the CLI
+  binary in v0.1.10 and is now wired back in (it had become an orphaned source file). Pulls in the
+  desktop dispatch/render logic without the GUI/Tauri dependency.
+
+### Changed
+
+- `serde_json` now preserves object key order (`preserve_order`) so `vigil-hub setup` does not
+  reorder the keys of your `settings.json`. Audit hashing is unaffected (it uses JCS canonicalization).
+- README now leads with a **"Protect Claude Code in one command"** section.
+
 ## [v0.1.11] — 2026-06-05
 
 A quality patch: the desktop app no longer re-prompts to update, and `vigil-hub demo` renders

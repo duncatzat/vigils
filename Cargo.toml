@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 rust-version = "1.80"
 license = "Apache-2.0"
@@ -47,7 +47,9 @@ dbg_macro = "warn"
 [workspace.dependencies]
 # vigil-types 核心依赖;其他 crate 如需引用类型,应依赖 vigil-types 而非重复引入这些包
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order:对象按插入顺序序列化;`vigil-hub setup` 编辑用户 settings.json 时不重排其键。
+# 哈希全走 serde_jcs(JCS 自排序),与 Map 内部顺序无关,故对审计链/golden 哈希无影响。
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "1"
 
 # I01 激活:SQLite + JCS + hash / id / time

@@ -10,7 +10,10 @@
 
 pub mod add_remote;
 pub mod demo;
+pub mod hook;
+pub mod inspect;
 pub mod serve;
+pub mod setup;
 
 use std::path::PathBuf;
 use std::time::Duration;

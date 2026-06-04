@@ -109,6 +109,28 @@ Linux** 的预构建安装包与二进制:
 
 ## 快速开始
 
+### 一键保护 Claude Code(turnkey)
+
+下载 release 后,只跑**一条命令**。Vigils 把自己注册为 Claude Code 的 `PreToolUse` hook,于是
+**每一次工具调用**(Bash、Edit、Write、Read、MCP 工具……)在执行前都先被检查:真实凭据流入工具会被
+**fail-closed 拦截**,并记入本地防篡改审计账本。无需手动改配置——你既有的设置会被备份,只新增 Vigils
+自己的条目。
+
+```bash
+vigil-hub setup             # 检测 Claude Code → 注册守门(备份 ~/.claude/settings.json)
+vigil-hub setup --status    # 校验保护已 ACTIVE + 跑内置自检
+vigil-hub setup --uninstall # 干净移除(仅 Vigils 自己的条目;你的 hook 不动)
+```
+
+重启 Claude Code(或开新会话),agent 的原生工具调用即受保护。这是从 GitHub 下载到真实防护的最快路径。
+
+### 先用 60 秒看价值(零设置)
+
+```bash
+vigil-hub demo            # 默认拒绝 → 占位符往返 → 真值只到本地工具 → 审计零明文
+vigil-hub demo --tamper   # 另演示:篡改账本一行,看 verify-chain 检测到(可证伪)
+```
+
 ### 作为 MCP 网关(CLI)
 
 把 Vigils 放在你的 MCP server 前面,让每次工具调用都经过防火墙、审批与审计:

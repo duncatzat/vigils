@@ -9,7 +9,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use vigil_hub_cli::demo::{self, DemoArgs};
+use vigil_hub_cli::hook::{self, HookArgs};
+use vigil_hub_cli::inspect::{self, InspectArgs};
 use vigil_hub_cli::serve::{self, ServeArgs};
+use vigil_hub_cli::setup::{self, SetupArgs};
 use vigil_hub_cli::{add_remote, AddRemoteArgs};
 
 /// Vigil Hub CLI(I10b-β:含 `add-remote-mcp`)。
@@ -36,6 +39,26 @@ enum Command {
     /// 走 Vigil 真实运行时代码(firewall / 脱敏 / 审计),只模拟外部 model/tool;不联系任何 LLM,
     /// 不需账号/key/网络。`--tamper` 额外演示篡改账本被检测(可证伪)。
     Demo(CliDemoArgs),
+    /// Claude Code `PreToolUse` hook adapter(P1-α1,guard-only):从 stdin 读 PreToolUse 事件,
+    /// 对带 secret 的**原生**工具调用 fail-closed deny(exit 2 + stderr)并审计;干净调用放行(exit 0)。
+    ///
+    /// settings.json 注册示例(matcher `*` = **所有**工具 —— 裸 secret 纵深防御需覆盖 `mcp__*`,
+    /// 故不要把 matcher 限定到 `Bash|Edit|...`,否则 hook 对 MCP 工具根本不触发):
+    /// ```json
+    /// {"hooks":{"PreToolUse":[{"matcher":"*",
+    ///   "hooks":[{"type":"command","command":"vigil-hub hook --ledger C:\\Vigil\\ledger.sqlite"}]}]}}
+    /// ```
+    /// 注:hook 对**每个**工具调用触发(含 Read);干净调用零开销放行。占位符替换在后续增量加入。
+    Hook(CliHookArgs),
+    /// 一键接入:把 Vigil 保护写进已装 AI agent 配置,让"下载 → 运行一次 → 直接受保护"成立。
+    ///
+    /// v1 = 检测 Claude Code → 注册 PreToolUse hook(全工具 secret 守门 + 本地审计)。
+    /// `--uninstall` 干净移除;`--status` 报告 + 自检;`--dry-run` 只预览不写盘。
+    Setup(CliSetupArgs),
+    /// 命令行查询本地审计账本:activity / search / approvals / session / servers / verify-chain。
+    ///
+    /// 用法:`vigil-hub inspect --db-path ./vigil.db activity --limit 20`。
+    Inspect(InspectArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -43,6 +66,35 @@ struct CliDemoArgs {
     /// 额外演示可证伪:篡改一条账本行后真 verify_chain 检测到篡改(失败)。
     #[arg(long)]
     tamper: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct CliHookArgs {
+    /// 审计账本路径(与 `serve --ledger` 同一文件以保持审计链连续)。
+    /// 省略 = 不审计(仍做安全决策;stderr 提示)。
+    #[arg(long)]
+    ledger: Option<PathBuf>,
+    /// 由 `vigil-hub setup` 写入的托管标记(被本命令**忽略**;仅供 setup 识别/卸载其托管条目)。
+    #[arg(long = "vigil-managed", hide = true)]
+    #[allow(dead_code)]
+    // clap 解析后不读取;存在只为接受该 flag,不让 Claude Code 调用报未知参数
+    vigil_managed: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct CliSetupArgs {
+    /// 移除 Vigil 托管配置(仅 Vigil 自己的条目,不动你其它配置)。
+    #[arg(long)]
+    uninstall: bool,
+    /// 报告当前保护状态 + 自检(含合成 fake token 跑真 hook 断言被拦的 smoke test)。
+    #[arg(long)]
+    status: bool,
+    /// 只打印将要做的改动,不写盘。
+    #[arg(long)]
+    dry_run: bool,
+    /// 覆盖审计账本路径(默认 `<本机数据目录>/Vigil/ledger.sqlite3`)。
+    #[arg(long)]
+    ledger: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -178,5 +230,141 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
+        Some(Command::Hook(args)) => {
+            // Claude Code PreToolUse adapter:stdin 读事件 → 决策。
+            // **deny 必须用 exit 2**(blocking error,stderr 回喂模型);exit 1 在 Claude Code
+            // 约定里是 **non-blocking**(fail-open),绝不能用作拦截。Allow = exit 0 静默放行。
+            let hook_args = HookArgs {
+                ledger_path: args.ledger,
+            };
+            let stdin = std::io::stdin();
+            let mut reader = stdin.lock();
+            match hook::run(&hook_args, &mut reader) {
+                hook::HookOutcome::Allow => std::process::ExitCode::SUCCESS,
+                hook::HookOutcome::Deny(reason) => {
+                    eprintln!("{reason}");
+                    std::process::ExitCode::from(2)
+                }
+            }
+        }
+        Some(Command::Setup(args)) => {
+            let setup_args = SetupArgs {
+                uninstall: args.uninstall,
+                status: args.status,
+                dry_run: args.dry_run,
+                ledger: args.ledger,
+            };
+            match setup::run(&setup_args) {
+                Ok(report) => print_setup_report(&setup_args, &report),
+                Err(e) => {
+                    eprintln!("vigil-hub setup failed: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        Some(Command::Inspect(args)) => inspect::run(args),
     }
+}
+
+/// 打印 setup/status 的人类可读报告(ASCII-safe,cp936/cp437 不乱码)。返回退出码。
+fn print_setup_report(args: &SetupArgs, r: &setup::SetupReport) -> std::process::ExitCode {
+    use setup::ProtectionState;
+    if args.status {
+        let self_test = setup::doctor_self_test();
+        println!("Vigil status");
+        println!(
+            "  Claude Code:   {}",
+            if r.claude_detected {
+                "detected"
+            } else {
+                "not detected (~/.claude not found)"
+            }
+        );
+        // 诚实分级:Active 仅当托管条目存在且 command 未漂移且 exe 存在(Codex R1 HIGH)。
+        match r.state {
+            ProtectionState::Active => {
+                println!("  Protection:    ACTIVE");
+                println!("  Hook command:  {}", r.hook_command);
+                println!("  Audit ledger:  {}", r.ledger.display());
+            }
+            ProtectionState::Stale => {
+                println!("  Protection:    INSTALLED but STALE");
+                println!(
+                    "                 the registered hook points at a different binary/ledger,"
+                );
+                println!("                 or a missing executable. Re-run `vigil-hub setup` to refresh.");
+            }
+            ProtectionState::NotInstalled => {
+                println!("  Protection:    not installed");
+            }
+        }
+        println!(
+            "  Self-test:     {}",
+            if self_test {
+                "PASS - a synthetic fake credential was blocked by the hook logic"
+            } else {
+                "FAIL - the hook did NOT block a synthetic credential (please report)"
+            }
+        );
+        if r.state != ProtectionState::Active && r.claude_detected {
+            println!("\n  Run `vigil-hub setup` to turn on protection.");
+        }
+        // self-test 失败是真问题 → 非零退出
+        return if self_test {
+            std::process::ExitCode::SUCCESS
+        } else {
+            std::process::ExitCode::FAILURE
+        };
+    }
+
+    if args.uninstall {
+        println!("Vigil setup --uninstall");
+        if r.changed {
+            println!("  Removed Vigil's PreToolUse hook from Claude Code settings.");
+            if let Some(b) = &r.backup_path {
+                println!("  Backup:        {}", b.display());
+            }
+        } else {
+            println!("  Nothing to remove (Vigil hook was not present).");
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
+
+    // install
+    println!("Vigil setup");
+    if !r.claude_detected {
+        println!("  Claude Code:   not detected (~/.claude not found)");
+        println!("  Nothing to do. Install Claude Code, then re-run `vigil-hub setup`.");
+        println!("  (For other agents, use the MCP gateway: `vigil-hub serve --stdio`.)");
+        return std::process::ExitCode::SUCCESS;
+    }
+    println!("  Claude Code:   detected");
+    if r.dry_run {
+        println!("  [dry-run] would register Vigil's PreToolUse hook in:");
+        println!("            {}", r.settings_path.display());
+        println!("  [dry-run] hook command: {}", r.hook_command);
+        println!("  [dry-run] audit ledger: {}", r.ledger.display());
+        println!("  (no changes written)");
+        return std::process::ExitCode::SUCCESS;
+    }
+    if r.changed {
+        println!("  Protection:    PreToolUse hook registered (all tools)");
+        println!("  Hook command:  {}", r.hook_command);
+        println!("  Audit ledger:  {}", r.ledger.display());
+        if let Some(b) = &r.backup_path {
+            println!("  Backup:        {}  (your previous settings)", b.display());
+        }
+        println!();
+        println!("  Your Claude Code tool calls are now guarded by Vigil: raw secrets are");
+        println!("  blocked from Bash/Edit/Write/etc., and every block is recorded in a");
+        println!("  tamper-evident local audit ledger.");
+        println!();
+        println!("  Verify:  vigil-hub setup --status");
+        println!("  Undo:    vigil-hub setup --uninstall");
+        println!("  Restart Claude Code (or start a new session) for the hook to take effect.");
+    } else {
+        println!("  Protection:    already active (no change).");
+        println!("  Verify:  vigil-hub setup --status");
+    }
+    std::process::ExitCode::SUCCESS
 }
