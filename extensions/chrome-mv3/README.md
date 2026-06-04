@@ -1,4 +1,4 @@
-# chrome-mv3 — Vigil Paste Guard Extension
+# chrome-mv3 — Vigils Browser Guard Extension
 
 Chrome MV3 扩展,I09b-α1 提供 paste / input / submit 守门 + 与本机 Native Host(`com.vigil.host`)通信。
 

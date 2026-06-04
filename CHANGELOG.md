@@ -8,6 +8,35 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.9] — 2026-06-04
+
+Chrome extension gains a manual-input redaction guard, plus release-download improvements.
+Existing installs auto-update.
+
+### Added
+
+- **Chrome extension: manual-input redaction guard** — a debounced `input` listener now checks
+  manually-typed field text (not just paste/submit) against the classifier and redacts secrets in
+  place. Best-effort cleanup; paste (pre-insert preventDefault) and submit remain the hard guards.
+  No new extension permissions.
+- **Release: the Chrome extension is now a downloadable asset** — `vigils-chrome-extension.zip`
+  (unzip, then load unpacked at `chrome://extensions`).
+
+### Fixed
+
+- **Redaction false positive** — the `env_assignment` rule's bare-key form now requires `=` (not
+  `:`), so URI schemes like `token://…` and YAML `token:` contexts are no longer misredacted.
+  `token=secret` still redacts. (This restored a leak-guard regression.)
+
+### Changed
+
+- **Release filenames + download guide** — CLI archives use friendly platform names
+  (`vigils-cli-linux-x64` / `-macos-arm64` / `-windows-x64`) instead of Rust target triples, and the
+  release notes now include a short "which file do I want?" guide (desktop app vs CLI gateway vs
+  browser extension).
+
+---
+
 ## [v0.1.8] — 2026-06-04
 
 MCP gateway fixes — connecting `npx` / `uvx`-based upstream MCP servers (filesystem, GitHub, …)

@@ -58,7 +58,12 @@ jobs:
           fi
           {
             printf '\n---\n\n'
-            printf '%s\n\n' '**Downloads.** Desktop installers (Windows `.exe` / `.msi`, macOS `.dmg`, Linux `.AppImage` / `.deb` / `.rpm`) and CLI binaries (`vigil-hub`, `vigil-native-host`) are attached below. The Chrome MV3 extension lives in `extensions/chrome-mv3/`.'
+            printf '%s\n\n' '### Downloads — which file do I want?'
+            printf '%s\n' '- **Desktop app** (most users): the installer for your OS — Windows `Vigils_*_x64-setup.exe` (or `.msi`), macOS `Vigils_*.dmg`, Linux `.AppImage` / `.deb` / `.rpm`. Gives you the GUI: Activity Feed, Approval Queue, Server Registry.'
+            printf '%s\n' '- **CLI gateway** (put Vigils in front of an AI agent — Claude Code / Codex / Cursor / Zed): `vigils-cli-<platform>` (contains `vigil-hub` + `vigil-native-host`). This is the MCP proxy your agent connects to.'
+            printf '%s\n' '- **Browser extension** (guard pasting/typing secrets into AI web apps, Chrome MV3): `vigils-chrome-extension.zip` — unzip, then load unpacked at `chrome://extensions`.'
+            printf '%s\n\n' '- The `.sig` and `Vigils.app.tar.gz` files are desktop auto-updater artifacts — you do not need to download them.'
+            printf '%s\n\n' 'New here? Full setup & agent-integration guide: https://duncatzat.github.io/vigils'
             printf '%s\n\n' 'Early releases are unsigned; your OS may show a Gatekeeper / SmartScreen prompt on first run.'
             printf '%s\n' 'Apache-2.0 · https://vigils.ai · [Full changelog](https://github.com/duncatzat/vigils/blob/main/CHANGELOG.md)'
           } >> "$notes"
@@ -81,9 +86,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  suffix: "",     archive: tar.gz }
-          - { os: macos-latest,   target: aarch64-apple-darwin,      suffix: "",     archive: tar.gz }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,    suffix: ".exe", archive: zip }
+          # plat = 面向用户的友好平台名(替代 Rust target triple,新用户更易辨认下载哪个)
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  plat: linux-x64,   suffix: "",     archive: tar.gz }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      plat: macos-arm64, suffix: "",     archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    plat: windows-x64, suffix: ".exe", archive: zip }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -104,19 +110,19 @@ jobs:
         run: |
           set -e
           mkdir -p dist
-          tar -C target/release -czf "dist/vigils-cli-${{ matrix.target }}.tar.gz" vigil-hub vigil-native-host
+          tar -C target/release -czf "dist/vigils-cli-${{ matrix.plat }}.tar.gz" vigil-hub vigil-native-host
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path target/release/vigil-hub.exe, target/release/vigil-native-host.exe -DestinationPath "dist/vigils-cli-${{ matrix.target }}.zip"
+          Compress-Archive -Path target/release/vigil-hub.exe, target/release/vigil-native-host.exe -DestinationPath "dist/vigils-cli-${{ matrix.plat }}.zip"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
-          files: dist/vigils-cli-${{ matrix.target }}.${{ matrix.archive }}
+          files: dist/vigils-cli-${{ matrix.plat }}.${{ matrix.archive }}
 
   # ── 3. 桌面安装包（3 平台,Tauri bundle）─────────────────────────────
   desktop:
@@ -211,3 +217,21 @@ jobs:
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
           files: latest-${{ matrix.plat }}.json
+
+  # ── 4. Chrome MV3 扩展（zip,供用户 load unpacked）──────────────────────
+  extension:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package Chrome MV3 extension
+        run: |
+          set -e
+          mkdir -p dist
+          # 顶层保留 chrome-mv3/ 便于解压后直接 load unpacked;排除点文件 / node_modules
+          (cd extensions && zip -r "../dist/vigils-chrome-extension.zip" chrome-mv3 -x '*/.*' '*/node_modules/*')
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          files: dist/vigils-chrome-extension.zip

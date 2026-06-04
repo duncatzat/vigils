@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "Vigil Paste Guard",
-  "short_name": "Vigil",
-  "version": "0.1.0",
-  "description": "Vigil I09b(α1-α4): paste/input/submit 守门 —— 硬指纹检测 + 与本机 Native Host(com.vigil.host)通信。原文仅在 Host 内存停留,分类完立即 drop(ADR 0009 §I-9.1)。",
+  "name": "Vigils Browser Guard",
+  "short_name": "Vigils",
+  "version": "0.1.9",
+  "description": "Vigils 浏览器守门:对你粘贴 / 输入 / 提交进 AI 网站的文本做密钥与 PII 硬指纹检测,经本机 Native Host(com.vigil.host)原地脱敏。原文仅在 Host 内存停留,分类完立即 drop。",
   "minimum_chrome_version": "120",
   "permissions": [
     "nativeMessaging",
