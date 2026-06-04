@@ -8,6 +8,38 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.8] — 2026-06-04
+
+MCP gateway fixes — connecting `npx` / `uvx`-based upstream MCP servers (filesystem, GitHub, …)
+now works end-to-end. Previously the gateway could aggregate **zero** tools from such servers, so
+an agent saw Vigils as a 0-tool server. Validated on Linux against the real
+`@modelcontextprotocol/server-filesystem` (14 tools surface, the firewall gates the call, the audit
+chain verifies). No public API or SDK surface change; existing installs auto-update.
+
+### Fixed
+
+- **stdio upstream env policy** — user-configured upstream launchers (`npx` / `uvx` / `node`) were
+  spawned with the sandbox runner's full `env_clear`, which strips `PATH` / `HOME`, so the launcher
+  could not find its interpreter or package-manager cache and never started — the Hub then
+  aggregated zero tools. Upstreams now use a dedicated env policy: `env_clear` plus a curated
+  allowlist of **non-secret** runtime variables (`PATH` / `HOME` / `APPDATA` / locale / …), then
+  approved per-tool secrets. The allowlist deliberately excludes secret-class and code-injection
+  variables, so the parent process's API keys and tokens still never reach an upstream; the sandbox
+  runner is unchanged. ([ADR 0007](docs/adr/0007-sandbox-runner.md) amendment)
+- **MCP initialize handshake** — the Hub now performs the MCP client lifecycle handshake
+  (`initialize` → `notifications/initialized`) before listing an upstream's tools, as the protocol
+  requires, so strict MCP SDK servers that reject `tools/list` before initialization are supported.
+  The negotiated protocol version is validated (fail-closed on an unsupported version). A
+  broken/slow upstream is non-fatal — logged, its tools simply unavailable, rather than taking down
+  the gateway.
+
+### Docs
+
+- Agent integration guide: corrected the tool-namespacing notation to the actual `__`
+  (double-underscore) separator — `fs__read_file`, not `fs/read_file`.
+
+---
+
 ## [v0.1.7] — 2026-06-03
 
 Security hardening. Ports the fixes from the project's first comprehensive security audit
