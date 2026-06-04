@@ -1,7 +1,8 @@
-// I09b-α1/α2 content script —— paste / submit 守门。
+// I09b-α1/α2 content script —— paste / input / submit 守门。
 //
 // 职责:
 //   - 监听 document 级 `paste` 事件(捕获阶段,拦下纯文本粘贴前 dispatch)
+//   - 监听 document 级 `input` 事件(防抖后检查手动输入,命中后回写脱敏文本)
 //   - 监听 `submit` 事件(form submit + contenteditable Enter + button[type=submit])
 //   - 将候选文本 + origin + event_kind 送到 background service worker,
 //     收到 Response 后按 action 执行:
@@ -34,44 +35,64 @@
     "use strict";
 
     const ORIGIN = location.origin;
+    const INPUT_DEBOUNCE_MS = 700;
 
     // ───────────────────────── 极简通知 UI(固定在页面顶部) ─────────────────────────
 
     let toastEl = null;
-    function showToast(message, tone /* "info" | "warn" | "error" */) {
-        // 懒创建;Vue / naive 那一套不可用(content script 是独立 JS world)
+    function ensureToastMounted() {
+        const parent = document.body || document.documentElement;
+        if (!parent) return false;
         if (!toastEl) {
             toastEl = document.createElement("div");
             toastEl.setAttribute("data-vigil-toast", "");
+            toastEl.setAttribute("role", "status");
+            toastEl.setAttribute("aria-live", "polite");
             // 样式 inline,避免被站点 CSS 覆盖
             Object.assign(toastEl.style, {
                 position: "fixed",
-                top: "12px",
-                left: "50%",
-                transform: "translateX(-50%)",
+                right: "16px",
+                bottom: "16px",
                 zIndex: "2147483647",
-                padding: "8px 14px",
+                maxWidth: "min(420px, calc(100vw - 32px))",
+                padding: "10px 14px",
                 borderRadius: "6px",
+                boxShadow: "0 12px 32px rgba(15, 23, 42, 0.28)",
                 fontFamily: "system-ui, -apple-system, sans-serif",
                 fontSize: "13px",
-                fontWeight: "500",
+                lineHeight: "1.45",
+                fontWeight: "600",
                 color: "#fff",
                 pointerEvents: "none",
-                transition: "opacity 0.2s",
+                transition: "opacity 0.2s, transform 0.2s",
                 opacity: "0",
+                transform: "translateY(8px)",
+                whiteSpace: "normal",
             });
-            (document.documentElement || document.body).appendChild(toastEl);
         }
+        if (!toastEl.isConnected) {
+            parent.appendChild(toastEl);
+        }
+        return true;
+    }
+
+    function showToast(message, tone /* "info" | "warn" | "error" */) {
+        // 懒创建;Vue / naive 那一套不可用(content script 是独立 JS world)
+        if (!ensureToastMounted()) return;
         const color =
             tone === "error" ? "#b91c1c" : tone === "warn" ? "#b45309" : "#1e40af";
         toastEl.style.background = color;
         // 用 textContent(Vue 默认插值同效),杜绝站点 HTML 注入 contaminate Vigil 提示
         toastEl.textContent = message;
         toastEl.style.opacity = "1";
+        toastEl.style.transform = "translateY(0)";
         clearTimeout(showToast._t);
         showToast._t = setTimeout(() => {
-            if (toastEl) toastEl.style.opacity = "0";
-        }, 2500);
+            if (toastEl) {
+                toastEl.style.opacity = "0";
+                toastEl.style.transform = "translateY(8px)";
+            }
+        }, 4000);
     }
 
     // ───────────────────────── SW 请求 ─────────────────────────
@@ -228,6 +249,93 @@
         }
         return null;
     }
+
+    // ───────────────────────── manual input 监听 ─────────────────────────
+    //
+    // 手动输入已进入 DOM,无法像 paste 那样在写入前 preventDefault。这里是**尽力而为的事后
+    // 清理**:用户停顿(防抖)后把输入框全文交 Native Host,命中即回写 redacted_text。
+    //
+    // ⚠️ 安全边界(Codex review):防抖窗口(~700ms)内未脱敏文本仍在 DOM,页面 JS 可在此期间
+    // 读取并经 fetch/XHR/WebSocket/autosave 外发,**绕过**本清理(无 DOM submit)。真正的硬保证在
+    // paste 的写入前 preventDefault 与 submit 守门;manual input 守门只是纵深防御的补充层,
+    // **不**作"完整泄漏防护"承诺。不落 storage / console,只保留 per-element timer 与序号。
+
+    const inputChecks = new WeakMap();
+
+    // 先登记"扩展写入的确切值"再 setText —— 若 setText 触发同步 input 事件,
+    // scheduleInputCheck 能据此精确识别为自写而跳过,避免无限 input→redact 循环。
+    function writeFieldByExtension(target, adapter, value) {
+        const st = inputChecks.get(target);
+        if (st) st.lastWritten = value;
+        adapter.setText(value);
+    }
+
+    function scheduleInputCheck(target) {
+        const adapter = adaptTarget(target);
+        if (!adapter || !(target instanceof Element)) return;
+        const text = adapter.getText();
+        if (!text) return;
+
+        const prev = inputChecks.get(target) || {
+            seq: 0,
+            timer: 0,
+            lastText: "",
+            lastWritten: null,
+        };
+        // Codex review NEEDS-FIX:仅当全文 === 扩展上次写入的**确切值**才跳过(防循环)。
+        // **不**用包含式 redaction 标记匹配 —— 否则用户在普通文本里手打 `[REDACTED ...]`
+        // 即可诱导跳过分类,绕过守门。绝不信任用户控制的文本内容。
+        if (text === prev.lastWritten) return;
+
+        if (prev.timer) clearTimeout(prev.timer);
+        const next = {
+            seq: prev.seq + 1,
+            timer: 0,
+            lastText: text,
+            lastWritten: prev.lastWritten,
+        };
+        next.timer = setTimeout(async () => {
+            const current = inputChecks.get(target);
+            if (!current || current.seq !== next.seq) return;
+            const ad = adaptTarget(target);
+            if (!ad) return;
+            const latest = ad.getText();
+            if (!latest || latest !== next.lastText) return;
+
+            const resp = await callBackground("input", latest);
+            const after = inputChecks.get(target);
+            if (!after || after.seq !== next.seq) return;
+            const latestAdapter = adaptTarget(target);
+            if (!latestAdapter) return;
+            const latestAgain = latestAdapter.getText();
+            if (latestAgain !== latest) return;
+
+            if (resp.action === "allow") return;
+            if (resp.action === "redact" && typeof resp.redacted_text === "string") {
+                writeFieldByExtension(target, latestAdapter, resp.redacted_text);
+                const kinds = (resp.findings || []).join(", ") || "secret";
+                showToast(`Vigil: 输入内容包含 ${kinds},已脱敏`, "warn");
+                return;
+            }
+
+            writeFieldByExtension(target, latestAdapter, "");
+            const reason = resp._error || (resp.findings || []).join(", ") || "block";
+            showToast(`Vigil: 输入内容被阻断(${reason})`, "error");
+        }, INPUT_DEBOUNCE_MS);
+        inputChecks.set(target, next);
+    }
+
+    document.addEventListener(
+        "input",
+        (ev) => {
+            try {
+                scheduleInputCheck(ev.target);
+            } catch (_) {
+                // 守住 paste/submit 稳定路径:input 增强失败时只放弃本次手动输入检查。
+            }
+        },
+        true,
+    );
 
     // ───────────────────────── paste 监听 ─────────────────────────
 

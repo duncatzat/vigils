@@ -25,7 +25,9 @@ mod framing;
 mod origin;
 mod protocol;
 
-pub use audit::{build_audit_payload, event_type_for, BrowserAuditMeta, EVENT_PASTE, EVENT_SUBMIT};
+pub use audit::{
+    build_audit_payload, event_type_for, BrowserAuditMeta, EVENT_INPUT, EVENT_PASTE, EVENT_SUBMIT,
+};
 pub use classifier::{classify, ClassifyOutcome};
 pub use framing::{read_frame, write_frame, MAX_MESSAGE_BYTES};
 pub use origin::validate_browser_origin;

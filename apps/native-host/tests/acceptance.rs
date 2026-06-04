@@ -65,6 +65,15 @@ fn make_req(text: &str, origin: &str) -> BrowserCheckRequest {
     }
 }
 
+fn make_input_req(text: &str, origin: &str) -> BrowserCheckRequest {
+    BrowserCheckRequest {
+        request_id: "aa000000-0000-0000-0000-000000000002".into(),
+        origin: origin.into(),
+        event_kind: BrowserEventKind::Input,
+        text: text.into(),
+    }
+}
+
 /// §12.3 I09-1:GitHub token paste → Redact(有 finding + 有 redacted_text)
 #[test]
 fn i09_github_token_triggers_redact() {
@@ -104,6 +113,27 @@ fn i09_normal_paste_allows() {
     assert_eq!(resp.action, BrowserAction::Allow);
     assert!(resp.findings.is_empty());
     assert!(resp.redacted_text.is_none());
+}
+
+#[test]
+fn i09_manual_input_token_assignment_triggers_redact_and_input_audit() {
+    let req = make_input_req("token=sadqwdzcfqdqdwqdqdq", "https://chatgpt.com");
+    let (ledger, sid, v) = run_once(&req);
+    let resp: BrowserCheckResponse = serde_json::from_value(v).unwrap();
+    assert_eq!(resp.action, BrowserAction::Redact);
+    assert!(resp.findings.contains(&FindingKind::EnvAssignment));
+    assert_eq!(
+        resp.redacted_text.as_deref(),
+        Some("[REDACTED env_assignment]")
+    );
+
+    let events = ledger.replay_session(&sid).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == "browser.input_checked"),
+        "input 请求应写 browser.input_checked 审计事件"
+    );
 }
 
 /// §12.3 I09-4:SENTINEL 注入原文,audit payload 和任一响应 JSON **都不含**原文

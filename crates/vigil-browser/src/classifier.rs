@@ -188,6 +188,16 @@ mod tests {
     }
 
     #[test]
+    fn classifier_bare_token_assignment_redacts() {
+        let text = "token=sadqwdzcfqdqdwqdqdq";
+        let r = resp(classify(&req(text)));
+        assert_eq!(r.action, BrowserAction::Redact);
+        assert_eq!(r.findings, vec![FindingKind::EnvAssignment]);
+        let redacted = r.redacted_text.unwrap();
+        assert_eq!(redacted, "[REDACTED env_assignment]");
+    }
+
+    #[test]
     fn classifier_localhost_url_redacts() {
         let text = "run against http://localhost:8080/api/debug";
         let r = resp(classify(&req(text)));

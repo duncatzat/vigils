@@ -15,6 +15,9 @@ use crate::protocol::{
 /// `browser.paste_checked` 审计事件类型。
 pub const EVENT_PASTE: &str = "browser.paste_checked";
 
+/// `browser.input_checked` 审计事件类型。
+pub const EVENT_INPUT: &str = "browser.input_checked";
+
 /// `browser.submit_checked` 审计事件类型。
 pub const EVENT_SUBMIT: &str = "browser.submit_checked";
 
@@ -39,6 +42,7 @@ pub fn build_audit_payload(meta: &BrowserAuditMeta<'_>, response: &BrowserCheckR
     let finding_kinds: Vec<&'static str> = response.findings.iter().map(|f| f.as_str()).collect();
     let event_kind = match meta.event_kind {
         BrowserEventKind::Paste => "paste",
+        BrowserEventKind::Input => "input",
         BrowserEventKind::Submit => "submit",
     };
     let action = match response.action {
@@ -59,10 +63,11 @@ pub fn build_audit_payload(meta: &BrowserAuditMeta<'_>, response: &BrowserCheckR
     })
 }
 
-/// 给定 request 返对应 event type(`browser.paste_checked` / `browser.submit_checked`)。
+/// 给定 request 返对应 event type(`browser.*_checked`)。
 pub fn event_type_for(kind: BrowserEventKind) -> &'static str {
     match kind {
         BrowserEventKind::Paste => EVENT_PASTE,
+        BrowserEventKind::Input => EVENT_INPUT,
         BrowserEventKind::Submit => EVENT_SUBMIT,
     }
 }
@@ -140,6 +145,21 @@ mod tests {
         assert_eq!(length_bucket(500), "500-2000");
         assert_eq!(length_bucket(1999), "500-2000");
         assert_eq!(length_bucket(2000), "2000+");
+    }
+
+    #[test]
+    fn input_event_maps_to_input_audit_type_and_payload_kind() {
+        let meta = BrowserAuditMeta {
+            origin: "https://chatgpt.com",
+            event_kind: BrowserEventKind::Input,
+            request_id: "rid-input",
+            text_len: 42,
+        };
+        let resp = mk_resp(BrowserAction::Redact, vec![FindingKind::EnvAssignment]);
+        let payload = build_audit_payload(&meta, &resp);
+        assert_eq!(event_type_for(BrowserEventKind::Input), EVENT_INPUT);
+        assert_eq!(payload["event_kind"], "input");
+        assert_eq!(payload["action"], "redact");
     }
 
     /// ADR §I-9.1:audit payload 不得含原文 / redacted_text

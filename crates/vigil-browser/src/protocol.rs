@@ -25,12 +25,14 @@ use serde::{Deserialize, Serialize};
 ///   golden 守门;详见 `docs/adr/0013-hardfp-model-merge.md` "Revised — ISS-021" 段
 pub const RULE_PROFILE_VERSION: &str = "v5";
 
-/// 浏览器事件:粘贴 / 提交。`Ask` 交互延 I09c。
+/// 浏览器事件:粘贴 / 手动输入 / 提交。`Ask` 交互延 I09c。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BrowserEventKind {
     /// 用户触发 `paste` 事件
     Paste,
+    /// 用户触发普通 `input` 事件,由扩展防抖后检查
+    Input,
     /// 用户触发 submit(button click / form submit / contenteditable 回车)
     Submit,
 }
@@ -111,7 +113,7 @@ pub struct BrowserCheckRequest {
     pub request_id: String,
     /// 完整 origin,形如 `https://chatgpt.com`;Core 做特权 scheme fail-closed 校验(ADR §D7)
     pub origin: String,
-    /// `paste` / `submit`
+    /// `paste` / `input` / `submit`
     pub event_kind: BrowserEventKind,
     /// 原文;**仅在 Host 进程内存停留**,分类完立即 drop(ADR §I-9.1)
     pub text: String,

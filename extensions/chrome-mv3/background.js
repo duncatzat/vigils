@@ -12,7 +12,7 @@
 //                                     ◀──postMessage(BrowserCheckResponse)────
 //
 // 协议严格对齐 `crates/vigil-browser/src/protocol.rs`:
-//   Request  : { request_id, origin, event_kind: "paste"|"submit", text }
+//   Request  : { request_id, origin, event_kind: "paste"|"input"|"submit", text }
 //   Response : { request_id, action: "allow"|"redact"|"block", findings: [...], redacted_text? }
 //   Error    : { error: "too_large"|"bad_json"|"origin_denied"|"bad_request_id"|"internal",
 //                request_id? }
@@ -83,7 +83,7 @@ function recordFinding(entry) {
 }
 
 // α4:session-scoped 豁免。用户在 popup 点"豁免 N 分钟"后,**仅本 tab + 仅本 origin**
-// 的 paste/submit 直接 allow,不走 Native Host 分类器。
+// 的 paste/input/submit 直接 allow,不走 Native Host 分类器。
 //
 // 安全权衡:
 //   - **硬上限** 10 分钟(`EXEMPT_MAX_MS`):防用户误点长时间失守;超限 clamp 不 panic
@@ -235,8 +235,8 @@ function checkWithHost({ origin, event_kind, text }) {
             _error: "origin_denied_sw",
         });
     }
-    // 早退 4:event_kind 协议白名单(只有 "paste" / "submit" 两值,Rust 端 serde 反序列也会拒其它)
-    if (event_kind !== "paste" && event_kind !== "submit") {
+    // 早退 4:event_kind 协议白名单(只有 "paste" / "input" / "submit" 三值,Rust 端 serde 反序列也会拒其它)
+    if (event_kind !== "paste" && event_kind !== "input" && event_kind !== "submit") {
         return Promise.resolve({
             action: "block",
             findings: [],

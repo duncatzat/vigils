@@ -3,7 +3,7 @@
   "name": "Vigil Paste Guard",
   "short_name": "Vigil",
   "version": "0.1.0",
-  "description": "Vigil I09b(α1-α4): paste/submit 守门 —— 硬指纹检测 + 与本机 Native Host(com.vigil.host)通信。原文仅在 Host 内存停留,分类完立即 drop(ADR 0009 §I-9.1)。",
+  "description": "Vigil I09b(α1-α4): paste/input/submit 守门 —— 硬指纹检测 + 与本机 Native Host(com.vigil.host)通信。原文仅在 Host 内存停留,分类完立即 drop(ADR 0009 §I-9.1)。",
   "minimum_chrome_version": "120",
   "permissions": [
     "nativeMessaging",

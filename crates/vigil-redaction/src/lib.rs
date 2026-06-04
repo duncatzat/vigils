@@ -10,8 +10,9 @@
 //! - **PEM 私钥块**(任何 `-----BEGIN ... PRIVATE KEY-----` 开头)
 //! - **JSON object-key 启发**:当 key 名含 `secret|token|password|api_key|auth` 时,
 //!   整个字符串值被替换为 `[REDACTED len=N by_key=...]`
-//! - **自由文本 `.env` 风格键值对**:`[A-Z_]+(KEY|TOKEN|SECRET|PASSWORD|AUTH|...)=value` 和
-//!   `... : value` 两种形态,即使 value 不匹配任何服务指纹也整段脱敏(规则名 `env_assignment`)
+//! - **自由文本 `.env` 风格键值对**:`[A-Z_]+(KEY|TOKEN|SECRET|PASSWORD|AUTH|...)=value`、
+//!   裸敏感 key(`token=value` / `password:value`)两种形态,即使 value 不匹配任何服务指纹
+//!   也整段脱敏(规则名 `env_assignment`)
 //! - **email 列表**
 //! - **内部 IPv4**(10/8、172.16/12、192.168/16、127/8)
 //!
@@ -308,17 +309,19 @@ pub(crate) static ALL_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             // 故意宽松匹配 `sk-...`;anthropic 规则已在前面先替换,不会被本规则再吞。
             pattern: Regex::new(r"\bsk-[A-Za-z0-9_\-]{20,}\b").expect("regex"),
         },
-        // ---- 通用 .env 风格键值对:`SOMETHING_KEY/TOKEN/...=value` ----
+        // ---- 通用 .env 风格键值对:`SOMETHING_KEY/TOKEN/...=value` / `token=value` ----
         //
         // 覆盖"自由文本"里的键值对(区别于 JSON object-key 启发)。例如:
         //   "OPENAI_API_KEY=sk-xxxx"
         //   "DATABASE_PASSWORD=hunter2"
         //   "SOME_SECRET: 'abc'"
-        // key 部分允许大小写混合 + `_`,值部分吞到空白/逗号/引号止。
+        //   "token=sadqwdzcfqdqdwqdqdq"
+        // key 部分允许大小写混合 + `_`;裸敏感 key 也算凭据上下文。
+        // 值部分吞到空白/逗号/引号止。
         Rule {
             name: "env_assignment",
             pattern: Regex::new(
-                r#"(?i)\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*[=:]\s*["']?[^\s"',;}\]]+"#,
+                r#"(?i)\b(?:[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*[=:]\s*["']?[^\s"',;}\]]+"#,
             )
             .expect("regex"),
         },
@@ -438,7 +441,7 @@ pub(crate) static HARD_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         Rule {
             name: "env_assignment",
             pattern: Regex::new(
-                r#"(?i)\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*[=:]\s*["']?[^\s"',;}\]]+"#,
+                r#"(?i)\b(?:[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*[=:]\s*["']?[^\s"',;}\]]+"#,
             )
             .expect("regex"),
         },
@@ -552,6 +555,16 @@ mod tests {
         assert!(!s.contains("hunter2"));
         assert!(s.contains("[REDACTED"));
         assert!(s.contains("hello")); // 普通字段保持
+    }
+
+    #[test]
+    fn redacts_bare_token_env_assignment_in_text() {
+        let clean = scrub_text("token=sadqwdzcfqdqdwqdqdq");
+        assert_eq!(clean, "[REDACTED env_assignment]");
+        assert_eq!(
+            detect_hard_secret("token=sadqwdzcfqdqdwqdqdq"),
+            Some("env_assignment")
+        );
     }
 
     #[test]
