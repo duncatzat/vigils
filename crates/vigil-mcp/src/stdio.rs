@@ -81,11 +81,12 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024
 /// O3(ADR 0007 §I-7.1 amendment,Codex ACCEPT-design 2026-06-01):把 `argv[0]` 解析为
 /// **绝对路径**。
 ///
-/// **为何需要**:`spawn` 经 `apply_native_env_policy` 做 `env_clear()`,子进程 env 无 PATH;
-/// 而 `std::process::Command` 在 Unix 按 command 自身 env 的 PATH 解析裸名 → 裸命令(`node`/
-/// `npx`/`python`,MCP 生态惯例)在被清环境里解析失败(`NotFound`)。本函数在 **spawn 前、
-/// 用宿主进程 PATH** 把裸名解析为绝对路径;随后 `Command::new(<absolute>)` + `env_clear` 即可
-/// —— **子进程 env 仍被完全清空**(§I-7.1 不变量保留),仅"程序定位"用了父进程 PATH。
+/// **为何需要**:即便 MCP upstream env 政策(`apply_mcp_upstream_env_policy`)现在会把宿主 PATH
+/// 纳入子进程白名单,程序定位仍**坚持在 spawn 前、用宿主 PATH** 把裸名解析为绝对路径,原因有二:
+/// (1) **安全**:解析出的绝对路径喂给 V1.1 resolved-program drift gate(抓"裸 `node` 解析到不同
+/// 二进制"),这是独立于 env 政策的 pin 维度,不能依赖子进程自解析;(2) **确定性**:`Command::new(
+/// <absolute>)` 让程序定位与子进程 env 政策解耦,不受白名单内容变动影响。裸命令(`node`/`npx`/
+/// `python`,MCP 生态惯例)由此稳定解析。
 ///
 /// 规则(Codex review 要求):
 /// - argv[0] 含路径分隔符 → 视为路径,`canonicalize` 校验存在并转绝对(**不**做 PATH 搜索)
@@ -180,13 +181,16 @@ impl StdioUpstream {
     ///
     /// - `program`:Hub 用宿主 PATH 解析出的绝对路径(`resolve_program`);argv 已由 caller 审批
     /// - `argv_tail`:`argv[1..]`(参数,不参与解析)
-    /// - `env`:批准注入的环境变量。进程先 `env_clear()`(§I-7.1 不变量保留),然后:
-    ///   - **Windows**:注入 `RESERVED_SYSTEM_ENV_KEYS`(SystemRoot 等,让 cmd.exe / ping
-    ///     等系统命令能解析 System32 DLL;见 ADR 0007 §I-7.1 helper)
-    ///   - 最后注入 caller 批准的 `env`(优先级最高,覆盖同名 system 保留键)
+    /// - `env`:批准注入的环境变量。进程先 `env_clear()`,然后:
+    ///   - 注入 `MCP_UPSTREAM_ENV_ALLOWLIST` 里**当前进程存在**的非敏感运行时 env
+    ///     (PATH/HOME/APPDATA/SystemRoot…)—— 让 `npx`/`uvx`/`node` 启动器能定位解释器与
+    ///     包管理器 cache 而真正起来(否则永不就绪,Hub 聚合 0 工具)
+    ///   - 最后注入 caller 批准的 `env`(优先级最高)
     ///
-    /// env 政策全路径由 `vigil_runner_types::apply_native_env_policy` 统一实现,与 `spawn_native`
-    /// 共享,消除跨 crate 漂移(I07.5+ / ADR 0007 §I-7.1 / ADR 0018);仅"程序定位"用了父 PATH。
+    /// env 政策由 `vigil_runner_types::apply_mcp_upstream_env_policy` 实现 —— 与沙箱 runner 的
+    /// `apply_native_env_policy`(完全 env_clear)**有意分叉**(ADR 0007 §I-7.1 amendment):MCP
+    /// upstream 是可信启动器需运行时 env,沙箱跑不可信代码故全清;白名单 deny-by-default 不含密钥,
+    /// 父进程的 API key/token 仍不泄漏。仅"程序定位"用了父 PATH(`resolve_program`)。
     pub(crate) fn spawn_resolved(
         server_id: impl Into<String>,
         program: std::path::PathBuf,
@@ -197,12 +201,19 @@ impl StdioUpstream {
         for a in argv_tail {
             cmd.arg(a);
         }
-        // I07.5+ (ADR 0007 §I-7.1):与 vigil-runner::spawn_native 共享 env 政策 helper,
-        // 消除历史漂移(此前 StdioUpstream 缺失 Windows SystemRoot 注入 → cmd.exe / ping
-        // 作为 MCP server 时无法解析 System32 DLL)。
-        // helper 签名要求 IntoIterator<Item=(K,V)>,slice iter 的 items 是 &(String,String),
-        // 通过 map(|(k,v)| (k,v)) 解构为引用元组,AsRef<OsStr> blanket impl 覆盖 &String。
-        vigil_runner_types::apply_native_env_policy(&mut cmd, env.iter().map(|(k, v)| (k, v)));
+        // MCP upstream env 政策(ADR 0007 §I-7.1 amendment):与沙箱 runner 的
+        // `apply_native_env_policy`(完全 env_clear)**有意分叉**。MCP stdio upstream 是用户配置的
+        // 可信启动器(`npx`/`uvx`/`node`),完全清 env 会让它们拿不到 PATH/HOME 而**起不来**
+        // (Linux+Windows 实测 `mcp-server-filesystem: not found`,upstream 永不就绪 → Hub 聚合 0 工具)。
+        // 改用 `apply_mcp_upstream_env_policy`:env_clear → 注入非敏感运行时 env 白名单
+        // (PATH/HOME/APPDATA/SystemRoot…,deny-by-default,不含任何密钥)→ 注入批准 user_env。
+        // 父进程的 API key/token 仍不泄漏给 upstream(隔离方向是收紧白名单,而非放开)。
+        // helper 签名要 IntoIterator<Item=(K,V)>;slice iter 的 item 是 &(String,String),
+        // map(|(k,v)| (k,v)) 解构为引用元组,AsRef<OsStr> blanket impl 覆盖 &String。
+        vigil_runner_types::apply_mcp_upstream_env_policy(
+            &mut cmd,
+            env.iter().map(|(k, v)| (k, v)),
+        );
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

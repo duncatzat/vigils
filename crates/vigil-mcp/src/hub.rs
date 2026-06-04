@@ -437,7 +437,9 @@ impl Hub {
         self.check_upstream_command_drift(server_id, argv)?;
         // 4. resolved-program drift gate(spawn 之前;首见建基线 / 漂移 fail-closed)
         self.check_upstream_resolved_program_drift(server_id, &argv[0], &resolved_str)?;
-        // 5. 双 gate 通过 → 才用已解析路径 spawn(子进程 env 仍 env_clear,§I-7.1 保留)
+        // 5. 双 gate 通过 → 才用已解析路径 spawn。子进程 env 走 MCP upstream 专用政策
+        //    (env_clear → 非敏感运行时白名单 PATH/HOME/… → 批准 user_env;§I-7.1 amendment,
+        //    见 StdioUpstream::spawn_resolved 注释)—— 让 npx/uvx 启动器能跑,父进程密钥不泄漏。
         let upstream = StdioUpstream::spawn_resolved(server_id, resolved, &argv[1..], env)
             .map_err(HubError::StdioSpawn)?;
         // 5.5. MCP 客户端生命周期握手(initialize → initialized)。

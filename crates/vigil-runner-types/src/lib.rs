@@ -23,7 +23,8 @@ pub mod plan;
 
 pub use audit::{NullAuditSink, RunnerAuditSink, RunnerEvent};
 pub use env_policy::{
-    apply_native_env_policy, is_reserved_env_key, ScrubCallback, RESERVED_SYSTEM_ENV_KEYS,
+    apply_mcp_upstream_env_policy, apply_native_env_policy, is_reserved_env_key, ScrubCallback,
+    MCP_UPSTREAM_ENV_ALLOWLIST, RESERVED_SYSTEM_ENV_KEYS,
 };
 pub use error::{RejectField, RunnerError};
 pub use plan::{ExecutionPlan, ExecutionResult, RunnerKind, RunnerSpecific, SandboxProfile};
