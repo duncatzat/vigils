@@ -10,9 +10,10 @@
 //! - **PEM 私钥块**(任何 `-----BEGIN ... PRIVATE KEY-----` 开头)
 //! - **JSON object-key 启发**:当 key 名含 `secret|token|password|api_key|auth` 时,
 //!   整个字符串值被替换为 `[REDACTED len=N by_key=...]`
-//! - **自由文本 `.env` 风格键值对**:`[A-Z_]+(KEY|TOKEN|SECRET|PASSWORD|AUTH|...)=value`、
-//!   裸敏感 key(`token=value` / `password:value`)两种形态,即使 value 不匹配任何服务指纹
-//!   也整段脱敏(规则名 `env_assignment`)
+//! - **自由文本 `.env` 风格键值对**:带前缀 key `[A-Z_]+(KEY|TOKEN|SECRET|PASSWORD|AUTH|...)`
+//!   允许 `=`/`:`;裸敏感 key(`token`/`key`/`auth`…)**仅** `=`(如 `token=value`,不收 `:` 以免
+//!   误吞 URI scheme `token://` 与 YAML `token:`)。即使 value 不匹配任何服务指纹也整段脱敏
+//!   (规则名 `env_assignment`)
 //! - **email 列表**
 //! - **内部 IPv4**(10/8、172.16/12、192.168/16、127/8)
 //!
@@ -314,14 +315,19 @@ pub(crate) static ALL_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         // 覆盖"自由文本"里的键值对(区别于 JSON object-key 启发)。例如:
         //   "OPENAI_API_KEY=sk-xxxx"
         //   "DATABASE_PASSWORD=hunter2"
-        //   "SOME_SECRET: 'abc'"
-        //   "token=sadqwdzcfqdqdwqdqdq"
-        // key 部分允许大小写混合 + `_`;裸敏感 key 也算凭据上下文。
+        //   "SOME_SECRET: 'abc'"   ← 带前缀 key 允许 `:`
+        //   "token=sadqwdzcfqdqdwqdqdq"   ← 裸 key 仅 `=`
+        // key 部分允许大小写混合 + `_`;裸敏感 key 也算凭据上下文,但仅认 `=` 分隔
+        //(`:` 会与 URI scheme `token://` / YAML `token:` 撞,故裸 key 不收 `:`)。
         // 值部分吞到空白/逗号/引号止。
         Rule {
             name: "env_assignment",
             pattern: Regex::new(
-                r#"(?i)\b(?:[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*[=:]\s*["']?[^\s"',;}\]]+"#,
+                // 带前缀的 key(`MY_TOKEN` / `OPENAI_API_KEY`)允许 `=` 或 `:` 分隔;
+                // **裸**敏感 key(`token` / `key` / `auth` …)**仅** `=` —— 不匹配 `:`,否则会误吞
+                // URI scheme(如 vigil-http-auth 内部 token_ref `token://oauth/...`)与 YAML/JSON
+                // 的 `token:` 上下文(Codex / 全 workspace 测试发现的 false positive)。
+                r#"(?i)(?:\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*[=:]|\b(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*=)\s*["']?[^\s"',;}\]]+"#,
             )
             .expect("regex"),
         },
@@ -441,7 +447,11 @@ pub(crate) static HARD_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         Rule {
             name: "env_assignment",
             pattern: Regex::new(
-                r#"(?i)\b(?:[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*[=:]\s*["']?[^\s"',;}\]]+"#,
+                // 带前缀的 key(`MY_TOKEN` / `OPENAI_API_KEY`)允许 `=` 或 `:` 分隔;
+                // **裸**敏感 key(`token` / `key` / `auth` …)**仅** `=` —— 不匹配 `:`,否则会误吞
+                // URI scheme(如 vigil-http-auth 内部 token_ref `token://oauth/...`)与 YAML/JSON
+                // 的 `token:` 上下文(Codex / 全 workspace 测试发现的 false positive)。
+                r#"(?i)(?:\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*[=:]|\b(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*=)\s*["']?[^\s"',;}\]]+"#,
             )
             .expect("regex"),
         },
@@ -563,6 +573,29 @@ mod tests {
         assert_eq!(clean, "[REDACTED env_assignment]");
         assert_eq!(
             detect_hard_secret("token=sadqwdzcfqdqdwqdqdq"),
+            Some("env_assignment")
+        );
+    }
+
+    /// 回归门(Codex review):裸敏感 key **仅** `=` 触发,不收 `:` —— 否则会误吞 URI scheme
+    /// (vigil-http-auth 内部 token_ref `token://oauth/...` 曾被误报 HardSecretDetected,致
+    /// `resolve_access_value` 失败)与 YAML/free-text 的 `token:` 上下文。带前缀 key 仍允许 `:`。
+    #[test]
+    fn env_assignment_bare_key_requires_equals_not_colon() {
+        // 误报回归:URI scheme + 裸冒号不得命中
+        assert_eq!(detect_hard_secret("token://oauth/access/aaa/bbb"), None);
+        assert_eq!(detect_hard_secret("token: abc"), None);
+        // 真命中保持:裸 key 的 `=`、带前缀 key 的 `=` 与 `:`
+        assert_eq!(
+            detect_hard_secret("token=sadqwdzcfqdqdwqdqdq"),
+            Some("env_assignment")
+        );
+        assert_eq!(
+            detect_hard_secret("DATABASE_PASSWORD=hunter2"),
+            Some("env_assignment")
+        );
+        assert_eq!(
+            detect_hard_secret("SOME_SECRET: abcdef"),
             Some("env_assignment")
         );
     }
