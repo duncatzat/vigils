@@ -127,7 +127,8 @@ vigil-hub add-remote-mcp https://mcp.example.com/
 vigil-hub inspect --db-path ./vigil.db activity --limit 20
 ```
 
-把你的 agent(Claude Code / Cursor / Zed)指向 `vigil-hub` 而非原始 MCP server 即可。
+把你的 agent(Claude Code / Cursor / Zed)指向 `vigil-hub` 而非原始 MCP server 即可。各 agent 配置
+与"如何验证它在管控"见 **[Agent 接入与测试指南](https://duncatzat.github.io/vigils/getting-started/agent-integration.zh-CN.html)**。
 
 ### 桌面应用
 
@@ -203,6 +204,12 @@ cargo test --workspace
 ```
 
 每次 PR,CI 都会在 Linux 上跑同样的门禁,并构建 UI。
+
+### 文档(双语)
+
+Vigils 同时服务中文社区与国际社区,因此**面向用户的文档采用双语**。新增或修改指南 / 教程 / 说明类
+文档时,评估是否需要双语——需要则写一份英文页 **+ 一份独立中文页**(绝不逐句中英交错),如
+`foo.md` + `foo.zh-CN.md`,顶部互链。参考 / ADR / 内部文档可只保留英文。
 
 ## 许可证
 

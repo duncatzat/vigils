@@ -70,4 +70,5 @@ Cursor / Zed):
 vigil-hub serve --stdio    # MCP agent entry point
 ```
 
-See the [agent integration guide](https://github.com/duncatzat/vigils/blob/main/docs/user-guide/agent-integration.md) for per-agent config.
+See the [Agent Integration & Test guide](./agent-integration.md) for per-agent config
+([中文](./agent-integration.zh-CN.md)).

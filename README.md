@@ -130,7 +130,9 @@ vigil-hub add-remote-mcp https://mcp.example.com/
 vigil-hub inspect --db-path ./vigil.db activity --limit 20
 ```
 
-Point your agent (Claude Code / Cursor / Zed) at `vigil-hub` instead of the raw MCP server.
+Point your agent (Claude Code / Cursor / Zed) at `vigil-hub` instead of the raw MCP server. See
+the **[Agent Integration & Test guide](https://duncatzat.github.io/vigils/getting-started/agent-integration.html)**
+for per-agent config and how to verify it's gating.
 
 ### Desktop app
 
@@ -211,6 +213,14 @@ cargo test --workspace
 ```
 
 CI runs the same gates on Linux and the UI build on every PR.
+
+### Documentation (bilingual)
+
+Vigils serves both the Chinese and international communities, so **user-facing docs are
+bilingual**. When you add or change a guide / how-to / explanatory doc, evaluate whether it needs
+both languages — if so, write an English page **plus a separate Chinese page** (never
+sentence-by-sentence interleaving), e.g. `foo.md` + `foo.zh-CN.md`, cross-linked at the top.
+Reference / ADR / internal docs may stay English-only.
 
 ## License
 

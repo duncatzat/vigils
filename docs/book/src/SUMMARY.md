@@ -7,6 +7,7 @@
 - [Installation](./getting-started/installation.md)
 - [Quickstart — Embedding the SDK](./getting-started/sdk-quickstart.md)
 - [Quickstart — Desktop App](./getting-started/desktop-quickstart.md)
+- [Agent Integration & Test](./getting-started/agent-integration.md)
 
 # Core Concepts
 
@@ -35,3 +36,7 @@
 # Release Notes
 
 - [Changelog & Releases](./releases/changelog.md)
+
+# 中文 (Chinese)
+
+- [Agent 接入与测试指南](./getting-started/agent-integration.zh-CN.md)
