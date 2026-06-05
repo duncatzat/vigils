@@ -8,6 +8,28 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.15] — 2026-06-06
+
+`vigil-hub setup --mcp` 现在也保护 **local scope(按项目)** 的 MCP server —— 闭合了 `claude mcp add`
+(默认就写 local/project scope)留下 server 不受保护的常见情况。
+
+### 变更
+
+- **`setup --mcp` 默认同时保护 user scope 与 local scope 的 MCP server。** 此前它只包裹 user scope
+  (`~/.claude.json` 顶层 `mcpServers`),遇到 local scope(`projects.*.mcpServers`)的 server 会拒绝。
+  而 `claude mcp add` **默认写 local scope**,导致典型配置反而裸奔。现在 `--apply` 两者都包裹;
+  `--user-scope-only` 可显式跳过 local scope 并诚实报告留下多少 server 不受保护;`--uninstall` 还原
+  两个 scope。你仓库里**已提交**的 `.mcp.json`(与队友共享)仍然绝不触碰。
+- **local scope 的 server 获得项目限定、抗碰撞的网关身份。** 名为 `filesystem` 的 server 可能存在于
+  多个项目;若都用同一身份包裹,一个项目的批准会悄悄授权另一个项目的同名 server。现在每个 local scope
+  server 都用命名空间不相交的 id 包裹(`local-<项目哈希>-<名字>`,与 user scope 的 `user-<名字>` 不相交),
+  使跨项目同名 server 在共享账本里保持各自独立的审计/审批状态。
+
+### 新增
+
+- **`setup --mcp` 预览现在同时列出两个 scope**,在你执行 `--apply` 前明确展示 user scope 与各项目
+  配置里将被包裹的内容。
+
 ## [v0.1.14] — 2026-06-05
 
 为 **MCP 服务器**提供一键保护:把 Vigils 的防火墙、脱敏、审批与审计放在你的 AI agent 与任意 MCP

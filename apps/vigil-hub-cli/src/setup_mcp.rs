@@ -1,16 +1,20 @@
 //! `vigil-hub setup --mcp` —— turnkey:把 Claude Code 的 stdio MCP server 改写为
 //! `vigil-hub wrap ...`(逐 server 网关),可逆。
 //!
-//! # 范围(Claude Code user scope)
-//! **`~/.claude.json` 顶层 `mcpServers`** 的枚举 + 分类 + 预览 + **改写 / 还原**:
+//! # 范围(Claude Code user scope + local scope)
+//! **`~/.claude.json`** 的 user scope(顶层 `mcpServers`)**与** local scope(`projects.<path>.mcpServers`)
+//! 枚举 + 分类 + 预览 + **改写 / 还原**:
 //! - `setup --mcp`:只读预览;`--apply`:改写为 wrap;`--uninstall`:self-describing 还原;`--dry-run` 只算不写。
 //! - **改写直接编辑文件**(非 `claude mcp` CLI)—— 关键理由是「生产逻辑可测」:CLI 始终操作**真实**
 //!   `~/.claude.json` 无法测;直接编辑用**可注入路径**,能在 tempfile 上跑完整 apply→验证→uninstall→还原
 //!   功能测试而**绝不**碰用户真实配置。写盘复用 [`crate::setup::atomic_write_with_backup`]
 //!   (原子 temp+rename + 备份 + preserve_order 保留用户键序)。
-//! - **local scope**(`projects.<path>.mcpServers`)有未保护 server 时 apply **fail-closed 拒绝**
-//!   (Codex guardrail:漏 scope=fail-open),除非 `--user-scope-only`。**project scope**(`.mcp.json`
-//!   独立文件)v1 不枚举 —— 后续增量补。
+//! - **local scope**(`projects.<path>.mcpServers`)**默认也被保护**(`claude mcp add` 默认就写这里)。
+//!   关键:local scope 的 server 名只在单项目内唯一 → 用 [`local_scope_server_id`] 派生**项目限定
+//!   server-id**(`local-<sha256(projpath)[:32]>-<name>`,与 user scope 的 `user-<name>` 命名空间
+//!   不相交)防跨项目同名在共享账本里身份塌缩。`--user-scope-only`
+//!   显式跳过 local(诚实报告 `local_skipped`)。**project scope**(`<root>/.mcp.json` 独立**提交**文件)
+//!   仍不枚举/不改 —— 改写提交文件会波及没装 vigil 的队友,刻意不碰。
 //! - 用户须**关闭 Claude Code 后再 `--apply`**(避免与其并发写 claude.json 的 lost-update;有备份兜底)。
 //!
 //! # 设计基线(已定)
@@ -25,6 +29,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::setup::SetupError;
 
@@ -221,6 +226,55 @@ pub fn wrapped_argv(
     out
 }
 
+/// local scope server-id 用的 SHA-256 截断长度(hex 字符数)。32 hex = **128 bit**:跨项目 birthday
+/// 碰撞概率 ~ n²/2¹²⁸,对任何现实项目数天文级不可能(Codex D8 review:8 hex/32-bit 太短,要求 ≥128-bit)。
+const LOCAL_ID_HASH_HEX: usize = 32;
+
+/// 为 **user scope**(顶层 `mcpServers`)的 server 派生 server-id:`user-<name>`。
+///
+/// 加 `user-` 前缀(而非裸 `<name>`)是为与 [`local_scope_server_id`] 的 `local-` 命名空间**可证不相交**
+/// —— Codex D8 R1 指出:裸名会与 local id 撞(用户若把 user-scope server 命名成形似 local id 的串,
+/// 两者在共享账本里塌缩)。两侧都由 Vigil 加 disjoint 前缀后,任意用户取名都不可能跨 scope 撞 id。
+/// 分隔符用 `-`(**非** `:`)—— `:` 不在网关 `SERVER_ID_RE = ^[a-z0-9_-]+$` 字符集内会 attach 失败
+/// (Codex D8 R2 抓的回归);`-` 合法。
+pub fn user_scope_server_id(name: &str) -> String {
+    format!("user-{name}")
+}
+
+/// 为 **local scope**(`projects.<path>.mcpServers`)的 server 派生**项目限定** server-id。
+///
+/// **为何不能直接用 name 当 server-id**:local scope 的 server 名只在**单个项目内**唯一 —— 两个不同项目
+/// 都可能有名为 `filesystem` 的 server(`claude mcp add` 默认就写 local scope)。若都用 `--server-id
+/// filesystem` 写**共享账本**,descriptor pin / 审批会跨项目串(项目 A 批准 filesystem → 项目 B 的
+/// filesystem 被自动放行 = fail-open;正是 wrap 基石 R1 Codex 抓的"固定 server-id 身份塌缩"BLOCKER)。
+///
+/// 方案:`local-<sha256(project_path)[:32]>-<name>` —— 稳定(同项目恒同 id)、跨项目碰撞天文级不可能
+/// (128-bit hash)、与 user scope 的 `user-<name>` 命名空间**可证不相交**(`local-` ≠ `user-` 前缀,
+/// 与用户取名无关,Codex D8 R1)。分隔符用 `-` 保持在网关 `SERVER_ID_RE` 合法字符集内(Codex D8 R2)。
+/// unwrap 是 self-describing(从 `-- origcmd origargs` 逐字还原),**与 server-id 无关**,故反向不受影响。
+pub fn local_scope_server_id(project_path: &str, name: &str) -> String {
+    let digest = Sha256::digest(project_path.as_bytes());
+    let hash = &hex::encode(digest)[..LOCAL_ID_HASH_HEX];
+    format!("local-{hash}-{name}")
+}
+
+/// 枚举 **local scope**(`projects.<path>.mcpServers`)所有 server → `(project_path, 分类)`。纯函数。
+/// 供预览展示 + apply/uninstall 复用同一分类口径。无 `projects` / 形状不符 → 空 Vec。
+pub fn classify_local_scope_servers(claude_cfg: &Value) -> Vec<(String, McpServerClass)> {
+    let mut out = Vec::new();
+    let Some(projects) = claude_cfg.get("projects").and_then(Value::as_object) else {
+        return out;
+    };
+    for (proj_path, proj) in projects {
+        if let Some(servers) = proj.get("mcpServers").and_then(Value::as_object) {
+            for (name, entry) in servers {
+                out.push((proj_path.clone(), classify_one(name, entry)));
+            }
+        }
+    }
+    out
+}
+
 /// `setup --mcp`(只读)的预览报告 —— 供 CLI 层渲染。
 #[derive(Debug, Clone)]
 pub struct McpPreviewReport {
@@ -230,16 +284,27 @@ pub struct McpPreviewReport {
     pub exists: bool,
     /// 用于改写的 vigil-hub 可执行路径。
     pub exe: String,
-    /// user scope server 分类结果。
+    /// user scope(顶层 mcpServers)server 分类结果。
     pub servers: Vec<McpServerClass>,
+    /// local scope(`projects.<path>.mcpServers`)分类结果:`(project_path, 分类)`。
+    /// `--apply` 默认也保护这些(用项目限定 server-id);`--user-scope-only` 跳过。
+    pub local_servers: Vec<(String, McpServerClass)>,
 }
 
 impl McpPreviewReport {
-    /// 可被 wrap 的 server 数。
+    /// user scope 可被 wrap 的 server 数。
     pub fn wrappable_count(&self) -> usize {
         self.servers
             .iter()
             .filter(|s| matches!(s, McpServerClass::Wrappable { .. }))
+            .count()
+    }
+
+    /// local scope 可被 wrap 的 server 数。
+    pub fn local_wrappable_count(&self) -> usize {
+        self.local_servers
+            .iter()
+            .filter(|(_, s)| matches!(s, McpServerClass::Wrappable { .. }))
             .count()
     }
 }
@@ -249,15 +314,20 @@ impl McpPreviewReport {
 pub fn run_preview(home: &Path, exe: &str) -> Result<McpPreviewReport, SetupError> {
     let path = claude_json_path(home);
     let cfg = read_claude_json(&path)?;
-    let (exists, servers) = match cfg {
-        Some(v) => (true, classify_user_scope_servers(&v)),
-        None => (false, Vec::new()),
+    let (exists, servers, local_servers) = match cfg {
+        Some(v) => (
+            true,
+            classify_user_scope_servers(&v),
+            classify_local_scope_servers(&v),
+        ),
+        None => (false, Vec::new(), Vec::new()),
     };
     Ok(McpPreviewReport {
         claude_json: path,
         exists,
         exe: exe.to_string(),
         servers,
+        local_servers,
     })
 }
 
@@ -347,54 +417,108 @@ fn unwrap_entry(wrapped: &Value) -> Option<Value> {
     Some(e)
 }
 
-/// user scope(顶层 mcpServers)对所有 Wrappable 应用 wrap(纯函数)。返回 (新 cfg, 改写数)。
-pub fn apply_wrap_to_config(cfg: &Value, exe: &str) -> (Value, usize) {
-    let mut new = cfg.clone();
+/// 在一个 `mcpServers` 对象上对所有 Wrappable 应用 wrap(内部)。`id_for(name)` 派生 server-id
+/// (user scope = 裸 name;local scope = 项目限定 [`local_scope_server_id`])。返回改写数。
+fn wrap_servers_object(
+    servers: &mut serde_json::Map<String, Value>,
+    exe: &str,
+    id_for: impl Fn(&str) -> String,
+) -> usize {
     let mut count = 0;
-    if let Some(servers) = new.get_mut("mcpServers").and_then(Value::as_object_mut) {
-        let names: Vec<String> = servers.keys().cloned().collect();
-        for name in names {
-            let Some(entry) = servers.get(&name).cloned() else {
-                continue;
-            };
-            if let McpServerClass::Wrappable {
-                command,
-                args,
-                env_keys,
-                ..
-            } = classify_one(&name, &entry)
-            {
-                let wrapped = wrap_entry(&entry, exe, &name, &command, &args, &env_keys);
-                servers.insert(name, wrapped);
-                count += 1;
-            }
+    let names: Vec<String> = servers.keys().cloned().collect();
+    for name in names {
+        let Some(entry) = servers.get(&name).cloned() else {
+            continue;
+        };
+        if let McpServerClass::Wrappable {
+            command,
+            args,
+            env_keys,
+            ..
+        } = classify_one(&name, &entry)
+        {
+            let sid = id_for(&name);
+            let wrapped = wrap_entry(&entry, exe, &sid, &command, &args, &env_keys);
+            servers.insert(name, wrapped);
+            count += 1;
         }
     }
-    (new, count)
+    count
 }
 
-/// user scope 对所有 Vigil 托管条目 self-describing 还原(纯函数)。返回 (新 cfg, 还原数)。
-pub fn apply_unwrap_config(cfg: &Value) -> (Value, usize) {
-    let mut new = cfg.clone();
+/// 在一个 `mcpServers` 对象上对所有 Vigil 托管条目 self-describing 还原(内部)。返回还原数。
+fn unwrap_servers_object(servers: &mut serde_json::Map<String, Value>) -> usize {
     let mut count = 0;
-    if let Some(servers) = new.get_mut("mcpServers").and_then(Value::as_object_mut) {
-        let names: Vec<String> = servers.keys().cloned().collect();
-        for name in names {
-            let Some(entry) = servers.get(&name).cloned() else {
-                continue;
-            };
-            if let Some(orig) = unwrap_entry(&entry) {
-                servers.insert(name, orig);
-                count += 1;
+    let names: Vec<String> = servers.keys().cloned().collect();
+    for name in names {
+        let Some(entry) = servers.get(&name).cloned() else {
+            continue;
+        };
+        if let Some(orig) = unwrap_entry(&entry) {
+            servers.insert(name, orig);
+            count += 1;
+        }
+    }
+    count
+}
+
+/// 对 user scope(裸 name id)+ 可选 local scope(项目限定 id)应用 wrap(纯函数)。
+/// 返回 `(新 cfg, user_changed, local_changed)`。`user_scope_only` = true 时跳过 local(projects.*)。
+pub fn apply_wrap_to_config(
+    cfg: &Value,
+    exe: &str,
+    user_scope_only: bool,
+) -> (Value, usize, usize) {
+    let mut new = cfg.clone();
+    let user_changed = new
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .map(|servers| wrap_servers_object(servers, exe, user_scope_server_id))
+        .unwrap_or(0);
+
+    let mut local_changed = 0;
+    if !user_scope_only {
+        if let Some(projects) = new.get_mut("projects").and_then(Value::as_object_mut) {
+            for (proj_path, proj) in projects.iter_mut() {
+                // key 与 value 借用分离;clone 项目路径供闭包派生限定 id,避免与 servers 的 &mut 纠缠。
+                let proj_path = proj_path.clone();
+                if let Some(servers) = proj.get_mut("mcpServers").and_then(Value::as_object_mut) {
+                    local_changed += wrap_servers_object(servers, exe, |name| {
+                        local_scope_server_id(&proj_path, name)
+                    });
+                }
             }
         }
     }
-    (new, count)
+    (new, user_changed, local_changed)
+}
+
+/// 对 user scope + local scope 所有 Vigil 托管条目 self-describing 还原(纯函数)。
+/// 返回 `(新 cfg, user_changed, local_changed)`。uninstall **始终**还原两个 scope —— 还原是 self-describing
+/// (从 `-- origcmd origargs` 逐字),与 wrap 时用的 server-id 无关,故不受 `--user-scope-only` 影响。
+pub fn apply_unwrap_config(cfg: &Value) -> (Value, usize, usize) {
+    let mut new = cfg.clone();
+    let user_changed = new
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .map(unwrap_servers_object)
+        .unwrap_or(0);
+
+    let mut local_changed = 0;
+    if let Some(projects) = new.get_mut("projects").and_then(Value::as_object_mut) {
+        for (_proj_path, proj) in projects.iter_mut() {
+            if let Some(servers) = proj.get_mut("mcpServers").and_then(Value::as_object_mut) {
+                local_changed += unwrap_servers_object(servers);
+            }
+        }
+    }
+    (new, user_changed, local_changed)
 }
 
 /// 统计 **local scope**(`projects.<path>.mcpServers`)里**未保护**(Wrappable)的 server 数。
-/// 返回值非 0 时 apply 须 fail-closed 拒绝(Codex guardrail:漏 scope=fail-open),除非 `--user-scope-only`。
-/// 注:project scope(`<root>/.mcp.json` 独立文件)v1 不枚举 —— 后续增量补。
+/// 现用途:`--user-scope-only` 跳过 local 时,诚实报告**被跳过**(留作不保护)的 local server 数
+/// (`McpApplyReport::local_skipped`)。默认 `--apply` 已会保护 local scope(项目限定 id),不再拒绝。
+/// 注:project scope(`<root>/.mcp.json` 独立提交文件)仍不枚举 —— 改写提交文件会波及队友,刻意不碰。
 pub fn count_unprotected_local_scope(cfg: &Value) -> usize {
     let mut n = 0;
     if let Some(projects) = cfg.get("projects").and_then(Value::as_object) {
@@ -416,18 +540,28 @@ pub fn count_unprotected_local_scope(cfg: &Value) -> usize {
 pub struct McpApplyReport {
     /// `~/.claude.json` 路径。
     pub claude_json: PathBuf,
-    /// 实际(或 dry-run 将)改写/还原的 server 数。
+    /// **user scope**(顶层 mcpServers)实际(或 dry-run 将)改写/还原的 server 数。
     pub changed: usize,
+    /// **local scope**(`projects.<path>.mcpServers`)改写/还原的 server 数(项目限定 server-id)。
+    pub local_changed: usize,
+    /// `--user-scope-only` 时**被跳过**(留作不保护)的 local scope Wrappable server 数(诚实报告)。
+    pub local_skipped: usize,
     /// 仅预览不写盘。
     pub dry_run: bool,
     /// 写盘时产生的备份路径(若有)。
     pub backup: Option<PathBuf>,
-    /// 非 0 = 因 local scope 有未保护 server 被 **fail-closed 拒绝**(**未写任何东西**);CLI 应报错退出。
-    pub blocked_local_scope: usize,
 }
 
-/// `setup --mcp --apply`:读 → wrap user scope → 原子写。local scope 有未保护 server →
-/// fail-closed 拒绝(除非 `user_scope_only`)。`dry_run` 只算不写。home/exe 注入 → 测试走 tempfile。
+impl McpApplyReport {
+    /// 两个 scope 合计改写/还原数(决定是否需要写盘)。
+    pub fn total_changed(&self) -> usize {
+        self.changed + self.local_changed
+    }
+}
+
+/// `setup --mcp --apply`:读 → wrap **user scope + local scope**(默认两者都保护)→ 原子写。
+/// `user_scope_only` = true 时只保护 user scope,跳过 local(`local_skipped` 诚实报告)。`dry_run` 只算不写。
+/// home/exe 注入 → 测试走 tempfile。
 pub fn run_apply(
     home: &Path,
     exe: &str,
@@ -441,29 +575,25 @@ pub fn run_apply(
             return Ok(McpApplyReport {
                 claude_json: path,
                 changed: 0,
+                local_changed: 0,
+                local_skipped: 0,
                 dry_run,
                 backup: None,
-                blocked_local_scope: 0,
             })
         }
     };
-    // Codex guardrail:local scope 有未保护 server → fail-closed,**不写任何东西**(漏 scope=fail-open)。
-    let local_unprotected = count_unprotected_local_scope(&cfg);
-    if local_unprotected > 0 && !user_scope_only {
-        return Ok(McpApplyReport {
-            claude_json: path,
-            changed: 0,
-            dry_run,
-            backup: None,
-            blocked_local_scope: local_unprotected,
-        });
-    }
+    // `--user-scope-only` 显式跳过 local scope —— 诚实报告被留作不保护的 local Wrappable 数。
+    let local_skipped = if user_scope_only {
+        count_unprotected_local_scope(&cfg)
+    } else {
+        0
+    };
     // 读取时刻的 (mtime, len) → TOCTOU 防护(替换前比对;Claude Code 并发改写则 abort 不覆盖)。
     let stamp = std::fs::metadata(&path)
         .ok()
         .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
-    let (new_cfg, changed) = apply_wrap_to_config(&cfg, exe);
-    let backup = if !dry_run && changed > 0 {
+    let (new_cfg, changed, local_changed) = apply_wrap_to_config(&cfg, exe, user_scope_only);
+    let backup = if !dry_run && (changed + local_changed) > 0 {
         crate::setup::atomic_write_with_backup(&path, &new_cfg, stamp)?
     } else {
         None
@@ -471,9 +601,10 @@ pub fn run_apply(
     Ok(McpApplyReport {
         claude_json: path,
         changed,
+        local_changed,
+        local_skipped,
         dry_run,
         backup,
-        blocked_local_scope: 0,
     })
 }
 
@@ -486,17 +617,18 @@ pub fn run_uninstall(home: &Path, dry_run: bool) -> Result<McpApplyReport, Setup
             return Ok(McpApplyReport {
                 claude_json: path,
                 changed: 0,
+                local_changed: 0,
+                local_skipped: 0,
                 dry_run,
                 backup: None,
-                blocked_local_scope: 0,
             })
         }
     };
     let stamp = std::fs::metadata(&path)
         .ok()
         .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
-    let (new_cfg, changed) = apply_unwrap_config(&cfg);
-    let backup = if !dry_run && changed > 0 {
+    let (new_cfg, changed, local_changed) = apply_unwrap_config(&cfg);
+    let backup = if !dry_run && (changed + local_changed) > 0 {
         crate::setup::atomic_write_with_backup(&path, &new_cfg, stamp)?
     } else {
         None
@@ -504,9 +636,10 @@ pub fn run_uninstall(home: &Path, dry_run: bool) -> Result<McpApplyReport, Setup
     Ok(McpApplyReport {
         claude_json: path,
         changed,
+        local_changed,
+        local_skipped: 0,
         dry_run,
         backup,
-        blocked_local_scope: 0,
     })
 }
 
@@ -768,7 +901,7 @@ mod tests {
         // apply
         let rep = run_apply(home, "vigil-hub", false, false).unwrap();
         assert_eq!(rep.changed, 1);
-        assert_eq!(rep.blocked_local_scope, 0);
+        assert_eq!(rep.local_changed, 0, "无 local scope server");
         assert!(rep.backup.is_some(), "改写应产生备份");
         let after: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
         assert_eq!(after["mcpServers"]["fs"]["command"], json!("vigil-hub"));
@@ -801,39 +934,140 @@ mod tests {
     }
 
     #[test]
-    fn apply_refuses_when_local_scope_has_unprotected_servers() {
-        // Codex guardrail:local scope 有未保护 server → fail-closed,不写;--user-scope-only 显式放行。
+    fn apply_protects_local_scope_by_default_with_user_scope_only_escape() {
+        // 默认 --apply 保护 user **和** local scope(local scope 用项目限定 server-id);
+        // --user-scope-only 跳过 local 并诚实报告 local_skipped。
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let claude = home.join(".claude.json");
-        fs::write(
-            &claude,
-            json!({
-                "mcpServers": {"fs": {"command": "npx", "args": ["x"]}},
-                "projects": {"/proj": {"mcpServers": {"local_srv": {"command": "uvx", "args": ["y"]}}}}
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let initial = json!({
+            "mcpServers": {"fs": {"command": "npx", "args": ["x"]}},
+            "projects": {"/proj": {"mcpServers": {"local_srv": {"command": "uvx", "args": ["y"]}}}}
+        });
+        fs::write(&claude, initial.to_string()).unwrap();
 
+        // 默认:user(fs)+ local(local_srv)都被保护
         let rep = run_apply(home, "vigil-hub", false, false).unwrap();
-        assert_eq!(rep.blocked_local_scope, 1, "local scope 1 未保护 → 拒绝");
-        assert_eq!(rep.changed, 0, "拒绝时不改写");
-        assert!(rep.backup.is_none(), "拒绝时不写不备份");
-        let unchanged: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+        assert_eq!(rep.changed, 1, "user scope fs 被 wrap");
+        assert_eq!(rep.local_changed, 1, "local scope local_srv 被 wrap");
+        assert_eq!(rep.local_skipped, 0);
+        assert!(rep.backup.is_some());
+        let after: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+        let local_entry = &after["projects"]["/proj"]["mcpServers"]["local_srv"];
         assert_eq!(
-            unchanged["mcpServers"]["fs"]["command"],
-            json!("npx"),
-            "拒绝时文件原样"
+            local_entry["command"],
+            json!("vigil-hub"),
+            "local 也被 wrap"
+        );
+        // local scope 的 --server-id 必须是**项目限定**(local-<hash>-local_srv),非裸 "local_srv"
+        let expected_id = local_scope_server_id("/proj", "local_srv");
+        assert!(
+            expected_id.starts_with("local-") && expected_id.ends_with("-local_srv"),
+            "id 应项目限定 local- 命名空间:{expected_id}"
+        );
+        let local_args: Vec<String> = local_entry["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect();
+        let sid_idx = local_args.iter().position(|a| a == "--server-id").unwrap();
+        assert_eq!(
+            local_args[sid_idx + 1],
+            expected_id,
+            "local scope 必须用项目限定 server-id 防跨项目身份塌缩"
+        );
+        // user scope 的 fs 用 user: 前缀(与 local: 命名空间不相交)
+        let user_args: Vec<String> = after["mcpServers"]["fs"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect();
+        let usid = user_args.iter().position(|a| a == "--server-id").unwrap();
+        assert_eq!(
+            user_args[usid + 1],
+            user_scope_server_id("fs"),
+            "user scope 用 user: 前缀 id"
         );
 
-        // --user-scope-only 显式放行 → 只 wrap user scope
+        // uninstall 还原**两个** scope(self-describing,与 id 无关)
+        let rep_u = run_uninstall(home, false).unwrap();
+        assert_eq!(rep_u.changed, 1);
+        assert_eq!(rep_u.local_changed, 1, "local scope 也被还原");
+        let restored: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+        assert_eq!(restored, initial, "往返后与初始**逐字**一致");
+
+        // --user-scope-only:只 wrap user,跳过 local,诚实报告 local_skipped
+        fs::write(&claude, initial.to_string()).unwrap();
         let rep2 = run_apply(home, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep2.changed, 1, "user scope fs 被 wrap");
+        assert_eq!(rep2.local_changed, 0, "--user-scope-only 跳过 local");
         assert_eq!(
-            rep2.changed, 1,
-            "--user-scope-only 应 wrap user scope 的 fs"
+            rep2.local_skipped, 1,
+            "诚实报告 1 个 local server 留作不保护"
         );
-        assert_eq!(rep2.blocked_local_scope, 0);
+        let after2: Value = serde_json::from_str(&fs::read_to_string(&claude).unwrap()).unwrap();
+        assert_eq!(
+            after2["projects"]["/proj"]["mcpServers"]["local_srv"]["command"],
+            json!("uvx"),
+            "--user-scope-only 下 local server 原样未动"
+        );
+    }
+
+    #[test]
+    fn server_ids_are_stable_unique_and_namespace_disjoint() {
+        // 同项目+同名 → 恒同 id(稳定);不同项目+同名 → 不同 id(防身份塌缩);
+        // 格式 local-<32hex>-<name>(128-bit hash);user scope = user-<name>;两命名空间**可证不相交**。
+        let a1 = local_scope_server_id("/home/u/projA", "filesystem");
+        let a2 = local_scope_server_id("/home/u/projA", "filesystem");
+        let b = local_scope_server_id("/home/u/projB", "filesystem");
+        assert_eq!(a1, a2, "同项目同名 → 稳定同 id");
+        assert_ne!(a1, b, "不同项目同名 → 不同 id(防跨项目身份塌缩)");
+        // 格式:local-<32 hex>-<name>
+        assert!(a1.starts_with("local-"), "local 前缀:{a1}");
+        assert!(a1.ends_with("-filesystem"));
+        let hash = a1
+            .strip_prefix("local-")
+            .unwrap()
+            .strip_suffix("-filesystem")
+            .unwrap();
+        assert_eq!(hash.len(), 32, "128-bit = 32 hex(Codex D8 R1:8 hex 太短)");
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // **命名空间不相交**(Codex D8 R1 critical):无论用户给 user-scope server 取什么名,
+        // user-<name> 永不等于任一 local-<hash>-<name>(前缀 user- ≠ local-)。
+        let u = user_scope_server_id("filesystem");
+        assert_eq!(u, "user-filesystem");
+        assert_ne!(u, a1, "user id 不撞 local id");
+        // 即便用户把 user-scope server 命名成形似 local id 的串,加 user- 前缀后仍不相交
+        let evil = user_scope_server_id("local-deadbeefdeadbeefdeadbeefdeadbeef-filesystem");
+        assert!(evil.starts_with("user-"), "user 前缀兜住:{evil}");
+        assert_ne!(evil, a1);
+
+        // **守门(Codex D8 R2 回归):生成的 id 必须过网关真验证器 `validate_server_id`**
+        // (`SERVER_ID_RE = ^[a-z0-9_-]+$`)—— `:` 等非法分隔符会让 wrap attach 在网关启动时失败。
+        // 此处直接调真验证器(非重造正则),防 id scheme 再改成非法字符集时漏测。
+        for id in [&a1, &b, &u, &evil] {
+            vigil_mcp::namespace::validate_server_id(id)
+                .unwrap_or_else(|e| panic!("生成的 server-id `{id}` 必须过网关校验:{e:?}"));
+        }
+    }
+
+    #[test]
+    fn classify_local_scope_enumerates_per_project() {
+        let cfg = json!({
+            "projects": {
+                "/p1": {"mcpServers": {"fs": {"command": "npx", "args": ["a"]}}},
+                "/p2": {"mcpServers": {"git": {"command": "uvx", "args": ["b"]}}}
+            }
+        });
+        let local = classify_local_scope_servers(&cfg);
+        assert_eq!(local.len(), 2);
+        assert!(local.iter().any(|(p, c)| p == "/p1"
+            && matches!(c, McpServerClass::Wrappable { name, .. } if name == "fs")));
+        assert!(local.iter().any(|(p, c)| p == "/p2"
+            && matches!(c, McpServerClass::Wrappable { name, .. } if name == "git")));
     }
 }

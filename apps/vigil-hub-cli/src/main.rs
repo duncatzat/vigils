@@ -130,17 +130,18 @@ struct CliSetupArgs {
     /// 覆盖审计账本路径(默认 `<本机数据目录>/Vigil/ledger.sqlite3`)。
     #[arg(long)]
     ledger: Option<PathBuf>,
-    /// **MCP turnkey**:把 Claude Code(`~/.claude.json` user scope)的 stdio MCP server 改写为
-    /// `vigil-hub wrap` 网关(default enforce)。`--mcp` 单用 = **只读预览**;`--mcp --apply` 真改写;
-    /// `--mcp --uninstall` 还原;`--dry-run` 只算不写。local scope 有未保护 server 时 apply fail-closed
-    /// 拒绝,除非 `--user-scope-only`。
+    /// **MCP turnkey**:把 Claude Code(`~/.claude.json`)的 stdio MCP server 改写为 `vigil-hub wrap`
+    /// 网关(default enforce)。**默认保护 user scope(顶层 mcpServers)+ local scope(`projects.*`,
+    /// `claude mcp add` 默认写这里)**;local scope 用项目限定 server-id 防跨项目同名身份塌缩。
+    /// `--mcp` 单用 = **只读预览**;`--mcp --apply` 真改写;`--mcp --uninstall` 还原(两 scope);
+    /// `--dry-run` 只算不写。
     #[arg(long)]
     mcp: bool,
     /// 配合 `--mcp`:真正改写 `~/.claude.json`(否则 `--mcp` 仅预览)。原子写 + 备份 + 可逆。
     #[arg(long)]
     apply: bool,
-    /// 配合 `--mcp --apply`:仅改写 user scope,显式接受 local/project scope 的 server **不被保护**
-    /// (默认遇 local scope 未保护 server 会 fail-closed 拒绝,防漏 scope=fail-open)。
+    /// 配合 `--mcp --apply`:**只**保护 user scope,显式跳过 local scope(`projects.*`)的 server
+    /// (让它们**不被保护**;CLI 会诚实报告被跳过的数量)。默认两个 scope 都保护。
     #[arg(long = "user-scope-only")]
     user_scope_only: bool,
 }
@@ -364,38 +365,37 @@ fn setup_mcp_dispatch(args: &CliSetupArgs) -> Result<std::process::ExitCode, set
     }
 }
 
-/// 打印 `setup --mcp --apply/--uninstall` 结果(ASCII-safe)。被拒/失败 → FAILURE。
+/// 打印 `setup --mcp --apply/--uninstall` 结果(ASCII-safe)。
 fn print_mcp_apply(r: &setup_mcp::McpApplyReport, op: &str) -> std::process::ExitCode {
-    // local scope 被 fail-closed 拒绝:报错 + FAILURE,引导 --user-scope-only。
-    if r.blocked_local_scope > 0 {
-        eprintln!(
-            "vigil-hub setup --mcp --apply: REFUSED -- {} local-scope MCP server(s) (in \
-             projects.*.mcpServers of {}) would be left UNPROTECTED.",
-            r.blocked_local_scope,
-            r.claude_json.display()
-        );
-        eprintln!(
-            "  Wrapping local/project-scope servers is not yet supported. Re-run with \
-             --user-scope-only to wrap ONLY user-scope servers (accepting that local-scope \
-             servers stay unprotected), or wrap them manually with `vigil-hub wrap`."
-        );
-        return std::process::ExitCode::FAILURE;
-    }
     let dry = if r.dry_run { " (dry-run)" } else { "" };
     let verb = if r.dry_run { "would" } else { "did" };
     let what = if op == "uninstall" { "restore" } else { "wrap" };
+    let total = r.total_changed();
     println!(
-        "Vigil setup --mcp --{op}{dry}: {verb} {what} {} MCP server(s) in {}",
-        r.changed,
+        "Vigil setup --mcp --{op}{dry}: {verb} {what} {total} MCP server(s) in {}",
         r.claude_json.display()
     );
+    // 分 scope 报告:local scope(projects.*)用**项目限定 server-id**(跨项目同名不串账本)。
+    if r.local_changed > 0 {
+        println!(
+            "  ({} user-scope + {} local-scope/per-project)",
+            r.changed, r.local_changed
+        );
+    }
     if let Some(b) = &r.backup {
         println!("  backup of the previous config: {}", b.display());
     }
-    if r.changed == 0 && !r.dry_run {
+    if total == 0 && !r.dry_run {
         println!("  (nothing to {what} -- no matching servers)");
     }
-    if op == "apply" && r.changed > 0 && !r.dry_run {
+    // `--user-scope-only` 跳过了可保护的 local scope server → 诚实提示它们仍未受保护。
+    if r.local_skipped > 0 {
+        println!(
+            "  NOTE: {} local-scope (per-project) MCP server(s) left UNPROTECTED (--user-scope-only).",
+            r.local_skipped
+        );
+    }
+    if op == "apply" && total > 0 && !r.dry_run {
         println!(
             "  Restart Claude Code to pick up the change. Undo with: vigil-hub setup --mcp --uninstall"
         );
@@ -404,6 +404,45 @@ fn print_mcp_apply(r: &setup_mcp::McpApplyReport, op: &str) -> std::process::Exi
 }
 
 /// 打印 `setup --mcp` 只读预览(ASCII-safe,cp936/cp437 不乱码)。返回退出码。
+/// 渲染单个 server 分类的预览行(user scope 与 local scope 各调一次)。`project_path` = `Some(p)`
+/// 表示 local scope(用项目限定 server-id 展示真实改写 argv),`None` 表示 user scope(裸 name)。
+fn print_mcp_server_preview(exe: &str, project_path: Option<&str>, class: &McpServerClass) {
+    match class {
+        McpServerClass::Wrappable {
+            name,
+            command,
+            args,
+            env_keys,
+        } => {
+            // 两侧都由 Vigil 加 disjoint 命名空间前缀(local- / user-)防跨 scope 身份塌缩。
+            let wrap_id = match project_path {
+                Some(p) => setup_mcp::local_scope_server_id(p, name),
+                None => setup_mcp::user_scope_server_id(name),
+            };
+            let argv = setup_mcp::wrapped_argv(exe, &wrap_id, command, args, env_keys);
+            println!("  [WRAP] {name}");
+            // 预览里的 command/args 可能含用户内联的 token(如 `--api-key sk-...`)。过硬指纹 scrub
+            // 再展示,守"secrets 绝不进 UI/日志"不变量(Codex setup_mcp review hygiene)。
+            let from_disp = vigil_redaction::scrub_text(&format!("{} {}", command, args.join(" ")));
+            let to_disp = vigil_redaction::scrub_text(&argv.join(" "));
+            println!("         from: {from_disp}");
+            println!("         to:   {to_disp}");
+            if !env_keys.is_empty() {
+                println!(
+                    "         env (key-only, values never copied): {}",
+                    env_keys.join(", ")
+                );
+            }
+        }
+        McpServerClass::AlreadyWrapped { name } => {
+            println!("  [OK]   {name} -- already Vigil-managed (skipped)");
+        }
+        McpServerClass::Skipped { name, reason } => {
+            println!("  [SKIP] {name} -- {reason}");
+        }
+    }
+}
+
 fn print_mcp_preview(r: &setup_mcp::McpPreviewReport) -> std::process::ExitCode {
     println!("Vigil setup --mcp (PREVIEW ONLY -- nothing is changed)");
     println!("  Claude Code config: {}", r.claude_json.display());
@@ -415,50 +454,41 @@ fn print_mcp_preview(r: &setup_mcp::McpPreviewReport) -> std::process::ExitCode 
     }
     println!("  vigil-hub: {}", r.exe);
     println!();
-    if r.servers.is_empty() {
-        println!("  No MCP servers found in user scope (top-level mcpServers).");
+    if r.servers.is_empty() && r.local_servers.is_empty() {
+        println!("  No MCP servers found (user scope or per-project local scope).");
         return std::process::ExitCode::SUCCESS;
     }
-    println!(
-        "  {} stdio server(s) can be protected by the Vigil gateway:",
-        r.wrappable_count()
-    );
-    for s in &r.servers {
-        match s {
-            McpServerClass::Wrappable {
-                name,
-                command,
-                args,
-                env_keys,
-            } => {
-                let argv = setup_mcp::wrapped_argv(&r.exe, name, command, args, env_keys);
-                println!("  [WRAP] {name}");
-                // 预览里的 command/args 可能含用户内联的 token(如 `--api-key sk-...`)。过硬指纹
-                // scrub 再展示,守"secrets 绝不进 UI/日志"不变量(Codex setup_mcp review hygiene)。
-                let from_disp =
-                    vigil_redaction::scrub_text(&format!("{} {}", command, args.join(" ")));
-                let to_disp = vigil_redaction::scrub_text(&argv.join(" "));
-                println!("         from: {from_disp}");
-                println!("         to:   {to_disp}");
-                if !env_keys.is_empty() {
-                    println!(
-                        "         env (key-only, values never copied): {}",
-                        env_keys.join(", ")
-                    );
-                }
-            }
-            McpServerClass::AlreadyWrapped { name } => {
-                println!("  [OK]   {name} -- already Vigil-managed (skipped)");
-            }
-            McpServerClass::Skipped { name, reason } => {
-                println!("  [SKIP] {name} -- {reason}");
-            }
+    // user scope(顶层 mcpServers)
+    if !r.servers.is_empty() {
+        println!(
+            "  User scope (top-level mcpServers) -- {} can be protected:",
+            r.wrappable_count()
+        );
+        for s in &r.servers {
+            print_mcp_server_preview(&r.exe, None, s);
+        }
+    }
+    // local scope(projects.<path>.mcpServers)—— claude mcp add 默认写这里
+    if !r.local_servers.is_empty() {
+        println!();
+        println!(
+            "  Local scope (per-project mcpServers) -- {} can be protected:",
+            r.local_wrappable_count()
+        );
+        println!(
+            "  (wrapped with a project-scoped server-id so same-named servers across projects"
+        );
+        println!("   don't share audit/approval identity)");
+        for (proj, s) in &r.local_servers {
+            print_mcp_server_preview(&r.exe, Some(proj), s);
         }
     }
     println!();
-    println!("  Default posture: ENFORCE (risky tool calls need approval; add --monitor to a");
-    println!("  wrapped server for non-blocking audit-only). Applying these changes (and");
-    println!("  --uninstall) is a later increment; this run is preview-only and wrote nothing.");
+    println!("  Default posture: ENFORCE (risky tool calls need approval; add --monitor for");
+    println!("  non-blocking audit-only). Apply with:  vigil-hub setup --mcp --apply");
+    println!(
+        "  (protects user + local scope; --user-scope-only skips local; --uninstall reverts)."
+    );
     std::process::ExitCode::SUCCESS
 }
 

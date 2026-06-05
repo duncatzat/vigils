@@ -8,6 +8,31 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.15] — 2026-06-06
+
+`vigil-hub setup --mcp` now protects **local-scope** (per-project) MCP servers too — closing the
+common case where `claude mcp add` (which defaults to local/project scope) left servers unguarded.
+
+### Changed
+
+- **`setup --mcp` protects both user-scope and local-scope MCP servers by default.** Previously it
+  only wrapped user-scope servers (`~/.claude.json` top-level `mcpServers`) and refused when
+  local-scope servers (`projects.*.mcpServers`) were present. Since `claude mcp add` writes
+  **local scope by default**, the typical setup was left unprotected. Now `--apply` wraps both;
+  `--user-scope-only` opts out of local scope and honestly reports how many servers it left
+  unprotected; `--uninstall` restores both scopes. Your repo's committed `.mcp.json` (shared with
+  teammates) is still never touched.
+- **Local-scope servers get a project-scoped, collision-resistant gateway identity.** A server
+  named `filesystem` can exist in many projects; wrapping them all under one identity would let one
+  project's approval silently authorize another's. Each local-scope server is now wrapped with a
+  namespace-disjoint id (`local-<project-hash>-<name>`, distinct from user-scope `user-<name>`), so
+  same-named servers across projects keep independent audit/approval state in the shared ledger.
+
+### Added
+
+- **`setup --mcp` preview now lists both scopes**, showing exactly what would be wrapped in your
+  user-scope and per-project configurations before you run `--apply`.
+
 ## [v0.1.14] — 2026-06-05
 
 Turnkey protection for **MCP servers**: put Vigils' firewall, redaction, approval, and audit
