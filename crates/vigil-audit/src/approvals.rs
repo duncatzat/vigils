@@ -320,6 +320,16 @@ impl Ledger {
 
         let effect_json = serde_json::to_string(effects)?;
 
+        // no-plaintext ledger 守门(Codex audit MEDIUM):approvals **表**是 SQLite ledger 的持久面,
+        // 但此前 title/summary/effect_json 原样 INSERT,**绕过**了 `append_event` 的硬指纹 fail-closed
+        // 自检(只有 `approval.created` **事件**走 `redact_free_text`)。monitor 模式会自动建+解 approval,
+        // 使此 sink 在无 GUI 时也活跃。用 `scrub_text` 在落表前遮蔽硬指纹 secret —— 保留 paths/hosts
+        // 可读(GUI 审批仍能判断要批什么),只屏蔽真 secret 形态(proportionate;scrub 后仍是合法 JSON,
+        // 读回可反序列化)。返回的 in-memory `ApprovalRequest` 仍保留原文(Hub 进程内决策用,不落盘)。
+        let title_db = vigil_redaction::scrub_text(title);
+        let summary_db = vigil_redaction::scrub_text(summary);
+        let effect_json_db = vigil_redaction::scrub_text(&effect_json);
+
         {
             let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
             guard.execute(
@@ -333,9 +343,9 @@ impl Ledger {
                     decision.decision_id,
                     decision.invocation_id,
                     session_id,
-                    title,
-                    summary,
-                    effect_json,
+                    title_db,
+                    summary_db,
+                    effect_json_db,
                     context.args_hash,
                     context.server_id,
                     context.tool_name,

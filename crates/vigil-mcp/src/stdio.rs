@@ -33,7 +33,7 @@ pub enum StdioError {
     #[error("upstream response timeout after {0:?}")]
     Timeout(Duration),
     /// 上游返回 JSON-RPC error
-    #[error("upstream error: code={code} message={message}")]
+    #[error("upstream error: code={code} message_sha256={}", upstream_message_fingerprint(.message))]
     Upstream {
         /// JSON-RPC error code
         code: i32,
@@ -67,6 +67,20 @@ pub enum StdioError {
         /// server 在 `initialize` 响应里回的版本
         negotiated: String,
     },
+}
+
+/// 把不可信的上游错误 `message` 折叠成 sha256 指纹供 `StdioError::Upstream` 的 `Display`。
+///
+/// 上游 JSON-RPC `error.message` 由远端 server 控制、属不可信输入,可能携带 secret。若原样进
+/// `Display`,会经任何 `{e}` 格式化(如 Hub 初始化握手失败的 stderr 诊断,见 `hub.rs`)流入本
+/// 进程 stderr 并可能被 agent harness 捕获进 transcript。故指纹化 —— 与 `impl McpUpstream for
+/// StdioUpstream::call` 把 `Upstream.message` 投影为 `UpstreamError::JsonRpc { message_sha256 }`
+/// 的处理**保持一致**(同一不可信输入,单一脱敏收敛)。
+fn upstream_message_fingerprint(message: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(message.as_bytes());
+    hex::encode(h.finalize())
 }
 
 type PendingTable = Arc<Mutex<HashMap<String, Sender<Value>>>>;
@@ -268,7 +282,11 @@ impl StdioUpstream {
                                 // M2(Codex I04 review):非法 JSON 不再静默吞掉让 reader
                                 // 永久空转;log 一条并继续尝试下一行(rust-style 宽容),
                                 // 但上游如果连续坏很快触发 Eof。
-                                eprintln!("[vigil-hub upstream {tag}] stdio parse error: {e}");
+                                // `ProtocolError` 的 Display 可能内嵌上游原始字节(malformed
+                                // JSON 片段);先过硬指纹 scrub 再转发,避免 server 输出里的
+                                // secret 经本进程 stderr 外泄。
+                                let safe = vigil_redaction::scrub_text(&e.to_string());
+                                eprintln!("[vigil-hub upstream {tag}] stdio parse error: {safe}");
                                 // 继续循环:下一个 read_line 会消费下一行
                                 continue;
                             }
@@ -290,7 +308,12 @@ impl StdioUpstream {
                 .spawn(move || {
                     let r = BufReader::new(stderr);
                     for line in r.lines().map_while(Result::ok) {
-                        eprintln!("[upstream {tag}] {line}");
+                        // 上游 MCP server 的 stderr 可能记录它收到的凭证(如
+                        // "authenticated with ghp_…")。wrap/serve 把 Vigil 置于中间,原样转发
+                        // 会二次扩大泄漏面(可能被 agent harness 捕获)。过硬指纹 scrub:保留
+                        // 可读诊断、遮蔽已知 secret 形态(redaction-first 边界,见 scrub_text)。
+                        let safe = vigil_redaction::scrub_text(&line);
+                        eprintln!("[upstream {tag}] {safe}");
                     }
                 })
                 .ok();
@@ -534,5 +557,45 @@ mod resolve_program_tests {
         let again = resolve_program(&abs.to_string_lossy())
             .expect("absolute path to existing binary must resolve");
         assert!(again.is_absolute() && again.exists());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+mod display_redaction_tests {
+    use super::StdioError;
+
+    /// stderr-leak HIGH(Codex wrap R1 守门):`StdioError::Upstream` 的 `Display` 绝不原样回显
+    /// 上游不可信 `message`;只暴露 sha256 指纹(与 `impl McpUpstream::call` 的
+    /// `message_sha256` 投影一致)。本测试守 `hub.rs` 初始化握手失败 `{e}` 诊断路径不泄漏 secret。
+    #[test]
+    fn upstream_display_fingerprints_message_not_raw() {
+        let secret = "authenticated with ghp_1234567890abcdef1234567890abcdef12345678";
+        let err = StdioError::Upstream {
+            code: -32000,
+            message: secret.to_string(),
+        };
+        let shown = err.to_string();
+        assert!(
+            !shown.contains(secret),
+            "Display 不得包含原始 message: {shown}"
+        );
+        assert!(
+            !shown.contains("ghp_1234567890abcdef1234567890abcdef12345678"),
+            "Display 不得泄漏 secret 形态: {shown}"
+        );
+        assert!(
+            shown.contains("message_sha256="),
+            "Display 须含 sha256 指纹字段: {shown}"
+        );
+        // 指纹须为 message 的确定性 sha256(同 message 同指纹,便于关联诊断)。
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(secret.as_bytes());
+        let expect = hex::encode(h.finalize());
+        assert!(
+            shown.contains(&expect),
+            "指纹须为 message 的 sha256: {shown}"
+        );
     }
 }

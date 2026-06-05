@@ -8,6 +8,46 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.14] — 2026-06-05
+
+Turnkey protection for **MCP servers**: put Vigils' firewall, redaction, approval, and audit
+between your AI agent and any MCP tool server — by changing one line of config, or letting
+`vigil-hub setup --mcp` do it for you.
+
+### Added
+
+- **`vigil-hub wrap` — transparent MCP gateway shim.** Wrap any stdio MCP server command so every
+  `tools/list` and `tools/call` flows through Vigils' gateway (default-deny firewall,
+  hard-fingerprint secret redaction, approval, and tamper-evident audit) before reaching the real
+  server. Your agent connects to `wrap` exactly as if it were the original server. Usage:
+  `vigil-hub wrap --server-id <name> -- npx -y @modelcontextprotocol/server-filesystem /data`
+  (in your agent's MCP config, set `command` to `vigil-hub` and prefix the args with
+  `["wrap", "--server-id", "<name>", "--", ...original command]`). Secrets are handled safely: the
+  child process only receives the env keys you explicitly pass with `--env-key` (nothing else is
+  forwarded by default), and secrets in tool results are redacted before they reach the model.
+- **`vigil-hub setup --mcp` — auto-wrap your Claude Code MCP servers.** Enumerates the stdio MCP
+  servers in your Claude Code config (`~/.claude.json`, user scope) and rewrites each to go through
+  `vigil-hub wrap`. `--mcp` alone is a **read-only preview**; `--mcp --apply` writes the change
+  (atomic write + backup, fully reversible); `--mcp --uninstall` restores the originals. The rewrite
+  is self-describing and byte-faithful — your original command, args, and env are preserved verbatim,
+  so uninstall reconstructs them exactly. If a project/local-scope server would be left unprotected,
+  `--apply` refuses (fail-closed) unless you pass `--user-scope-only`.
+- **Monitor posture (`vigil-hub wrap --monitor`).** Opt-in, non-blocking: risky tool calls are
+  auto-allowed *and* fully audited (instead of pausing for approval), which fits turnkey use with no
+  desktop approver running. Raw secrets are still blocked and tool results are still redacted; only
+  the human-approval gate is downgraded to observe-and-record. The default stays **enforce**.
+
+### Security
+
+- **Call-time descriptor oracle is now ledger-backed.** The MCP gateway consults a
+  `RegistryDescriptorOracle` at `tools/call` time, so a tool's first-seen / drift state is re-checked
+  against the audit ledger at the enforcement point. A tool reaching the call path without a matching
+  approved descriptor pin degrades to first-seen / drifted (requiring approval) instead of being
+  silently allowed — defense-in-depth on top of the `tools/list` exposure gate.
+- **No raw secrets or untrusted input in logs/audit.** Upstream stderr, MCP handshake errors, and
+  approval records are scrubbed through hard-fingerprint redaction before being written or surfaced;
+  upstream error messages are fingerprinted (SHA-256) rather than echoed verbatim.
+
 ## [v0.1.13] — 2026-06-05
 
 A small but completing patch: after `vigil-hub setup`, you can now *see* your protection working

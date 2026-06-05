@@ -8,6 +8,38 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.14] — 2026-06-05
+
+为 **MCP 服务器**提供一键保护:把 Vigils 的防火墙、脱敏、审批与审计放在你的 AI agent 与任意 MCP
+工具服务器之间 —— 只需改一行配置,或交给 `vigil-hub setup --mcp` 自动完成。
+
+### 新增
+
+- **`vigil-hub wrap` —— 透明 MCP 网关 shim。** 包裹任意 stdio MCP server 命令,使每一次
+  `tools/list` 与 `tools/call` 在抵达真实 server 前都经过 Vigils 网关(default-deny 防火墙、
+  硬指纹 secret 脱敏、审批、防篡改审计)。你的 agent 像直连原 server 一样连接 `wrap`。用法:
+  `vigil-hub wrap --server-id <名> -- npx -y @modelcontextprotocol/server-filesystem /data`
+  (在 agent 的 MCP 配置里把 `command` 改为 `vigil-hub`,args 前缀
+  `["wrap", "--server-id", "<名>", "--", ...原命令]`)。Secret 处理安全:子进程仅收到你用
+  `--env-key` 显式传入的 env 键(默认不转发任何其它内容),工具结果里的 secret 在回到模型前被脱敏。
+- **`vigil-hub setup --mcp` —— 自动包裹你的 Claude Code MCP 服务器。** 枚举 Claude Code 配置
+  (`~/.claude.json`,user scope)中的 stdio MCP server,逐个改写为经过 `vigil-hub wrap`。单用
+  `--mcp` 是**只读预览**;`--mcp --apply` 真正写入(原子写 + 备份,完全可逆);`--mcp --uninstall`
+  还原。改写是自描述、逐字保真的 —— 你的原始命令、args、env 都被逐字保留,卸载时精确重建。若某个
+  project/local-scope server 会被遗漏不保护,`--apply` 会 fail-closed 拒绝,除非你传 `--user-scope-only`。
+- **Monitor 姿态(`vigil-hub wrap --monitor`)。** 可选、非阻塞:风险工具调用被自动放行**并**完整
+  审计(而非暂停等待审批),适合没有桌面审批端的一键场景。裸 secret 仍被拦截、工具结果仍被脱敏;
+  仅"人工审批"这道门被降级为观察+记录。默认仍为 **enforce**。
+
+### 安全
+
+- **call 时的 descriptor oracle 改为账本支撑。** MCP 网关在 `tools/call` 时查询
+  `RegistryDescriptorOracle`,因此工具的首见 / 漂移状态会在强制点对审计账本重新核对。一个到达
+  call 路径却没有匹配的已批准 descriptor pin 的工具,会降级为首见 / 漂移(需审批)而非被静默放行
+  —— 在 `tools/list` 暴露门之上再加一层纵深防御。
+- **日志/审计中绝无裸 secret 或不可信输入。** 上游 stderr、MCP 握手错误、审批记录在写入或展示前
+  都经硬指纹脱敏;上游错误消息以指纹(SHA-256)呈现而非原样回显。
+
 ## [v0.1.13] — 2026-06-05
 
 一个小而收尾的补丁:`vigil-hub setup` 之后,你现在可以**零额外配置**直接看到保护在工作。

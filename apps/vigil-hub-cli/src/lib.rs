@@ -14,6 +14,8 @@ pub mod hook;
 pub mod inspect;
 pub mod serve;
 pub mod setup;
+pub mod setup_mcp;
+pub mod wrap;
 
 use std::path::PathBuf;
 use std::time::Duration;

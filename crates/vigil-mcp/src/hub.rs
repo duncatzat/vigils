@@ -118,6 +118,15 @@ pub struct HubConfig {
     /// 值会漏 key 位 secret;重解析失败则 fail-closed 整体占位,绝不透传原文)。
     /// 见 docs/research/reversible-redaction-research.md hook (c)。
     pub redact_tool_results: bool,
+    /// **Monitor posture**(opt-in,非阻塞观察;Codex wrap R1 MEDIUM)。
+    ///
+    /// turnkey 场景(无 desktop GUI resolver)下,本应人审批(`FirewallOutcome::Approve`)的风险
+    /// 调用会阻塞 `approval_wait`(默认 300s)后超时 deny —— 看似 server 卡死。开启本模式:Approve
+    /// 路径**自动放行 + 完整审计**(auto-resolve 刚建的 approval,resolver=`vigil-monitor-mode`,
+    /// scope=`Once` 仅本次),不阻塞。**保护不变量仍在**:`Denied`/default-deny 仍 deny;raw-secret
+    /// 前门仍 hard-deny;结果仍按 `redact_tool_results` 脱敏。语义=「观察+脱敏+审计,不拦人审批类
+    /// 风险动作」,比 enforce 弱,故**必须显式 opt-in**(默认 false = enforce 阻塞审批)。
+    pub monitor_mode: bool,
 }
 
 impl Default for HubConfig {
@@ -129,6 +138,7 @@ impl Default for HubConfig {
             outbox_enabled: true,
             auto_approve_first_seen_tools: false,
             redact_tool_results: false,
+            monitor_mode: false,
         }
     }
 }
@@ -629,8 +639,12 @@ impl Hub {
         //      —— 一个坏/慢上游不拖垮整个网关;它的工具不会出现在 tools/list(因 tools/list
         //      对它的调用同样失败被跳过),tools/call 也无从路由到它,故无害。
         if let Err(e) = upstream.initialize_handshake(self.config.upstream_call_timeout) {
+            // `StdioError` 的 Display 里 `Upstream.message` 已指纹化;但 `Protocol(_)` 变体仍可能
+            // 内嵌上游原始字节。对整串再过一道 scrub 作纵深防御,确保初始化诊断绝不把上游 secret
+            // 原样带进本进程 stderr(wrap/serve 场景下可能被 agent harness 捕获)。
+            let safe = vigil_redaction::scrub_text(&e.to_string());
             eprintln!(
-                "[vigil-hub] upstream '{server_id}' MCP initialize handshake failed: {e} \
+                "[vigil-hub] upstream '{server_id}' MCP initialize handshake failed: {safe} \
                  (attached anyway; its tools will be unavailable until it initializes)"
             );
         }
@@ -1013,7 +1027,9 @@ impl Hub {
                 effects,
                 approval,
             } => {
-                // 若效应含 CommSend / NetOutbound 且开启 outbox:先 draft,绑定本 approval
+                // 若效应含 CommSend / NetOutbound 且开启 outbox:先 draft,绑定本 approval。
+                // **monitor 模式也走此 draft**(Codex D2 review finding):outbox 是高风险出站内容的
+                // 「冻结 + 脱敏预览」审计/控制面,不能因 monitor 非阻塞就跳过(否则丢失可观测性)。
                 let outbox_id = if self.config.outbox_enabled
                     && (effects.effects.contains(&EffectKind::CommSend)
                         || effects.effects.contains(&EffectKind::NetOutbound))
@@ -1036,6 +1052,25 @@ impl Hub {
                 } else {
                     None
                 };
+
+                // Monitor posture(opt-in,非阻塞;Codex wrap R1 MEDIUM + D2 review):把本应人审批的
+                // 风险调用**自动放行 + 完整审计**,但**保留 outbox**(上面已 draft+submit)。auto-resolve
+                // 刚建 approval(resolver=`vigil-monitor-mode`,scope=`Once` 仅本次)+ 标 outbox approved,
+                // 随后走与"人已批准"完全一致的 `invoke_upstream`(传 outbox_id + 真 decision,不伪造)。
+                // 不阻塞 → turnkey 无 GUI resolver 不再"看似卡死"。保护不变量仍在:raw-secret 前门已更前
+                // 处 hard-deny;`Denied`/default-deny 仍 deny;结果按 `redact_tool_results` 脱敏;outbox
+                // 预览已记录。仅"人审批类风险动作"被降级为观察(故 opt-in 默认 false)。
+                if self.config.monitor_mode {
+                    self.ledger.approve(
+                        &approval.approval_id,
+                        vigil_types::ApprovalScope::Once,
+                        Some("vigil-monitor-mode"),
+                    )?;
+                    if let Some(oid) = &outbox_id {
+                        self.ledger.mark_outbox_approved(oid)?;
+                    }
+                    return self.invoke_upstream(req, &invocation, &route, outbox_id, decision);
+                }
 
                 // 阻塞等待审批
                 let resolution = self
@@ -1122,6 +1157,11 @@ impl Hub {
             g.get(&route.server_id).cloned()
         };
         let Some(up) = upstream else {
+            // outbox 已被 caller 标 approved(人审批或 monitor 自动);此处上游缺失提前返,
+            // 须 finalize 防 dangling Approved(Codex audit:approved outbox 不能因 pre-call 早返悬挂)。
+            if let Some(oid) = &outbox_id {
+                let _ = self.ledger.mark_outbox_failed(oid);
+            }
             return Ok(Some(req.error(
                 JsonRpcError::VIGIL_UPSTREAM_UNAVAILABLE,
                 "upstream not attached",
@@ -1139,6 +1179,10 @@ impl Hub {
             match detokenize_alias_refs(&invocation.args, &route.server_id, &self.secret_aliases) {
                 Ok(a) => a,
                 Err(alias_err) => {
+                    // 同上:approved outbox 在 alias 边界失败早返时也须 finalize 防悬挂。
+                    if let Some(oid) = &outbox_id {
+                        let _ = self.ledger.mark_outbox_failed(oid);
+                    }
                     return Ok(Some(req.error(
                         JsonRpcError::VIGIL_DENIED,
                         "secret:// alias resolution failed at tool boundary",

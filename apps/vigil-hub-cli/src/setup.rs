@@ -383,8 +383,16 @@ fn read_settings(path: &Path) -> Result<Option<Value>, SetupError> {
 }
 
 /// 原子写 `value` 到 `path`:先备份原文件 → 写 tmp → rename 替换。pretty-print 保持可读。
-/// rename 失败时 best-effort 清理 tmp(原文件未动)。
-fn atomic_write_with_backup(path: &Path, value: &Value) -> Result<Option<PathBuf>, SetupError> {
+/// rename 失败时 best-effort 清理 tmp(原文件未动)。`pub(crate)`:`setup_mcp` 改写 `~/.claude.json`
+/// 复用同一原子写/备份机制(serde_json preserve_order 保留用户键序)。
+pub(crate) fn atomic_write_with_backup(
+    path: &Path,
+    value: &Value,
+    // TOCTOU 防护(Codex mutation review Medium):caller 传"读取时刻"的 `(mtime, len)`;rename 替换
+    // **前**再 stat 比对,若文件已被(如 Claude Code)并发改写则 abort 不覆盖,防 lost-update。
+    // `None` = 不检查(hook setup 改的 settings.json 无活跃并发写者)。
+    expect_unchanged: Option<(std::time::SystemTime, u64)>,
+) -> Result<Option<PathBuf>, SetupError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|_| SetupError::Io {
             what: "create config directory",
@@ -413,6 +421,22 @@ fn atomic_write_with_backup(path: &Path, value: &Value) -> Result<Option<PathBuf
         what: "write temp config",
         path: tmp.clone(),
     })?;
+    // TOCTOU(Codex mutation review Medium):替换前再 stat;若文件在我们读取后被并发改写
+    // (mtime/len 变)→ abort,清理 tmp,绝不用陈旧 clone 覆盖(用户的并发新写不丢)。窗口收窄到
+    // 此 stat 与下面 rename 之间(微秒级)。serialize/temp-write 的耗时已在 stat **之前**发生。
+    if let Some((exp_mtime, exp_len)) = expect_unchanged {
+        if let Ok(m) = std::fs::metadata(path) {
+            let changed =
+                m.len() != exp_len || m.modified().map(|t| t != exp_mtime).unwrap_or(true);
+            if changed {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(SetupError::Io {
+                    what: "config changed during update (close Claude Code, then re-run; original left intact)",
+                    path: path.to_path_buf(),
+                });
+            }
+        }
+    }
     // 现代 Rust `std::fs::rename` 在 Windows 走 `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)`,
     // 原子替换既有目标(测试 install_creates_backup_of_existing + 真机 E2E 实证可覆盖既有
     // settings.json)。极少数 target 被占用/AV 锁定时 rename 失败 —— 此时**原文件未动**(fail-safe,
@@ -545,7 +569,7 @@ pub fn run_with(
     };
 
     let backup_path = if changed && !args.dry_run {
-        atomic_write_with_backup(&settings_path, &new_settings)?
+        atomic_write_with_backup(&settings_path, &new_settings, None)?
     } else {
         None
     };

@@ -23,6 +23,7 @@ fn default_args() -> ServeArgs {
         // T7 ISS-008 Phase 2:默认 false,与 v0.4 行为兼容(走 NoopEngine 默认 scanner)。
         enable_privacy_filter: false,
         redact_tool_results: false,
+        monitor: false,
     }
 }
 
@@ -62,6 +63,7 @@ fn b2_privacy_filter_unavailable_when_feature_off() {
         dev_permissive_firewall: false,
         enable_privacy_filter: true, // flag on,但 feature off → fail-closed
         redact_tool_results: false,
+        monitor: false,
     };
     match build_hub(&args) {
         Err(ServeError::PrivacyFilterUnavailable) => {}
@@ -242,6 +244,7 @@ fn b2_upstream_config_empty_argv_returns_invalid_upstream() {
         dev_permissive_firewall: false,
         enable_privacy_filter: false,
         redact_tool_results: false,
+        monitor: false,
     };
 
     match build_hub(&args) {
@@ -296,6 +299,7 @@ fn b2_stage2_attach_real_stdio_upstream_via_node() {
         dev_permissive_firewall: false,
         enable_privacy_filter: false,
         redact_tool_results: false,
+        monitor: false,
     };
 
     let (hub, ledger) = build_hub(&args).expect("build_hub with real upstream");
@@ -372,6 +376,7 @@ fn b2_stage2_strict_upstream_requires_handshake_regression() {
         dev_permissive_firewall: false,
         enable_privacy_filter: false,
         redact_tool_results: false,
+        monitor: false,
     };
 
     // build_hub 同步执行 initialize 握手:返回时严格 server 已 operational。

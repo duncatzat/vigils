@@ -676,7 +676,8 @@ impl Ledger {
     // I03 会在其上实装完整的 state machine(create/approve/deny/wait_for_resolution)。
     // I01 只暴露最小写/读,供"pending approval 跨重启存活"验收测试使用。
 
-    /// 插入一个 `Pending` 的 approval 行(骨架 API,I03 会替换为完整流程)。
+    /// 插入一个 `Pending` 的 approval 行(I01 遗留骨架 API;生产已由 `approvals.rs::create_approval`
+    /// 取代,现仅 `tests/ledger_invariants.rs` 用)。
     // I01 骨架 API 直接镜像 SQL 行,多个独立 String/i64。I03 会以 `ApprovalRequest` DTO 收窄签名。
     #[allow(clippy::too_many_arguments)]
     pub fn store_pending_approval_skeleton(
@@ -690,6 +691,12 @@ impl Ledger {
         expires_at: i64,
     ) -> Result<()> {
         validate_nonempty("approval_id", approval_id)?;
+        // no-plaintext ledger 守门(Codex audit R2):本骨架 API 与 `create_approval` 是 approvals
+        // 表的**两个写入口**,任一不 scrub 即破表不变量(Codex 抓出此旁路)。落表前过 scrub_text
+        // 遮蔽硬指纹/PII,与 `create_approval` 完全一致。
+        let title_db = vigil_redaction::scrub_text(title);
+        let summary_db = vigil_redaction::scrub_text(summary);
+        let effect_json_db = vigil_redaction::scrub_text(effect_json);
         let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
         guard.execute(
             "INSERT INTO approvals
@@ -700,9 +707,9 @@ impl Ledger {
                 approval_id,
                 decision_id,
                 session_id,
-                title,
-                summary,
-                effect_json,
+                title_db,
+                summary_db,
+                effect_json_db,
                 expires_at,
                 now_secs(),
             ],

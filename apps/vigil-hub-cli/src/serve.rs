@@ -40,12 +40,15 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use vigil_audit::Ledger;
-use vigil_firewall::scorer::{DescriptorOracle, DescriptorStatus, StaticDescriptorOracle};
+use vigil_firewall::scorer::DescriptorOracle;
 use vigil_firewall::{Firewall, FirewallConfig};
 // 可逆脱敏 Slice 2:从 `upstreams.json` 的 `secrets` map 读 env:/keyring: 源装 SecretAliasMap。
 use vigil_lease::{KeyringSecretStore, SecretStore, SecretValue};
 use vigil_mcp::protocol::{read_message, write_message, ProtocolError};
-use vigil_mcp::{compute_argv_hash, Hub, HubConfig, HubError, JsonRpcRequest, SecretAliasMap};
+use vigil_mcp::{
+    compute_argv_hash, Hub, HubConfig, HubError, JsonRpcRequest, RegistryDescriptorOracle,
+    SecretAliasMap,
+};
 use vigil_policy::{defaults::default_ruleset, PolicyAction, PolicyEngine, PolicyRule};
 use vigil_types::{ServerProfile, TransportKind, TrustLevel};
 
@@ -88,6 +91,11 @@ pub struct ServeArgs {
     /// 可逆脱敏 Slice 1:上游工具响应命中硬指纹 secret 时,**in-band** 脱敏 result 后再返回
     /// agent/LLM(默认 off = 既有 out-of-band 仅审计行为)。见 HubConfig::redact_tool_results。
     pub redact_tool_results: bool,
+
+    /// **Monitor posture**(opt-in,非阻塞观察;Codex wrap R1 MEDIUM)。直通 [`HubConfig::monitor_mode`]:
+    /// turnkey 无 GUI resolver 时,把本应人审批的风险调用自动放行 + 完整审计(不阻塞),而非阻塞
+    /// `approval_wait` 300s 看似卡死。`Denied`/raw-secret/结果脱敏不变量仍在。默认 false = enforce。
+    pub monitor: bool,
 }
 
 /// JSON 配置 schema(`--upstream-config` 指向的文件)。
@@ -205,6 +213,23 @@ pub enum ServeError {
 /// **session 语义**:每次 `serve` 启动开新 session(source=`"vigil-hub-serve"`)。
 /// agent 连接期间的所有 tool call / 审批都归在此 session,退出即结束。
 pub fn build_hub(args: &ServeArgs) -> Result<(Arc<Hub>, Arc<Ledger>), ServeError> {
+    // 读 upstreams config 文件(若有)→ 解析,再委托 build_hub_with_config。
+    let upstreams_cfg = match args.upstreams_config.as_deref() {
+        Some(cfg_path) => {
+            let raw = std::fs::read_to_string(cfg_path)?;
+            Some(serde_json::from_str::<UpstreamsConfig>(&raw)?)
+        }
+        None => None,
+    };
+    build_hub_with_config(args, upstreams_cfg)
+}
+
+/// 同 [`build_hub`],但接受**已解析**的 upstreams 配置 —— 供 `vigil-hub wrap` 注入"单 upstream"
+/// (透明 shim:把一个已存在的 MCP server 命令作唯一 upstream,无需写临时配置文件)。
+pub fn build_hub_with_config(
+    args: &ServeArgs,
+    upstreams_cfg: Option<UpstreamsConfig>,
+) -> Result<(Arc<Hub>, Arc<Ledger>), ServeError> {
     // 1. Ledger(磁盘或内存)
     let ledger = Arc::new(match args.ledger_path.as_deref() {
         Some(p) => Ledger::open(p)?,
@@ -280,10 +305,17 @@ pub fn build_hub(args: &ServeArgs) -> Result<(Arc<Hub>, Arc<Ledger>), ServeError
         ))
     };
 
-    // 3. DescriptorOracle —— Stage 1:静态 ApprovedStable 兜底
-    //    Stage 2 应换成 `RegistryDescriptorOracle`,从 Ledger 查 descriptor 实时状态
-    let oracle: Arc<dyn DescriptorOracle> =
-        Arc::new(StaticDescriptorOracle(DescriptorStatus::ApprovedStable));
+    // 3. DescriptorOracle —— ledger-backed,call 时实时查 descriptor 状态(取代早期静态
+    //    ApprovedStable 兜底)。Codex auto_approve posture review(NIT-1)指出:静态 oracle
+    //    会在 call-time 对**任何**工具一律返 ApprovedStable,等于对 descriptor 漂移/未批准
+    //    橡皮图章。改用 `RegistryDescriptorOracle` 后,call-time descriptor 状态独立于
+    //    `tools/list` 的路由过滤再核一道:
+    //      - 已批准且 hash 未变(正常可路由工具)→ ApprovedStable(零额外摩擦);
+    //      - 漏到 call 路径的未批准/漂移工具 → FirstSeen/Drifted → 触发审批(fail-closed
+    //        纵深防御,不再被静态 oracle 放行)。
+    //    Posture 一句话:**信任已配置 server 的 descriptor 用于发现,但 call 仍逐条强制/监控**。
+    //    `auto_approve_first_seen_tools` 只控制 `tools/list` 的首见**暴露**,不改这条 call-time 路径。
+    let oracle: Arc<dyn DescriptorOracle> = Arc::new(RegistryDescriptorOracle::new(ledger.clone()));
 
     // 4. Hub
     //    **ISS-019 Phase 1 之后**(2026-04-28):approval_wait 直接走 HubConfig::default()
@@ -299,19 +331,13 @@ pub fn build_hub(args: &ServeArgs) -> Result<(Arc<Hub>, Arc<Ledger>), ServeError
     let hub_cfg = HubConfig {
         auto_approve_first_seen_tools: args.auto_approve_first_seen,
         redact_tool_results: args.redact_tool_results,
+        monitor_mode: args.monitor,
         ..Default::default()
     };
 
-    // 4'. 可逆脱敏 Slice 2:**先**读 upstreams config(若有),让 `secrets` map 在 Hub::new 前
-    //     就绪 —— alias 真值映射是 Hub 的构造参数(运行时 only,绝不入账本)。config 只读一次,
-    //     既供 secrets 装配也供下面的 upstream attach(避免读两遍 / drift)。
-    let upstreams_cfg = match args.upstreams_config.as_deref() {
-        Some(cfg_path) => {
-            let raw = std::fs::read_to_string(cfg_path)?;
-            Some(serde_json::from_str::<UpstreamsConfig>(&raw)?)
-        }
-        None => None,
-    };
+    // 4'. 可逆脱敏 Slice 2:`secrets` map 在 Hub::new 前就绪 —— alias 真值映射是 Hub 的构造参数
+    //     (运行时 only,绝不入账本)。`upstreams_cfg` 由 caller 传入(已解析),既供 secrets 装配
+    //     也供下面的 upstream attach。
     let secret_aliases = match &upstreams_cfg {
         Some(cfg) => build_secret_alias_map(&cfg.secrets)?,
         None => SecretAliasMap::default(),
@@ -329,10 +355,11 @@ pub fn build_hub(args: &ServeArgs) -> Result<(Arc<Hub>, Arc<Ledger>), ServeError
     // 把它改名为 `set_session_id`(同时 `_for_test` 作为 guard 仅 cfg(test) 暴露)。
     hub.set_session_id_for_test(session_id)?;
 
-    // 5. Upstream attach(Stage 2):对 config 的每个 entry 跑完整 onboarding
+    // 5. Upstream attach(Stage 2):对 config 的每个 entry 跑完整 onboarding。
+    //    serve 模式传空 env(走 MCP env 白名单);wrap 模式由 caller 自己 attach 并透传 env。
     if let Some(cfg) = &upstreams_cfg {
         for entry in &cfg.upstreams {
-            attach_stdio_upstream(&ledger, &hub, entry)?;
+            attach_stdio_upstream(&ledger, &hub, entry, &[])?;
         }
     }
 
@@ -427,6 +454,7 @@ pub fn attach_stdio_upstream(
     ledger: &Arc<Ledger>,
     hub: &Arc<Hub>,
     entry: &UpstreamEntry,
+    env: &[(String, String)],
 ) -> Result<(), ServeError> {
     // argv 必须非空(下游 spawn 会拒,但在此提前 fail-closed 给更清晰错)
     if entry.argv.is_empty() {
@@ -470,7 +498,7 @@ pub fn attach_stdio_upstream(
     // 4. Hub-owned gate-before-spawn(V1.1):resolve → argv-drift → resolved-program-drift → spawn → attach
     //    单一路径替代旧的 StdioUpstream::spawn + attach_upstream 两步,确保进程在双 drift gate
     //    通过**之前绝不 spawn**(封死 public 裸 argv spawn 旁路)。
-    hub.spawn_attach_stdio_upstream(&entry.name, &entry.argv, &[])?;
+    hub.spawn_attach_stdio_upstream(&entry.name, &entry.argv, env)?;
 
     Ok(())
 }
