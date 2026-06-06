@@ -129,20 +129,31 @@ vigil-hub demo --tamper   # also: alter the audit ledger and watch verify-chain 
 
 ### Protect Claude Code in one command (turnkey)
 
-Download the release, then run **one command**. Vigils registers itself as a Claude Code
-`PreToolUse` hook, so **every tool call** (Bash, Edit, Write, Read, MCP tools, …) is checked
-before it runs: a real credential heading into a tool is **blocked fail-closed** and recorded in
-your local, tamper-evident audit ledger. No manual config editing — your existing settings are
-backed up and only Vigils' own entry is added.
+Download the release, then run **one command** to get fully protected. No manual config editing —
+your existing settings are backed up and only Vigils' own entries are added (fully reversible):
 
 ```bash
-vigil-hub setup             # detect Claude Code → register the guard (backs up ~/.claude/settings.json)
-vigil-hub setup --status    # verify protection is ACTIVE + run a built-in self-test
-vigil-hub setup --uninstall # cleanly remove (only Vigils' own entry; your hooks untouched)
+vigil-hub setup --all       # protect everything, in one step
 ```
 
-Restart Claude Code (or start a new session) and your agent's native tool calls are guarded.
-This is the fastest path from a GitHub download to real protection.
+`setup --all` wires up **both** layers of protection:
+
+1. **Native-tool input guard** — a Claude Code `PreToolUse` hook so **every tool call** (Bash,
+   Edit, Write, Read, MCP tools, …) is checked before it runs; a real credential heading *into* a
+   tool is **blocked fail-closed** and recorded in your tamper-evident audit ledger.
+2. **MCP gateway** — routes each of your stdio MCP servers through Vigils so secrets in tool
+   **results** are scrubbed before the model ever sees them, and every call is audited. It defaults
+   to **monitor** posture — your servers stay fully usable while every hard protection stays on
+   (raw-secret block, result redaction, tamper-evident audit). Add `--enforce` for default-deny gating.
+
+```bash
+vigil-hub setup --mcp --doctor    # pre-flight: will each wrapped MCP server actually start? (PATH check, read-only)
+vigil-hub inspect protection      # after using your agent: see what Vigils caught (secrets blocked, leaks redacted, chain intact)
+vigil-hub setup --all --uninstall # cleanly remove everything (your config restored byte-for-byte)
+```
+
+Restart Claude Code (or start a new session) and you're protected. This is the fastest path from a
+GitHub download to real protection.
 
 ### As an MCP gateway (CLI)
 
@@ -157,6 +168,9 @@ vigil-hub serve --stdio --upstream-config ./upstreams.json
 
 # Register a remote (HTTP) MCP server with OAuth onboarding
 vigil-hub add-remote-mcp https://mcp.example.com/
+
+# See what Vigils has protected at a glance (secrets blocked, leaks redacted, audit chain intact)
+vigil-hub inspect protection
 
 # Inspect the local audit ledger from the command line (one-line JSON, pipe to jq)
 vigil-hub inspect --db-path ./vigil.db activity --limit 20

@@ -111,18 +111,29 @@ Linux** 的预构建安装包与二进制:
 
 ### 一键保护 Claude Code(turnkey)
 
-下载 release 后,只跑**一条命令**。Vigils 把自己注册为 Claude Code 的 `PreToolUse` hook,于是
-**每一次工具调用**(Bash、Edit、Write、Read、MCP 工具……)在执行前都先被检查:真实凭据流入工具会被
-**fail-closed 拦截**,并记入本地防篡改审计账本。无需手动改配置——你既有的设置会被备份,只新增 Vigils
-自己的条目。
+下载 release 后,只跑**一条命令**即全面受保护。无需手动改配置——你既有的设置会被备份,只新增 Vigils
+自己的条目(完全可逆):
 
 ```bash
-vigil-hub setup             # 检测 Claude Code → 注册守门(备份 ~/.claude/settings.json)
-vigil-hub setup --status    # 校验保护已 ACTIVE + 跑内置自检
-vigil-hub setup --uninstall # 干净移除(仅 Vigils 自己的条目;你的 hook 不动)
+vigil-hub setup --all       # 一步全保护
 ```
 
-重启 Claude Code(或开新会话),agent 的原生工具调用即受保护。这是从 GitHub 下载到真实防护的最快路径。
+`setup --all` 同时接入**两层**保护:
+
+1. **原生工具输入侧守门** —— Claude Code `PreToolUse` hook,于是**每一次工具调用**(Bash、Edit、
+   Write、Read、MCP 工具……)在执行前都先被检查:真实凭据流*入*工具会被 **fail-closed 拦截**,记入
+   防篡改审计账本。
+2. **MCP 网关** —— 把你每个 stdio MCP server 经 Vigils 路由,工具**结果**里的 secret 在模型看到之前
+   被脱敏,每次调用都被审计。默认 **monitor** 姿态 —— 你的 server 保持完全可用,同时所有硬保护照常
+   生效(裸 secret 拦截、结果脱敏、防篡改审计)。加 `--enforce` 升级为 default-deny 硬拦。
+
+```bash
+vigil-hub setup --mcp --doctor    # 接入前预检:每个被包裹的 MCP server 真能启动吗?(PATH 检查,只读)
+vigil-hub inspect protection      # 用过 agent 后:一眼看清 Vigils 拦了什么(裸 secret 拦截、泄漏脱敏、链完整)
+vigil-hub setup --all --uninstall # 干净移除全部(你的配置逐字节还原)
+```
+
+重启 Claude Code(或开新会话)即受保护。这是从 GitHub 下载到真实防护的最快路径。
 
 ### 先用 60 秒看价值(零设置)
 

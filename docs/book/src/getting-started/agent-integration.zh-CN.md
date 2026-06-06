@@ -41,6 +41,32 @@ MCP 工具服务器（"upstream"），对每次调用进行管控。
 
 验证：`vigil-hub --help`
 
+## 最快路径 —— Claude Code，一条命令（`setup --all`）
+
+如果你用 **Claude Code**,完全不必手写配置。一条命令检测你的环境并全面保护 —— 既有配置会被备份,只新增
+Vigils 自己的条目(完全可逆):
+
+```bash
+vigil-hub setup --all
+```
+
+`setup --all` 同时接入**两层**:
+
+1. **原生工具输入侧守门** —— `PreToolUse` hook,于是每次工具调用(Bash、Edit、Write、Read、MCP
+   工具……)执行前都先被检查:真实凭据流*入*工具会被 fail-closed 拦截并审计。
+2. **MCP 网关** —— 把你每个 stdio MCP server 改写为经 Vigils 路由,工具**结果**里的 secret 在模型看到
+   之前被脱敏,每次调用都被审计。默认 **monitor** 姿态(你的 server 保持可用;裸 secret 拦截、结果脱敏、
+   审计照常)。加 `--enforce` 升级 default-deny 硬拦。
+
+```bash
+vigil-hub setup --mcp --doctor    # 接入前预检:每个被包裹的 MCP server 真能启动吗?(只读 PATH 检查)
+vigil-hub inspect protection      # 用过 agent 后:Vigils 拦了什么(裸 secret 拦截、泄漏脱敏、链完整)
+vigil-hub setup --all --uninstall # 移除全部(配置逐字节还原)
+```
+
+重启 Claude Code 即受保护。本指南余下部分是**手动路径** —— 用于非 Claude agent(Codex / Cursor /
+Zed / …)或你想显式控制 `serve` 网关及其 `upstreams.json` 时。
+
 ## 第 1 步 —— 冒烟测试 `vigil-hub`（30 秒，不用 agent）
 
 接任何 agent 之前，先确认网关能说 MCP。给它喂一个 `initialize` + `tools/list`（MCP stdio 是逐行
@@ -167,6 +193,7 @@ mcpServers:
 等 agent 跑一次工具调用（或你自己触发一次）后，查本地账本。`inspect` 输出单行 JSON，可接 `jq`：
 
 ```bash
+vigil-hub inspect --db-path ./vigil.db protection            # 一眼看清:裸 secret 拦截、泄漏脱敏、链完整
 vigil-hub inspect --db-path ./vigil.db activity --limit 20   # 最近事件 / 决策
 vigil-hub inspect --db-path ./vigil.db search "read_file"     # 全文搜索审计链
 vigil-hub inspect --db-path ./vigil.db approvals list         # 待你处理的高危调用

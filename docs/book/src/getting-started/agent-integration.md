@@ -44,6 +44,36 @@ Install the CLI gateway, `vigil-hub`:
 
 Verify: `vigil-hub --help`
 
+## Fastest path — Claude Code, one command (`setup --all`)
+
+If you use **Claude Code**, you don't need to hand-write configs at all. One command detects your
+setup and protects everything — your existing config is backed up and only Vigils' own entries are
+added (fully reversible):
+
+```bash
+vigil-hub setup --all
+```
+
+`setup --all` wires up **both** layers:
+
+1. **Native-tool input guard** — a `PreToolUse` hook so every tool call (Bash, Edit, Write, Read,
+   MCP tools, …) is checked before it runs; a real credential heading *into* a tool is blocked
+   fail-closed and audited.
+2. **MCP gateway** — rewrites each of your stdio MCP servers to run through Vigils, so secrets in
+   tool **results** are scrubbed before the model sees them and every call is audited. Defaults to
+   **monitor** posture (your servers stay usable; raw-secret block, result redaction, and audit
+   stay on). Add `--enforce` for default-deny gating.
+
+```bash
+vigil-hub setup --mcp --doctor    # pre-flight: will each wrapped MCP server actually start? (read-only PATH check)
+vigil-hub inspect protection      # after using your agent: what Vigils caught (secrets blocked, leaks redacted, chain intact)
+vigil-hub setup --all --uninstall # remove everything (config restored byte-for-byte)
+```
+
+Restart Claude Code and you're protected. The rest of this guide is the **manual path** — use it
+for non-Claude agents (Codex / Cursor / Zed / …) or when you want explicit control over the
+`serve` gateway and its `upstreams.json`.
+
 ## Step 1 — Smoke-test `vigil-hub` (30s, no agent needed)
 
 Confirm the gateway speaks MCP before wiring any agent. Pipe an `initialize` + `tools/list` into
@@ -172,6 +202,7 @@ After your agent runs a tool call (or trigger one yourself), inspect the local l
 prints single-line JSON — pipe to `jq`:
 
 ```bash
+vigil-hub inspect --db-path ./vigil.db protection            # at-a-glance: secrets blocked, leaks redacted, chain intact
 vigil-hub inspect --db-path ./vigil.db activity --limit 20   # recent events / decisions
 vigil-hub inspect --db-path ./vigil.db search "read_file"     # full-text search the trail
 vigil-hub inspect --db-path ./vigil.db approvals list         # risky calls awaiting you
