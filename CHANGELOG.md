@@ -8,6 +8,25 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.20] — 2026-06-06
+
+`vigil-hub setup --all` protects everything in one command — closing the last "download → directly
+protected" gap where full protection used to take two separate commands.
+
+### Added
+
+- **`vigil-hub setup --all` — one command for full protection.** Until now, full protection meant
+  running two commands: `setup` (the native-tool PreToolUse hook that blocks raw secrets in tool
+  *inputs*) **and** `setup --mcp --apply` (route each MCP server through Vigil's gateway for result
+  redaction + audit). `--all` does both at once. `--all --uninstall` removes both; `--all --dry-run`
+  previews both without writing. The two steps write different files and are each atomic, backed up,
+  and reversible. After it's done: `vigil-hub inspect protection` shows what Vigil has caught.
+- **Honest partial-failure reporting.** If the hook step succeeds but the MCP step fails (or vice
+  versa), the CLI tells you exactly which step applied and how to undo just that one — never a vague
+  "failed" that hides a half-applied state. `--all` is rejected at parse time when combined with the
+  read-only `--status` / `--doctor` / `--mcp` flags, so it can never silently turn a read-only check
+  into a write.
+
 ## [v0.1.19] — 2026-06-06
 
 A new `vigil-hub setup --mcp --doctor` pre-flight tells you, before you even run your agent, whether

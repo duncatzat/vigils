@@ -8,6 +8,21 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.20] — 2026-06-06
+
+`vigil-hub setup --all` 一条命令全保护 —— 闭合"download → 直接得到保护"的最后一个缺口(此前全保护需跑两条
+分开的命令)。
+
+### 新增
+
+- **`vigil-hub setup --all` —— 一条命令全保护。** 此前全保护要跑两条命令:`setup`(原生工具 PreToolUse
+  hook,拦截工具**输入**里的裸 secret)**和** `setup --mcp --apply`(把每个 MCP server 经 Vigil 网关做
+  结果脱敏 + 审计)。`--all` 一次完成两者。`--all --uninstall` 撤销两者;`--all --dry-run` 预览两者不写盘。
+  两步写不同文件,各自原子写 + 备份 + 可逆。完成后:`vigil-hub inspect protection` 看 Vigil 拦下了什么。
+- **诚实的部分失败报告。** 若 hook 步成功但 MCP 步失败(或反之),CLI 会明确告诉你哪一步已应用、如何只撤销
+  那一步 —— 绝不用笼统的"失败"掩盖半应用状态。`--all` 与只读的 `--status` / `--doctor` / `--mcp` 组合时
+  在 parse 期即被拒绝,故它绝不会把只读检查静默变成写操作。
+
 ## [v0.1.19] — 2026-06-06
 
 新增 `vigil-hub setup --mcp --doctor` 预检:在你运行 agent **之前**就告诉你每个被包裹的 MCP server 能否

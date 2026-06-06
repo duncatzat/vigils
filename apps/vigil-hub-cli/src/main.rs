@@ -160,6 +160,17 @@ struct CliSetupArgs {
     /// server 起不来、为什么"(最常见失败 = 程序没装 / 不在 PATH)。**纯静态、只读、不启动任何 server**。
     #[arg(long)]
     doctor: bool,
+    /// **一条命令全保护**:同时接入 hook(原生工具输入侧 secret 拦截)**和** MCP 网关 wrap(脱敏 +
+    /// 审计 + 审批 + descriptor pin),兑现"download → 直接得到保护"。等价于 `setup` + `setup --mcp
+    /// --apply` 两步合一(两者写不同文件、互不冲突)。`--all --uninstall` 撤销两者;`--all --dry-run`
+    /// 预览两者;MCP 侧默认 monitor 姿态(加 `--enforce` 升级硬拦)。
+    ///
+    /// 与只读操作 `--status` / `--doctor` **互斥**(Codex D13 HIGH:否则 `--all --status` 会因
+    /// `--all` 优先而**变成写操作**,破坏只读契约)—— clap 在 parse 期即拒绝该组合,fail-fast 防惊吓写入。
+    /// 也与 `--mcp` 互斥(Codex D13 R2 nit:`--all` 已含 MCP wrap,`--mcp` 此处会被静默忽略 = 歧义;
+    /// 拒绝逼用户明确用 `--all` **或** `--mcp` 之一)。
+    #[arg(long, conflicts_with_all = ["status", "doctor", "mcp"])]
+    all: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -317,7 +328,16 @@ fn main() -> std::process::ExitCode {
             }
         }
         Some(Command::Setup(args)) => {
-            if args.mcp {
+            if args.all {
+                // 一条命令全保护:hook + MCP wrap 一次完成(兑现 download→直接保护)。
+                match run_setup_all(&args) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        eprintln!("vigil-hub setup --all failed: {e}");
+                        std::process::ExitCode::FAILURE
+                    }
+                }
+            } else if args.mcp {
                 // MCP turnkey:--apply 改写 / --uninstall 还原 / 默认只读预览。
                 match setup_mcp_dispatch(&args) {
                     Ok(code) => code,
@@ -389,6 +409,130 @@ fn setup_mcp_dispatch(args: &CliSetupArgs) -> Result<std::process::ExitCode, set
         let rep = setup_mcp::run_preview(&home, &exe, monitor)?;
         Ok(print_mcp_preview(&rep))
     }
+}
+
+fn run_setup_all(args: &CliSetupArgs) -> Result<std::process::ExitCode, setup::SetupError> {
+    let home = dirs::home_dir().ok_or(setup::SetupError::MissingHomeDir)?;
+    let exe = std::env::current_exe().map_err(|_| setup::SetupError::MissingCurrentExe)?;
+    // ledger:`--ledger` 覆盖 → 否则默认(`VIGIL_LEDGER_PATH` / `<data 目录>/Vigil/ledger.sqlite3`)。
+    let ledger = args
+        .ledger
+        .clone()
+        .or_else(setup::default_ledger_path)
+        .ok_or(setup::SetupError::MissingDataDir)?;
+    let monitor = !args.enforce;
+    let op = if args.uninstall {
+        "uninstall"
+    } else if args.dry_run {
+        "preview"
+    } else {
+        "apply"
+    };
+    match setup_mcp::run_all_with(
+        &home,
+        &exe,
+        &ledger,
+        args.uninstall,
+        args.dry_run,
+        args.user_scope_only,
+        monitor,
+    ) {
+        Ok((hook_rep, mcp_rep)) => Ok(print_setup_all(&hook_rep, &mcp_rep, op)),
+        // hook 步就失败 → 什么都没改(hook 写盘前 gate,失败即未写):诚实"nothing changed"。
+        Err(setup_mcp::AllError::Hook(e)) => {
+            eprintln!("vigil-hub setup --all: hook step failed -- nothing was changed: {e}");
+            Ok(std::process::ExitCode::FAILURE)
+        }
+        // hook 成功、MCP 步失败 → **半应用**:诚实告知 hook 已应用 + 如何单独撤销(Codex D13 HIGH)。
+        Err(setup_mcp::AllError::McpAfterHook { hook, source }) => {
+            let did = if op == "uninstall" {
+                if hook.changed {
+                    "removed"
+                } else {
+                    "nothing to remove"
+                }
+            } else if hook.changed {
+                "applied"
+            } else {
+                "already up to date"
+            };
+            println!(
+                "Vigil setup --all --{op}: PARTIAL (the hook step completed, the MCP step did not)"
+            );
+            println!("  [1/2] hook (PreToolUse input-secret guard): {did}");
+            eprintln!("  [2/2] MCP gateway step FAILED: {source}");
+            if op == "uninstall" {
+                // 不声称"hook 已移除"(若 changed=false 则本就没东西可移除,会过度陈述;Codex D13 R2 nit)。
+                eprintln!("  The hook step completed (see above); MCP wrap entries may remain. Retry: vigil-hub setup --mcp --uninstall");
+            } else {
+                eprintln!(
+                    "  The hook above IS applied. Undo just the hook with: vigil-hub setup --uninstall"
+                );
+                eprintln!("  (or fix the cause and re-run: vigil-hub setup --all)");
+            }
+            Ok(std::process::ExitCode::FAILURE)
+        }
+    }
+}
+
+/// 打印 `setup --all` 合并报告(ASCII-safe)。两段(hook / mcp)各自诚实陈述 + 末尾下一步。
+fn print_setup_all(
+    hook: &setup::SetupReport,
+    mcp: &setup_mcp::McpApplyReport,
+    op: &str,
+) -> std::process::ExitCode {
+    let dry = if hook.dry_run { " (dry-run)" } else { "" };
+    println!("Vigil setup --all --{op}{dry}: native-tool hook + MCP gateway in one step");
+
+    // [1/2] hook(原生工具输入侧 secret 拦截)
+    if !hook.claude_detected {
+        println!(
+            "  [1/2] hook: Claude Code not detected (~/.claude not found) -- hook step skipped"
+        );
+    } else if op == "uninstall" {
+        let did = if hook.changed {
+            "removed"
+        } else {
+            "nothing to remove"
+        };
+        println!("  [1/2] hook (PreToolUse input-secret guard): {did}");
+    } else {
+        let did = if hook.changed {
+            "registered"
+        } else {
+            "already up to date"
+        };
+        println!("  [1/2] hook (PreToolUse input-secret guard): {did}");
+    }
+
+    // [2/2] MCP 网关 wrap(脱敏 + 审计 + 审批 + descriptor pin)
+    let total = mcp.total_changed();
+    let verb = if op == "uninstall" {
+        "restored"
+    } else {
+        "wrapped"
+    };
+    println!("  [2/2] MCP gateway: {verb} {total} server(s)");
+    if mcp.local_skipped > 0 {
+        println!(
+            "        NOTE: {} local-scope server(s) left unprotected (--user-scope-only).",
+            mcp.local_skipped
+        );
+    }
+
+    // 下一步 / 撤销
+    println!();
+    if op == "preview" {
+        println!("  Preview only -- nothing written. Apply with: vigil-hub setup --all");
+    } else if op == "uninstall" {
+        println!("  Vigil protection removed (hook + MCP gateway). Restart your agent.");
+    } else {
+        println!(
+            "  Protected. Restart your agent to activate. See what Vigil catches: vigil-hub inspect protection"
+        );
+        println!("  Undo everything with: vigil-hub setup --all --uninstall");
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// 打印 `setup --mcp --doctor` 健壮性预检结果(ASCII-safe,cp936/cp437 不乱码)。返回退出码:

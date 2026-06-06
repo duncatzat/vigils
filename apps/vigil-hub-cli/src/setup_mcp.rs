@@ -792,6 +792,71 @@ pub fn run_doctor(home: &Path) -> Result<Vec<McpDoctorRow>, SetupError> {
     Ok(rows)
 }
 
+// ============================ setup --all(统一接入:hook + MCP wrap 一条命令) ============================
+//
+// **采用关键**:全保护此前需两条命令 —— `setup`(hook,原生工具输入侧 secret 拦截)+ `setup --mcp --apply`
+// (MCP 网关:脱敏 + 审计 + 审批 + descriptor pin)。与"download → 直接得到保护"相违(用户可能只跑一条、
+// 漏掉 MCP 网关的脱敏/审计)。`--all` 一次完成两者。两者写**不同文件**(hook → `~/.claude/settings.json`;
+// mcp → `~/.claude.json`),互不冲突、顺序无关、各自原子写 + 备份 + 可逆。
+
+/// `run_all_with` 的失败结果 —— **区分两步**以便 CLI 诚实报告部分应用状态(Codex D13 review HIGH)。
+#[derive(Debug)]
+pub enum AllError {
+    /// **第 1 步(hook)就失败** → 什么都没改(hook 用 abort-on-unexpected + 写盘前 gate,失败即未写)。
+    Hook(SetupError),
+    /// **hook 成功、第 2 步(MCP)失败** → hook **已应用**(可单独 `setup --uninstall` 撤销)。
+    /// 携带 hook 报告供 CLI 把"[1/2] 已完成 + [2/2] 失败 + 如何撤销 hook"如实告知用户。
+    McpAfterHook {
+        /// 已成功应用的 hook 报告(`Box` 化:SetupReport 较大,避免 `Result` 的 Err 变体超阈值 = clippy
+        /// `result_large_err`,也省得正常 Ok 路径背着大 Err)。
+        hook: Box<crate::setup::SetupReport>,
+        /// MCP 步的失败原因。
+        source: SetupError,
+    },
+}
+
+/// 统一接入编排(注入式 home/exe/ledger → 可测):hook + MCP wrap 一次完成。`uninstall` 撤销两者,
+/// `dry_run` 预览两者,`monitor`/`user_scope_only` 透传给 MCP 侧。
+///
+/// **部分失败诚实**(Codex D13 review HIGH):hook 先做 —— hook 失败 → [`AllError::Hook`](什么都没改);
+/// hook 成功后 MCP 失败 → [`AllError::McpAfterHook`](携 hook 报告,CLI 据此告知 hook 已应用 + 如何撤销),
+/// **绝不**用裸 `?` 把"hook 已改"信息吞掉只报一句笼统失败。
+pub fn run_all_with(
+    home: &Path,
+    exe: &Path,
+    ledger: &Path,
+    uninstall: bool,
+    dry_run: bool,
+    user_scope_only: bool,
+    monitor: bool,
+) -> Result<(crate::setup::SetupReport, McpApplyReport), AllError> {
+    // 1) hook(settings.json):原生工具调用的输入侧裸 secret 拦截(`setup` 的既有逻辑,注入式复用)。
+    let hook_args = crate::setup::SetupArgs {
+        uninstall,
+        status: false,
+        dry_run,
+        ledger: Some(ledger.to_path_buf()),
+    };
+    let hook_rep = crate::setup::run_with(&hook_args, home, exe, ledger).map_err(AllError::Hook)?;
+
+    // 2) MCP wrap(.claude.json):把每个 stdio MCP server 套上 Vigil 网关(`setup --mcp` 的既有逻辑)。
+    // 失败 → McpAfterHook(**移动** hook 报告进 error,无需 Clone):此时 hook 已应用,绝不假装"什么都没做"。
+    let exe_str = exe.to_string_lossy().to_string();
+    let mcp_res = if uninstall {
+        run_uninstall(home, dry_run)
+    } else {
+        run_apply(home, &exe_str, dry_run, user_scope_only, monitor)
+    };
+    match mcp_res {
+        Ok(mcp_rep) => Ok((hook_rep, mcp_rep)),
+        // 分支互斥:此处把 hook_rep 移入 error;Ok 分支才在元组里用它,借用检查通过(无需 clone)。
+        Err(source) => Err(AllError::McpAfterHook {
+            hook: Box::new(hook_rep),
+            source,
+        }),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1426,5 +1491,156 @@ mod tests {
     fn run_doctor_empty_when_no_config() {
         let dir = tempfile::tempdir().unwrap();
         assert!(run_doctor(dir.path()).unwrap().is_empty());
+    }
+
+    // ---------------- setup --all(统一接入)----------------
+
+    #[test]
+    fn run_all_installs_then_uninstalls_both_hook_and_mcp() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let exe = home.join("vigil-hub");
+        fs::write(&exe, b"x").unwrap(); // hook state 计算要求 exe 存在
+        let ledger = home.join("ledger.sqlite3");
+        // Claude Code 被检测到的前提:`~/.claude/` 存在(hook 注册条件)。
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        // MCP 配置:一个可 wrap 的 stdio server。
+        let initial = json!({"mcpServers": {"fs": {"command": "npx", "args": ["x"]}}});
+        let claude_json = home.join(".claude.json");
+        fs::write(&claude_json, initial.to_string()).unwrap();
+
+        // --all 安装:hook + mcp 一次完成。
+        let (hook_rep, mcp_rep) =
+            run_all_with(home, &exe, &ledger, false, false, false, true).unwrap();
+        assert!(hook_rep.changed, "hook 应写入 settings.json");
+        assert_eq!(mcp_rep.changed, 1, "user-scope MCP server 应被 wrap");
+
+        // hook 真落 settings.json(含 Vigil 托管 sentinel)。
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(home.join(".claude").join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            settings.to_string().contains("vigil-managed"),
+            "settings.json 应含 Vigil 托管 hook"
+        );
+        // mcp server 真被改写(command 变 wrap exe + 带 sentinel)。
+        let claude: Value =
+            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        let fs_args = claude["mcpServers"]["fs"]["args"].as_array().unwrap();
+        assert!(
+            fs_args.iter().any(|a| a == "--vigil-managed-mcp"),
+            "MCP server 应被 wrap(带 sentinel)"
+        );
+
+        // --all 卸载:两者都被撤销。
+        let (hook_rep2, mcp_rep2) =
+            run_all_with(home, &exe, &ledger, true, false, false, true).unwrap();
+        assert!(hook_rep2.changed, "hook 应被移除");
+        assert_eq!(mcp_rep2.changed, 1, "mcp wrap 应被还原");
+        // .claude.json 逐字还原回初始(self-describing unwrap)。
+        let restored: Value =
+            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(restored, initial, "uninstall 后 MCP 配置与初始一致");
+    }
+
+    #[test]
+    fn run_all_dry_run_writes_nothing() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let exe = home.join("vigil-hub");
+        fs::write(&exe, b"x").unwrap();
+        let ledger = home.join("ledger.sqlite3");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        let initial = json!({"mcpServers": {"fs": {"command": "npx", "args": ["x"]}}});
+        let claude_json = home.join(".claude.json");
+        fs::write(&claude_json, initial.to_string()).unwrap();
+
+        let (hook_rep, _mcp_rep) =
+            run_all_with(home, &exe, &ledger, false, true, false, true).unwrap();
+        assert!(hook_rep.dry_run, "dry_run 应透传");
+        // settings.json 不应被创建,.claude.json 不应被改。
+        assert!(
+            !home.join(".claude").join("settings.json").exists(),
+            "dry-run 不得写 settings.json"
+        );
+        let after: Value =
+            serde_json::from_str(&fs::read_to_string(&claude_json).unwrap()).unwrap();
+        assert_eq!(after, initial, "dry-run 不得改 .claude.json");
+    }
+
+    #[test]
+    fn run_all_partial_failure_reports_hook_applied_when_mcp_step_fails() {
+        // hook 成功、MCP 步失败 → AllError::McpAfterHook(携 hook 报告),绝不吞掉"hook 已应用"。
+        // 构造:有效 ~/.claude/(hook 可写)+ **损坏** ~/.claude.json(run_apply 读它即 MalformedConfig)。
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let exe = home.join("vigil-hub");
+        fs::write(&exe, b"x").unwrap();
+        let ledger = home.join("ledger.sqlite3");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        // 损坏的 MCP 配置 → run_apply 的 read_claude_json 报 MalformedConfig。
+        fs::write(home.join(".claude.json"), "{ this is not valid json").unwrap();
+
+        let err =
+            run_all_with(home, &exe, &ledger, false, false, false, true).expect_err("MCP 步应失败");
+        match err {
+            AllError::McpAfterHook { hook, source } => {
+                assert!(hook.changed, "hook 步应已成功应用(半应用状态须如实携带)");
+                assert!(
+                    home.join(".claude").join("settings.json").exists(),
+                    "hook 真写了 settings.json"
+                );
+                assert!(
+                    matches!(source, SetupError::MalformedConfig { .. }),
+                    "MCP 失败原因应为 MalformedConfig,得到 {source:?}"
+                );
+            }
+            AllError::Hook(e) => {
+                panic!("hook 不该失败(它读的是 settings.json 非 .claude.json):{e:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn run_all_uninstall_partial_failure_reports_hook_removed_when_mcp_step_fails() {
+        // 镜像:先正常 install 两者,再损坏 .claude.json,再 uninstall → hook 移除成功、MCP 步失败
+        // → McpAfterHook(hook.changed=true 表已移除)。锁定 uninstall-partial 状态与恢复路径(Codex D13 R2)。
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let exe = home.join("vigil-hub");
+        fs::write(&exe, b"x").unwrap();
+        let ledger = home.join("ledger.sqlite3");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        let claude_json = home.join(".claude.json");
+        fs::write(
+            &claude_json,
+            json!({"mcpServers": {"fs": {"command": "npx", "args": ["x"]}}}).to_string(),
+        )
+        .unwrap();
+
+        // 正常 install 两者(hook 写入 settings.json + mcp wrap)。
+        run_all_with(home, &exe, &ledger, false, false, false, true).unwrap();
+        assert!(home.join(".claude").join("settings.json").exists());
+
+        // 损坏 .claude.json → 随后 uninstall 的 MCP 步(read_claude_json)失败。
+        fs::write(&claude_json, "}{ broken").unwrap();
+
+        let err =
+            run_all_with(home, &exe, &ledger, true, false, false, true).expect_err("MCP 步应失败");
+        match err {
+            AllError::McpAfterHook { hook, source } => {
+                assert!(hook.changed, "hook 已被移除(uninstall 改了 settings.json)");
+                assert!(
+                    matches!(source, SetupError::MalformedConfig { .. }),
+                    "MCP uninstall 失败原因应为 MalformedConfig,得到 {source:?}"
+                );
+            }
+            AllError::Hook(e) => panic!("hook uninstall 不该失败:{e:?}"),
+        }
     }
 }
