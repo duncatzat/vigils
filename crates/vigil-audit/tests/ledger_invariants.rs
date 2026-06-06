@@ -22,6 +22,29 @@ use serde_json::json;
 use tempfile::tempdir;
 use vigil_audit::{AuditError, Ledger, RESERVED_EVENT_PREFIXES};
 
+/// (0) D15 真机 E2E 回归:`Ledger::open` 必须**自建账本父目录**。SQLite 只建文件不建目录,
+/// 默认账本路径 `<data>/Vigil/ledger.sqlite3` 的 `Vigil/` 子目录在首跑机器上不存在 → 不建即
+/// `unable to open database file` = turnkey 首跑静默坏掉(隔离 HOME 真 E2E 暴露)。
+#[test]
+fn open_creates_missing_parent_dirs() {
+    let dir = tempdir().unwrap();
+    // 多层均不存在的父目录(模拟首跑 `.local/share/Vigil/`)。
+    let path = dir
+        .path()
+        .join("a")
+        .join("b")
+        .join("Vigil")
+        .join("ledger.sqlite3");
+    assert!(!path.parent().unwrap().exists(), "前置:父目录不存在");
+    let l = Ledger::open(&path).expect("open 应自建父目录并成功");
+    assert!(path.exists(), "账本文件已创建");
+    // 真能用(写一条 + verify)。
+    let sid = l.start_session("t", None).unwrap();
+    l.append_event(&sid, "x", &json!({"n": 1}), Some("n1"))
+        .unwrap();
+    l.verify_chain().unwrap();
+}
+
 /// (1) append_event 基本往返:新增后计数 +1,hash 非空,verify_chain OK。
 #[test]
 fn append_event_round_trip() {

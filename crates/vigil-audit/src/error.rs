@@ -10,6 +10,10 @@ pub enum AuditError {
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// 文件系统 IO 错误(如开库前 `create_dir_all` 建账本父目录失败)。
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+
     /// JSON 规范化或反序列化错误(影响 hash 计算)。
     #[error("json canonicalization: {0}")]
     Json(#[from] serde_json::Error),

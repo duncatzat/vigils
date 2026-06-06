@@ -8,6 +8,22 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.22] — 2026-06-06
+
+Fixes the very first protected run on a fresh machine — the audit ledger now creates its own
+data directory instead of failing to open.
+
+### Fixed
+
+- **First run on a clean machine no longer fails to open the audit ledger.** On a machine where
+  Vigil had never written its data directory yet (`~/.local/share/Vigil/` on Linux,
+  `%LOCALAPPDATA%\Vigil\` on Windows), the very first protected tool call tried to open the audit
+  ledger at a path whose parent directory didn't exist and failed with
+  `unable to open database file`. The ledger now creates any missing parent directories before
+  opening, so the turnkey flow works on a brand-new install with no manual `mkdir`. (Found by
+  running the full `setup --all` → wrapped MCP server → audit loop end-to-end on a fresh machine —
+  the directory always already existed on developer machines, so no prior test surfaced it.)
+
 ## [v0.1.21] — 2026-06-06
 
 Fixes the Linux CLI so it actually runs on Ubuntu 22.04 LTS, Debian 12, and most current

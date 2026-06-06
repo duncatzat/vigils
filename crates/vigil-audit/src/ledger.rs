@@ -234,7 +234,19 @@ pub struct ReplayEvent {
 
 impl Ledger {
     /// 打开一个磁盘账本;不存在则创建并建表。
+    ///
+    /// **先建父目录**(D15 真机 E2E 发现):SQLite `Connection::open` 只建**文件**不建**目录**,
+    /// 而默认账本路径 `<data 目录>/Vigil/ledger.sqlite3` 的 `Vigil/` 子目录在**首跑机器上不存在**
+    /// (无人预建)→ 第一个打开默认账本的进程(`wrap`/`serve`/`hook`)直接 `unable to open database
+    /// file` 失败 = turnkey 首跑静默坏掉。开库前 `create_dir_all(parent)` 兜底(fail-safe;父目录是
+    /// 用户自己的 data 目录,无安全副作用);目录已存在则 no-op。
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
         let conn = Connection::open(path)?;
         Self::init(conn)
     }
