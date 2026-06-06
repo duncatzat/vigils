@@ -62,11 +62,34 @@ pub enum StdioError {
     /// `SUPPORTED_PROTOCOL_VERSIONS`)。按 MCP spec 客户端遇此应断开 → fail-closed
     /// (Codex review SHOULD-FIX:此前硬编码版本且忽略协商结果,对仅支持旧版/未来漂移的
     /// server 有互操作风险)。
-    #[error("upstream negotiated unsupported MCP protocol version: {negotiated}")]
+    #[error("upstream negotiated unsupported MCP protocol version: {}", safe_protocol_version(.negotiated))]
     ProtocolVersionUnsupported {
-        /// server 在 `initialize` 响应里回的版本
+        /// server 在 `initialize` 响应里回的版本(不可信上游输入;Display 经 `safe_protocol_version`
+        /// 净化后才渲染,字段本身保留原值供程序判定)。
         negotiated: String,
     },
+}
+
+/// `ProtocolVersionUnsupported.negotiated` 的 Display 净化(Codex D18 R2 Medium):该值来自上游
+/// `initialize` 响应、属**不可信输入**,可能被恶意 server 塞入任意字节(含 secret)。`Display` 经任何
+/// `{e}` 格式化会流入本进程 stderr(serve/wrap 诊断)或 doctor `--probe` 失败原因。合法 protocolVersion
+/// 是短日期串(如 `2025-06-18`),故仅在「短 + 安全字符集」时原样显示(保诊断价值),否则降级为 sha256
+/// 指纹(绝不渲染原始字节)。与 `StdioError::Upstream` 的 `message` 指纹化同源思路。
+///
+/// 安全字符集**刻意排除字母**:合法 MCP protocolVersion 是纯数字日期串(`2025-06-18`),而绝大多数
+/// secret 含字母 —— 故只放行「短 + 仅数字/`-`/`.`」者原样显示,其余(含任何字母/异常字符/超长)一律
+/// 指纹化。即便一个 ≤20 位纯数字串理论上可能是 secret,渲染纯数字 token 的泄漏价值也极低(Codex R2)。
+fn safe_protocol_version(negotiated: &str) -> String {
+    let safe = !negotiated.is_empty()
+        && negotiated.len() <= 20
+        && negotiated
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | '.'));
+    if safe {
+        negotiated.to_string()
+    } else {
+        format!("sha256:{}", upstream_message_fingerprint(negotiated))
+    }
 }
 
 /// 把不可信的上游错误 `message` 折叠成 sha256 指纹供 `StdioError::Upstream` 的 `Display`。
@@ -171,6 +194,44 @@ fn is_executable_file(p: &std::path::Path) -> bool {
     }
 }
 
+/// **Doctor 深度探测(D18)**:真 spawn 一个 stdio 上游 + 完成 MCP `initialize` 握手,
+/// **返回真实握手结果**后立即关停 —— 仅验证"该 server 在本环境真能起来并说 MCP",**不 attach、
+/// 不建 descriptor 基线、不改任何 drift 状态**。与 [`Hub::spawn_attach_stdio_upstream`](握手失败
+/// 仍 attach、优雅降级)**有意分叉**:doctor 要的是诊断结论,故握手失败必须如实返出。
+///
+/// 进程在函数返回(`upstream` 离开作用域 → `Drop` → `shutdown_raw`)时 **kill + wait 直接子进程**。
+/// **限界(Codex D18 R2 Medium)**:只 kill 直接子进程,**不强制 contain 其后代**。`npx`/`uvx` 这类
+/// 启动器会再 spawn `node`/解释器孙进程;正常 MCP server 在其 stdin 关闭(随父被 kill)时会自行退出,
+/// 但一个行为异常的孙进程可能短暂存活(未做 Unix process-group / Windows Job Object 容器化 —— 作为
+/// 后续硬化项跟踪)。probe 是 opt-in 且短时,故此限界可接受。
+///
+/// env 走与真实运行**完全相同**的 [`StdioUpstream::spawn_resolved`](MCP upstream env 政策:
+/// env_clear → 非敏感运行时白名单 → 批准 user_env),故 probe 忠实复现 agent 真实启动该 server 的条件。
+///
+/// **副作用警示**:本函数会真启动 server 进程(执行其 init 代码)。仅在用户显式 `--probe` 时调用;
+/// 默认 doctor 保持纯静态、无副作用。`timeout` 对慢/挂起 server 设上界,防诊断被拖住。
+///
+/// # Errors
+/// - [`StdioError::ProgramNotFound`]:`argv[0]` 不在 PATH(与静态 doctor `resolve_program` 同源)
+/// - [`StdioError::Spawn`]:`argv` 为空 / 进程起不来
+/// - [`StdioError::Timeout`] / [`StdioError::Protocol`] / [`StdioError::ProtocolVersionUnsupported`] /
+///   [`StdioError::Upstream`]:server 起来了但未在 `timeout` 内完成合法 MCP `initialize` 握手
+pub fn probe_stdio_initialize(
+    server_id: &str,
+    argv: &[String],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Result<(), StdioError> {
+    let program = argv
+        .first()
+        .ok_or_else(|| StdioError::Spawn(std::io::Error::other("probe: empty argv")))?;
+    let resolved = resolve_program(program)?;
+    // spawn_resolved 应用 MCP upstream env 政策(与真实运行一致);upstream 在函数末尾 drop → kill+wait。
+    // forward_diagnostics=false:probe 不转发上游 stderr/parse 错误(消除 env 值回显泄漏面;Codex R1)。
+    let upstream = StdioUpstream::spawn_resolved(server_id, resolved, &argv[1..], env, false)?;
+    upstream.initialize_handshake(timeout)
+}
+
 /// 一个上游 stdio server 的连接。
 pub struct StdioUpstream {
     server_id: String,
@@ -213,6 +274,12 @@ impl StdioUpstream {
         program: std::path::PathBuf,
         argv_tail: &[String],
         env: &[(String, String)],
+        // `forward_diagnostics`:是否把上游 stderr / stdout 解析错误转发到本进程 stderr。
+        // serve/wrap = true(运维需看上游诊断,已过 scrub)。**doctor `--probe` = false**:probe 用
+        // 用户真实 env 值启动 server,而 server 可能在自己 stderr 回显该 env 值(非硬指纹形态,scrub
+        // 抓不住)→ 转发即泄漏。probe 不需要上游 stderr(只看 initialize 成败),故全程吞掉(仍 drain
+        // 管道防子进程 stderr 缓冲写满阻塞),消除该泄漏面(Codex D18 R1 High)。
+        forward_diagnostics: bool,
     ) -> Result<Self, StdioError> {
         let mut cmd = Command::new(program);
         for a in argv_tail {
@@ -287,9 +354,14 @@ impl StdioUpstream {
                                 // 但上游如果连续坏很快触发 Eof。
                                 // `ProtocolError` 的 Display 可能内嵌上游原始字节(malformed
                                 // JSON 片段);先过硬指纹 scrub 再转发,避免 server 输出里的
-                                // secret 经本进程 stderr 外泄。
-                                let safe = vigil_redaction::scrub_text(&e.to_string());
-                                eprintln!("[vigil-hub upstream {tag}] stdio parse error: {safe}");
+                                // secret 经本进程 stderr 外泄。probe(forward_diagnostics=false)
+                                // 全程不转发(消除 env 值回显泄漏面,Codex D18 R1 High)。
+                                if forward_diagnostics {
+                                    let safe = vigil_redaction::scrub_text(&e.to_string());
+                                    eprintln!(
+                                        "[vigil-hub upstream {tag}] stdio parse error: {safe}"
+                                    );
+                                }
                                 // 继续循环:下一个 read_line 会消费下一行
                                 continue;
                             }
@@ -310,13 +382,18 @@ impl StdioUpstream {
                 .name(format!("vigil-mcp-stdio-stderr-{tag}"))
                 .spawn(move || {
                     let r = BufReader::new(stderr);
+                    // **始终 drain**(读完每一行)防子进程 stderr 缓冲写满阻塞;**是否转发**由
+                    // forward_diagnostics 决定。probe(false)全程吞掉:server 可能在 stderr 回显
+                    // 注入的真实 env 值(非硬指纹形态,scrub 抓不住),转发即泄漏(Codex D18 R1 High)。
                     for line in r.lines().map_while(Result::ok) {
-                        // 上游 MCP server 的 stderr 可能记录它收到的凭证(如
-                        // "authenticated with ghp_…")。wrap/serve 把 Vigil 置于中间,原样转发
-                        // 会二次扩大泄漏面(可能被 agent harness 捕获)。过硬指纹 scrub:保留
-                        // 可读诊断、遮蔽已知 secret 形态(redaction-first 边界,见 scrub_text)。
-                        let safe = vigil_redaction::scrub_text(&line);
-                        eprintln!("[upstream {tag}] {safe}");
+                        if forward_diagnostics {
+                            // 上游 MCP server 的 stderr 可能记录它收到的凭证(如
+                            // "authenticated with ghp_…")。wrap/serve 把 Vigil 置于中间,原样转发
+                            // 会二次扩大泄漏面(可能被 agent harness 捕获)。过硬指纹 scrub:保留
+                            // 可读诊断、遮蔽已知 secret 形态(redaction-first 边界,见 scrub_text)。
+                            let safe = vigil_redaction::scrub_text(&line);
+                            eprintln!("[upstream {tag}] {safe}");
+                        }
                     }
                 })
                 .ok();
@@ -561,6 +638,59 @@ mod resolve_program_tests {
             .expect("absolute path to existing binary must resolve");
         assert!(again.is_absolute() && again.exists());
     }
+
+    // ──────────────── D18 doctor 深度探测:失败路径(无外部依赖) ────────────────
+    #[test]
+    fn probe_nonexistent_program_returns_program_not_found() {
+        let err = super::probe_stdio_initialize(
+            "doctor-probe-test",
+            &["vigil_definitely_not_a_real_command_xyz".to_string()],
+            &[],
+            std::time::Duration::from_millis(500),
+        )
+        .expect_err("probing a non-existent program must fail (same source as static doctor)");
+        assert!(
+            matches!(err, StdioError::ProgramNotFound { .. }),
+            "must be ProgramNotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn probe_empty_argv_errors() {
+        let err = super::probe_stdio_initialize(
+            "doctor-probe-test",
+            &[],
+            &[],
+            std::time::Duration::from_millis(500),
+        )
+        .expect_err("empty argv must error");
+        assert!(matches!(err, StdioError::Spawn(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn probe_non_mcp_program_fails_within_timeout_and_cleans_up() {
+        // SYSTEM_CMD(sh/cmd)会启动但**不说 MCP** —— 不回 initialize 响应 → probe 必须在超时内返
+        // Err(而非挂死),并在返回时已 kill 子进程(StdioUpstream::Drop → shutdown_raw)。
+        let start = std::time::Instant::now();
+        let err = super::probe_stdio_initialize(
+            "doctor-probe-test",
+            &[SYSTEM_CMD.to_string()],
+            &[],
+            std::time::Duration::from_millis(700),
+        )
+        .expect_err("a non-MCP program must not complete an MCP initialize handshake");
+        let elapsed = start.elapsed();
+        // 不挂:应在 timeout + 合理裕量内返回(宿主慢 spawn 留 5s 裕量)。
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "probe must not hang; took {elapsed:?}"
+        );
+        // 程序存在故失败必是握手失败(Timeout/Protocol/Eof…),**不**是 ProgramNotFound。
+        assert!(
+            !matches!(err, StdioError::ProgramNotFound { .. }),
+            "program exists → failure must be a handshake failure, not ProgramNotFound: {err:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -600,5 +730,32 @@ mod display_redaction_tests {
             shown.contains(&expect),
             "指纹须为 message 的 sha256: {shown}"
         );
+    }
+
+    /// Codex D18 R2 Medium 守门:`ProtocolVersionUnsupported` 的 `negotiated` 来自不可信上游 initialize
+    /// 响应。合法短日期串原样显示(诊断);含异常字符 / 超长(可能藏 secret)的降级为 sha256 指纹,
+    /// **绝不**原样渲染上游字节。
+    #[test]
+    fn protocol_version_display_sanitizes_untrusted_negotiated() {
+        // 1) 合法版本:原样显示(诊断价值)
+        let ok = StdioError::ProtocolVersionUnsupported {
+            negotiated: "2099-01-01".to_string(),
+        }
+        .to_string();
+        assert!(ok.contains("2099-01-01"), "合法版本应原样显示: {ok}");
+        assert!(!ok.contains("sha256:"), "合法版本不该被指纹化: {ok}");
+
+        // 2) 恶意/异常 negotiated(内嵌 secret + 非安全字符)→ 指纹化,不泄漏
+        let secret = "ghp_1234567890abcdef1234567890abcdef12345678 leaked!";
+        let bad = StdioError::ProtocolVersionUnsupported {
+            negotiated: secret.to_string(),
+        }
+        .to_string();
+        assert!(!bad.contains(secret), "不得原样渲染上游字节: {bad}");
+        assert!(
+            !bad.contains("ghp_1234567890abcdef1234567890abcdef12345678"),
+            "不得泄漏 secret 形态: {bad}"
+        );
+        assert!(bad.contains("sha256:"), "异常 negotiated 应降级指纹: {bad}");
     }
 }

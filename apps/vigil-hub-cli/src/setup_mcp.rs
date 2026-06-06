@@ -35,11 +35,18 @@
 //! - 分类 + argv 构造是**纯函数**(fixture 可测),IO 边界(读真实文件)单独一层 —— 单测**绝不**碰真实配置。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::setup::SetupError;
+
+/// `setup --mcp --doctor --probe` 每 server 的 MCP `initialize` 握手上界。
+/// 取较宽松值:`npx`/`uvx` server **首次**启动会下载包(冷缓存可能数十秒)—— 同样的延迟 agent
+/// 真实首启也会遇到,故 probe 超时本身是有用信号(慢=坏首启体验),但默认给足时间避免对冷缓存
+/// 误报 FAIL。caller 可经 `--probe` 触发;默认 doctor 纯静态不调用本路径。
+pub const DOCTOR_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `~/.claude.json` 解析允许的最大字节(防病态超大文件 OOM;真实文件含会话历史可达数十 MB)。
 const MAX_CLAUDE_JSON_BYTES: u64 = 256 * 1024 * 1024;
@@ -705,6 +712,21 @@ pub enum DoctorStatus {
     Malformed,
 }
 
+/// `--probe` 深度探测结果(真 spawn server + MCP `initialize` 握手)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// **底层 server** 真启动并在超时内完成合法 MCP `initialize` 握手。注:这只证明底层 server 能
+    /// 起 + 说 MCP;对已 vigil-wrapped 条目,真实网关启动还会强制 descriptor drift gate(probe 刻意
+    /// 不走),故 Initialized **不等同**"agent 一定见到工具"(Codex D18 R2)。
+    Initialized,
+    /// server 起来了但未完成握手(超时 / 不说 MCP / 协议不兼容)→ agent 会看不到它的工具。
+    /// `reason` 已过 value-aware 脱敏 + `scrub_text`(上游错误可能含 secret 片段)。
+    Failed {
+        /// 脱敏后的失败原因(诊断用,不含明文 secret)。
+        reason: String,
+    },
+}
+
 /// `setup --mcp --doctor` 的单行结果。
 #[derive(Debug, Clone)]
 pub struct McpDoctorRow {
@@ -714,8 +736,10 @@ pub struct McpDoctorRow {
     pub scope: String,
     /// 是否 Vigil 托管(已 wrap)。未托管的也检查(预告它若被 wrap 能否启动)。
     pub wrapped: bool,
-    /// 诊断结论。
+    /// 静态诊断结论(PATH 可解析性)。
     pub status: DoctorStatus,
+    /// `--probe` 深度探测结果;`None` = 未探测(默认静态档 / 静态判定就起不来 / Skipped/Malformed)。
+    pub probe: Option<ProbeOutcome>,
 }
 
 /// 从一个 server 条目取**底层 stdio 程序**(供 doctor 解析)。纯函数(可单测,不碰 PATH/FS)。
@@ -737,8 +761,78 @@ fn doctor_target_for(name: &str, entry: &Value) -> Result<(String, bool), Doctor
     }
 }
 
+/// probe 失败原因的 **value-aware** 脱敏(Codex D18 R1 High 防御):probe 用用户真实 env **值**启动
+/// server,失败原因(如 server 回的 malformed JSON 内嵌该值)可能带出 env 值,而这些值未必是硬指纹
+/// 形态(`scrub_text` 抓不住)。先按**注入的精确 env 值**逐个子串替换(我们确知它们就是要遮的),再过
+/// `scrub_text` 兜硬指纹。过度遮蔽(短值)只影响诊断可读性、不泄漏 —— 安全优先。
+fn redact_probe_reason(raw: &str, env: &[(String, String)]) -> String {
+    let mut s = raw.to_string();
+    for (_, v) in env {
+        if !v.is_empty() {
+            s = s.replace(v.as_str(), "[REDACTED env-value]");
+        }
+    }
+    vigil_redaction::scrub_text(&s)
+}
+
+/// 从一个条目的 `env` 对象抽 `(key, value)` 对(probe 真 spawn 时注入子进程,同真实运行)。
+/// 非字符串值跳过。**仅 probe 内部用**;绝不进日志/审计(probe 失败 reason 走 `redact_probe_reason`)。
+fn entry_env_pairs(entry: &Value) -> Vec<(String, String)> {
+    entry
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// probe 真 spawn 所需的 `(完整 argv, env 键值对)`。
+type ProbeArgvEnv = (Vec<String>, Vec<(String, String)>);
+
+/// 取**可 spawn 的完整 argv + env**(`--probe` 用,与真实启动该 server 一致)。
+/// `Wrappable` = 原 `command` + `args`;`AlreadyWrapped` = `unwrap_entry` 还原原始 argv;
+/// 两者 env 都从(还原后的)条目 `env` 取。`None` = Skipped/Malformed(不探测)。
+fn doctor_probe_argv_env(name: &str, entry: &Value) -> Option<ProbeArgvEnv> {
+    match classify_one(name, entry) {
+        McpServerClass::Wrappable { command, args, .. } => {
+            let mut argv = Vec::with_capacity(1 + args.len());
+            argv.push(command);
+            argv.extend(args);
+            Some((argv, entry_env_pairs(entry)))
+        }
+        McpServerClass::AlreadyWrapped { .. } => {
+            let inner = unwrap_entry(entry)?;
+            let command = inner.get("command").and_then(Value::as_str)?.to_string();
+            let args: Vec<String> = inner
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut argv = Vec::with_capacity(1 + args.len());
+            argv.push(command);
+            argv.extend(args);
+            Some((argv, entry_env_pairs(&inner)))
+        }
+        McpServerClass::Skipped { .. } => None,
+    }
+}
+
 /// 对一个条目产出 doctor 行:取底层程序 → 用网关同款 `resolve_program` 验 PATH 可解析。
-fn doctor_row(name: &str, scope: &str, entry: &Value) -> McpDoctorRow {
+/// `probe_timeout=Some(..)` 且静态判定 `Launchable` 时,**额外**真 spawn + MCP `initialize` 握手
+/// (深度探测;`--probe`)。静态判定就起不来(`ProgramNotFound`)的不浪费一次 spawn。
+fn doctor_row(
+    name: &str,
+    scope: &str,
+    entry: &Value,
+    probe_timeout: Option<Duration>,
+) -> McpDoctorRow {
     let (status, wrapped) = match doctor_target_for(name, entry) {
         Ok((program, wrapped)) => {
             let st = match vigil_mcp::stdio::resolve_program(&program) {
@@ -756,17 +850,44 @@ fn doctor_row(name: &str, scope: &str, entry: &Value) -> McpDoctorRow {
             (skip_or_malformed, wrapped)
         }
     };
+    // 深度探测:仅当显式 --probe 且静态判定可启动时才真 spawn(side-effectful,见 probe_stdio_initialize)。
+    let probe = match (probe_timeout, &status) {
+        (Some(timeout), DoctorStatus::Launchable { .. }) => {
+            doctor_probe_argv_env(name, entry).map(|(argv, env)| {
+                // server_id 仅作 probe 进程的 reader 线程标签(不持久化/不入账本/不走 namespace 校验);
+                // 用 name 即可。失败原因走 value-aware 脱敏(按注入的精确 env 值)+ scrub(Codex R1 High)。
+                match vigil_mcp::stdio::probe_stdio_initialize(name, &argv, &env, timeout) {
+                    Ok(()) => ProbeOutcome::Initialized,
+                    Err(e) => ProbeOutcome::Failed {
+                        reason: redact_probe_reason(&e.to_string(), &env),
+                    },
+                }
+            })
+        }
+        _ => None,
+    };
     McpDoctorRow {
         name: name.to_string(),
         scope: scope.to_string(),
         wrapped,
         status,
+        probe,
     }
 }
 
 /// `setup --mcp --doctor`:读真实 `~/.claude.json` → 对 user + local scope 每个 MCP server 做启动预检。
-/// 纯静态(不 spawn);`home` 注入 → 测试走 fixture 绝不碰真实配置。无配置文件 → 空 Vec(诚实:没东西可查)。
-pub fn run_doctor(home: &Path) -> Result<Vec<McpDoctorRow>, SetupError> {
+///
+/// `probe_timeout`:
+/// - `None`(默认 `--doctor`):**纯静态**(只验 `resolve_program` PATH 可解析,不 spawn,无副作用/无延迟)。
+/// - `Some(timeout)`(`--doctor --probe`):对静态判定可启动者**额外**真 spawn + MCP `initialize` 握手,
+///   逐 server 设 `timeout` 上界 —— 抓"程序在 PATH 但运行时起不来/不说 MCP"(D15 实证的 turnkey 头号
+///   静默失败)。**有副作用**(真启动每个 server 进程片刻);每个 server 顺序探测。
+///
+/// `home` 注入 → 测试走 fixture 绝不碰真实配置。无配置文件 → 空 Vec(诚实:没东西可查)。
+pub fn run_doctor(
+    home: &Path,
+    probe_timeout: Option<Duration>,
+) -> Result<Vec<McpDoctorRow>, SetupError> {
     let path = claude_json_path(home);
     let cfg = match read_claude_json(&path)? {
         Some(v) => v,
@@ -776,7 +897,7 @@ pub fn run_doctor(home: &Path) -> Result<Vec<McpDoctorRow>, SetupError> {
     // user scope(顶层 mcpServers)
     if let Some(servers) = cfg.get("mcpServers").and_then(Value::as_object) {
         for (name, entry) in servers {
-            rows.push(doctor_row(name, "user", entry));
+            rows.push(doctor_row(name, "user", entry, probe_timeout));
         }
     }
     // local scope(projects.<path>.mcpServers)
@@ -784,7 +905,7 @@ pub fn run_doctor(home: &Path) -> Result<Vec<McpDoctorRow>, SetupError> {
         for (proj_path, proj) in projects {
             if let Some(servers) = proj.get("mcpServers").and_then(Value::as_object) {
                 for (name, entry) in servers {
-                    rows.push(doctor_row(name, proj_path, entry));
+                    rows.push(doctor_row(name, proj_path, entry, probe_timeout));
                 }
             }
         }
@@ -1441,7 +1562,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = run_doctor(home).unwrap();
+        let rows = run_doctor(home, None).unwrap();
         let by = |n: &str| &rows.iter().find(|r| r.name == n).unwrap().status;
         assert!(
             matches!(by("good"), DoctorStatus::Launchable { .. }),
@@ -1478,7 +1599,7 @@ mod tests {
             json!({ "mcpServers": { "fs": wrapped } }).to_string(),
         )
         .unwrap();
-        let rows = run_doctor(home).unwrap();
+        let rows = run_doctor(home, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].wrapped, "应识别为 Vigil 托管");
         assert!(
@@ -1490,7 +1611,94 @@ mod tests {
     #[test]
     fn run_doctor_empty_when_no_config() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(run_doctor(dir.path()).unwrap().is_empty());
+        assert!(run_doctor(dir.path(), None).unwrap().is_empty());
+    }
+
+    // ──────────────── D18 --probe:可 spawn argv+env 提取(纯函数,无 spawn) ────────────────
+    #[test]
+    fn doctor_probe_argv_env_wrappable_extracts_full_argv_and_string_env() {
+        let entry = json!({
+            "command": "node",
+            "args": ["server.js", "--flag"],
+            "env": { "API_TOKEN": "ghp_secret", "PORT": 8080, "MODE": "prod" }
+        });
+        let (argv, env) = doctor_probe_argv_env("srv", &entry).expect("wrappable → Some");
+        assert_eq!(
+            argv,
+            vec!["node", "server.js", "--flag"],
+            "完整 argv = command + args"
+        );
+        // env:仅字符串值入对(PORT=8080 非字符串被跳过);键序按 serde_json 对象迭代。
+        let mut keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["API_TOKEN", "MODE"], "非字符串 env 值跳过");
+        assert!(
+            env.iter()
+                .any(|(k, v)| k == "API_TOKEN" && v == "ghp_secret"),
+            "字符串 env 值逐字保留(供真 spawn,同真实运行)"
+        );
+    }
+
+    #[test]
+    fn doctor_probe_argv_env_already_wrapped_unwraps_inner() {
+        // 已包裹 server:probe 必须 spawn **内部真实程序**(unwrap 还原),而非 vigil-hub。
+        let wrapped = wrap_entry(
+            &json!({"command": "uvx", "args": ["mcp-server-git"], "env": {"GIT_TOKEN": "t0ken"}}),
+            "vigil-hub",
+            "git",
+            "uvx",
+            &["mcp-server-git".into()],
+            &[],
+            true,
+        );
+        let (argv, env) = doctor_probe_argv_env("git", &wrapped).expect("already-wrapped → Some");
+        assert_eq!(
+            argv,
+            vec!["uvx", "mcp-server-git"],
+            "应还原内部 argv,而非 vigil-hub wrap"
+        );
+        assert!(
+            env.iter().any(|(k, v)| k == "GIT_TOKEN" && v == "t0ken"),
+            "wrap 保留的原 env 仍可被 probe 取到"
+        );
+    }
+
+    #[test]
+    fn doctor_probe_argv_env_skipped_returns_none() {
+        let http = json!({ "type": "http", "url": "https://mcp.example.com/" });
+        assert!(
+            doctor_probe_argv_env("remote", &http).is_none(),
+            "remote/http 无底层 stdio 程序 → 不探测"
+        );
+    }
+
+    #[test]
+    fn entry_env_pairs_skips_non_string_and_handles_missing() {
+        assert!(
+            entry_env_pairs(&json!({"command": "x"})).is_empty(),
+            "无 env → 空"
+        );
+        let pairs = entry_env_pairs(&json!({"env": {"A": "1", "B": true, "C": "3"}}));
+        let mut keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["A", "C"], "非字符串值跳过");
+    }
+
+    #[test]
+    fn redact_probe_reason_value_aware_redacts_injected_env_secret() {
+        // Codex D18 R1 High:server 在失败诊断里回显注入的 env **值**(非硬指纹形态,scrub 抓不住),
+        // 必须按精确值遮蔽。这里的 secret 是任意非指纹字符串,scrub_text 单独不会动它。
+        let secret = "correct-horse-battery-staple-not-a-fingerprint";
+        let env = vec![("MY_SECRET".to_string(), secret.to_string())];
+        let raw = format!("upstream said: failed to auth with {secret} during init");
+        let out = redact_probe_reason(&raw, &env);
+        assert!(!out.contains(secret), "注入的 env 值必须被遮蔽:{out}");
+        assert!(out.contains("[REDACTED env-value]"), "应有遮蔽占位:{out}");
+        // 空 env 值不参与替换;硬指纹仍由 scrub 兜底。
+        let env2 = vec![("EMPTY".to_string(), String::new())];
+        let gh = "ghp_aBcD1234567890aBcD1234567890aBcD1234";
+        let out2 = redact_probe_reason(&format!("leaked {gh}"), &env2);
+        assert!(!out2.contains(gh), "硬指纹仍由 scrub 兜底:{out2}");
     }
 
     // ---------------- setup --all(统一接入)----------------

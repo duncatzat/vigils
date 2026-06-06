@@ -8,6 +8,25 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.24] — 2026-06-07
+
+新增深度健康检查:真启动每个 MCP server 确认它能跑 —— 而不只是确认其程序已安装。
+
+### 新增
+
+- **`vigil-hub setup --mcp --doctor --probe` —— 验证每个 MCP server 真能起来。** 现有 `--doctor` 是
+  静态的:只检查每个 server 的程序(如 `npx`、`uvx`)能否在 `PATH` 解析。但最常见的静默失败是程序
+  *已安装*却在运行时起不来 —— 包拉不动、server 启动即崩、或不说 MCP —— 而你的 agent 只是静默地看不到
+  它的任何工具。`--probe` 更进一步:对每个通过静态检查的 server,它会**短暂启动该 server 并完成一次真
+  实的 MCP `initialize` 握手**,随后停止,并逐 server 报告 `[OK]` / `FAILED to initialize`。它是可选
+  开启的,因为会执行每个 server 的启动代码;不带 `--probe` 的 `--doctor` 保持纯静态、无副作用。
+  (`npx`/`uvx` server 首次探测可能因下载包而超时 —— 暖缓存后重跑即可。)
+
+### 安全
+
+- 探测从不转发被启动 server 的 stderr(故一个在启动时回显配置 secret 的 server 不会经 doctor 泄漏),
+  把配置的精确 env 值从任何失败信息里遮蔽,并对不可信的协议版本串做指纹化而非原样打印。
+
 ## [v0.1.23] — 2026-06-06
 
 修复 secret 以 `KEY=value` 形式出现时,脱敏占位符可能畸形的问题(外观损坏但 secret 本身始终被

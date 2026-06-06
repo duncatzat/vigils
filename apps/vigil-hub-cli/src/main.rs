@@ -160,6 +160,14 @@ struct CliSetupArgs {
     /// server 起不来、为什么"(最常见失败 = 程序没装 / 不在 PATH)。**纯静态、只读、不启动任何 server**。
     #[arg(long)]
     doctor: bool,
+    /// 配合 `--doctor`:**深度探测**。对静态判定可启动的 server**真启动**其底层程序 + 完成 MCP
+    /// `initialize` 握手(逐 server 有超时上界),再立即关停。回答静态档答不了的"程序在 PATH 但**运行时**
+    /// 真能起来 + 说 MCP 吗"——抓"装了 Node 但 npx 包拉不动 / server 启动即崩 / 不说 MCP"这类静默失败
+    /// (agent 表现为该 server **零工具**)。**有副作用**:会真启动每个 server 进程片刻(执行其 init 代码),
+    /// 故 opt-in;默认 `--doctor` 保持纯静态无副作用。`npx`/`uvx` server **首次**探测可能因下包慢而超时
+    /// (同 agent 首启;暖缓存后重跑即 OK)。
+    #[arg(long, requires = "doctor")]
+    probe: bool,
     /// **一条命令全保护**:同时接入 hook(原生工具输入侧 secret 拦截)**和** MCP 网关 wrap(脱敏 +
     /// 审计 + 审批 + descriptor pin),兑现"download → 直接得到保护"。等价于 `setup` + `setup --mcp
     /// --apply` 两步合一(两者写不同文件、互不冲突)。`--all --uninstall` 撤销两者;`--all --dry-run`
@@ -396,8 +404,20 @@ fn setup_mcp_dispatch(args: &CliSetupArgs) -> Result<std::process::ExitCode, set
     // 让 turnkey 接入即可用且仍守全部硬地板(详见 CliSetupArgs::enforce doc)。
     let monitor = !args.enforce;
     if args.doctor {
-        // 健壮性预检(纯静态只读;先于 uninstall/apply,与它们互斥语义上不冲突但 doctor 优先)。
-        let rows = setup_mcp::run_doctor(&home)?;
+        // 健壮性预检:默认纯静态只读;`--probe` 升级为深度探测(真 spawn + MCP initialize 握手,
+        // 有副作用,见 CliSetupArgs::probe doc)。先于 uninstall/apply,doctor 优先。
+        let probe_timeout = if args.probe {
+            // Codex D18 R2 Low:probe 真执行每个配置 server 的启动代码 —— 动手**前**(run_doctor 内即
+            // 开始 spawn)在 stderr 明确告警,而非仅 help 文案 / 事后表头。
+            eprintln!(
+                "[vigil-hub] --probe will briefly START each MCP server in ~/.claude.json (runs its \
+                 startup code) to test a real MCP handshake, then stop it. Ctrl-C to abort."
+            );
+            Some(setup_mcp::DOCTOR_PROBE_TIMEOUT)
+        } else {
+            None
+        };
+        let rows = setup_mcp::run_doctor(&home, probe_timeout)?;
         Ok(print_mcp_doctor(&rows))
     } else if args.uninstall {
         let rep = setup_mcp::run_uninstall(&home, args.dry_run)?;
@@ -543,10 +563,18 @@ fn print_setup_all(
 /// **hygiene**(Codex D12 nit):所有展示字段(name/scope/program/resolved)过 `scrub_text` 再输出 ——
 /// argv[0]/路径通常无 secret,但纵深防御统一遵守"绝不把可能含敏感串的值原样进 UI/日志"(与 preview 一致)。
 fn print_mcp_doctor(rows: &[setup_mcp::McpDoctorRow]) -> std::process::ExitCode {
-    use setup_mcp::DoctorStatus;
+    use setup_mcp::{DoctorStatus, ProbeOutcome};
     let scrub = vigil_redaction::scrub_text;
+    // 是否处于深度探测档(任一行带 probe 结果)—— 决定表头/表尾措辞与失败语义。
+    let probing = rows.iter().any(|r| r.probe.is_some());
     println!("Vigil setup --mcp --doctor: can each MCP server's program be launched in THIS environment?");
     println!("  (resolves argv[0] in the current PATH, exactly as the gateway does at spawn time)");
+    if probing {
+        // Codex D18 R2 Low:probe 会真执行每个 server 的启动代码 —— 在动手前明确告知(非仅 help 文案)。
+        println!("  --probe: WARNING — this briefly STARTS each configured server (runs its startup code)");
+        println!("           to complete a real MCP initialize handshake, then stops it. Direct child is killed;");
+        println!("           a misbehaving npx/uvx grandchild may survive briefly.");
+    }
     if rows.is_empty() {
         println!("  No MCP servers found in ~/.claude.json (nothing to check).");
         return std::process::ExitCode::SUCCESS;
@@ -568,6 +596,22 @@ fn print_mcp_doctor(rows: &[setup_mcp::McpDoctorRow]) -> std::process::ExitCode 
                     scrub(program),
                     scrub(resolved)
                 );
+                // 深度探测结果(--probe):静态可解析但运行时起不来 = 真失败(agent 会零工具)。
+                match &r.probe {
+                    Some(ProbeOutcome::Initialized) => {
+                        // 措辞:probe 验的是**底层 server** 能起 + 说 MCP;对 vigil-wrapped 条目,真实
+                        // 网关启动还会额外强制 descriptor drift gate,故不等同"agent 一定见到工具"(Codex R2 M3)。
+                        println!("           probe: the underlying server initialized OK (started + MCP handshake succeeded)");
+                    }
+                    Some(ProbeOutcome::Failed { reason }) => {
+                        failed += 1;
+                        // reason 已在 setup_mcp 侧 value-aware 脱敏 + scrub;此处直接展示。
+                        println!("           probe: FAILED to initialize: {reason}");
+                        println!("           -> the program runs but did not complete an MCP handshake; your agent will see no tools from it.");
+                        println!("           -> if it's an npx/uvx server on first run, packages may still be downloading; re-run --probe once warm.");
+                    }
+                    None => {}
+                }
             }
             DoctorStatus::ProgramNotFound { program } => {
                 failed += 1;
@@ -596,12 +640,26 @@ fn print_mcp_doctor(rows: &[setup_mcp::McpDoctorRow]) -> std::process::ExitCode 
     }
     println!();
     if failed == 0 {
-        println!("  All checked servers resolve in this environment.");
+        if probing {
+            println!(
+                "  All checked servers resolve AND their underlying program completes an MCP handshake here."
+            );
+            // Codex R2 M3:probe 验底层 server;对已 vigil-wrapped 条目,真实网关启动还会强制 descriptor
+            // drift gate(probe 刻意不走、不改状态),故 probe OK 不等同"agent 一定见到工具"。
+            println!("  (probe checks the underlying server; for vigil-wrapped entries the live gateway also enforces descriptor drift.)");
+        } else {
+            println!("  All checked servers resolve in this environment.");
+        }
         println!("  Note: your agent must launch vigil-hub with the same PATH for this to hold.");
         std::process::ExitCode::SUCCESS
     } else {
+        let what = if probing {
+            "will not start / initialize"
+        } else {
+            "will not start"
+        };
         println!(
-            "  {failed} server(s) will not start in this environment. Fix the above, then re-run --doctor."
+            "  {failed} server(s) {what} in this environment. Fix the above, then re-run --doctor."
         );
         std::process::ExitCode::from(1)
     }

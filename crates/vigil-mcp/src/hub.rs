@@ -633,7 +633,9 @@ impl Hub {
         // 5. 双 gate 通过 → 才用已解析路径 spawn。子进程 env 走 MCP upstream 专用政策
         //    (env_clear → 非敏感运行时白名单 PATH/HOME/… → 批准 user_env;§I-7.1 amendment,
         //    见 StdioUpstream::spawn_resolved 注释)—— 让 npx/uvx 启动器能跑,父进程密钥不泄漏。
-        let upstream = StdioUpstream::spawn_resolved(server_id, resolved, &argv[1..], env)
+        // forward_diagnostics=true:serve/wrap 运维需看上游 stderr 诊断(已过 scrub);doctor --probe
+        // 走独立的 probe_stdio_initialize(false)。
+        let upstream = StdioUpstream::spawn_resolved(server_id, resolved, &argv[1..], env, true)
             .map_err(HubError::StdioSpawn)?;
         // 5.5. MCP 客户端生命周期握手(initialize → initialized)。
         //      MCP SDK server(filesystem / github 等官方 server)在 initialize 握手完成前会

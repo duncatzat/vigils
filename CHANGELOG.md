@@ -8,6 +8,29 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.24] — 2026-06-07
+
+Adds a deep health check that actually starts each MCP server to confirm it works — not just
+that its program is installed.
+
+### Added
+
+- **`vigil-hub setup --mcp --doctor --probe` — verify each MCP server really starts.** The existing
+  `--doctor` is static: it only checks that each server's program (e.g. `npx`, `uvx`) resolves on
+  your `PATH`. But the most common silent failure is a program that *is* installed yet fails at
+  runtime — the package won't download, the server crashes on startup, or it doesn't speak MCP — and
+  your agent just silently sees zero tools from it. `--probe` goes further: for each server that
+  passes the static check, it briefly **starts the server and completes a real MCP `initialize`
+  handshake**, then stops it, and reports `[OK]` / `FAILED to initialize` per server. It's opt-in
+  because it runs each server's startup code; plain `--doctor` stays static with no side effects.
+  (First run of an `npx`/`uvx` server may time out while it downloads packages — re-run once warm.)
+
+### Security
+
+- The probe never forwards a started server's stderr (so a server that echoes a configured secret on
+  startup can't leak it through the doctor), redacts the exact configured env values out of any
+  failure message, and fingerprints untrusted protocol-version strings instead of printing them raw.
+
 ## [v0.1.23] — 2026-06-06
 
 Fixes a cosmetic-but-real corruption in the secret redaction placeholder when a secret is
