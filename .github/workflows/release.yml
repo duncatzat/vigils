@@ -28,6 +28,23 @@ jobs:
       - uses: actions/checkout@v4
       - id: resolve
         run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      # 版本一致性守门(D21 发现:apps/desktop/tauri.conf.json 有**独立** version 字段,
+      # 每次发版须与 workspace Cargo.toml 同步 bump,易漏 → 桌面安装包/OTA manifest 版本漂移
+      # [v0.1.26 即漏 bump tauri 致桌面包标 0.1.25])。在创建 Release 前断言三者一致,早失败。
+      - name: Verify version consistency (tag == Cargo.toml == tauri.conf.json)
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="${{ steps.resolve.outputs.tag }}"; want="${want#v}"
+          cargo_v=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          tauri_v=$(grep -m1 -E '"version"' apps/desktop/tauri.conf.json | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+          echo "tag=$want  Cargo.toml=$cargo_v  tauri.conf.json=$tauri_v"
+          if [ "$cargo_v" != "$want" ] || [ "$tauri_v" != "$want" ]; then
+            echo "::error::version drift — tag '$want' vs Cargo.toml '$cargo_v' vs tauri.conf.json '$tauri_v' must all match; bump all three before tagging."
+            exit 1
+          fi
+
       # Release notes = English CHANGELOG section + a clearly-separated Chinese section
       # (never interleaved) + Downloads/footer. Single source of truth: the curated notes
       # live in CHANGELOG.md / CHANGELOG.zh-CN.md, not duplicated here.
