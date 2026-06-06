@@ -236,23 +236,80 @@ fn redact_value(v: &Value, findings: &mut Vec<String>) -> Value {
 }
 
 fn redact_string(s: &str, findings: &mut Vec<String>) -> String {
-    // PEM 块单独处理:整块替换
+    // PEM 块单独处理:整串视为单一 secret,整块替换(不与其他规则叠加)。
     if PEM_RE.is_match(s) {
         findings.push("pem_private_key".to_string());
         return "[REDACTED pem_private_key]".to_string();
     }
 
-    let mut out = s.to_string();
-    for rule in ALL_RULES.iter() {
-        if rule.pattern.is_match(&out) {
-            findings.push(rule.name.to_string());
-            out = rule
-                .pattern
-                .replace_all(&out, |_: &regex::Captures<'_>| {
-                    format!("[REDACTED {}]", rule.name)
-                })
-                .into_owned();
+    // ── 单遍 span 收集:所有规则在**原文** s 上各自扫描 ──
+    //
+    // 为什么不能逐条规则在前一条的替换结果上 `replace_all`(旧实现):后续规则会匹配进
+    // 前一条规则留下的 `[REDACTED <rule>]` 占位符,把它打碎。最常见的 `api_token=ghp_...`:
+    // github_token 先替换出 `api_token=[REDACTED github_token]`,env_assignment 的值匹配器
+    // `[^\s...]+` 再吃掉 `api_token=[REDACTED` 前缀 → `[REDACTED env_assignment] github_token]`
+    // (raw secret 已在第一步消失、不复现/不泄漏,但占位符损坏是真实正确性 bug)。改为在原文
+    // 上一次性收集全部命中 span,再做单次替换 —— 占位符不会回流成为可匹配文本。
+    struct Hit {
+        start: usize,
+        end: usize,
+        name: &'static str,
+        order: usize, // ALL_RULES 声明序;同位重叠时声明序靠前者作代表(anthropic 先于 openai)
+    }
+    let mut hits: Vec<Hit> = Vec::new();
+    for (order, rule) in ALL_RULES.iter().enumerate() {
+        for m in rule.pattern.find_iter(s) {
+            hits.push(Hit {
+                start: m.start(),
+                end: m.end(),
+                name: rule.name,
+                order,
+            });
         }
+    }
+    if hits.is_empty() {
+        return s.to_string();
+    }
+
+    // findings 契约:每条命中规则名至多记一次(caller 再 sort+dedup,顺序无关)。
+    let mut seen: Vec<&'static str> = Vec::new();
+    for h in &hits {
+        if !seen.contains(&h.name) {
+            seen.push(h.name);
+            findings.push(h.name.to_string());
+        }
+    }
+
+    // 排序:start 升序;同 start 时 end 降序(长 span 优先);再声明序升序(precedence)。
+    hits.sort_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then(b.end.cmp(&a.end))
+            .then(a.order.cmp(&b.order))
+    });
+
+    // ── 重叠区间**并集合并**(leak-safe)──
+    //
+    // 重叠的多个 span 必须合并成并集 [min_start, max_end),而非"挑一个丢其余"——否则若挑中
+    // 的 span 比被丢的短,被丢 span 超出部分的 secret 字节会留在明文(泄漏)。并集保证每个被
+    // 任一规则命中的字节都落入某个被替换区间。代表名取并集内排序最靠前者(已由上面排序保证:
+    // start 最小→end 最长→声明序最前)。相邻(a.end == b.start)不算重叠,保持独立占位符。
+    let mut merged: Vec<(usize, usize, &'static str)> = Vec::new();
+    for h in &hits {
+        match merged.last_mut() {
+            Some(last) if h.start < last.1 => {
+                if h.end > last.1 {
+                    last.1 = h.end; // 扩展并集上界;代表名保持 last.2(排序更靠前者)
+                }
+            }
+            _ => merged.push((h.start, h.end, h.name)),
+        }
+    }
+
+    // 右→左替换避免 index 漂移;merged 已按 start 升序且互不重叠,从后往前安全。
+    let mut out = s.to_string();
+    for (start, end, name) in merged.iter().rev() {
+        out.replace_range(*start..*end, &format!("[REDACTED {name}]"));
     }
     out
 }
@@ -281,9 +338,14 @@ pub(crate) struct Rule {
     pub(crate) pattern: Regex,
 }
 
-// NOTE: 规则**顺序敏感** —— redact_string 会逐条 replace_all,命中即替换为占位符,
-// 后续规则不会再匹配同一片段。因此 anthropic 必须**先于** openai,
-// 否则 `sk-[A-Za-z0-9_\-]{20,}` 会先吞掉 `sk-ant-...`。
+// NOTE: 规则**顺序仍语义敏感**,但实现已改为"原文单遍 span 收集 + 重叠并集合并"
+// (见 `redact_string`),不再逐条 replace_all。声明序在重叠时作占位符**代表名**的
+// tiebreak:同 start、同 end 的重叠 span,声明靠前者胜。因此 anthropic 必须**先于**
+// openai —— `sk-ant-...` 上两条规则同 start 且**共终点**(openai 的 `[A-Za-z0-9_\-]{20,}`
+// 也吞 `ant-...`),order tiebreak 选中更专的 anthropic 标签。
+// 注:并集合并的 **leak 安全性与代表名无关**(并集总覆盖所有被命中字节);代表名仅影响
+// 占位符可读性。当前代表名取"start 最小→end 最长→声明序最前"者(span 最广、标签最贴合
+// 被遮区间);若未来新增比 anthropic 延伸更远的宽 `sk-` 规则,标签可能变笼统(仍不泄漏)。
 //
 // 规则集演进见 ADR 0002 §D1 与 I01.md。规则清单是**本迭代已声明覆盖**的 secret
 // 指纹集合;未列入的指纹(Slack / Stripe / GCP SA key / SSH host key / OAuth client_secret
@@ -575,6 +637,33 @@ mod tests {
             detect_hard_secret("token=sadqwdzcfqdqdwqdqdq"),
             Some("env_assignment")
         );
+    }
+
+    /// 回归门(D16,真机 turnkey E2E 发现):`KEY=secret` 让两条 HARD 规则同位重叠 ——
+    /// env_assignment 匹配整段 `api_token=ghp_...`,github_token 匹配内层 `ghp_...`。
+    /// 旧实现逐条规则在前一条的替换结果上 `replace_all`,env_assignment 的值匹配器吃掉
+    /// github_token 留下的 `[REDACTED` 前缀 → 破碎占位符 `[REDACTED env_assignment] github_token]`
+    /// (括号不配对)。raw secret 此时已消失(无泄漏),但损坏占位符是真实正确性 bug。
+    /// 修复:单遍原文 span 收集 + 重叠并集合并 → 单一良构占位符。
+    #[test]
+    fn redacts_overlapping_env_assignment_and_github_token_cleanly() {
+        let raw = "ghp_aBcD1234567890aBcD1234567890aBcD1234"; // 假 PAT(硬指纹),非真实 secret
+        let input = format!("api_token={raw}");
+        let clean = scrub_text(&input);
+        // 1) 绝不泄漏原始 secret
+        assert!(!clean.contains(raw), "raw secret 不得残留: {clean}");
+        // 2) 整段 KEY=secret 并集合并为单一良构占位符(无破碎悬挂 `]`)
+        assert_eq!(
+            clean, "[REDACTED env_assignment]",
+            "重叠 span 应并集合并为单一占位符"
+        );
+        assert_eq!(
+            clean.matches("[REDACTED").count(),
+            1,
+            "恰一个占位符,不得碎成多个: {clean}"
+        );
+        // 3) 内层裸 github token 无 env_assignment 包裹时仍单独正确脱敏(未回归)
+        assert_eq!(scrub_text(raw), "[REDACTED github_token]");
     }
 
     /// 回归门(Codex review):裸敏感 key **仅** `=` 触发,不收 `:` —— 否则会误吞 URI scheme

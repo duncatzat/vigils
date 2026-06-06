@@ -8,6 +8,26 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.23] — 2026-06-06
+
+Fixes a cosmetic-but-real corruption in the secret redaction placeholder when a secret is
+written as `KEY=value` — the redacted output could come out malformed. The secret itself was
+always fully removed; only the `[REDACTED …]` marker was broken.
+
+### Fixed
+
+- **Redaction placeholders are now well-formed when a secret is assigned to a variable.** For the
+  most common shape — a secret on the right of `=`, e.g. `api_token=ghp_…` in a tool result — two
+  detection rules overlap (one matches the whole `key=value`, one matches the token inside). The
+  gateway's redactor applied rules one after another over already-redacted text, so the second rule
+  matched *into* the first rule's `[REDACTED …]` marker and shattered it into
+  `[REDACTED env_assignment] github_token]` (unbalanced brackets). The raw secret was already gone
+  in every case — this was never a leak — but the marker looked broken. The redactor now scans the
+  original text once, merges overlapping matches into a single covered span, and emits one clean
+  `[REDACTED …]` marker. (Found by the full end-to-end turnkey run on a real machine; reviewed for
+  leak-safety — merging overlapping spans by their *union* guarantees no secret byte is ever left
+  behind.)
+
 ## [v0.1.22] — 2026-06-06
 
 Fixes the very first protected run on a fresh machine — the audit ledger now creates its own
