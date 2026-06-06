@@ -110,8 +110,11 @@ const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024
 /// **V1.1(已实现,Codex Design R2 ACCEPT)**:解析后绝对路径现由 `Hub::spawn_attach_stdio_upstream`
 /// 在 spawn **之前**纳入 server command pinning 的第二独立维度(列 `resolved_program_path` 与审计
 /// `server.resolved_program_drifted`),抓"裸 `node` 解析到不同二进制"。TOCTOU(解析时刻 vs exec
-/// 时刻二进制替换)仍 O-D 超范围(无 inode/content pinning)。`pub(crate)` 供 Hub 调用。
-pub(crate) fn resolve_program(argv0: &str) -> Result<std::path::PathBuf, StdioError> {
+/// 时刻二进制替换)仍 O-D 超范围(无 inode/content pinning)。
+///
+/// `pub`:Hub 在 spawn 前调用(gate 维度),同时 `setup --mcp --doctor` 用它做**与网关一致**的程序
+/// PATH 可解析预检(SSOT —— doctor 的 ✓/✗ 判定必须与真实 spawn 行为同源,否则误报)。
+pub fn resolve_program(argv0: &str) -> Result<std::path::PathBuf, StdioError> {
     let not_found = || StdioError::ProgramNotFound {
         program: argv0.to_string(),
     };

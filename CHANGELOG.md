@@ -8,6 +8,24 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.19] — 2026-06-06
+
+A new `vigil-hub setup --mcp --doctor` pre-flight tells you, before you even run your agent, whether
+each wrapped MCP server can actually start — so a silently-broken server no longer looks like "Vigil
+broke my setup".
+
+### Added
+
+- **`vigil-hub setup --mcp --doctor` — launchability pre-flight for your MCP servers.** For each MCP
+  server in your config (including ones already wrapped by Vigil), it checks whether the underlying
+  program can be resolved in your `PATH`, using the exact same resolution the gateway does at spawn
+  time. You get a per-server `[OK]` / `[FAIL] program not found` / `[skip]` (for remote servers), with
+  an actionable hint (e.g. "install Node.js" for a missing `npx`). This answers the most common
+  turnkey failure — "which server won't start, and why?" — which previously showed up only as silently
+  missing tools in your agent. Static and read-only: it resolves programs, it does **not** start any
+  server. Exit code is non-zero if any server won't launch, so you can use it in scripts. For an
+  already-wrapped entry it checks the **real** server program, not `vigil-hub` itself.
+
 ## [v0.1.18] — 2026-06-06
 
 A new `vigil-hub inspect protection` command shows, at a glance, what Vigil has actually protected —

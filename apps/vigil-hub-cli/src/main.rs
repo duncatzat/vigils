@@ -155,6 +155,11 @@ struct CliSetupArgs {
     /// 想要硬拦语义(已知工具集 / 自建 server / 高保障场景)再显式 `--enforce`。
     #[arg(long)]
     enforce: bool,
+    /// 配合 `--mcp`:**健壮性预检**。对每个 MCP server(含已被 Vigil 包裹的)检查其底层 stdio 程序能否
+    /// 在 PATH 解析(用网关同款解析逻辑)→ 逐 server ✓/✗ + 可操作原因。回答"我的接入是否能跑 / 哪个
+    /// server 起不来、为什么"(最常见失败 = 程序没装 / 不在 PATH)。**纯静态、只读、不启动任何 server**。
+    #[arg(long)]
+    doctor: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -370,7 +375,11 @@ fn setup_mcp_dispatch(args: &CliSetupArgs) -> Result<std::process::ExitCode, set
     // 硬拦。第三方 server 工具名不在 effect 词表 → enforce 一律 default-deny = server 全不可用,故默认 monitor
     // 让 turnkey 接入即可用且仍守全部硬地板(详见 CliSetupArgs::enforce doc)。
     let monitor = !args.enforce;
-    if args.uninstall {
+    if args.doctor {
+        // 健壮性预检(纯静态只读;先于 uninstall/apply,与它们互斥语义上不冲突但 doctor 优先)。
+        let rows = setup_mcp::run_doctor(&home)?;
+        Ok(print_mcp_doctor(&rows))
+    } else if args.uninstall {
         let rep = setup_mcp::run_uninstall(&home, args.dry_run)?;
         Ok(print_mcp_apply(&rep, "uninstall"))
     } else if args.apply {
@@ -379,6 +388,78 @@ fn setup_mcp_dispatch(args: &CliSetupArgs) -> Result<std::process::ExitCode, set
     } else {
         let rep = setup_mcp::run_preview(&home, &exe, monitor)?;
         Ok(print_mcp_preview(&rep))
+    }
+}
+
+/// 打印 `setup --mcp --doctor` 健壮性预检结果(ASCII-safe,cp936/cp437 不乱码)。返回退出码:
+/// 有任一 server 起不来(ProgramNotFound/Malformed)→ 退出码 1(脚本可据此判失败);否则 0。
+///
+/// **truth-in-labeling**(Codex D12 nit):解析用**本进程当前 PATH**,= 网关 spawn 时同款 `resolve_program`
+/// (SSOT);但若 agent 启动 `vigil-hub wrap` 的 PATH 与此不同,verdict 可能偏差 → 文案明示"在本环境"。
+/// **hygiene**(Codex D12 nit):所有展示字段(name/scope/program/resolved)过 `scrub_text` 再输出 ——
+/// argv[0]/路径通常无 secret,但纵深防御统一遵守"绝不把可能含敏感串的值原样进 UI/日志"(与 preview 一致)。
+fn print_mcp_doctor(rows: &[setup_mcp::McpDoctorRow]) -> std::process::ExitCode {
+    use setup_mcp::DoctorStatus;
+    let scrub = vigil_redaction::scrub_text;
+    println!("Vigil setup --mcp --doctor: can each MCP server's program be launched in THIS environment?");
+    println!("  (resolves argv[0] in the current PATH, exactly as the gateway does at spawn time)");
+    if rows.is_empty() {
+        println!("  No MCP servers found in ~/.claude.json (nothing to check).");
+        return std::process::ExitCode::SUCCESS;
+    }
+    let mut failed = 0usize;
+    for r in rows {
+        // scope 标注:user 或项目路径(local)。wrapped 标注是否已受 Vigil 保护。全部过 scrub。
+        let name = scrub(&r.name);
+        let scope = if r.scope == "user" {
+            "user".to_string()
+        } else {
+            format!("local:{}", scrub(&r.scope))
+        };
+        let guard = if r.wrapped { " [vigil-wrapped]" } else { "" };
+        match &r.status {
+            DoctorStatus::Launchable { program, resolved } => {
+                println!(
+                    "  [OK]   {name} ({scope}){guard}: {} -> {}",
+                    scrub(program),
+                    scrub(resolved)
+                );
+            }
+            DoctorStatus::ProgramNotFound { program } => {
+                failed += 1;
+                println!(
+                    "  [FAIL] {name} ({scope}){guard}: program `{}` not found in PATH",
+                    scrub(program)
+                );
+                // 可操作提示:最常见两类运行时。
+                let hint = match program.as_str() {
+                    "npx" | "node" => "  -> install Node.js (npx/node), then restart your agent",
+                    "uvx" | "uv" => "  -> install uv (uvx/uv), then restart your agent",
+                    _ => "  -> install this program or fix its PATH, then restart your agent",
+                };
+                println!("{hint}");
+            }
+            DoctorStatus::Skipped { reason } => {
+                println!("  [skip] {name} ({scope}): {reason}");
+            }
+            DoctorStatus::Malformed => {
+                failed += 1;
+                println!(
+                    "  [FAIL] {name} ({scope}){guard}: Vigil-managed entry is malformed (cannot determine the underlying program)"
+                );
+            }
+        }
+    }
+    println!();
+    if failed == 0 {
+        println!("  All checked servers resolve in this environment.");
+        println!("  Note: your agent must launch vigil-hub with the same PATH for this to hold.");
+        std::process::ExitCode::SUCCESS
+    } else {
+        println!(
+            "  {failed} server(s) will not start in this environment. Fix the above, then re-run --doctor."
+        );
+        std::process::ExitCode::from(1)
     }
 }
 

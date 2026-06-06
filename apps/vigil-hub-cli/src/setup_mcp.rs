@@ -684,6 +684,114 @@ pub fn run_uninstall(home: &Path, dry_run: bool) -> Result<McpApplyReport, Setup
     })
 }
 
+// ============================ setup --mcp --doctor(健壮性预检) ============================
+//
+// **采用关键**:`setup --mcp --apply` 后,若某被包裹 server 的底层程序根本起不来(最常见 = 程序不在
+// PATH / 没装,如 `npx` 没装 Node、`uvx` 没装 uv),agent 只见工具静默坏掉、无诊断 → 归咎 Vigil。
+// doctor 对每个 MCP server **预检底层 stdio 程序能否被网关解析**(用网关同款 `resolve_program`,SSOT),
+// 逐 server 给 ✓/✗ + 可操作原因。**纯静态**(不 spawn 真 server,无副作用/无延迟/无挂起风险);更深的
+// spawn+handshake 健康检查留后续增量。
+
+/// 单个 MCP server 的启动可行性诊断结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DoctorStatus {
+    /// 底层程序可在 PATH 解析 → 大概率可启动。`resolved` = 解析到的绝对路径(诊断用)。
+    Launchable { program: String, resolved: String },
+    /// 底层程序在 PATH 找不到 → 起不来(最常见、最可操作的失败;提示装对应运行时)。
+    ProgramNotFound { program: String },
+    /// 非本地 stdio 程序(remote/http MCP 或无 `command`)→ doctor 不适用,跳过。
+    Skipped { reason: String },
+    /// Vigil 托管条目但形态异常无法还原出底层程序(诚实标记,不静默忽略)。
+    Malformed,
+}
+
+/// `setup --mcp --doctor` 的单行结果。
+#[derive(Debug, Clone)]
+pub struct McpDoctorRow {
+    /// server 名(agent 配置里的 key)。
+    pub name: String,
+    /// 作用域:`"user"`(顶层 mcpServers)或项目路径(local scope)。
+    pub scope: String,
+    /// 是否 Vigil 托管(已 wrap)。未托管的也检查(预告它若被 wrap 能否启动)。
+    pub wrapped: bool,
+    /// 诊断结论。
+    pub status: DoctorStatus,
+}
+
+/// 从一个 server 条目取**底层 stdio 程序**(供 doctor 解析)。纯函数(可单测,不碰 PATH/FS)。
+/// 返回 `Ok((program, wrapped))`;`Err(DoctorStatus)` 表示无需解析(Skipped/Malformed)直接定论。
+fn doctor_target_for(name: &str, entry: &Value) -> Result<(String, bool), DoctorStatus> {
+    match classify_one(name, entry) {
+        // 未托管的 stdio server:底层程序就是其 command。
+        McpServerClass::Wrappable { command, .. } => Ok((command, false)),
+        // 已 Vigil 包裹:self-describing 还原出 `-- <原 cmd>` 的原始程序再检查(检查的是**真正会被起的**程序,
+        // 而非 vigil-hub 自身;否则 doctor 永远只在验 vigil-hub 可达,毫无意义)。
+        McpServerClass::AlreadyWrapped { .. } => unwrap_entry(entry)
+            .and_then(|v| v.get("command").and_then(Value::as_str).map(String::from))
+            .map(|prog| (prog, true))
+            .ok_or(DoctorStatus::Malformed),
+        // remote/http/无 command:非本地程序,doctor 不适用。
+        McpServerClass::Skipped { reason, .. } => Err(DoctorStatus::Skipped {
+            reason: reason.to_string(),
+        }),
+    }
+}
+
+/// 对一个条目产出 doctor 行:取底层程序 → 用网关同款 `resolve_program` 验 PATH 可解析。
+fn doctor_row(name: &str, scope: &str, entry: &Value) -> McpDoctorRow {
+    let (status, wrapped) = match doctor_target_for(name, entry) {
+        Ok((program, wrapped)) => {
+            let st = match vigil_mcp::stdio::resolve_program(&program) {
+                Ok(p) => DoctorStatus::Launchable {
+                    program,
+                    resolved: p.to_string_lossy().into_owned(),
+                },
+                // 任何解析失败(找不到 / 路径不存在)统一 ProgramNotFound —— 这是可操作信号(装运行时)。
+                Err(_) => DoctorStatus::ProgramNotFound { program },
+            };
+            (st, wrapped)
+        }
+        Err(skip_or_malformed) => {
+            let wrapped = matches!(skip_or_malformed, DoctorStatus::Malformed);
+            (skip_or_malformed, wrapped)
+        }
+    };
+    McpDoctorRow {
+        name: name.to_string(),
+        scope: scope.to_string(),
+        wrapped,
+        status,
+    }
+}
+
+/// `setup --mcp --doctor`:读真实 `~/.claude.json` → 对 user + local scope 每个 MCP server 做启动预检。
+/// 纯静态(不 spawn);`home` 注入 → 测试走 fixture 绝不碰真实配置。无配置文件 → 空 Vec(诚实:没东西可查)。
+pub fn run_doctor(home: &Path) -> Result<Vec<McpDoctorRow>, SetupError> {
+    let path = claude_json_path(home);
+    let cfg = match read_claude_json(&path)? {
+        Some(v) => v,
+        None => return Ok(Vec::new()),
+    };
+    let mut rows = Vec::new();
+    // user scope(顶层 mcpServers)
+    if let Some(servers) = cfg.get("mcpServers").and_then(Value::as_object) {
+        for (name, entry) in servers {
+            rows.push(doctor_row(name, "user", entry));
+        }
+    }
+    // local scope(projects.<path>.mcpServers)
+    if let Some(projects) = cfg.get("projects").and_then(Value::as_object) {
+        for (proj_path, proj) in projects {
+            if let Some(servers) = proj.get("mcpServers").and_then(Value::as_object) {
+                for (name, entry) in servers {
+                    rows.push(doctor_row(name, proj_path, entry));
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1209,5 +1317,114 @@ mod tests {
             && matches!(c, McpServerClass::Wrappable { name, .. } if name == "fs")));
         assert!(local.iter().any(|(p, c)| p == "/p2"
             && matches!(c, McpServerClass::Wrappable { name, .. } if name == "git")));
+    }
+
+    // ---------------- setup --mcp --doctor ----------------
+
+    #[test]
+    fn doctor_target_extracts_underlying_program_across_kinds() {
+        // 未托管 stdio → 底层程序 = command,wrapped=false
+        let wrappable = json!({"command": "npx", "args": ["-y", "pkg"]});
+        assert_eq!(
+            doctor_target_for("fs", &wrappable),
+            Ok(("npx".to_string(), false))
+        );
+
+        // 已 Vigil 包裹 → unwrap 取**内部**真实程序(uvx,而非 vigil-hub),wrapped=true
+        let wrapped = wrap_entry(
+            &json!({"command": "uvx", "args": ["x"]}),
+            "vigil-hub",
+            "git",
+            "uvx",
+            &["x".into()],
+            &[],
+            true,
+        );
+        assert_eq!(
+            doctor_target_for("git", &wrapped),
+            Ok(("uvx".to_string(), true)),
+            "doctor 检查的必须是被包裹的真实程序,不是 vigil-hub 自身"
+        );
+
+        // remote/http → Err(Skipped),不当本地程序解析
+        let remote = json!({"url": "https://mcp.example.com/"});
+        assert!(matches!(
+            doctor_target_for("remote", &remote),
+            Err(DoctorStatus::Skipped { .. })
+        ));
+    }
+
+    #[test]
+    fn run_doctor_flags_missing_program_passes_resolvable_skips_remote() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // path-style 的真实存在文件 → resolve_program canonicalize 成功 → Launchable(跨平台确定性)。
+        let real = home.join("realprog");
+        fs::write(&real, b"x").unwrap();
+        let real_str = real.to_string_lossy().to_string();
+        fs::write(
+            home.join(".claude.json"),
+            json!({
+                "mcpServers": {
+                    "good": {"command": real_str, "args": []},
+                    "bad": {"command": "definitely-not-a-real-prog-xyz789", "args": []},
+                    "remote": {"url": "https://mcp.example.com/"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let rows = run_doctor(home).unwrap();
+        let by = |n: &str| &rows.iter().find(|r| r.name == n).unwrap().status;
+        assert!(
+            matches!(by("good"), DoctorStatus::Launchable { .. }),
+            "存在的程序应 Launchable"
+        );
+        assert!(
+            matches!(by("bad"), DoctorStatus::ProgramNotFound { .. }),
+            "PATH 找不到的程序应 ProgramNotFound(最常见可操作失败)"
+        );
+        assert!(
+            matches!(by("remote"), DoctorStatus::Skipped { .. }),
+            "remote/http server 应 Skipped"
+        );
+    }
+
+    #[test]
+    fn run_doctor_checks_already_wrapped_inner_program() {
+        // 已包裹的 server:doctor 必须 unwrap 后检查内部程序(bogus → ProgramNotFound),
+        // 证明 doctor 看穿 wrap 看真实程序,且 wrapped 标记为 true。
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let wrapped = wrap_entry(
+            &json!({"command": "definitely-not-a-real-prog-xyz789", "args": ["x"]}),
+            "vigil-hub",
+            "fs",
+            "definitely-not-a-real-prog-xyz789",
+            &["x".into()],
+            &[],
+            true,
+        );
+        fs::write(
+            home.join(".claude.json"),
+            json!({ "mcpServers": { "fs": wrapped } }).to_string(),
+        )
+        .unwrap();
+        let rows = run_doctor(home).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].wrapped, "应识别为 Vigil 托管");
+        assert!(
+            matches!(rows[0].status, DoctorStatus::ProgramNotFound { .. }),
+            "应检查 unwrap 出的内部程序(bogus → ProgramNotFound)"
+        );
+    }
+
+    #[test]
+    fn run_doctor_empty_when_no_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(run_doctor(dir.path()).unwrap().is_empty());
     }
 }

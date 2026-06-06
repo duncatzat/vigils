@@ -8,6 +8,20 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.19] — 2026-06-06
+
+新增 `vigil-hub setup --mcp --doctor` 预检:在你运行 agent **之前**就告诉你每个被包裹的 MCP server 能否
+真正启动 —— 静默坏掉的 server 不再像是"Vigil 弄坏了我的配置"。
+
+### 新增
+
+- **`vigil-hub setup --mcp --doctor` —— MCP server 启动可行性预检。** 对配置里每个 MCP server(含已被
+  Vigil 包裹的),检查其底层程序能否在你的 `PATH` 中解析,用的是**网关 spawn 时同款**的解析逻辑。逐 server
+  给出 `[OK]` / `[FAIL] 程序不在 PATH` / `[skip]`(远程 server),并附可操作提示(如 `npx` 缺失时提示"装
+  Node.js")。这回答了最常见的一键接入失败 —— "哪个 server 起不来、为什么?" —— 此前它只表现为 agent 里
+  工具静默消失。纯静态、只读:只解析程序,**不启动**任何 server。有任一 server 起不来则退出码非 0,可用于
+  脚本。对已包裹的条目,检查的是**真实**被包裹的 server 程序,而非 `vigil-hub` 自身。
+
 ## [v0.1.18] — 2026-06-06
 
 新增 `vigil-hub inspect protection` 命令,一眼看清 Vigil 实际保护了什么 —— 让"monitor 模式仍在保护你"
