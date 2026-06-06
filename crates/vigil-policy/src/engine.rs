@@ -299,6 +299,12 @@ impl Default for PolicyContext {
     }
 }
 
+/// 引擎 **fail-closed 兜底 floor** 的保留 policy id —— 无规则匹配时 [`PolicyEngine::evaluate`] 产出
+/// `policy_ids == [DEFAULT_DENY_POLICY_ID]`。**任何规则都不得占用此 id**(`new`/`add_rule` 会过滤掉),
+/// 这样下游(如 monitor 降级 default-deny floor)可凭此 id **唯一且不可伪造**地识别"兜底拒绝"
+/// 与"显式 Deny 规则"(Codex review HIGH:否则一条 id 为 default-deny 的显式 Deny 会被误当 floor)。
+pub const DEFAULT_DENY_POLICY_ID: &str = "default-deny";
+
 /// 规则引擎。
 #[derive(Debug, Clone, Default)]
 pub struct PolicyEngine {
@@ -308,14 +314,25 @@ pub struct PolicyEngine {
 impl PolicyEngine {
     /// 用一组规则构造引擎。规则内部可乱序,引擎会按 priority 自排。
     pub fn new(rules: Vec<PolicyRule>) -> Self {
+        // 过滤掉**保留 id** [`DEFAULT_DENY_POLICY_ID`] 的规则:该 id 专属引擎的 fail-closed 兜底
+        // floor(无规则匹配时产出)。若允许某规则携带此 id,下游("policy_ids == [floor id]"判定
+        // floor,如 monitor 降级)会把一条**显式 Deny 规则**误当兜底 floor(Codex review HIGH:可伪造)。
+        let rules: Vec<PolicyRule> = rules
+            .into_iter()
+            .filter(|r| r.id != DEFAULT_DENY_POLICY_ID)
+            .collect();
         let mut e = Self { rules };
         e.rules
             .sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
         e
     }
 
-    /// 追加一条规则(测试 / 动态装载)。
+    /// 追加一条规则(测试 / 动态装载)。携带保留 id [`DEFAULT_DENY_POLICY_ID`] 的规则被**拒绝**
+    /// (静默忽略)—— 该 id 专属引擎 floor,不得被任何规则占用(否则 floor 检测可被伪造,Codex HIGH)。
     pub fn add_rule(&mut self, r: PolicyRule) {
+        if r.id == DEFAULT_DENY_POLICY_ID {
+            return;
+        }
         self.rules.push(r);
         self.rules
             .sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
@@ -352,7 +369,7 @@ impl PolicyEngine {
         if hits.is_empty() {
             return Ok(PolicyDecision {
                 action: PolicyAction::Deny,
-                policy_ids: vec!["default-deny".to_string()],
+                policy_ids: vec![DEFAULT_DENY_POLICY_ID.to_string()],
                 reasons: vec!["no rule matched; fail-closed default deny".to_string()],
             });
         }
@@ -1011,6 +1028,37 @@ mod tests {
             PolicyAction::Deny,
             "scope deny 必须压倒 approve(fail-closed 偏序),reasons={:?}",
             res.reasons
+        );
+    }
+
+    #[test]
+    fn default_deny_policy_id_is_reserved_and_unspoofable() {
+        // Codex review HIGH:下游凭 `policy_ids == [DEFAULT_DENY_POLICY_ID]` 识别"兜底 floor"
+        // (如 monitor 降级)。必须保证**没有任何规则**能占用此 id —— 否则一条 id 恰为 default-deny 的
+        // **显式 Deny 规则**单独命中时也产出同样 policy_ids,把"显式拒绝"伪装成"兜底拒绝"被误降级放行。
+        let reserved_rule = PolicyRule {
+            id: DEFAULT_DENY_POLICY_ID.into(),
+            match_effects: vec![],
+            conditions: vec![], // 无条件 → 若未被过滤会总命中
+            action: PolicyAction::Deny,
+            priority: 1000,
+        };
+        // new() 过滤掉保留 id 规则
+        let e = PolicyEngine::new(vec![reserved_rule.clone()]);
+        assert_eq!(e.len(), 0, "new() 必须过滤掉占用保留 id 的规则");
+        // add_rule() 也拒绝
+        let mut e2 = PolicyEngine::new(vec![]);
+        e2.add_rule(reserved_rule);
+        assert_eq!(e2.len(), 0, "add_rule() 必须拒绝占用保留 id 的规则");
+        // 结论:`policy_ids == [DEFAULT_DENY_POLICY_ID]` 只可能来自引擎 floor(无规则匹配),
+        // 不可能来自某条命中规则 → 下游 floor 检测不可伪造。
+        let res = e
+            .evaluate(&EffectVector::default(), &PolicyContext::default())
+            .unwrap();
+        assert_eq!(res.policy_ids, vec![DEFAULT_DENY_POLICY_ID.to_string()]);
+        assert!(
+            res.reasons.iter().any(|r| r.contains("no rule matched")),
+            "此 id 必来自 floor(no rule matched),非规则命中"
         );
     }
 }

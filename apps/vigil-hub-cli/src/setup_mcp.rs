@@ -21,8 +21,11 @@
 //! - **默认 enforce** posture(Codex audit 论证:monitor 自动放行恰恰该拦的风险动作 → 不作 turnkey
 //!   默认;monitor 保持显式 opt-in)。故预览的 wrap argv **不含** `--monitor`。
 //! - 改写形态:`vigil-hub wrap --server-id <名> [--env-key <K>]... --vigil-managed-mcp -- <原 cmd> <原 args>`。
-//! - **env key-only**:只透传 agent 为该 server 配的 env **键名**(值由 wrap 运行时从自身 env 读),
-//!   生成的配置里**绝不**出现 secret 值(复用 wrap `--env-key` allowlist,Codex R1 HIGH 决策)。
+//! - **env key-only(指 wrap argv,非整个条目)**:改写产出的 **wrap 命令行**只含 env **键名**
+//!   (`--env-key K`,值由 wrap 运行时从自身 env 读),**argv 里绝不出现 secret 值**。注意:被包裹
+//!   条目原有的 `env` 对象(含用户**早已写入**的值)**逐字保留**(reversible 需要 + Claude 仍按它设
+//!   wrap 的 env)—— wrap **既不新增也不复制** secret 值,只是不让值出现在 argv;原值本就在用户配置里,
+//!   故"配置 at-rest 无 secret"**不**成立(Codex holistic MEDIUM 澄清;`--env-key` 只限子进程转发)。
 //! - **sentinel `--vigil-managed-mcp`**:幂等防双重 wrap + 标识 Vigil 托管条目(供未来 uninstall 识别)。
 //! - 分类 + argv 构造是**纯函数**(fixture 可测),IO 边界(读真实文件)单独一层 —— 单测**绝不**碰真实配置。
 
@@ -185,6 +188,19 @@ fn classify_one(name: &str, entry: &Value) -> McpServerClass {
                 .collect()
         }
     };
+    // F3(Codex holistic MEDIUM):server-id 由 name 派生(`user-<name>` / `local-<hash>-<name>`),
+    // 但网关 attach 时只接受 `^[a-z0-9_-]+$`(namespace::validate_server_id)。若 name 含大写/空格/点/
+    // 斜杠等(Claude server 名可任意),改写会"apply 成功但 wrap 启动失败"(配置坏了却看不出)。
+    // 用**真验证器**校验 name —— 名合法则 `user-`/`local-<hash>-` 前缀拼接后必合法;不合法则 Skip
+    // (不改写),让用户改名后再保护,而非产出一个起不来的网关条目。
+    if vigil_mcp::namespace::validate_server_id(name).is_err() {
+        return McpServerClass::Skipped {
+            name: name.into(),
+            reason: "server name has characters not allowed in a gateway id (use a-z 0-9 _ -); \
+                     rename it in your MCP config to protect it",
+        };
+    }
+
     // env **键名**(只键不值;绝不读 secret 值)。
     let env_keys: Vec<String> = entry
         .get("env")
@@ -797,6 +813,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn invalid_server_name_skipped_not_wrapped() {
+        // F3(Codex holistic MEDIUM):名含网关 server-id 不允许的字符(大写/空格/点/斜杠)→ Skip,
+        // 否则 apply 成功但 wrap attach 在 validate_server_id 失败 = 坏配置。逐名核对真验证器口径。
+        let cfg = json!({"mcpServers": {
+            "Filesystem": {"command": "npx", "args": ["a"]},          // 大写
+            "my server": {"command": "npx", "args": ["a"]},          // 空格
+            "weather.api": {"command": "npx", "args": ["a"]},        // 点
+            "a/b": {"command": "npx", "args": ["a"]},                // 斜杠
+            "good-name_1": {"command": "npx", "args": ["a"]}         // 合法
+        }});
+        let c = classify_user_scope_servers(&cfg);
+        let skipped = |n: &str| {
+            c.iter()
+                .any(|x| matches!(x, McpServerClass::Skipped { name, .. } if name == n))
+        };
+        for bad in ["Filesystem", "my server", "weather.api", "a/b"] {
+            assert!(
+                skipped(bad),
+                "非法名 `{bad}` 须 Skipped(否则 wrap 启动失败)"
+            );
+        }
+        // 合法名仍 Wrappable
+        assert!(c
+            .iter()
+            .any(|x| matches!(x, McpServerClass::Wrappable { name, .. } if name == "good-name_1")));
+        // 真验证器一致性:被 Skip 的名确实过不了 validate_server_id
+        assert!(vigil_mcp::namespace::validate_server_id("Filesystem").is_err());
+        assert!(vigil_mcp::namespace::validate_server_id("good-name_1").is_ok());
+    }
+
     // ---- mutation 增量:wrap/unwrap 往返 + 功能测试 ----
 
     #[test]
@@ -978,7 +1025,7 @@ mod tests {
             expected_id,
             "local scope 必须用项目限定 server-id 防跨项目身份塌缩"
         );
-        // user scope 的 fs 用 user: 前缀(与 local: 命名空间不相交)
+        // user scope 的 fs 用 user- 前缀(与 local- 命名空间不相交)
         let user_args: Vec<String> = after["mcpServers"]["fs"]["args"]
             .as_array()
             .unwrap()
@@ -989,7 +1036,7 @@ mod tests {
         assert_eq!(
             user_args[usid + 1],
             user_scope_server_id("fs"),
-            "user scope 用 user: 前缀 id"
+            "user scope 用 user- 前缀 id"
         );
 
         // uninstall 还原**两个** scope(self-describing,与 id 无关)

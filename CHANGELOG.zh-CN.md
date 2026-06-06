@@ -8,6 +8,26 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.16] — 2026-06-06
+
+让被包裹的 MCP server 在 monitor 模式下真正可用,外加安全加固 —— 由对真实第三方 MCP server 的端到端
+测试发现。
+
+### 修复
+
+- **被包裹的 MCP server 现在在 monitor 模式下可用了。** 此前用 `vigil-hub wrap --monitor` 包裹的
+  server(没有桌面审批端时推荐的姿态)大部分工具会被**拒绝** —— 防火墙无法分类的第三方工具撞上
+  default-deny 兜底,而 monitor 只自动放行"需审批"的调用、不放行兜底拒绝。现在 monitor 把
+  **default-deny 兜底**降级为观察放行(并完整审计),被包裹的 filesystem/git 等 server 开箱即用。
+  这**只**影响未分类的兜底:显式拒绝规则、裸 secret 拦截、结果脱敏全部仍然强制,默认的 `enforce`
+  姿态不变(仍是默认安全)。
+- **monitor 模式不再自动批准"已变更(漂移)"的工具 descriptor。** descriptor 漂移是篡改 / 供应链
+  信号;现在 monitor 下漂移的 descriptor 会落到审批路径(无 GUI 的一键场景下被拒绝)而非被静默放行,
+  保持 descriptor-pinning 信任锚完整。
+- **`vigil-hub setup --mcp` 跳过名字无法作为合法网关 id 的 server。** 含大写字母、空格、点或斜杠的
+  server 名此前会被成功改写、但包裹后的网关启动时失败。现在它被跳过并清晰提示改名。
+- **`vigil-hub` 启动 banner 显示真实发布版本**(如 `vigil-hub v0.1.16`)而非内部构建标记。
+
 ## [v0.1.15] — 2026-06-06
 
 `vigil-hub setup --mcp` 现在也保护 **local scope(按项目)** 的 MCP server —— 闭合了 `claude mcp add`

@@ -121,11 +121,15 @@ pub struct HubConfig {
     /// **Monitor posture**(opt-in,非阻塞观察;Codex wrap R1 MEDIUM)。
     ///
     /// turnkey 场景(无 desktop GUI resolver)下,本应人审批(`FirewallOutcome::Approve`)的风险
-    /// 调用会阻塞 `approval_wait`(默认 300s)后超时 deny —— 看似 server 卡死。开启本模式:Approve
-    /// 路径**自动放行 + 完整审计**(auto-resolve 刚建的 approval,resolver=`vigil-monitor-mode`,
-    /// scope=`Once` 仅本次),不阻塞。**保护不变量仍在**:`Denied`/default-deny 仍 deny;raw-secret
-    /// 前门仍 hard-deny;结果仍按 `redact_tool_results` 脱敏。语义=「观察+脱敏+审计,不拦人审批类
-    /// 风险动作」,比 enforce 弱,故**必须显式 opt-in**(默认 false = enforce 阻塞审批)。
+    /// 调用会阻塞 `approval_wait`(默认 300s)后超时 deny —— 看似 server 卡死;且未分类的第三方工具撞
+    /// **default-deny floor** 直接被拒,使被包裹的真实 server 开箱不可用。开启本模式 = 真「观察」姿态:
+    /// - `Approve` 路径**自动放行 + 完整审计**(auto-resolve approval,resolver=`vigil-monitor-mode`),
+    ///   **但 descriptor-drift 例外**(F1:篡改/信任锚信号,落回阻塞审批,绝不静默放行);
+    /// - **default-deny floor**(无规则匹配的未分类工具)降级为**观察放行 + 审计**(F2:使真实 server 可用)。
+    ///
+    /// **仍强制的floor(不被 monitor 削弱)**:raw-secret 前门 hard-deny(在 firewall 之前);**显式 Deny
+    /// 规则** + descriptor-drift 仍 deny/阻塞;结果仍按 `redact_tool_results` 脱敏;全程审计。语义=
+    /// 「观察+脱敏+审计,不阻塞」,比 enforce 弱,故**必须显式 opt-in**(默认 false = enforce)。
     pub monitor_mode: bool,
 }
 
@@ -1012,16 +1016,48 @@ impl Hub {
             FirewallOutcome::Allowed { decision, .. } => {
                 self.invoke_upstream(req, &invocation, &route, None, decision)
             }
-            FirewallOutcome::Denied { decision, .. } => Ok(Some(req.error(
-                JsonRpcError::VIGIL_DENIED,
-                "denied by firewall",
-                Some(json!({
-                    "decision_id": decision.decision_id,
-                    "reasons": decision.reasons,
-                    "policy_ids": decision.policy_ids,
-                    "risk_score": decision.risk_score,
-                })),
-            ))),
+            FirewallOutcome::Denied { decision, .. } => {
+                // Monitor posture(opt-in,非阻塞观察):**default-deny FLOOR**(`policy_ids ==
+                // ["default-deny"]` —— 无规则匹配的未分类工具,如第三方 MCP server 的 read_file)在
+                // monitor 下降级为「观察放行」,使被包裹的真实 server **开箱可用**(否则 effect 提取器
+                // 不认第三方工具名 → 全 default-deny → enforce/monitor 都拒 → wrap 无用)。
+                // **只翻 floor**:显式 Deny 规则(policy_ids 非 ["default-deny"])仍 deny。
+                // 保护不变量全保留:raw-secret 前门已更前处 hard-deny;结果按 redact_tool_results 脱敏;
+                // 本次 override 记一条真实 Allow DecisionRecord(resolver=vigil-monitor-mode)入审计链
+                // (诚实:审计显示 monitor 放行,非"deny 后却执行")。enforce 不变(默认仍 deny)。
+                // floor 用**保留 policy id**(vigil_policy 已禁止任何规则占用此 id)→ 此判定唯一识别
+                // "无规则匹配的兜底拒绝",不会被一条 id 恰为 default-deny 的显式 Deny 规则伪造(Codex HIGH)。
+                if self.config.monitor_mode
+                    && decision.policy_ids == [vigil_firewall::DEFAULT_DENY_POLICY_ID]
+                {
+                    let dec = DecisionRecord {
+                        decision_id: Uuid::new_v4().to_string(),
+                        invocation_id: invocation_id.clone(),
+                        decision: DecisionKind::Allow,
+                        risk_score: decision.risk_score,
+                        reasons: vec![
+                            "monitor mode: default-deny floor downgraded to observe-allow \
+                             (non-blocking; redaction + raw-secret gate still enforced)"
+                                .to_string(),
+                        ],
+                        policy_ids: vec!["vigil-monitor-mode".to_string()],
+                        created_at: 0,
+                    };
+                    self.ledger
+                        .record_decision(&session_id, &dec, &EffectVector::default())?;
+                    return self.invoke_upstream(req, &invocation, &route, None, dec);
+                }
+                Ok(Some(req.error(
+                    JsonRpcError::VIGIL_DENIED,
+                    "denied by firewall",
+                    Some(json!({
+                        "decision_id": decision.decision_id,
+                        "reasons": decision.reasons,
+                        "policy_ids": decision.policy_ids,
+                        "risk_score": decision.risk_score,
+                    })),
+                )))
+            }
             FirewallOutcome::Approve {
                 decision,
                 effects,
@@ -1057,10 +1093,19 @@ impl Hub {
                 // 风险调用**自动放行 + 完整审计**,但**保留 outbox**(上面已 draft+submit)。auto-resolve
                 // 刚建 approval(resolver=`vigil-monitor-mode`,scope=`Once` 仅本次)+ 标 outbox approved,
                 // 随后走与"人已批准"完全一致的 `invoke_upstream`(传 outbox_id + 真 decision,不伪造)。
-                // 不阻塞 → turnkey 无 GUI resolver 不再"看似卡死"。保护不变量仍在:raw-secret 前门已更前
-                // 处 hard-deny;`Denied`/default-deny 仍 deny;结果按 `redact_tool_results` 脱敏;outbox
-                // 预览已记录。仅"人审批类风险动作"被降级为观察(故 opt-in 默认 false)。
-                if self.config.monitor_mode {
+                // 不阻塞 → turnkey 无 GUI resolver 不再"看似卡死"。仍强制的 floor:raw-secret 前门已更前
+                // 处 hard-deny;**显式 Deny 规则** + descriptor-drift(下方 F1)仍 deny/阻塞;结果按
+                // `redact_tool_results` 脱敏;outbox 预览已记录。(default-deny **floor** 在上面 Denied
+                // 臂的 F2 分支降级为观察放行,使真实 server 可用 —— 见 monitor_mode 字段 doc。)
+                // F1(Codex holistic HIGH):monitor 自动放行 Approve 类风险调用,**但排除
+                // descriptor-drift**。drift = 工具的已 pin descriptor **变了**(篡改 / 供应链信号);
+                // 若 monitor 静默自动批准,等于绕过 descriptor-pinning 信任锚。drift 落到下面的正常
+                // 阻塞审批路径(turnkey 无 GUI 下超时 → deny = 安全;且响亮审计),绝不在 monitor 下自动放行。
+                let is_descriptor_drift = decision
+                    .policy_ids
+                    .iter()
+                    .any(|p| p == "approve-descriptor-drift");
+                if self.config.monitor_mode && !is_descriptor_drift {
                     self.ledger.approve(
                         &approval.approval_id,
                         vigil_types::ApprovalScope::Once,

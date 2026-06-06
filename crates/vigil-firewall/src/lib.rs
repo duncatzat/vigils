@@ -33,6 +33,9 @@ mod preflight;
 pub mod scorer;
 
 pub use engine::{Firewall, FirewallConfig, FirewallError, FirewallOutcome, OAuthScopeContext};
+// 转发 policy 的兜底 floor 保留 id —— 下游(vigil-mcp 的 monitor floor 降级)用它**不可伪造**地
+// 识别 default-deny floor;vigil-mcp 只把 vigil-policy 作 dev-dep,故经 vigil-firewall 这条正式依赖暴露。
+pub use vigil_policy::DEFAULT_DENY_POLICY_ID;
 // R2 BLOCKER 2 + R2 NICE:只暴露 `PiiScanner` trait(Firewall::with_scanner 签名需要)。
 // `DefaultScanner` 和 `FailingScanner` 是实现细节 —— 生产 caller 不需直接构造
 // DefaultScanner(Firewall::new 内部选择);测试可本地实现 PiiScanner trait(见

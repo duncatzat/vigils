@@ -20,7 +20,7 @@ mod engine;
 pub use defaults::default_pii_rules;
 pub use engine::{
     Condition, DescriptorState, EffectField, PiiFindingSummary, PolicyAction, PolicyContext,
-    PolicyDecision, PolicyEngine, PolicyError, PolicyRule, PolicyValue,
+    PolicyDecision, PolicyEngine, PolicyError, PolicyRule, PolicyValue, DEFAULT_DENY_POLICY_ID,
 };
 
 /// 当前迭代号。

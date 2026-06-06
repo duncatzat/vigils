@@ -233,3 +233,77 @@ fn monitor_mode_finalizes_outbox_when_upstream_missing() {
         "approved outbox 在 pre-call 早返时必须 finalize 为 Failed,不得悬挂 Approved;实际 {status}"
     );
 }
+
+/// F2 守门(Codex holistic + 真实-server E2E 发现):monitor 模式把 **default-deny FLOOR**
+/// (无规则匹配的未分类工具,如第三方 MCP server 的 read_file —— effect 提取器不认其工具名)
+/// 降级为「观察放行」,使被包裹的真实 server **开箱可用**;enforce 仍 deny。**只翻 floor**。
+/// 不注入 catch-all,用 default_ruleset + 中性工具(无 effect)稳定撞 default-deny。
+fn build_plain_hub(l: &Arc<Ledger>, monitor: bool) -> Arc<Hub> {
+    let policy = PolicyEngine::new(default_ruleset()); // 无 catch-all → 中性工具撞 default-deny
+    let fw = Arc::new(Firewall::new(l.clone(), policy, FirewallConfig::default()));
+    let oracle: Arc<dyn DescriptorOracle> =
+        Arc::new(StaticDescriptorOracle(DescriptorStatus::ApprovedStable));
+    Arc::new(Hub::new(
+        l.clone(),
+        fw,
+        oracle,
+        HubConfig {
+            approval_wait: Duration::from_millis(200),
+            upstream_call_timeout: Duration::from_millis(500),
+            monitor_mode: monitor,
+            ..Default::default()
+        },
+        vigil_mcp::SecretAliasMap::default(),
+    ))
+}
+
+#[test]
+fn monitor_mode_allows_default_deny_floor() {
+    // 中性工具(无 url/path,无 effect)→ 无规则匹配 → default-deny floor。monitor 应降级放行
+    // → 一路到 invoke_upstream(NoopUpstream 成功 → resp 无 error)。这是 wrap 真实 server 可用的关键。
+    let l = Arc::new(Ledger::open_in_memory().unwrap());
+    let hub = build_plain_hub(&l, true);
+    let session = l.start_session("monitor_floor_test", None).unwrap();
+    hub.set_session_id_for_test(session.clone()).unwrap();
+    hub.inject_route_for_test("calc", "compute", "hash_abc")
+        .unwrap();
+    hub.attach_upstream(
+        "calc",
+        &["mock".to_string()],
+        Arc::new(NoopUpstream("calc".into())),
+    )
+    .unwrap();
+
+    let resp = call_compute(&hub);
+    assert!(
+        resp.error.is_none(),
+        "monitor 应把 default-deny floor 降级放行到 invoke_upstream;实际 resp={resp:?}"
+    );
+    // 审计诚实:override 记一条 vigil-monitor-mode 的决策(非"deny 后却执行")。
+    let events = l.replay_session_verified(&session).unwrap();
+    assert!(
+        events.iter().any(|e| e
+            .payload
+            .get("policy_ids")
+            .map(|v| v.to_string().contains("vigil-monitor-mode"))
+            .unwrap_or(false)),
+        "monitor floor 放行须记一条 vigil-monitor-mode 决策入审计链(诚实);events={events:?}"
+    );
+}
+
+#[test]
+fn enforce_mode_denies_default_deny_floor() {
+    // 对照:enforce(monitor off)下 default-deny floor 仍 deny —— F2 只动 monitor,enforce 不变。
+    let l = Arc::new(Ledger::open_in_memory().unwrap());
+    let hub = build_plain_hub(&l, false);
+    let session = l.start_session("enforce_floor_test", None).unwrap();
+    hub.set_session_id_for_test(session).unwrap();
+    hub.inject_route_for_test("calc", "compute", "hash_abc")
+        .unwrap();
+    let resp = call_compute(&hub);
+    assert_eq!(
+        resp.error.as_ref().unwrap().code,
+        JsonRpcError::VIGIL_DENIED,
+        "enforce 下 default-deny floor 必须仍 deny;实际 resp={resp:?}"
+    );
+}

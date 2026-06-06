@@ -8,6 +8,31 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.16] — 2026-06-06
+
+Makes wrapped MCP servers actually usable in monitor mode, plus security hardening — found by
+end-to-end testing the gateway against a real third-party MCP server.
+
+### Fixed
+
+- **Wrapped MCP servers now work in monitor mode.** Previously, a server wrapped with
+  `vigil-hub wrap --monitor` (the recommended posture when you have no desktop approver running)
+  would have most of its tools **denied** — third-party tools the firewall can't classify hit the
+  default-deny floor, and monitor only auto-allowed approval-required calls, not the floor. Now
+  monitor downgrades the **default-deny floor** to observe-allow (with full audit), so a wrapped
+  filesystem/git/etc. server is usable out of the box. This affects **only** the unclassified
+  floor: explicit deny rules, raw-secret blocking, and result redaction are all still enforced,
+  and the default `enforce` posture is unchanged (still secure-by-default).
+- **Monitor mode no longer auto-approves a changed (drifted) tool descriptor.** Descriptor drift
+  is a tamper / supply-chain signal; in monitor mode a drifted descriptor now falls through to the
+  approval path (and is denied in turnkey-without-GUI) instead of being silently allowed, keeping
+  the descriptor-pinning trust anchor intact.
+- **`vigil-hub setup --mcp` skips servers whose name can't be a valid gateway id.** A server name
+  with uppercase letters, spaces, dots, or slashes would previously be rewritten successfully but
+  then fail when the wrapped gateway started. It's now skipped with a clear message to rename it.
+- **The `vigil-hub` startup banner shows the real release version** (e.g. `vigil-hub v0.1.16`)
+  instead of an internal build marker.
+
 ## [v0.1.15] — 2026-06-06
 
 `vigil-hub setup --mcp` now protects **local-scope** (per-project) MCP servers too — closing the
