@@ -26,8 +26,9 @@ pub use error::{AuditError, Result};
 pub use ledger::RESERVED_EVENT_PREFIX;
 pub use ledger::{
     AppendedEvent, EventDetailRow, EventHit, Ledger, NewRedactionFinding, NewRedactionScan,
-    RedactionFindingRow, RedactionScanRow, ReplayEvent, SessionSummaryRow,
-    ALLOWED_REDACTION_LABELS, RESERVED_EVENT_PREFIXES,
+    ProtectionSummary, RedactionFindingRow, RedactionScanRow, ReplayEvent, SessionSummaryRow,
+    ALLOWED_REDACTION_LABELS, EVENT_TYPE_RAW_SECRET_BLOCKED, EVENT_TYPE_SECRET_ALIAS_UNRESOLVED,
+    EVENT_TYPE_TOOL_RESULT_LEAK, RESERVED_EVENT_PREFIXES,
 };
 pub use outbox::{OutboxItem, OutboxKind, OutboxStatus};
 pub use registry::{

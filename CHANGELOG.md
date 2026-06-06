@@ -8,6 +8,25 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.18] — 2026-06-06
+
+A new `vigil-hub inspect protection` command shows, at a glance, what Vigil has actually protected —
+so the "monitor mode still protects you" guarantee is visible, not just claimed.
+
+### Added
+
+- **`vigil-hub inspect protection` — a protection-summary view over your audit ledger.** It counts
+  secrets blocked at input, tool-result secret leaks detected (and redacted, when result redaction
+  is on — the default for `setup --mcp`/`wrap`), `secret://` aliases withheld, total events audited
+  across sessions, and whether the tamper-evident hash chain still verifies — plus the most recent
+  protection events (redacted summaries only). This makes the reversible-redaction value legible:
+  after running your MCP tools through Vigil, you can see exactly what it caught. Read-only;
+  `--json` for scripts. The wording is deliberately honest — it reports *observed* protection, not
+  inflated "threats stopped".
+- The summary **fails closed**: if the audit chain does not verify, the recent-event detail is
+  withheld (a tampered ledger's stored summaries can't be trusted), while the integer counts and a
+  clear "chain failed verification" warning are still shown.
+
 ## [v0.1.17] — 2026-06-06
 
 `vigil-hub setup --mcp` now defaults to **monitor** posture, so wrapping your existing MCP servers

@@ -105,6 +105,16 @@ enum InspectCmd {
     },
     /// Hash chain 校验
     VerifyChain,
+    /// 保护成效汇总:一眼看清 Vigil 拦了多少裸 secret、脱敏了多少 tool-result 泄漏、审计了多少、
+    /// 哈希链是否完整。turnkey(monitor 姿态)的"不阻塞 ≠ 没保护"证据面。
+    Protection {
+        /// 列出最近多少条保护类事件(裸 secret 拦截 / 泄漏脱敏 / alias 未解析)。
+        #[arg(long, default_value_t = 10)]
+        limit: u32,
+        /// 输出结构化 JSON(默认人类可读摘要;`--json` 供脚本/文档/桌面复用)。
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -354,10 +364,104 @@ fn build_command(cmd: InspectCmd) -> Result<UiCommand, String> {
             }),
         },
         InspectCmd::VerifyChain => UiCommand::VerifyChain,
+        // Protection 在 run() 中先于 build_command 被拦截直渲染(不走 UiCommand dispatch);
+        // 走到这里说明调用顺序被改坏 —— 防御性返回 Err(而非 panic)。
+        InspectCmd::Protection { .. } => {
+            return Err("protection summary is rendered directly, not via UiCommand".to_string())
+        }
     })
 }
 
 /// 执行 `vigil-hub inspect <cmd>`:打开 ledger → 构造 UiCommand → dispatch → 渲染 JSON。
+/// 渲染 `inspect protection` 的保护成效汇总(ASCII-safe,cp936/cp437 不乱码)。
+/// `json=true` → 单行结构化 JSON(脚本/文档/桌面复用);否则人类可读 proof-of-value 摘要。
+/// 退出码:0 成功 / 1 聚合查询失败。
+fn render_protection(ledger: &Ledger, limit: u32, json: bool) -> ExitCode {
+    let summary = match ledger.protection_summary(limit) {
+        Ok(s) => s,
+        Err(_e) => {
+            // 不回显底层错误原文(可能含路径/SQL);只给稳定 reason_code(与 run() 一致)。
+            eprintln!(
+                r#"{{"kind":"LedgerError","detail":{{"reason_code":"protection_summary_failed"}}}}"#
+            );
+            return ExitCode::from(1);
+        }
+    };
+
+    if json {
+        // serde 化 ProtectionSummary(含 recent EventHit,均已脱敏);失败极罕见 → reason_code。
+        match serde_json::to_string(&summary) {
+            Ok(s) => {
+                println!("{s}");
+                return ExitCode::SUCCESS;
+            }
+            Err(_) => {
+                eprintln!(
+                    r#"{{"kind":"SerializeError","detail":{{"reason_code":"protection_json_failed"}}}}"#
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // 人类可读:计数是主角(proof-of-value);措辞**诚实**——陈述"已观察到的保护结果",不夸大。
+    let chain = if summary.chain_intact {
+        "intact (audit log not tampered)"
+    } else {
+        "TAMPERED -- run `vigil-hub inspect verify-chain` for details"
+    };
+    println!("What Vigil has protected (observed in the local audit ledger)");
+    println!(
+        "  Secrets blocked at input:     {:>6}   (raw secrets denied before reaching the server/model)",
+        summary.raw_secrets_blocked
+    );
+    println!(
+        "  Tool-result leaks detected:   {:>6}   (secrets in tool output; redacted before the agent when result redaction is on)",
+        summary.tool_result_leaks_detected
+    );
+    println!(
+        "  Secret aliases withheld:      {:>6}   (secret:// placeholders that did not resolve -> denied)",
+        summary.secret_aliases_unresolved
+    );
+    println!(
+        "  Events audited:               {:>6}   across {} session(s)",
+        summary.total_events_audited, summary.sessions_covered
+    );
+    println!("  Audit chain integrity:        {chain}");
+
+    if !summary.chain_intact {
+        // fail-closed:链不可信时 protection_summary 已抑制 recent;诚实说明明细被扣留(非"无事件")。
+        println!();
+        println!(
+            "  Recent-event detail withheld: the audit chain failed verification, so the stored"
+        );
+        println!(
+            "  redacted summaries cannot be trusted. Run `vigil-hub inspect verify-chain` to triage."
+        );
+    } else if summary.recent.is_empty() {
+        println!();
+        println!(
+            "  No protection events yet. Run your MCP tools through Vigil (vigil-hub setup --mcp"
+        );
+        println!(
+            "  --apply, then use your agent normally) -- Vigil records and redacts as they execute."
+        );
+    } else {
+        println!();
+        println!("  Recent protection events (redacted summaries only):");
+        for e in &summary.recent {
+            // session_id 截断展示(短 id 便于扫读);redacted_text 已脱敏,缺省给占位。
+            let sid: String = e.session_id.chars().take(8).collect();
+            let summ = e.redacted_text.as_deref().unwrap_or("(no summary)");
+            println!(
+                "    #{:<6} {:<28} [{}] {}",
+                e.event_id, e.event_type, sid, summ
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 pub fn run(args: InspectArgs) -> ExitCode {
     // 打开 Ledger:--db-path 优先;省略 → 默认**共享账本**(与 setup/hook 同一个,
     // 让 `vigil-hub setup` 后直接 `vigil-hub inspect activity` 就能看到被拦内容);
@@ -380,6 +484,13 @@ pub fn run(args: InspectArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // protection:CLI 专属"保护成效"汇总(只读聚合,面向用户的 proof-of-value 摘要)。**不**走
+    // UiCommand dispatch —— 它不是数据查询,且避免再碰已与内部仓分叉的 ui-protocol/dispatcher/render
+    // (本增量刻意把改动收敛到 vigil-audit 数据层 + 本 CLI 文件两处)。按引用匹配,不移动 args.cmd。
+    if let InspectCmd::Protection { limit, json } = &args.cmd {
+        return render_protection(&ledger, *limit, *json);
+    }
 
     let ui_cmd = match build_command(args.cmd) {
         Ok(c) => c,

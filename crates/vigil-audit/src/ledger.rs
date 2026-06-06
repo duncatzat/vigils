@@ -128,6 +128,48 @@ pub struct EventHit {
     pub created_at: i64,
 }
 
+/// `inspect protection` 计数的三类"保护事件"的 `event_type` 值。
+///
+/// 这些字面量 = vigil-mcp 的 `EVENT_RAW_SECRET_ATTEMPT_DETECTED` / `EVENT_SECRET_LEAK_DETECTED` /
+/// `EVENT_SECRET_ALIAS_UNRESOLVED`(协议字符串)。vigil-mcp **依赖** vigil-audit,反向 import 会成环,
+/// 故此处持有**副本**;`vigil-hub-cli` 层(同时依赖二者)有 sync-guard 测试逐条核对二者相等,
+/// 防 vigil-mcp 改了常量值而本聚合静默计零([[SSOT drift guard]])。
+pub const EVENT_TYPE_RAW_SECRET_BLOCKED: &str = "raw_secret_attempt_detected";
+/// 见 [`EVENT_TYPE_RAW_SECRET_BLOCKED`]。
+pub const EVENT_TYPE_TOOL_RESULT_LEAK: &str = "secret.leak_detected";
+/// 见 [`EVENT_TYPE_RAW_SECRET_BLOCKED`]。
+pub const EVENT_TYPE_SECRET_ALIAS_UNRESOLVED: &str = "secret.alias_unresolved";
+
+/// `inspect protection` 的"保护成效"汇总(只读聚合,proof-of-value 面)。
+///
+/// 让 turnkey(`setup --mcp` / `wrap`,默认 monitor 姿态)用户**看见**"不阻塞 ≠ 没保护":
+/// 统计**持久化**的 ledger 事件(非进程内存计数 `leak_detected_count`,后者进程退出即丢)。
+/// 纯读、按 `event_type` 计数(不解析 payload)、不产生任何新携密 payload。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProtectionSummary {
+    /// 输入侧裸 secret 被硬拦的次数(`raw_secret_attempt_detected`):决策前门把含原始密钥的
+    /// tool 调用 fail-closed deny,密钥从未到达上游/远端 LLM。
+    pub raw_secrets_blocked: u64,
+    /// tool result 里命中硬指纹的 secret 泄漏被**检测**次数(`secret.leak_detected`)。注意:此事件在
+    /// **检测**即记录;实际脱敏仅在 `redact_tool_results=true`(`wrap`/`setup --mcp` 默认开,plain
+    /// `serve` 默认关)时发生。故诚实命名为 `detected` 而非 `redacted`,避免对未开脱敏的账本过度声称
+    /// (Codex D11-B review)。turnkey 路径下检测即脱敏,二者等价。
+    pub tool_result_leaks_detected: u64,
+    /// forward-path `secret://alias` 未能解析而被拒的次数(`secret.alias_unresolved`):
+    /// 可逆脱敏的"占位符进、真值不外泄"半边的 fail-closed 计数。
+    pub secret_aliases_unresolved: u64,
+    /// 审计账本事件总量(防"全零显得弱":只要有 MCP 活动就 > 0,证明 Vigil 在记录)。
+    pub total_events_audited: u64,
+    /// 覆盖的 session 数(distinct session_id)。
+    pub sessions_covered: u64,
+    /// 哈希链完整性(`verify_chain` 通过 = 账本未被篡改);防篡改审计的信任锚。
+    pub chain_intact: bool,
+    /// 最近 N 条**保护类**事件(仅上述三类;只含已脱敏摘要)。**fail-closed**:`chain_intact=false`
+    /// 时**强制为空** —— 篡改的账本里 `redacted_text` 可能被注入原始 secret,链不可信时绝不回显明细
+    /// (Codex D11-B review HIGH;计数是整数不泄密可留,明细文本抑制)。
+    pub recent: Vec<EventHit>,
+}
+
 /// I08 `list_sessions` 返回的 session 摘要投影。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionSummaryRow {
@@ -661,6 +703,94 @@ impl Ledger {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    /// `inspect protection` 的"保护成效"只读聚合 → [`ProtectionSummary`]。
+    ///
+    /// 按 `event_type` 计数持久化事件(不解析 payload,稳健),取最近 `recent_limit` 条保护类事件。
+    /// **先验链再读**:`verify_chain` 失败时**抑制 recent 明细**(fail-closed,篡改账本摘要不可信,
+    /// 整数计数仍给)。**纯读**,不写任何东西、不产生新携密 payload。
+    ///
+    /// **已接受的局限(Codex D11-B R2 NIT)**:`verify_chain` 释放锁后再取 recent,非单事务快照 →
+    /// 理论 TOCTOU(外部写者恰在两步间篡改可绕过抑制)。本地单用户审计模型下不构成实际威胁(攻击者
+    /// 有 ledger 写权时本可在 inspect 前直接篡改、且会被 verify_chain 抓),故不为此边际场景重构安全
+    /// 关键的 verify_chain 路径;若威胁模型纳入 inspect 期间并发本地篡改,应改为单读事务内验+读。
+    pub fn protection_summary(&self, recent_limit: u32) -> Result<ProtectionSummary> {
+        // 保护事件类型 = 模块级 pub const(vigil-hub-cli 有 sync-guard 测试核对与 vigil-mcp EVENT_* 一致)。
+        let raw_secret = EVENT_TYPE_RAW_SECRET_BLOCKED;
+        let leak = EVENT_TYPE_TOOL_RESULT_LEAK;
+        let alias_unresolved = EVENT_TYPE_SECRET_ALIAS_UNRESOLVED;
+
+        // **先**验链(Codex D11-B review HIGH:fail-closed)。链不完整 → 篡改者可能把原始 secret 注入
+        // 某保护事件的 `redacted_text`,故下面**抑制 recent 明细**,只回不泄密的整数计数 + chain_intact=false。
+        // verify_chain 自锁 conn,必须在取 guard **之前**调,避免重入死锁。
+        let chain_intact = self.verify_chain().is_ok();
+
+        // guard 作用域内取完所有 SQL 计数(+ chain 完整时才取 recent 明细)。
+        let (
+            raw_secrets_blocked,
+            tool_result_leaks_detected,
+            secret_aliases_unresolved,
+            total,
+            sessions,
+            recent,
+        ) = {
+            let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
+            let count_type = |t: &str| -> Result<u64> {
+                let n: i64 = guard.query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_type = ?1",
+                    [t],
+                    |r| r.get(0),
+                )?;
+                Ok(n as u64)
+            };
+            let raw_n = count_type(raw_secret)?;
+            let leak_n = count_type(leak)?;
+            let alias_n = count_type(alias_unresolved)?;
+            let total: i64 = guard.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+            let sessions: i64 =
+                guard.query_row("SELECT COUNT(DISTINCT session_id) FROM events", [], |r| {
+                    r.get(0)
+                })?;
+            // 最近 N 条保护类事件(只取三类;只投影已脱敏列)。**仅 chain 完整时取** —— 篡改账本的
+            // 摘要不可信,fail-closed 抑制(链坏时 recent = 空,counts 仍给但用户已见 chain TAMPERED)。
+            let recent = if chain_intact {
+                let mut stmt = guard.prepare(
+                    "SELECT event_id, session_id, event_type, redacted_text, created_at FROM events
+                     WHERE event_type IN (?1, ?2, ?3) ORDER BY event_id DESC LIMIT ?4",
+                )?;
+                let rows = stmt.query_map(
+                    rusqlite::params![raw_secret, leak, alias_unresolved, recent_limit as i64],
+                    |r| {
+                        Ok(EventHit {
+                            event_id: r.get(0)?,
+                            session_id: r.get(1)?,
+                            event_type: r.get(2)?,
+                            redacted_text: r.get(3)?,
+                            created_at: r.get(4)?,
+                        })
+                    },
+                )?;
+                let mut v = Vec::new();
+                for r in rows {
+                    v.push(r?);
+                }
+                v
+            } else {
+                Vec::new()
+            };
+            (raw_n, leak_n, alias_n, total, sessions, recent)
+        }; // guard 在此释放
+
+        Ok(ProtectionSummary {
+            raw_secrets_blocked,
+            tool_result_leaks_detected,
+            secret_aliases_unresolved,
+            total_events_audited: total as u64,
+            sessions_covered: sessions as u64,
+            chain_intact,
+            recent,
+        })
     }
 
     /// 主动触发 WAL checkpoint(TRUNCATE 模式:尽量缩短 WAL 文件)。
