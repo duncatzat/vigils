@@ -410,8 +410,9 @@ fn setup_mcp_dispatch(args: &CliSetupArgs) -> Result<std::process::ExitCode, set
             // Codex D18 R2 Low:probe 真执行每个配置 server 的启动代码 —— 动手**前**(run_doctor 内即
             // 开始 spawn)在 stderr 明确告警,而非仅 help 文案 / 事后表头。
             eprintln!(
-                "[vigil-hub] --probe will briefly START each MCP server in ~/.claude.json (runs its \
-                 startup code) to test a real MCP handshake, then stop it. Ctrl-C to abort."
+                "[vigil-hub] --probe will briefly START each configured MCP server (Claude / Codex / \
+                 Cursor / Windsurf) — running its startup code — to test a real MCP handshake, then \
+                 stop it. Ctrl-C to abort."
             );
             Some(setup_mcp::DOCTOR_PROBE_TIMEOUT)
         } else {
@@ -719,17 +720,21 @@ fn print_mcp_doctor(rows: &[setup_mcp::McpDoctorRow]) -> std::process::ExitCode 
         println!("           a misbehaving npx/uvx grandchild may survive briefly.");
     }
     if rows.is_empty() {
-        println!("  No MCP servers found in ~/.claude.json (nothing to check).");
+        println!(
+            "  No MCP servers found across Claude / Codex / Cursor / Windsurf (nothing to check)."
+        );
         return std::process::ExitCode::SUCCESS;
     }
     let mut failed = 0usize;
     for r in rows {
-        // scope 标注:user 或项目路径(local)。wrapped 标注是否已受 Vigil 保护。全部过 scrub。
+        // scope 标注:Claude user / Claude 项目路径(local) / 其它 agent(Codex/Cursor/Windsurf)。
+        // 三个 agent 名是本程序固定字面量(非用户输入),据此与 Claude 的 user/local-path 区分。wrapped
+        // 标注是否已受 Vigil 保护。全部过 scrub。
         let name = scrub(&r.name);
-        let scope = if r.scope == "user" {
-            "user".to_string()
-        } else {
-            format!("local:{}", scrub(&r.scope))
+        let scope = match r.scope.as_str() {
+            "user" => "user".to_string(),
+            "Codex" | "Cursor" | "Windsurf" => r.scope.clone(),
+            other => format!("local:{}", scrub(other)),
         };
         let guard = if r.wrapped { " [vigil-wrapped]" } else { "" };
         match &r.status {
@@ -771,13 +776,20 @@ fn print_mcp_doctor(rows: &[setup_mcp::McpDoctorRow]) -> std::process::ExitCode 
                 println!("{hint}");
             }
             DoctorStatus::Skipped { reason } => {
-                println!("  [skip] {name} ({scope}): {reason}");
+                // reason 可能含路径(如配置错误行)→ scrub(secrets 绝不进 UI;Codex D29 #5)。
+                println!("  [skip] {name} ({scope}): {}", scrub(reason));
             }
             DoctorStatus::Malformed => {
                 failed += 1;
                 println!(
                     "  [FAIL] {name} ({scope}){guard}: Vigil-managed entry is malformed (cannot determine the underlying program)"
                 );
+            }
+            // 整个 agent 配置坏了(malformed / 读不了)→ 计入失败(server 可能存在却对 doctor 不可见;
+            // doctor 不能因此谎称"全部正常")。reason 含路径 → scrub(Codex D29 #5/#6/#8)。
+            DoctorStatus::ConfigError { reason } => {
+                failed += 1;
+                println!("  [FAIL] {name} ({scope}): {}", scrub(reason));
             }
         }
     }

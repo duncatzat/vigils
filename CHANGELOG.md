@@ -8,6 +8,27 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.30] — 2026-06-07
+
+`--doctor` now health-checks every agent, not just Claude.
+
+### Added
+
+- **`setup --mcp --doctor` now covers all four agent surfaces.** The read-only launch-health preflight —
+  which answers "after wrapping, can each MCP server's underlying program still start in this
+  environment?" — previously checked only Claude Code's servers. It now checks Claude (user +
+  per-project), Codex, Cursor, and Windsurf in one pass, each row tagged by agent. `--doctor --probe`
+  likewise runs a real MCP-handshake test for servers across all four. It sees through Vigil's wrapping —
+  it checks the underlying program (e.g. `npx` / `uvx` / `python`), not `vigil-hub` itself. This directly
+  answers the most common worry after `setup --all`: "did wrapping break any of my tools?"
+
+### Fixed / Security
+
+- A broken (malformed or unreadable) config for a non-Claude agent is now reported as a counted doctor
+  failure with an accurate cause (parse failure vs permission/IO error), instead of being silently
+  skipped — so `--doctor` can no longer claim "all servers resolve" while an entire agent surface went
+  unchecked. All diagnostic output (including config paths) is scrubbed before printing.
+
 ## [v0.1.29] — 2026-06-07
 
 Cursor and Windsurf are protected now too — four agent surfaces from one command.

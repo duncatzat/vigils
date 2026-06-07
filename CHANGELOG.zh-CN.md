@@ -8,6 +8,24 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.30] — 2026-06-07
+
+`--doctor` 现在体检每个 agent,不再只是 Claude。
+
+### 新增
+
+- **`setup --mcp --doctor` 现在覆盖全部四个 agent 接入面。** 这个只读的启动健康预检 —— 回答"wrap 之后,
+  每个 MCP server 的底层程序在本环境还能起来吗" —— 此前只查 Claude Code 的 server。现在一次过查 Claude
+  (user + 各项目)、Codex、Cursor、Windsurf,每行按 agent 标注。`--doctor --probe` 同样对四个面的 server
+  做真实 MCP 握手测试。它看穿 Vigil 的包裹 —— 检查的是底层程序(如 `npx` / `uvx` / `python`)而非
+  `vigil-hub` 自身。这直接回应 `setup --all` 后最常见的担忧:"wrap 之后我的工具是不是被弄坏了?"
+
+### 修复 / 安全
+
+- 非 Claude agent 的配置坏了(无法解析 或 读不了),现在会作为**计入失败**的 doctor 项报告,并给出准确成因
+  (解析失败 vs 权限/IO 错误),而不再被静默跳过 —— 这样 `--doctor` 不会在某个 agent 面整个没被检查到的情况下
+  仍宣称"所有 server 都可解析"。所有诊断输出(含配置路径)在打印前都经脱敏。
+
 ## [v0.1.29] — 2026-06-07
 
 Cursor 与 Windsurf 现在也受保护 —— 一条命令覆盖四个 agent 接入面。

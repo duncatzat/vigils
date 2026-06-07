@@ -1279,6 +1279,10 @@ pub enum DoctorStatus {
     Skipped { reason: String },
     /// Vigil 托管条目但形态异常无法还原出底层程序(诚实标记,不静默忽略)。
     Malformed,
+    /// 某 agent 的**整个配置文件**坏了:malformed(解析失败)**或** unreadable(存在但 IO/权限读不了)。
+    /// 区别于"未配置"(无文件 → 无行):配置存在却查不了 = 该 agent 的 server **可能存在但对 doctor 不可见**,
+    /// 故**计入失败**(非静默 skip),不让 doctor 谎称"全部正常"(Codex D29 #6/#8)。`reason` 区分两类成因。
+    ConfigError { reason: String },
 }
 
 /// `--probe` 深度探测结果(真 spawn server + MCP `initialize` 握手)。
@@ -1444,7 +1448,82 @@ fn doctor_row(
     }
 }
 
-/// `setup --mcp --doctor`:读真实 `~/.claude.json` → 对 user + local scope 每个 MCP server 做启动预检。
+/// 某 agent 配置文件读失败时的诚实 doctor 行:不 abort 整个 doctor(其它 agent 仍要查)、不静默漏报、
+/// 且**计入失败**(`ConfigError` 在 print 侧累加 failed → exit 1,不让 doctor 谎称"全部正常";Codex D29 #6)。
+/// `reason` 按错误成因**区分** malformed(解析失败)与 unreadable(存在但 IO/权限读不了)(Codex D29 #8)。
+/// `reason` 含路径,在 print 侧统一过 `scrub`(Codex D29 #5)。
+fn config_error_doctor_row(agent_label: &str, path: &Path, err: &SetupError) -> McpDoctorRow {
+    let reason = match err {
+        SetupError::MalformedConfig { .. } => format!(
+            "config could not be parsed ({}); fix it to health-check this agent",
+            path.display()
+        ),
+        // Io / 其它:文件存在但读不了(权限等)—— 不是"未配置",server 可能存在却对 doctor 不可见。
+        _ => format!(
+            "config exists but could not be read ({}); fix permissions/IO to health-check this agent",
+            path.display()
+        ),
+    };
+    McpDoctorRow {
+        name: "(config file)".to_string(),
+        scope: agent_label.to_string(),
+        wrapped: false,
+        status: DoctorStatus::ConfigError { reason },
+        probe: None,
+    }
+}
+
+/// 把一个 JSON-`mcpServers` agent(Cursor/Windsurf)顶层 server 逐个产出 doctor 行,追加到 `rows`。
+/// 配置不存在 → 无行(用户未用该 agent);读失败 → 一条 `ConfigError` 行(不 abort,计入失败)。`scope`=agent 名。
+fn append_json_agent_doctor_rows(
+    agent: &JsonMcpAgent,
+    probe_timeout: Option<Duration>,
+    rows: &mut Vec<McpDoctorRow>,
+) {
+    match read_claude_json(&agent.config_path) {
+        Ok(Some(cfg)) => {
+            if let Some(servers) = cfg.get("mcpServers").and_then(Value::as_object) {
+                for (name, entry) in servers {
+                    rows.push(doctor_row(name, agent.display_name, entry, probe_timeout));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => rows.push(config_error_doctor_row(
+            agent.display_name,
+            &agent.config_path,
+            &e,
+        )),
+    }
+}
+
+/// Codex(TOML)doctor 行:每个 `mcp_servers` 条目桥接成 JSON(`item_to_json`)后复用 `doctor_row`。
+fn append_codex_doctor_rows(
+    home: &Path,
+    probe_timeout: Option<Duration>,
+    rows: &mut Vec<McpDoctorRow>,
+) {
+    let path = codex_config_path(home);
+    match read_codex_config(&path) {
+        Ok(Some(doc)) => {
+            if let Some(servers) = codex_servers_table(&doc) {
+                for (name, item) in servers.iter() {
+                    rows.push(doctor_row(
+                        name,
+                        "Codex",
+                        &item_to_json(item),
+                        probe_timeout,
+                    ));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => rows.push(config_error_doctor_row("Codex", &path, &e)),
+    }
+}
+
+/// `setup --mcp --doctor`:对**所有** agent 接入面(Claude user+local / Codex / Cursor / Windsurf)的
+/// 每个 MCP server 做启动预检 —— 兑现"turnkey wrap 之后,所有 agent 的 server 是否还能起"。
 ///
 /// `probe_timeout`:
 /// - `None`(默认 `--doctor`):**纯静态**(只验 `resolve_program` PATH 可解析,不 spawn,无副作用/无延迟)。
@@ -1452,32 +1531,35 @@ fn doctor_row(
 ///   逐 server 设 `timeout` 上界 —— 抓"程序在 PATH 但运行时起不来/不说 MCP"(D15 实证的 turnkey 头号
 ///   静默失败)。**有副作用**(真启动每个 server 进程片刻);每个 server 顺序探测。
 ///
-/// `home` 注入 → 测试走 fixture 绝不碰真实配置。无配置文件 → 空 Vec(诚实:没东西可查)。
+/// `home` 注入 → 测试走 fixture 绝不碰真实配置。无任何配置 → 空 Vec(诚实:没东西可查)。
+/// **错误契约**:Claude(`~/.claude.json`)malformed → abort(`?`,既有契约不变);其余 agent malformed →
+/// 一条诚实 Skipped 行,不 abort(读-only 健康检查应能跨 agent 看全,不因一个坏配置全瞎)。
 pub fn run_doctor(
     home: &Path,
     probe_timeout: Option<Duration>,
 ) -> Result<Vec<McpDoctorRow>, SetupError> {
-    let path = claude_json_path(home);
-    let cfg = match read_claude_json(&path)? {
-        Some(v) => v,
-        None => return Ok(Vec::new()),
-    };
     let mut rows = Vec::new();
-    // user scope(顶层 mcpServers)
-    if let Some(servers) = cfg.get("mcpServers").and_then(Value::as_object) {
-        for (name, entry) in servers {
-            rows.push(doctor_row(name, "user", entry, probe_timeout));
+    // Claude(~/.claude.json):user + local scope。malformed → abort(既有契约)。缺失 → 跳过(仍查其它 agent)。
+    if let Some(cfg) = read_claude_json(&claude_json_path(home))? {
+        if let Some(servers) = cfg.get("mcpServers").and_then(Value::as_object) {
+            for (name, entry) in servers {
+                rows.push(doctor_row(name, "user", entry, probe_timeout));
+            }
         }
-    }
-    // local scope(projects.<path>.mcpServers)
-    if let Some(projects) = cfg.get("projects").and_then(Value::as_object) {
-        for (proj_path, proj) in projects {
-            if let Some(servers) = proj.get("mcpServers").and_then(Value::as_object) {
-                for (name, entry) in servers {
-                    rows.push(doctor_row(name, proj_path, entry, probe_timeout));
+        if let Some(projects) = cfg.get("projects").and_then(Value::as_object) {
+            for (proj_path, proj) in projects {
+                if let Some(servers) = proj.get("mcpServers").and_then(Value::as_object) {
+                    for (name, entry) in servers {
+                        rows.push(doctor_row(name, proj_path, entry, probe_timeout));
+                    }
                 }
             }
         }
+    }
+    // 其余 agent 面(best-effort,各自独立文件):Codex(TOML)+ Cursor + Windsurf(JSON)。
+    append_codex_doctor_rows(home, probe_timeout, &mut rows);
+    for agent in [JsonMcpAgent::cursor(home), JsonMcpAgent::windsurf(home)] {
+        append_json_agent_doctor_rows(&agent, probe_timeout, &mut rows);
     }
     Ok(rows)
 }
@@ -2857,5 +2939,138 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
             Err(SetupError::MalformedConfig { .. })
         ));
         assert_eq!(fs::read_to_string(&agent.config_path).unwrap(), before);
+    }
+
+    // ============================ doctor 覆盖全部 agent 面(D29) ============================
+
+    /// doctor 现在覆盖全部 4 个 agent 面:Claude / Codex / Cursor / Windsurf 的 server 都进 doctor 行,
+    /// 各带正确 scope 标签;底层程序存在 → 全 Launchable。
+    #[test]
+    fn doctor_covers_all_four_agents() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // path-style 真实存在文件 → resolve_program 成功 → Launchable(跨平台确定性)。
+        let real = home.join("realprog");
+        fs::write(&real, b"x").unwrap();
+        let real_str = real.to_string_lossy().to_string();
+        // Claude(JSON)
+        fs::write(
+            home.join(".claude.json"),
+            json!({"mcpServers": {"cl": {"command": real_str, "args": []}}}).to_string(),
+        )
+        .unwrap();
+        // Codex(TOML)—— {:?} 对路径做转义,Windows 反斜杠也成合法 TOML basic string。
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex").join("config.toml"),
+            format!("[mcp_servers.cx]\ncommand = {real_str:?}\nargs = []\n"),
+        )
+        .unwrap();
+        // Cursor(JSON)
+        fs::create_dir_all(home.join(".cursor")).unwrap();
+        fs::write(
+            home.join(".cursor").join("mcp.json"),
+            json!({"mcpServers": {"cu": {"command": real_str, "args": []}}}).to_string(),
+        )
+        .unwrap();
+        // Windsurf(JSON)
+        fs::create_dir_all(home.join(".codeium").join("windsurf")).unwrap();
+        fs::write(
+            home.join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json"),
+            json!({"mcpServers": {"ws": {"command": real_str, "args": []}}}).to_string(),
+        )
+        .unwrap();
+
+        let rows = run_doctor(home, None).unwrap();
+        let scope_of = |n: &str| rows.iter().find(|r| r.name == n).map(|r| r.scope.as_str());
+        assert_eq!(scope_of("cl"), Some("user"), "Claude user scope");
+        assert_eq!(scope_of("cx"), Some("Codex"));
+        assert_eq!(scope_of("cu"), Some("Cursor"));
+        assert_eq!(scope_of("ws"), Some("Windsurf"));
+        assert!(
+            rows.iter()
+                .all(|r| matches!(r.status, DoctorStatus::Launchable { .. })),
+            "底层程序存在 → 全 Launchable"
+        );
+    }
+
+    /// Codex 的**已包裹**条目:doctor 看穿 wrap 检查内部程序(bogus → ProgramNotFound),scope=Codex,
+    /// wrapped=true —— 证明 doctor 验的是真正会被起的程序,不是 vigil-hub 自身。
+    #[test]
+    fn doctor_codex_wrapped_checks_inner_program() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(
+            home.join(".codex").join("config.toml"),
+            "[mcp_servers.cx]\ncommand = \"vigil-hub\"\n\
+             args = [\"wrap\", \"--server-id\", \"codex-cx\", \"--vigil-managed-mcp\", \"--\", \"definitely-not-a-real-prog-xyz789\", \"x\"]\n",
+        )
+        .unwrap();
+        let rows = run_doctor(home, None).unwrap();
+        let cx = rows.iter().find(|r| r.name == "cx").unwrap();
+        assert_eq!(cx.scope, "Codex");
+        assert!(cx.wrapped, "应识别为 Vigil 托管");
+        assert!(
+            matches!(cx.status, DoctorStatus::ProgramNotFound { .. }),
+            "应检查 unwrap 出的内部 bogus 程序"
+        );
+    }
+
+    /// malformed 的**非-Claude** agent 配置 → 一条诚实 `ConfigError` 行(计入失败、不静默漏报),
+    /// 但**不 abort**(Claude + 其它 agent 仍可查)(Codex D29 #6/#8)。
+    #[test]
+    fn doctor_malformed_agent_config_is_config_error_not_abort() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let real = home.join("realprog");
+        fs::write(&real, b"x").unwrap();
+        fs::write(
+            home.join(".claude.json"),
+            json!({"mcpServers": {"cl": {"command": real.to_string_lossy().to_string(), "args": []}}})
+                .to_string(),
+        )
+        .unwrap();
+        // Cursor 配置损坏
+        fs::create_dir_all(home.join(".cursor")).unwrap();
+        fs::write(home.join(".cursor").join("mcp.json"), "}{ not json").unwrap();
+
+        let rows = run_doctor(home, None).unwrap(); // 不 abort
+        assert!(
+            rows.iter().any(|r| r.name == "cl" && r.scope == "user"),
+            "Claude 行仍在"
+        );
+        // 损坏的 Cursor 配置 → ConfigError(计入失败,reason 说明可解析性)而非静默 skip。
+        let cursor_err = rows
+            .iter()
+            .find(|r| r.scope == "Cursor")
+            .expect("应有一条 Cursor 行");
+        match &cursor_err.status {
+            DoctorStatus::ConfigError { reason } => {
+                assert!(
+                    reason.contains("could not be parsed"),
+                    "malformed → parsed 措辞"
+                )
+            }
+            other => panic!("Cursor 坏配置应为 ConfigError,得到 {other:?}"),
+        }
+    }
+
+    /// **Claude** 配置 malformed → 仍 abort(既有错误契约不变)。
+    #[test]
+    fn doctor_claude_malformed_still_aborts() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        fs::write(home.join(".claude.json"), "}{ broken").unwrap();
+        assert!(matches!(
+            run_doctor(home, None),
+            Err(SetupError::MalformedConfig { .. })
+        ));
     }
 }
