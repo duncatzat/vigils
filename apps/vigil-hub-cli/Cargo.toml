@@ -52,6 +52,11 @@ getrandom = { workspace = true }
 rusqlite = { workspace = true }
 # `vigil-hub setup` 一键接入:跨平台定位用户 agent 配置目录(~/.claude 等)。
 dirs = "6"
+# `setup --mcp` 同时保护 Codex 的 `~/.codex/config.toml`(TOML `[mcp_servers.*]`)。用
+# format-preserving 的 `DocumentMut` 做外科手术式改写(只动命中条目的 command+args),保留用户
+# 配置里的注释/键序/其它设置段 —— 与 cargo 自身编辑 Cargo.toml 同款做法。版本对齐 lock 内既有
+# 0.25.x(transitive),不引入新副本。
+toml_edit = "0.25"
 # `vigil-hub inspect` 命令行查审计账本:复用 desktop 的 dispatch/render(default-features=false,
 # **不**拉 gui/tauri),+ runner(SandboxProfile)+ ui-protocol(Req 类型)。
 vigil-desktop = { path = "../desktop", default-features = false }

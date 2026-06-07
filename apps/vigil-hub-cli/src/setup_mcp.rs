@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use toml_edit::DocumentMut;
 
 use crate::setup::SetupError;
 
@@ -686,6 +687,359 @@ pub fn run_uninstall(home: &Path, dry_run: bool) -> Result<McpApplyReport, Setup
         changed,
         local_changed,
         local_skipped: 0,
+        dry_run,
+        backup,
+    })
+}
+
+// ============================ Codex 接入面(`~/.codex/config.toml`)============================
+//
+// Codex CLI 与 Claude Code 并列,是本命令第二个受保护的 agent 配置面。Codex 用 TOML
+// **`[mcp_servers.<name>]`** 表配 stdio MCP server,**每条目形状几乎与 Claude 的
+// `mcpServers.<name>` 对象一致**(`command` / `args` / `env`)。故策略 = **最大化复用 Claude 路径的
+// 安全机制**:把每个 TOML 条目桥接成 `serde_json::Value` 后,走**同一个** [`classify_one`]
+// (全部安全护栏:sentinel 精确匹配 / 危险字符拒绝 / 非 stdio 跳过 / server-id 校验)、
+// 同一个 [`wrapped_argv`](wrap argv 构造 SSOT)、同一个 [`unwrap_entry`](还原 SSOT)。
+// Codex 专属的只有 TOML 读写管道。
+//
+// **格式保留**:Codex 的 `config.toml` 常含用户手写注释 + model/approval 等其它设置段。用 `toml_edit`
+// 的 `DocumentMut` 做**外科手术式**改写(只替换命中条目的 `command`+`args` 两个值),保留注释 / 键序 /
+// 其它段 —— 与 cargo 自身编辑 Cargo.toml 同款。绝不整篇 `to_string` 重排丢注释。
+//
+// **server-id 命名空间**:Codex 条目派生 `codex-<name>`,与 user scope 的 `user-` / local scope 的
+// `local-` **可证不相交**(共享账本里跨 agent 同名 server 身份不塌缩)。
+
+/// Codex CLI 的 MCP 配置文件路径(`~/.codex/config.toml`)。
+pub fn codex_config_path(home: &Path) -> PathBuf {
+    home.join(".codex").join("config.toml")
+}
+
+/// 为 Codex `[mcp_servers.<name>]` 条目派生 server-id:`codex-<name>`。
+///
+/// 加 `codex-` 前缀与 [`user_scope_server_id`](`user-`)/ [`local_scope_server_id`](`local-`)
+/// 命名空间不相交。`name` 已由 [`classify_one`] 用真验证器 `validate_server_id` 过滤(`^[a-z0-9_-]+$`),
+/// 故 `codex-<name>` 拼接后必合法(`codex-` 全在字符集内)。
+pub fn codex_scope_server_id(name: &str) -> String {
+    format!("codex-{name}")
+}
+
+/// 读 + 解析 `~/.codex/config.toml`(格式保留)。不存在 → `Ok(None)`;损坏 / 超大 → abort
+/// (`MalformedConfig`,绝不臆测覆盖 —— 与 [`read_claude_json`] 同纪律,仅解析器从 JSON 换成 TOML)。
+pub fn read_codex_config(path: &Path) -> Result<Option<DocumentMut>, SetupError> {
+    match std::fs::metadata(path) {
+        Err(_) => Ok(None), // 不存在 = 用户未用 Codex(或未配 MCP)
+        Ok(m) if m.len() > MAX_CLAUDE_JSON_BYTES => Err(SetupError::MalformedConfig {
+            path: path.to_path_buf(),
+        }),
+        Ok(_) => {
+            let raw = std::fs::read_to_string(path).map_err(|_| SetupError::Io {
+                what: "read Codex config",
+                path: path.to_path_buf(),
+            })?;
+            match raw.parse::<DocumentMut>() {
+                Ok(d) => Ok(Some(d)),
+                Err(_) => Err(SetupError::MalformedConfig {
+                    path: path.to_path_buf(),
+                }),
+            }
+        }
+    }
+}
+
+/// 取 `[mcp_servers]` 表(标准 sub-table 形态;`mcp_servers = {..}` 内联 / 缺省 → `None` = 无可保护项)。
+fn codex_servers_table(doc: &DocumentMut) -> Option<&toml_edit::Table> {
+    doc.get("mcp_servers").and_then(|i| i.as_table())
+}
+fn codex_servers_table_mut(doc: &mut DocumentMut) -> Option<&mut toml_edit::Table> {
+    doc.get_mut("mcp_servers").and_then(|i| i.as_table_mut())
+}
+
+/// 把一个 `toml_edit` 条目桥接成 `serde_json::Value`,喂给共享的 [`classify_one`]。
+/// 只忠实复制值(string/array/table/...),**不**捏造任何字段 —— 故桥接 bug 至多让条目被分类成
+/// `Skipped`(不动 = fail-safe),绝不可能凭空造出 `vigil-hub`/sentinel 而误判 AlreadyWrapped(fail-open)。
+/// MCP 条目只含 string / array-of-string / table,无 TOML datetime;datetime 退化为字符串(不影响 classify)。
+fn item_to_json(item: &toml_edit::Item) -> Value {
+    match item {
+        toml_edit::Item::Value(v) => value_to_json(v),
+        toml_edit::Item::Table(t) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in t.iter() {
+                map.insert(k.to_string(), item_to_json(v));
+            }
+            Value::Object(map)
+        }
+        toml_edit::Item::ArrayOfTables(a) => Value::Array(
+            a.iter()
+                .map(|t| {
+                    let mut map = serde_json::Map::new();
+                    for (k, v) in t.iter() {
+                        map.insert(k.to_string(), item_to_json(v));
+                    }
+                    Value::Object(map)
+                })
+                .collect(),
+        ),
+        toml_edit::Item::None => Value::Null,
+    }
+}
+fn value_to_json(v: &toml_edit::Value) -> Value {
+    match v {
+        toml_edit::Value::String(s) => Value::String(s.value().clone()),
+        toml_edit::Value::Integer(i) => Value::Number((*i.value()).into()),
+        toml_edit::Value::Float(f) => serde_json::Number::from_f64(*f.value())
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        toml_edit::Value::Boolean(b) => Value::Bool(*b.value()),
+        toml_edit::Value::Datetime(d) => Value::String(d.value().to_string()),
+        toml_edit::Value::Array(a) => Value::Array(a.iter().map(value_to_json).collect()),
+        toml_edit::Value::InlineTable(t) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in t.iter() {
+                map.insert(k.to_string(), value_to_json(v));
+            }
+            Value::Object(map)
+        }
+    }
+}
+
+/// 在一个 `toml_edit` 条目上就地设 `command`+`args`(wrap / unwrap 共用的唯一写盘点)。
+/// `insert` 替换既有键的值、保留其位置与周围 trivia(注释/空白),只这两个值变。
+/// 用 `as_table_like_mut` 同时覆盖 `[mcp_servers.x]`(Table)与 `x = {..}`(InlineTable)两种条目
+/// 形态,且条目非表(理论不可达 —— 调用方只对 classify 确认含 `command` 字段的条目调用)时**安全 no-op**
+/// 而非 panic。
+fn set_codex_command_args(entry: &mut toml_edit::Item, command: &str, args: &[String]) {
+    if let Some(tbl) = entry.as_table_like_mut() {
+        tbl.insert("command", toml_edit::value(command));
+        let mut arr = toml_edit::Array::new();
+        for a in args {
+            arr.push(a.as_str());
+        }
+        tbl.insert("args", toml_edit::value(arr));
+    }
+}
+
+/// 从已解析的 Codex `DocumentMut` 枚举 `[mcp_servers.*]` 并分类(纯函数,不碰文件系统)。
+pub fn classify_codex_servers(doc: &DocumentMut) -> Vec<McpServerClass> {
+    let Some(servers) = codex_servers_table(doc) else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .map(|(name, item)| classify_one(name, &item_to_json(item)))
+        .collect()
+}
+
+/// 对 Codex `[mcp_servers.*]` 里每个 Wrappable 条目就地 wrap(`command`→vigil-hub,`args`→wrap 包裹 argv;
+/// 格式保留)。返回改写数。server-id = `codex-<name>`。
+pub fn apply_wrap_to_codex(doc: &mut DocumentMut, exe: &str, monitor: bool) -> usize {
+    // 先按分类器选出 Wrappable 的 (name, command, args, env_keys)(只读借用),再改写,
+    // 避免迭代期对 servers 的 &mut 借用纠缠;且确保"预览说会改的" == "apply 真改的"(同一 classify_one)。
+    let plan: Vec<(String, String, Vec<String>, Vec<String>)> = {
+        let Some(servers) = codex_servers_table(doc) else {
+            return 0;
+        };
+        servers
+            .iter()
+            .filter_map(
+                |(name, item)| match classify_one(name, &item_to_json(item)) {
+                    McpServerClass::Wrappable {
+                        name,
+                        command,
+                        args,
+                        env_keys,
+                    } => Some((name, command, args, env_keys)),
+                    _ => None,
+                },
+            )
+            .collect()
+    };
+    let Some(servers) = codex_servers_table_mut(doc) else {
+        return 0;
+    };
+    let mut changed = 0;
+    for (name, command, args, env_keys) in plan {
+        if let Some(entry) = servers.get_mut(&name) {
+            let argv = wrapped_argv(
+                exe,
+                &codex_scope_server_id(&name),
+                &command,
+                &args,
+                &env_keys,
+                monitor,
+            );
+            // argv[0] = 新 command(vigil-hub),argv[1..] = 新 args(wrap ... -- origcmd origargs)。
+            set_codex_command_args(entry, &argv[0], &argv[1..]);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// 对 Codex `[mcp_servers.*]` 里所有 Vigil 托管条目 self-describing 还原(格式保留)。返回还原数。
+/// 复用 [`unwrap_entry`](sentinel-anchored 反解 SSOT):桥接条目→json 反解,再把还原出的 command+args 写回。
+pub fn apply_unwrap_codex(doc: &mut DocumentMut) -> usize {
+    let names: Vec<String> = match codex_servers_table(doc) {
+        Some(t) => t.iter().map(|(n, _)| n.to_string()).collect(),
+        None => return 0,
+    };
+    let Some(servers) = codex_servers_table_mut(doc) else {
+        return 0;
+    };
+    let mut changed = 0;
+    for name in names {
+        if let Some(entry) = servers.get_mut(&name) {
+            // 桥接→json 走共享反解;非 Vigil 托管 / 形态异常 → None(不动,fail-safe)。
+            if let Some(restored) = unwrap_entry(&item_to_json(entry)) {
+                let cmd = restored.get("command").and_then(Value::as_str);
+                let args_arr = restored.get("args").and_then(Value::as_array);
+                // **abort-on-unexpected(Codex review #3 MEDIUM)**:Vigil 产出的 wrap 尾部原 argv
+                // **必然全字符串**(classify_one 改写前已拒非字符串 args + wrapped_argv 只产字符串)。
+                // 若某条目的还原 args 含**非字符串**元素(只可能来自用户手改注入,如 `args=[..,"--",123]`),
+                // 绝不 `filter_map` 静默丢弃 → 跳过该条目(留作 wrapped,数据不丢),而非 lossy 还原。
+                match (cmd, args_arr) {
+                    (Some(cmd), Some(arr)) if arr.iter().all(Value::is_string) => {
+                        let args: Vec<String> = arr
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect();
+                        set_codex_command_args(entry, cmd, &args);
+                        changed += 1;
+                    }
+                    // 形态异常(非常规手改):不动,fail-safe(原非字符串值仍以 wrapped 形式保留)。
+                    _ => {}
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Codex 接入面的只读预览报告(供 CLI 渲染)。
+#[derive(Debug, Clone)]
+pub struct CodexPreviewReport {
+    /// `~/.codex/config.toml` 路径。
+    pub codex_config: PathBuf,
+    /// 配置文件是否存在(不存在 = 用户未用 Codex,诚实标记)。
+    pub exists: bool,
+    /// 本进程 exe(预览 wrap argv 用)。
+    pub exe: String,
+    /// `[mcp_servers.*]` 逐条目分类。
+    pub servers: Vec<McpServerClass>,
+    /// 将落盘的姿态(`monitor` / `--enforce`),供预览文案一致。
+    pub monitor: bool,
+}
+
+impl CodexPreviewReport {
+    /// 可被保护(Wrappable)的 server 数。
+    pub fn wrappable_count(&self) -> usize {
+        self.servers
+            .iter()
+            .filter(|s| matches!(s, McpServerClass::Wrappable { .. }))
+            .count()
+    }
+}
+
+/// Codex 接入面 apply / uninstall 的结果报告。
+#[derive(Debug, Clone)]
+pub struct CodexApplyReport {
+    /// `~/.codex/config.toml` 路径。
+    pub codex_config: PathBuf,
+    /// 实际(或 dry-run 将)改写 / 还原的 server 数。
+    pub changed: usize,
+    /// 仅预览不写盘。
+    pub dry_run: bool,
+    /// 写盘时产生的备份路径(若有)。
+    pub backup: Option<PathBuf>,
+}
+
+/// 读真实 `~/.codex/config.toml`(IO 边界)→ 枚举 + 分类,产出只读预览。**不写任何东西**。
+/// `home` / `exe` 注入 → 测试走 fixture 而**绝不**碰真实用户配置。
+pub fn run_codex_preview(
+    home: &Path,
+    exe: &str,
+    monitor: bool,
+) -> Result<CodexPreviewReport, SetupError> {
+    let path = codex_config_path(home);
+    let doc = read_codex_config(&path)?;
+    let (exists, servers) = match doc {
+        Some(d) => (true, classify_codex_servers(&d)),
+        None => (false, Vec::new()),
+    };
+    Ok(CodexPreviewReport {
+        codex_config: path,
+        exists,
+        exe: exe.to_string(),
+        servers,
+        monitor,
+    })
+}
+
+/// `setup --mcp --apply`(Codex 面):读 → wrap 全部 Wrappable → 格式保留原子写。`dry_run` 只算不写。
+pub fn run_codex_apply(
+    home: &Path,
+    exe: &str,
+    dry_run: bool,
+    monitor: bool,
+) -> Result<CodexApplyReport, SetupError> {
+    let path = codex_config_path(home);
+    let mut doc = match read_codex_config(&path)? {
+        Some(d) => d,
+        None => {
+            return Ok(CodexApplyReport {
+                codex_config: path,
+                changed: 0,
+                dry_run,
+                backup: None,
+            })
+        }
+    };
+    // 读取时刻的 (mtime, len) → TOCTOU 防护(替换前比对;Codex 并发改写则 abort 不覆盖)。
+    let stamp = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let changed = apply_wrap_to_codex(&mut doc, exe, monitor);
+    let backup = if !dry_run && changed > 0 {
+        let rendered = doc.to_string(); // 格式保留序列化(只命中条目的 command+args 变)
+        crate::setup::atomic_write_str_with_backup(&path, &rendered, stamp)?
+    } else {
+        None
+    };
+    Ok(CodexApplyReport {
+        codex_config: path,
+        changed,
+        dry_run,
+        backup,
+    })
+}
+
+/// `setup --mcp --uninstall`(Codex 面):读 → 还原所有 Vigil 托管条目 → 格式保留原子写。`dry_run` 只算不写。
+pub fn run_codex_uninstall(home: &Path, dry_run: bool) -> Result<CodexApplyReport, SetupError> {
+    let path = codex_config_path(home);
+    let mut doc = match read_codex_config(&path)? {
+        Some(d) => d,
+        None => {
+            return Ok(CodexApplyReport {
+                codex_config: path,
+                changed: 0,
+                dry_run,
+                backup: None,
+            })
+        }
+    };
+    let stamp = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let changed = apply_unwrap_codex(&mut doc);
+    let backup = if !dry_run && changed > 0 {
+        let rendered = doc.to_string();
+        crate::setup::atomic_write_str_with_backup(&path, &rendered, stamp)?
+    } else {
+        None
+    };
+    Ok(CodexApplyReport {
+        codex_config: path,
+        changed,
         dry_run,
         backup,
     })
@@ -1850,5 +2204,255 @@ mod tests {
             }
             AllError::Hook(e) => panic!("hook uninstall 不该失败:{e:?}"),
         }
+    }
+
+    // ============================ Codex 接入面(`~/.codex/config.toml`)============================
+
+    /// Codex TOML `[mcp_servers.*]` 分类:stdio→Wrappable(env 只键名)/ remote(url)→Skipped /
+    /// sentinel→AlreadyWrapped。复用同一 `classify_one`,与 Claude 路径同护栏(桥接经 `item_to_json`)。
+    #[test]
+    fn codex_classifies_toml_servers() {
+        let src = r#"
+model = "gpt-5"
+
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+[mcp_servers.filesystem.env]
+FOO_TOKEN = "shh"
+BAR = "x"
+
+[mcp_servers.remote]
+url = "https://mcp.example.com/"
+
+[mcp_servers.already]
+command = "vigil-hub"
+args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "npx", "x"]
+"#;
+        let doc = src.parse::<DocumentMut>().unwrap();
+        let classes = classify_codex_servers(&doc);
+        assert_eq!(classes.len(), 3);
+
+        let fs = classes
+            .iter()
+            .find(|c| matches!(c, McpServerClass::Wrappable { name, .. } if name == "filesystem"))
+            .expect("filesystem wrappable");
+        if let McpServerClass::Wrappable {
+            command,
+            args,
+            env_keys,
+            ..
+        } = fs
+        {
+            assert_eq!(command, "npx");
+            assert_eq!(args[0], "-y");
+            assert!(env_keys.contains(&"FOO_TOKEN".to_string()));
+            // env 只键名,绝无值 "shh"
+            assert!(!env_keys.iter().any(|k| k.contains("shh")));
+        }
+        assert!(classes
+            .iter()
+            .any(|c| matches!(c, McpServerClass::Skipped { name, .. } if name == "remote")));
+        assert!(classes
+            .iter()
+            .any(|c| matches!(c, McpServerClass::AlreadyWrapped { name } if name == "already")));
+    }
+
+    /// server-id 命名空间:`codex-<name>` 与 `user-`/`local-` 不相交,且仍是合法网关 id。
+    #[test]
+    fn codex_server_id_is_namespace_disjoint() {
+        let id = codex_scope_server_id("filesystem");
+        assert_eq!(id, "codex-filesystem");
+        assert_ne!(id, user_scope_server_id("filesystem"));
+        assert!(!id.starts_with("user-"));
+        assert!(!id.starts_with("local-"));
+        assert!(vigil_mcp::namespace::validate_server_id(&id).is_ok());
+    }
+
+    /// **功能测试**:tempfile 真 `~/.codex/config.toml` apply → 验证 wrap + 格式保留 → uninstall →
+    /// 逐字还原(绝不碰真实用户配置)。
+    #[test]
+    fn codex_apply_uninstall_round_trip_on_tempfile() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let cfg = home.join(".codex").join("config.toml");
+        let original =
+            "# user comment kept\nmodel = \"gpt-5\"\napproval_policy = \"on-request\"\n\n\
+                        [mcp_servers.filesystem]\ncommand = \"npx\"\n\
+                        args = [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/data\"]\n\n\
+                        [mcp_servers.filesystem.env]\nFOO_TOKEN = \"shh\"\n";
+        fs::write(&cfg, original).unwrap();
+
+        // apply(monitor 姿态)
+        let rep = run_codex_apply(home, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 1);
+        assert!(rep.backup.is_some(), "写盘应留备份");
+        let wrapped = fs::read_to_string(&cfg).unwrap();
+        // 格式保留:注释 + 其它配置段存活(外科手术式改写,非整篇重排)
+        assert!(wrapped.contains("# user comment kept"));
+        assert!(wrapped.contains("model = \"gpt-5\""));
+        assert!(wrapped.contains("approval_policy"));
+
+        let doc = wrapped.parse::<DocumentMut>().unwrap();
+        // 已成 Vigil 托管(幂等检测能命中)
+        assert!(classify_codex_servers(&doc)
+            .iter()
+            .any(|c| matches!(c, McpServerClass::AlreadyWrapped { name } if name == "filesystem")));
+        // env 值仍在条目里(wrap 不动 env),但 secret 值**绝不**出现在 wrap argv(只 --env-key 键名)
+        assert!(wrapped.contains("FOO_TOKEN"));
+        let fargs: Vec<String> = doc["mcp_servers"]["filesystem"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert!(
+            !fargs.iter().any(|a| a.contains("shh")),
+            "secret 值绝不进 argv"
+        );
+        assert!(fargs.iter().any(|a| a == "--env-key"));
+        // server-id 用 codex- 前缀
+        assert!(fargs.iter().any(|a| a == "codex-filesystem"));
+
+        // uninstall → 逐字还原
+        let rep2 = run_codex_uninstall(home, false).unwrap();
+        assert_eq!(rep2.changed, 1);
+        let restored = fs::read_to_string(&cfg).unwrap();
+        let rdoc = restored.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            rdoc["mcp_servers"]["filesystem"]["command"].as_str(),
+            Some("npx")
+        );
+        let rargs: Vec<String> = rdoc["mcp_servers"]["filesystem"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert_eq!(
+            rargs,
+            vec!["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+        );
+        assert!(restored.contains("# user comment kept"), "还原后注释仍在");
+    }
+
+    /// 幂等:apply 两次 → 第二次 0 改写(AlreadyWrapped 跳过,绝不双重 wrap)。
+    #[test]
+    fn codex_apply_is_idempotent() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let cfg = home.join(".codex").join("config.toml");
+        fs::write(
+            &cfg,
+            "[mcp_servers.fs]\ncommand = \"npx\"\nargs = [\"x\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            run_codex_apply(home, "vigil-hub", false, true)
+                .unwrap()
+                .changed,
+            1
+        );
+        assert_eq!(
+            run_codex_apply(home, "vigil-hub", false, true)
+                .unwrap()
+                .changed,
+            0,
+            "已 wrap 条目第二次 apply 必跳过"
+        );
+    }
+
+    /// 损坏 TOML → `MalformedConfig`,且**原文件未被改写**(fail-safe,绝不臆测覆盖)。
+    #[test]
+    fn codex_malformed_aborts_without_touching_file() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        let cfg = home.join(".codex").join("config.toml");
+        fs::write(&cfg, "this is ]not[ valid toml =").unwrap();
+        let before = fs::read_to_string(&cfg).unwrap();
+
+        assert!(matches!(
+            run_codex_apply(home, "vigil-hub", false, true),
+            Err(SetupError::MalformedConfig { .. })
+        ));
+        assert_eq!(
+            fs::read_to_string(&cfg).unwrap(),
+            before,
+            "损坏配置绝不被覆盖"
+        );
+    }
+
+    /// 无 `~/.codex/config.toml` → 0 改写、无错、无备份(用户未用 Codex)。
+    #[test]
+    fn codex_no_config_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let rep = run_codex_apply(home, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 0);
+        assert!(rep.backup.is_none());
+        assert!(!run_codex_preview(home, "vigil-hub", true).unwrap().exists);
+    }
+
+    /// 非法 server 名(含大写 / 点)→ Skipped(不产出一个起不来的网关条目)。
+    #[test]
+    fn codex_invalid_server_name_skipped() {
+        let doc = "[mcp_servers.\"Bad.Name\"]\ncommand = \"npx\"\nargs = [\"x\"]\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let classes = classify_codex_servers(&doc);
+        assert_eq!(classes.len(), 1);
+        assert!(matches!(&classes[0], McpServerClass::Skipped { name, .. } if name == "Bad.Name"));
+    }
+
+    /// 内联表条目形态(`[mcp_servers]` 表内 `foo = { command=.., args=.. }`)也能 wrap/unwrap 往返,
+    /// 不 panic(`as_table_like_mut` 覆盖 InlineTable)。
+    #[test]
+    fn codex_inline_table_entry_round_trips() {
+        let mut doc = "[mcp_servers]\nfoo = { command = \"npx\", args = [\"-y\", \"pkg\"] }\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(apply_wrap_to_codex(&mut doc, "vigil-hub", true), 1);
+        assert!(classify_codex_servers(&doc)
+            .iter()
+            .any(|c| matches!(c, McpServerClass::AlreadyWrapped { name } if name == "foo")));
+        assert_eq!(apply_unwrap_codex(&mut doc), 1);
+        let rdoc = doc.to_string().parse::<DocumentMut>().unwrap();
+        assert_eq!(rdoc["mcp_servers"]["foo"]["command"].as_str(), Some("npx"));
+        let rargs: Vec<String> = rdoc["mcp_servers"]["foo"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert_eq!(rargs, vec!["-y", "pkg"]);
+    }
+
+    /// 安全(Codex review #3):用户手改在 wrap 尾部注入**非字符串** arg → uninstall **拒绝 lossy 还原**
+    /// (跳过该条目、数据不丢),而非 `filter_map` 静默丢弃。正常 Vigil 产出的 wrap 必然全字符串,故此
+    /// 路径只对手改的非常规条目生效。
+    #[test]
+    fn codex_uninstall_refuses_lossy_nonstring_args() {
+        // 看似 Vigil 托管(sentinel + wrap + vigil-hub 命中),但 args 尾被手改注入整数 123。
+        let src = "[mcp_servers.foo]\ncommand = \"vigil-hub\"\n\
+                   args = [\"wrap\", \"--server-id\", \"codex-foo\", \"--vigil-managed-mcp\", \"--\", \"npx\", 123]\n";
+        let mut doc = src.parse::<DocumentMut>().unwrap();
+        assert!(classify_codex_servers(&doc)
+            .iter()
+            .any(|c| matches!(c, McpServerClass::AlreadyWrapped { name } if name == "foo")));
+        // 含非字符串 arg → 跳过(0 还原),原条目逐字保留(123 不被丢弃)。
+        assert_eq!(apply_unwrap_codex(&mut doc), 0);
+        let after = doc.to_string();
+        assert!(after.contains("123"), "非字符串 arg 必须仍在(不被静默丢弃)");
+        assert!(
+            after.contains("--vigil-managed-mcp"),
+            "条目仍是原样 wrapped"
+        );
     }
 }

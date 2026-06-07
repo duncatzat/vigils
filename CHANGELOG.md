@@ -8,6 +8,32 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.28] — 2026-06-07
+
+One command now protects Codex too — not just Claude Code.
+
+### Added
+
+- **`setup --mcp` now protects Codex CLI's MCP servers, not only Claude Code's.** `vigil-hub setup
+  --mcp` (preview / `--apply` / `--uninstall`) and the all-in-one `setup --all` now also detect and
+  wrap the stdio MCP servers in Codex's `~/.codex/config.toml` (the `[mcp_servers.*]` tables), in
+  addition to Claude Code's `~/.claude.json`. One command protects every agent surface you have. Each
+  Codex server is rewritten to launch through the Vigil gateway (result redaction + raw-secret block +
+  tamper-evident audit, default monitor posture), reversibly — `--uninstall` restores the originals.
+  Edits are **format-preserving**: only the wrapped entry's `command`/`args` change; your comments,
+  key order, `env` tables, and other settings (model, approval policy, …) are left exactly as they
+  were. Codex servers get a `codex-<name>` gateway id, namespace-disjoint from the Claude
+  `user-`/`local-` ids so the same server name across agents never collides in the shared audit ledger.
+
+### Security
+
+- The Codex path reuses the **same** classifier and safety machinery as the Claude path (sentinel
+  exact-match for idempotency, dangerous-character rejection, non-stdio skip, server-id validation,
+  abort-on-malformed-config with atomic write + backup) — one source of truth, no drift. `env` values
+  are never copied into the rewritten command line (key names only) and never printed. Reviewed
+  adversarially (two rounds): uninstall refuses a lossy restore of any hand-edited entry, and a failing
+  Codex step after the Claude side already applied is reported honestly with recovery guidance.
+
 ## [v0.1.27] — 2026-06-07
 
 Verifiable supply chain, and a firewall that finally classifies risk on real MCP servers.

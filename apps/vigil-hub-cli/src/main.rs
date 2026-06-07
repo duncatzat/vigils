@@ -420,14 +420,71 @@ fn setup_mcp_dispatch(args: &CliSetupArgs) -> Result<std::process::ExitCode, set
         let rows = setup_mcp::run_doctor(&home, probe_timeout)?;
         Ok(print_mcp_doctor(&rows))
     } else if args.uninstall {
+        // 两个 agent 配置面都还原:Claude(`~/.claude.json`)+ Codex(`~/.codex/config.toml`)。
         let rep = setup_mcp::run_uninstall(&home, args.dry_run)?;
-        Ok(print_mcp_apply(&rep, "uninstall"))
+        let code = print_mcp_apply(&rep, "uninstall");
+        Ok(run_codex_leg(
+            setup_mcp::run_codex_uninstall(&home, args.dry_run),
+            "uninstall",
+            code,
+        ))
     } else if args.apply {
+        // 两个面都保护(turnkey:一条命令覆盖用户所有 agent 接入面)。
         let rep = setup_mcp::run_apply(&home, &exe, args.dry_run, args.user_scope_only, monitor)?;
-        Ok(print_mcp_apply(&rep, "apply"))
+        let code = print_mcp_apply(&rep, "apply");
+        Ok(run_codex_leg(
+            setup_mcp::run_codex_apply(&home, &exe, args.dry_run, monitor),
+            "apply",
+            code,
+        ))
     } else {
         let rep = setup_mcp::run_preview(&home, &exe, monitor)?;
-        Ok(print_mcp_preview(&rep))
+        let code = print_mcp_preview(&rep);
+        // 预览只读:Codex 配置 malformed 不硬 abort(什么都没写),优雅降级为一行提示而非突兀报错。
+        match setup_mcp::run_codex_preview(&home, &exe, monitor) {
+            Ok(codex) => print_codex_preview(&codex),
+            Err(e) => {
+                println!();
+                println!(
+                    "  Codex CLI config: {}",
+                    setup_mcp::codex_config_path(&home).display()
+                );
+                println!("  (could not read it: {e} -- fix the file to preview/protect Codex MCP servers)");
+            }
+        }
+        Ok(code)
+    }
+}
+
+/// 运行 Codex 接入面的一步(apply/uninstall)并**诚实处理半应用状态**(Codex review #7 MEDIUM):
+/// 成功 → 打印 Codex 报告,返回 Claude 侧退出码;失败(如 Codex 配置 malformed)→ **不吞错也不在成功
+/// 文案后突兀 `?` 报错**:明确告知 Claude 侧已生效 + Codex 步失败原因 + 恢复指引,返回 FAILURE。
+/// 对齐既有 `--all` 的 `McpAfterHook` 部分失败诚实哲学(报告每步状态 + 如何恢复,而非笼统失败)。
+fn run_codex_leg(
+    res: Result<setup_mcp::CodexApplyReport, setup::SetupError>,
+    op: &str,
+    claude_code: std::process::ExitCode,
+) -> std::process::ExitCode {
+    match res {
+        Ok(codex) => {
+            print_codex_apply(&codex, op);
+            claude_code
+        }
+        Err(e) => {
+            eprintln!("  [Codex] the {op} step FAILED (the Claude side already completed): {e}");
+            if op == "uninstall" {
+                eprintln!(
+                    "  The Claude side was restored. Fix ~/.codex/config.toml, then re-run: \
+                     vigil-hub setup --mcp --uninstall"
+                );
+            } else {
+                eprintln!(
+                    "  The Claude side IS applied. Fix ~/.codex/config.toml and re-run; or undo \
+                     the Claude side with: vigil-hub setup --mcp --uninstall"
+                );
+            }
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -457,7 +514,20 @@ fn run_setup_all(args: &CliSetupArgs) -> Result<std::process::ExitCode, setup::S
         args.user_scope_only,
         monitor,
     ) {
-        Ok((hook_rep, mcp_rep)) => Ok(print_setup_all(&hook_rep, &mcp_rep, op)),
+        Ok((hook_rep, mcp_rep)) => {
+            let code = print_setup_all(&hook_rep, &mcp_rep, op);
+            // 第三个接入面:Codex(`~/.codex/config.toml`)。独立文件,hook + Claude-MCP 两步成功后再做;
+            // 失败经 `run_codex_leg` **诚实半应用报告**(不回滚已应用的前两面 —— 各面独立、各自可逆)。
+            // op 在 dry-run 时为 "preview";Codex 步只认 apply/uninstall(dry 措辞由报告里 dry_run 决定)。
+            let exe_str = exe.to_string_lossy().to_string();
+            let codex_op = if args.uninstall { "uninstall" } else { "apply" };
+            let codex_res = if args.uninstall {
+                setup_mcp::run_codex_uninstall(&home, args.dry_run)
+            } else {
+                setup_mcp::run_codex_apply(&home, &exe_str, args.dry_run, monitor)
+            };
+            Ok(run_codex_leg(codex_res, codex_op, code))
+        }
         // hook 步就失败 → 什么都没改(hook 写盘前 gate,失败即未写):诚实"nothing changed"。
         Err(setup_mcp::AllError::Hook(e)) => {
             eprintln!("vigil-hub setup --all: hook step failed -- nothing was changed: {e}");
@@ -704,11 +774,11 @@ fn print_mcp_apply(r: &setup_mcp::McpApplyReport, op: &str) -> std::process::Exi
 }
 
 /// 打印 `setup --mcp` 只读预览(ASCII-safe,cp936/cp437 不乱码)。返回退出码。
-/// 渲染单个 server 分类的预览行(user scope 与 local scope 各调一次)。`project_path` = `Some(p)`
-/// 表示 local scope(用项目限定 server-id 展示真实改写 argv),`None` 表示 user scope(裸 name)。
+/// 渲染单个 server 分类的预览行(user / local / Codex scope 各调一次)。`derive_id` 由调用方注入
+/// scope 专属的 server-id 派生(user-/local-/codex-,disjoint 命名空间),让 WRAP 渲染逻辑单一真源。
 fn print_mcp_server_preview(
     exe: &str,
-    project_path: Option<&str>,
+    derive_id: impl Fn(&str) -> String,
     class: &McpServerClass,
     monitor: bool,
 ) {
@@ -719,11 +789,8 @@ fn print_mcp_server_preview(
             args,
             env_keys,
         } => {
-            // 两侧都由 Vigil 加 disjoint 命名空间前缀(local- / user-)防跨 scope 身份塌缩。
-            let wrap_id = match project_path {
-                Some(p) => setup_mcp::local_scope_server_id(p, name),
-                None => setup_mcp::user_scope_server_id(name),
-            };
+            // server-id 由调用方注入的 scope 派生器产出(各 scope 加 disjoint 前缀防身份塌缩)。
+            let wrap_id = derive_id(name);
             let argv = setup_mcp::wrapped_argv(exe, &wrap_id, command, args, env_keys, monitor);
             println!("  [WRAP] {name}");
             // 预览里的 command/args 可能含用户内联的 token(如 `--api-key sk-...`)。过硬指纹 scrub
@@ -770,7 +837,7 @@ fn print_mcp_preview(r: &setup_mcp::McpPreviewReport) -> std::process::ExitCode 
             r.wrappable_count()
         );
         for s in &r.servers {
-            print_mcp_server_preview(&r.exe, None, s, r.monitor);
+            print_mcp_server_preview(&r.exe, setup_mcp::user_scope_server_id, s, r.monitor);
         }
     }
     // local scope(projects.<path>.mcpServers)—— claude mcp add 默认写这里
@@ -785,7 +852,12 @@ fn print_mcp_preview(r: &setup_mcp::McpPreviewReport) -> std::process::ExitCode 
         );
         println!("   don't share audit/approval identity)");
         for (proj, s) in &r.local_servers {
-            print_mcp_server_preview(&r.exe, Some(proj), s, r.monitor);
+            print_mcp_server_preview(
+                &r.exe,
+                |n| setup_mcp::local_scope_server_id(proj, n),
+                s,
+                r.monitor,
+            );
         }
     }
     println!();
@@ -809,6 +881,53 @@ fn print_mcp_preview(r: &setup_mcp::McpPreviewReport) -> std::process::ExitCode 
         "  (protects user + local scope; --user-scope-only skips local; --uninstall reverts)."
     );
     std::process::ExitCode::SUCCESS
+}
+
+/// 打印 Codex 接入面只读预览(ASCII-safe)。附在 Claude 预览之后,作为第二个受保护配置面。
+/// 复用 [`print_mcp_server_preview`](注入 `codex-` server-id 派生),WRAP 渲染单一真源。
+fn print_codex_preview(r: &setup_mcp::CodexPreviewReport) {
+    println!();
+    println!("  Codex CLI config: {}", r.codex_config.display());
+    if !r.exists {
+        println!(
+            "  (no ~/.codex/config.toml found -- Codex not configured, or no MCP servers yet)"
+        );
+        return;
+    }
+    if r.servers.is_empty() {
+        println!("  No MCP servers found in Codex [mcp_servers].");
+        return;
+    }
+    println!(
+        "  Codex scope ([mcp_servers]) -- {} can be protected:",
+        r.wrappable_count()
+    );
+    for s in &r.servers {
+        print_mcp_server_preview(&r.exe, setup_mcp::codex_scope_server_id, s, r.monitor);
+    }
+}
+
+/// 打印 Codex 接入面 apply/uninstall 结果(ASCII-safe)。附在 Claude 结果之后。
+fn print_codex_apply(r: &setup_mcp::CodexApplyReport, op: &str) {
+    let dry = if r.dry_run { " (dry-run)" } else { "" };
+    let verb = if r.dry_run { "would" } else { "did" };
+    let what = if op == "uninstall" { "restore" } else { "wrap" };
+    println!(
+        "Vigil setup --mcp --{op}{dry} (Codex): {verb} {what} {} MCP server(s) in {}",
+        r.changed,
+        r.codex_config.display()
+    );
+    if let Some(b) = &r.backup {
+        println!("  backup of the previous config: {}", b.display());
+    }
+    if r.changed == 0 && !r.dry_run {
+        println!("  (nothing to {what} in Codex -- no matching servers)");
+    }
+    if op == "apply" && r.changed > 0 && !r.dry_run {
+        println!(
+            "  Restart Codex to pick up the change. Undo with: vigil-hub setup --mcp --uninstall"
+        );
+    }
 }
 
 /// 打印 setup/status 的人类可读报告(ASCII-safe,cp936/cp437 不乱码)。返回退出码。

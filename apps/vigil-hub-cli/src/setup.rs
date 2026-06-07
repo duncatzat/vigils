@@ -382,14 +382,31 @@ fn read_settings(path: &Path) -> Result<Option<Value>, SetupError> {
     }
 }
 
-/// 原子写 `value` 到 `path`:先备份原文件 → 写 tmp → rename 替换。pretty-print 保持可读。
-/// rename 失败时 best-effort 清理 tmp(原文件未动)。`pub(crate)`:`setup_mcp` 改写 `~/.claude.json`
-/// 复用同一原子写/备份机制(serde_json preserve_order 保留用户键序)。
+/// 原子写 `value`(JSON)到 `path`:pretty-print 保持可读后委托 [`atomic_write_str_with_backup`]。
+/// `pub(crate)`:`setup_mcp` 改写 `~/.claude.json` 复用同一原子写/备份机制
+/// (serde_json preserve_order 保留用户键序)。
 pub(crate) fn atomic_write_with_backup(
     path: &Path,
     value: &Value,
+    expect_unchanged: Option<(std::time::SystemTime, u64)>,
+) -> Result<Option<PathBuf>, SetupError> {
+    let mut rendered = serde_json::to_string_pretty(value).map_err(|_| SetupError::Io {
+        what: "serialize config",
+        path: path.to_path_buf(),
+    })?;
+    rendered.push('\n');
+    atomic_write_str_with_backup(path, &rendered, expect_unchanged)
+}
+
+/// 原子写**已渲染字符串** `rendered` 到 `path`:先备份原文件 → 写 tmp →(TOCTOU 校验)→ rename 替换。
+/// rename 失败时 best-effort 清理 tmp(原文件未动)。**序列化无关**的写盘核心 —— JSON
+/// (`~/.claude.json`,经 [`atomic_write_with_backup`])与 TOML(Codex `~/.codex/config.toml`,经
+/// `setup_mcp::run_codex_apply`)共用同一备份 / 原子替换 / 并发改写防护,避免重复实现这段安全敏感逻辑。
+pub(crate) fn atomic_write_str_with_backup(
+    path: &Path,
+    rendered: &str,
     // TOCTOU 防护(Codex mutation review Medium):caller 传"读取时刻"的 `(mtime, len)`;rename 替换
-    // **前**再 stat 比对,若文件已被(如 Claude Code)并发改写则 abort 不覆盖,防 lost-update。
+    // **前**再 stat 比对,若文件已被(如 Claude Code / Codex)并发改写则 abort 不覆盖,防 lost-update。
     // `None` = 不检查(hook setup 改的 settings.json 无活跃并发写者)。
     expect_unchanged: Option<(std::time::SystemTime, u64)>,
 ) -> Result<Option<PathBuf>, SetupError> {
@@ -409,12 +426,6 @@ pub(crate) fn atomic_write_with_backup(
         })?;
         backup_path = Some(bak);
     }
-
-    let mut rendered = serde_json::to_string_pretty(value).map_err(|_| SetupError::Io {
-        what: "serialize config",
-        path: path.to_path_buf(),
-    })?;
-    rendered.push('\n');
 
     let tmp = tmp_path_for(path);
     std::fs::write(&tmp, rendered.as_bytes()).map_err(|_| SetupError::Io {

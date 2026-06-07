@@ -8,6 +8,28 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.28] — 2026-06-07
+
+一条命令现在也保护 Codex —— 不再只是 Claude Code。
+
+### 新增
+
+- **`setup --mcp` 现在也保护 Codex CLI 的 MCP server,不再只限 Claude Code。** `vigil-hub setup --mcp`
+  (预览 / `--apply` / `--uninstall`)与一键的 `setup --all`,现在除 Claude Code 的 `~/.claude.json` 外,
+  还会检测并包裹 Codex `~/.codex/config.toml` 里(`[mcp_servers.*]` 表)的 stdio MCP server。一条命令
+  保护你拥有的每个 agent 接入面。每个 Codex server 被改写为经 Vigil 网关启动(结果脱敏 + 裸 secret 拦截 +
+  防篡改审计,默认 monitor 姿态),可逆 —— `--uninstall` 还原原样。改写**保留格式**:只改被包裹条目的
+  `command`/`args`;你的注释、键序、`env` 表、以及其它设置(model、approval policy……)逐字不动。Codex
+  server 用 `codex-<name>` 网关 id,与 Claude 的 `user-`/`local-` 命名空间不相交 —— 跨 agent 的同名 server
+  在共享审计账本里绝不串身份。
+
+### 安全
+
+- Codex 路径复用与 Claude 路径**完全相同**的分类器与安全机制(sentinel 精确匹配保证幂等、危险字符拒绝、
+  非 stdio 跳过、server-id 校验、配置损坏即 abort 且原子写 + 备份)—— 单一真源,绝不漂移。`env` 的值
+  从不被复制进改写后的命令行(只含键名)、也从不打印。经两轮对抗审查:uninstall 拒绝对任何被手改条目做
+  lossy 还原;Claude 侧已应用后 Codex 步若失败,会如实报告并给出恢复指引。
+
 ## [v0.1.27] — 2026-06-07
 
 可验证的供应链,以及终于能对真实 MCP server 做风险分类的防火墙。
