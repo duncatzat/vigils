@@ -561,14 +561,53 @@ pub fn run_stdio_loop<R: BufRead, W: Write>(
 /// 实际入口:`vigil-hub serve` 子命令分派到此。
 ///
 /// 从 stdin/stdout 真实 IO 跑循环,阻塞到 agent 断连或 EOF。
+/// 网关(优雅 EOF 或错误)关闭时 **best-effort** 锚定审计链头(ADR 0020),让 threat #7(整链
+/// 重写)保护对 turnkey 用户**自动生效** —— 他们不会手动跑 `vigil-hub checkpoint`,但每次 agent
+/// 会话结束都会自动留下一个锚点(单调:无新事件则不追加)。仅磁盘账本(内存账本无 sidecar);
+/// emit 失败只记 stderr,**绝不**影响关闭。stderr 而非 stdout —— stdout 是 MCP 协议通道,不得污染。
+///
+/// 注:本地 sidecar 锚点检出"仅改数据库"的整链重写;完全闭合还需把 `<ledger>.checkpoints` 外部化
+/// (append-only / 异地),见 ADR 0020。
+pub fn anchor_checkpoint_on_shutdown(ledger_path: Option<&std::path::Path>, ledger: &Arc<Ledger>) {
+    let Some(path) = ledger_path else {
+        return; // 内存账本无 sidecar,跳过
+    };
+    // emit 做**同步阻塞** FS I/O(read_to_string + append + flush + sync_data)。Codex review:放在
+    // 关闭主路径上,wedged / remote(NFS/SMB)账本可能卡住网关退出。故把它放独立线程,主线程**有界
+    // 等待**(5s);超时即放弃(detached 线程随进程退出结束;atomic append 即便被中断,load 端撕裂行
+    // 守门 fail-closed,不留半行污染)。
+    let path = path.to_path_buf();
+    let ledger = ledger.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let log = vigil_audit::CheckpointLog::sidecar_for(&path);
+        match log.emit(&ledger) {
+            Ok(Some(cp)) => eprintln!(
+                "vigil-hub: anchored audit checkpoint at event #{} (full-chain-rewrite guard) -> {}",
+                cp.event_id,
+                log.path().display()
+            ),
+            // 空账本 / 自上次锚点无新事件 → 静默(常态,不刷屏)。
+            Ok(None) => {}
+            Err(e) => eprintln!("vigil-hub: checkpoint on shutdown skipped (non-fatal): {e}"),
+        }
+        let _ = tx.send(()); // 完成信号;忽略 send 错误(主线程可能已超时离开)
+    });
+    if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+        eprintln!("vigil-hub: checkpoint on shutdown timed out (>5s), exiting promptly");
+    }
+}
+
 pub fn run(args: ServeArgs) -> Result<(), ServeError> {
-    let (hub, _ledger) = build_hub(&args)?;
+    let (hub, ledger) = build_hub(&args)?;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = std::io::BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
-    run_stdio_loop(&hub, &mut reader, &mut writer)?;
-    Ok(())
+    let loop_result = run_stdio_loop(&hub, &mut reader, &mut writer);
+    // 无论优雅 EOF 还是协议错误退出,都 best-effort 锚定本会话已写入的审计链头。
+    anchor_checkpoint_on_shutdown(args.ledger_path.as_deref(), &ledger);
+    loop_result
 }
 
 /// 工具函数:检查 config 路径可读,供 CLI 参数预校验使用。
@@ -576,4 +615,52 @@ pub fn validate_config_path(path: &Path) -> Result<UpstreamsConfig, ServeError> 
     let raw = std::fs::read_to_string(path)?;
     let cfg: UpstreamsConfig = serde_json::from_str(&raw)?;
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use vigil_audit::{Anchored, CheckpointLog};
+
+    #[test]
+    fn shutdown_anchor_emits_checkpoint_for_disk_ledger() {
+        // turnkey 自动锚定:有内容的会话关闭后,sidecar 产出且 verify 通过。
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = Arc::new(Ledger::open(&path).unwrap());
+        let sid = ledger.start_session("test", None).unwrap();
+        ledger
+            .append_event(&sid, "test.event", &serde_json::json!({"k":"v"}), None)
+            .unwrap();
+
+        anchor_checkpoint_on_shutdown(Some(path.as_path()), &ledger);
+
+        let log = CheckpointLog::sidecar_for(&path);
+        assert!(log.path().exists(), "关闭后应产出 checkpoint sidecar");
+        assert!(matches!(
+            log.verify_anchored(&ledger).unwrap(),
+            Anchored::Verified { .. }
+        ));
+    }
+
+    #[test]
+    fn shutdown_anchor_is_noop_for_memory_ledger() {
+        // 内存账本(无路径)→ 安全 no-op,不 panic。
+        let ledger = Arc::new(Ledger::open_in_memory().unwrap());
+        anchor_checkpoint_on_shutdown(None, &ledger);
+    }
+
+    #[test]
+    fn shutdown_anchor_empty_ledger_writes_no_sidecar() {
+        // 空账本(无事件)→ emit None → 不留空 sidecar(不刷屏、不产无意义文件)。
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let ledger = Arc::new(Ledger::open(&path).unwrap());
+        anchor_checkpoint_on_shutdown(Some(path.as_path()), &ledger);
+        assert!(
+            !CheckpointLog::sidecar_for(&path).path().exists(),
+            "空账本不应产 sidecar"
+        );
+    }
 }

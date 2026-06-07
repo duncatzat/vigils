@@ -8,6 +8,20 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.32] — 2026-06-08
+
+审计 checkpoint 锚点(v0.1.31)现在自动生效。
+
+### 变更
+
+- **网关在关闭时自动锚定审计链。** v0.1.31 加入了 `vigil-hub checkpoint` 来把防篡改账本锚定起来、
+  对抗整链重写,但 turnkey 用户(只跑 `setup --all` / `setup --mcp`、从不手动调用)永远不会有锚点
+  —— 那项保护对他们形同虚设。现在 `vigil-hub serve` 与 `vigil-hub wrap` 在网关关闭时**自动** emit 一个
+  checkpoint,于是每次 agent 会话都会自动留下锚点,无需任何手动步骤。它是 best-effort、**绝不阻断
+  关闭**(写操作在独立线程上跑、有 5 秒上界,wedged 或网络文件系统也卡不住退出),仅在有新事件时才写,
+  且输出到 stderr(绝不污染 MCP 通道)。随时可跑 `vigil-hub verify` 校验链内一致性 + 锚点。(要完全
+  闭合该威胁,请把 `<ledger>.checkpoints` 文件设为 append-only 或异地同步 —— 见 ADR 0020。)
+
 ## [v0.1.31] — 2026-06-08
 
 审计 checkpoint 锚定 —— 检出防篡改账本的整链重写。

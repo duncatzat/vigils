@@ -8,6 +8,23 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.32] — 2026-06-08
+
+The audit checkpoint anchor (v0.1.31) now activates automatically.
+
+### Changed
+
+- **The gateway auto-anchors the audit chain on shutdown.** v0.1.31 added `vigil-hub checkpoint`
+  to anchor the tamper-evident ledger against a full-chain rewrite, but a turnkey user (who runs
+  `setup --all` / `setup --mcp` and never invokes it by hand) would never have an anchor — leaving
+  that protection inert for them. Now `vigil-hub serve` and `vigil-hub wrap` emit a checkpoint
+  automatically when the gateway shuts down, so every agent session leaves an anchor without any
+  manual step. It's best-effort and never blocks shutdown (the write runs on a separate thread with
+  a 5-second bound, so a wedged or network filesystem can't stall exit), writes only when there are
+  new events, and prints to stderr (never the MCP channel). Run `vigil-hub verify` any time to check
+  both chain-internal consistency and the anchors. (To fully close the threat, keep the
+  `<ledger>.checkpoints` file append-only or synced offsite — see ADR 0020.)
+
 ## [v0.1.31] — 2026-06-08
 
 Audit checkpoint anchoring — detect a full-chain rewrite of the tamper-evident ledger.

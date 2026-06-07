@@ -149,8 +149,11 @@ pub fn run(args: &WrapArgs) -> Result<(), ServeError> {
     let stdout = std::io::stdout();
     let mut reader = std::io::BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
-    serve::run_stdio_loop(&hub, &mut reader, &mut writer)?;
-    Ok(())
+    let loop_result = serve::run_stdio_loop(&hub, &mut reader, &mut writer);
+    // 关闭(优雅或错误)时 best-effort 锚定审计链头(ADR 0020):turnkey 用户经 `setup --mcp` 用 wrap,
+    // 不会手动 `vigil-hub checkpoint` —— 这里让整链重写保护对他们自动生效。
+    serve::anchor_checkpoint_on_shutdown(serve_args.ledger_path.as_deref(), &ledger);
+    loop_result
 }
 
 #[cfg(test)]
