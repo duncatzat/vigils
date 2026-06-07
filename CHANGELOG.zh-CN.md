@@ -8,6 +8,28 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.1.29] — 2026-06-07
+
+Cursor 与 Windsurf 现在也受保护 —— 一条命令覆盖四个 agent 接入面。
+
+### 新增
+
+- **`setup --mcp` 现在也保护 Cursor 与 Windsurf,不再只限 Claude Code 与 Codex。** `vigil-hub setup
+  --mcp`(预览 / `--apply` / `--uninstall`)与一键的 `setup --all`,现在还会检测并包裹 Cursor
+  `~/.cursor/mcp.json` 与 Windsurf `~/.codeium/windsurf/mcp_config.json` 里的 stdio MCP server。一条命令
+  现在覆盖你可能拥有的全部四个 agent 接入面。两者复用**完全相同**的网关包裹(结果脱敏 + 裸 secret 拦截 +
+  防篡改审计,默认 monitor 姿态),可逆 —— `--uninstall` 还原原样。每个 server 用 `cursor-<name>` /
+  `windsurf-<name>` 网关 id,与 Claude 的 `user-`/`local-`、Codex 的 `codex-` 命名空间不相交 —— 跨 agent
+  的同名 server 在共享审计账本里绝不串身份。
+
+### 安全
+
+- Cursor 与 Windsurf 用与 Claude user scope **完全相同**的 JSON `mcpServers` 形态,故新代码复用**同一个**
+  分类器与安全编辑机制(sentinel 精确匹配、危险字符拒绝、非 stdio 跳过、server-id 校验、原子写 + 备份)。
+  对共享路径两处加固:用 Windsurf 的 `serverUrl` 字段(而非 `url`)声明的远程 server,现在被正确跳过而非误
+  当 stdio 包裹;以及一个**存在但读不到**的配置文件(如权限错误),现在会如实报错,而不是被静默当成"未配置"
+  —— 让不可访问的配置绝不被悄悄漏保护。已经对抗审查。
+
 ## [v0.1.28] — 2026-06-07
 
 一条命令现在也保护 Codex —— 不再只是 Claude Code。

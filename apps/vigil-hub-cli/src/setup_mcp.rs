@@ -93,7 +93,14 @@ pub fn claude_json_path(home: &Path) -> PathBuf {
 /// (`MalformedConfig`,绝不臆测覆盖 —— 与 `setup` 的 abort-on-unexpected 同纪律)。
 pub fn read_claude_json(path: &Path) -> Result<Option<Value>, SetupError> {
     match std::fs::metadata(path) {
-        Err(_) => Ok(None), // 不存在 = 用户未配 MCP(或未装 Claude Code)
+        // **真不存在** = 用户未配 MCP(或未装该 agent)→ Ok(None)。但**存在却不可访问**(权限等其它 stat
+        // 错误)绝不当"未配置"静默跳过(Codex D28 #8:那会 fail-open —— 一个存在的配置被悄悄漏保护),
+        // 诚实报 IO 错(fail-closed)。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(SetupError::Io {
+            what: "stat MCP config",
+            path: path.to_path_buf(),
+        }),
         Ok(m) if m.len() > MAX_CLAUDE_JSON_BYTES => Err(SetupError::MalformedConfig {
             path: path.to_path_buf(),
         }),
@@ -149,9 +156,10 @@ fn classify_one(name: &str, entry: &Value) -> McpServerClass {
         }
     }
 
-    // 远程(http/sse):有 `url` → 跳过(HTTP MCP wrap 留后续)。`has_url` 先于 `command` 判,
-    // 故 url+command 并存的异常条目也被正确跳过(Codex checked-OK)。
-    if entry.get("url").is_some() {
+    // 远程(http/sse):有 `url`(Claude/Cursor/Codex/Cline/Zed)或 `serverUrl`(Windsurf 专用字段)
+    // → 跳过(HTTP MCP wrap 留后续)。远程判定先于 `command`,故 url+command 并存的异常条目也被正确
+    // 跳过(Codex checked-OK)。stdio 条目绝不含 url/serverUrl,故加 serverUrl 对其它 agent 是 no-op。
+    if entry.get("url").is_some() || entry.get("serverUrl").is_some() {
         return McpServerClass::Skipped {
             name: name.into(),
             reason: "remote (http/sse) server — wrapping HTTP MCP is a later increment",
@@ -727,7 +735,13 @@ pub fn codex_scope_server_id(name: &str) -> String {
 /// (`MalformedConfig`,绝不臆测覆盖 —— 与 [`read_claude_json`] 同纪律,仅解析器从 JSON 换成 TOML)。
 pub fn read_codex_config(path: &Path) -> Result<Option<DocumentMut>, SetupError> {
     match std::fs::metadata(path) {
-        Err(_) => Ok(None), // 不存在 = 用户未用 Codex(或未配 MCP)
+        // 真不存在 → Ok(None);存在但不可访问(权限等)→ 诚实 IO 错,绝不当"未配置"静默跳过
+        // (Codex D28 #8,与 read_claude_json 同纪律)。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(SetupError::Io {
+            what: "stat Codex config",
+            path: path.to_path_buf(),
+        }),
         Ok(m) if m.len() > MAX_CLAUDE_JSON_BYTES => Err(SetupError::MalformedConfig {
             path: path.to_path_buf(),
         }),
@@ -1039,6 +1053,207 @@ pub fn run_codex_uninstall(home: &Path, dry_run: bool) -> Result<CodexApplyRepor
     };
     Ok(CodexApplyReport {
         codex_config: path,
+        changed,
+        dry_run,
+        backup,
+    })
+}
+
+// ============================ JSON `mcpServers` agent 接入面(Cursor / Windsurf) ============================
+//
+// Cursor(`~/.cursor/mcp.json`)与 Windsurf(`~/.codeium/windsurf/mcp_config.json`)的 MCP 配置**形态与
+// Claude user scope 完全一致**:专用 JSON 文件、顶层 `mcpServers` 对象、条目 `command`/`args`/`env`、
+// 远程用 `url`(Windsurf 另用 `serverUrl`,已并入 `classify_one` 远程检测)。故**直接复用 Claude 路径的
+// read/classify/wrap/unwrap/atomic-write 机制**,仅 config 路径与 server-id 前缀不同;无 `projects.*` 嵌套
+// (那是 Claude 专有),只处理顶层 scope。server-id 用 `<prefix>-<name>`(`cursor-`/`windsurf-`,与
+// `user-`/`local-`/`codex-` 命名空间不相交)。
+//
+// **范围**:Cursor + Windsurf —— 均为专用、安全可重写文件、零形态差异。Cline(globalStorage 路径随
+// VS Code 版本/fork 漂移 + 有删配置数据丢失史)、Zed(`context_servers` 键且嵌入共享 settings.json/JSONC)、
+// VS Code(`servers` 键 + 显式 `type`)形态/风险不同,留后续专门增量。
+
+/// 一个"JSON `mcpServers` 形态"的 agent 接入面描述符(Cursor / Windsurf)。
+#[derive(Debug, Clone)]
+pub struct JsonMcpAgent {
+    /// 人类可读名(报告/预览用)。
+    pub display_name: &'static str,
+    /// 配置文件绝对路径(已注入 home → 测试可指向 fixture,绝不碰真实用户配置)。
+    pub config_path: PathBuf,
+    /// server-id 前缀(`cursor` / `windsurf`)。
+    pub id_prefix: &'static str,
+}
+
+impl JsonMcpAgent {
+    /// Cursor:`~/.cursor/mcp.json`(user scope;项目级 `<repo>/.cursor/mcp.json` 是独立提交文件,不碰)。
+    pub fn cursor(home: &Path) -> Self {
+        JsonMcpAgent {
+            display_name: "Cursor",
+            config_path: home.join(".cursor").join("mcp.json"),
+            id_prefix: "cursor",
+        }
+    }
+    /// Windsurf:`~/.codeium/windsurf/mcp_config.json`(唯一 scope —— Windsurf 无项目级 MCP 配置)。
+    pub fn windsurf(home: &Path) -> Self {
+        JsonMcpAgent {
+            display_name: "Windsurf",
+            config_path: home
+                .join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json"),
+            id_prefix: "windsurf",
+        }
+    }
+    /// 派生 server-id:`<prefix>-<name>`(与 `user-`/`local-`/`codex-` 命名空间不相交)。
+    /// `name` 已由 [`classify_one`] 用真验证器过滤,前缀全在 `^[a-z0-9_-]+$` 字符集内,拼接后必合法。
+    fn server_id(&self, name: &str) -> String {
+        format!("{}-{}", self.id_prefix, name)
+    }
+}
+
+/// JSON-agent 接入面的只读预览报告。
+#[derive(Debug, Clone)]
+pub struct JsonAgentPreviewReport {
+    /// 人类可读 agent 名。
+    pub display_name: &'static str,
+    /// 配置文件路径。
+    pub config_path: PathBuf,
+    /// 文件是否存在(不存在 = 用户未用该 agent,诚实标记)。
+    pub exists: bool,
+    /// 本进程 exe(预览 wrap argv 用)。
+    pub exe: String,
+    /// 顶层 `mcpServers` 逐条目分类。
+    pub servers: Vec<McpServerClass>,
+    /// 将落盘的姿态(`monitor` / `--enforce`)。
+    pub monitor: bool,
+    /// server-id 前缀(预览渲染 wrap argv 用)。
+    pub id_prefix: &'static str,
+}
+
+impl JsonAgentPreviewReport {
+    /// 可被保护(Wrappable)的 server 数。
+    pub fn wrappable_count(&self) -> usize {
+        self.servers
+            .iter()
+            .filter(|s| matches!(s, McpServerClass::Wrappable { .. }))
+            .count()
+    }
+}
+
+/// JSON-agent 接入面 apply/uninstall 的结果报告。
+#[derive(Debug, Clone)]
+pub struct JsonAgentApplyReport {
+    /// 人类可读 agent 名。
+    pub display_name: &'static str,
+    /// 配置文件路径。
+    pub config_path: PathBuf,
+    /// 实际(或 dry-run 将)改写 / 还原的 server 数。
+    pub changed: usize,
+    /// 仅预览不写盘。
+    pub dry_run: bool,
+    /// 写盘时产生的备份路径(若有)。
+    pub backup: Option<PathBuf>,
+}
+
+/// 读真实配置(IO 边界)→ 枚举 + 分类,产出只读预览。**不写**。home/exe 注入 → 测试走 fixture。
+pub fn run_json_agent_preview(
+    agent: &JsonMcpAgent,
+    exe: &str,
+    monitor: bool,
+) -> Result<JsonAgentPreviewReport, SetupError> {
+    let cfg = read_claude_json(&agent.config_path)?;
+    let (exists, servers) = match cfg {
+        Some(v) => (true, classify_user_scope_servers(&v)),
+        None => (false, Vec::new()),
+    };
+    Ok(JsonAgentPreviewReport {
+        display_name: agent.display_name,
+        config_path: agent.config_path.clone(),
+        exists,
+        exe: exe.to_string(),
+        servers,
+        monitor,
+        id_prefix: agent.id_prefix,
+    })
+}
+
+/// `setup --mcp --apply`(JSON-agent):读 → wrap 顶层 `mcpServers` → 原子写。`dry_run` 只算不写。
+/// 复用 Claude 路径的 [`wrap_servers_object`](仅 server-id 派生器换成 `<prefix>-<name>`)。
+pub fn run_json_agent_apply(
+    agent: &JsonMcpAgent,
+    exe: &str,
+    dry_run: bool,
+    monitor: bool,
+) -> Result<JsonAgentApplyReport, SetupError> {
+    let cfg = match read_claude_json(&agent.config_path)? {
+        Some(v) => v,
+        None => {
+            return Ok(JsonAgentApplyReport {
+                display_name: agent.display_name,
+                config_path: agent.config_path.clone(),
+                changed: 0,
+                dry_run,
+                backup: None,
+            })
+        }
+    };
+    let stamp = std::fs::metadata(&agent.config_path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let mut new_cfg = cfg.clone();
+    let changed = new_cfg
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .map(|servers| wrap_servers_object(servers, exe, monitor, |n| agent.server_id(n)))
+        .unwrap_or(0);
+    let backup = if !dry_run && changed > 0 {
+        crate::setup::atomic_write_with_backup(&agent.config_path, &new_cfg, stamp)?
+    } else {
+        None
+    };
+    Ok(JsonAgentApplyReport {
+        display_name: agent.display_name,
+        config_path: agent.config_path.clone(),
+        changed,
+        dry_run,
+        backup,
+    })
+}
+
+/// `setup --mcp --uninstall`(JSON-agent):读 → 还原顶层 `mcpServers` 全部 Vigil 托管条目 → 原子写。
+/// 复用 Claude 路径的 [`unwrap_servers_object`](self-describing 反解 SSOT)。
+pub fn run_json_agent_uninstall(
+    agent: &JsonMcpAgent,
+    dry_run: bool,
+) -> Result<JsonAgentApplyReport, SetupError> {
+    let cfg = match read_claude_json(&agent.config_path)? {
+        Some(v) => v,
+        None => {
+            return Ok(JsonAgentApplyReport {
+                display_name: agent.display_name,
+                config_path: agent.config_path.clone(),
+                changed: 0,
+                dry_run,
+                backup: None,
+            })
+        }
+    };
+    let stamp = std::fs::metadata(&agent.config_path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let mut new_cfg = cfg.clone();
+    let changed = new_cfg
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+        .map(unwrap_servers_object)
+        .unwrap_or(0);
+    let backup = if !dry_run && changed > 0 {
+        crate::setup::atomic_write_with_backup(&agent.config_path, &new_cfg, stamp)?
+    } else {
+        None
+    };
+    Ok(JsonAgentApplyReport {
+        display_name: agent.display_name,
+        config_path: agent.config_path.clone(),
         changed,
         dry_run,
         backup,
@@ -2454,5 +2669,193 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
             after.contains("--vigil-managed-mcp"),
             "条目仍是原样 wrapped"
         );
+    }
+
+    // ============================ JSON agent 接入面(Cursor / Windsurf) ============================
+
+    /// Cursor/Windsurf 配置路径正确(home 注入)。
+    #[test]
+    fn json_agent_config_paths() {
+        let home = Path::new("/h");
+        assert_eq!(
+            JsonMcpAgent::cursor(home).config_path,
+            Path::new("/h").join(".cursor").join("mcp.json")
+        );
+        assert_eq!(
+            JsonMcpAgent::windsurf(home).config_path,
+            Path::new("/h")
+                .join(".codeium")
+                .join("windsurf")
+                .join("mcp_config.json")
+        );
+    }
+
+    /// server-id 命名空间:`cursor-`/`windsurf-` 与 `user-`/`local-`/`codex-` 不相交,且合法网关 id。
+    #[test]
+    fn json_agent_server_id_namespace_disjoint() {
+        let home = Path::new("/h");
+        let cid = JsonMcpAgent::cursor(home).server_id("fs");
+        let wid = JsonMcpAgent::windsurf(home).server_id("fs");
+        assert_eq!(cid, "cursor-fs");
+        assert_eq!(wid, "windsurf-fs");
+        for id in [&cid, &wid] {
+            assert!(!id.starts_with("user-"));
+            assert!(!id.starts_with("local-"));
+            assert!(!id.starts_with("codex-"));
+            assert!(vigil_mcp::namespace::validate_server_id(id).is_ok());
+        }
+        assert_ne!(cid, wid);
+    }
+
+    /// Windsurf 远程条目用 `serverUrl`(非 `url`)→ 仍被 `classify_one` 判为远程 Skipped(不 wrap)。
+    #[test]
+    fn json_agent_windsurf_serverurl_remote_skipped() {
+        let cfg = json!({
+            "mcpServers": {
+                "local": { "command": "npx", "args": ["x"] },
+                "remote": { "serverUrl": "https://mcp.example.com/sse" }
+            }
+        });
+        let classes = classify_user_scope_servers(&cfg);
+        assert!(classes
+            .iter()
+            .any(|c| matches!(c, McpServerClass::Wrappable { name, .. } if name == "local")));
+        assert!(
+            classes
+                .iter()
+                .any(|c| matches!(c, McpServerClass::Skipped { name, .. } if name == "remote")),
+            "serverUrl 远程条目必须被跳过(不当 stdio 误 wrap)"
+        );
+    }
+
+    /// **功能测试**:tempfile 真 `~/.cursor/mcp.json` apply → 验证 wrap(cursor- id)→ uninstall →
+    /// 逐字还原(绝不碰真实用户配置)。复用 Claude JSON 机制。
+    #[test]
+    fn json_agent_apply_uninstall_round_trip_on_tempfile() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent = JsonMcpAgent::cursor(home);
+        fs::create_dir_all(home.join(".cursor")).unwrap();
+        fs::write(
+            &agent.config_path,
+            json!({
+                "mcpServers": {
+                    "filesystem": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"],
+                        "env": {"FS_TOKEN": "shh"}
+                    },
+                    "remote": {"url": "https://mcp.example.com/"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // apply
+        let rep = run_json_agent_apply(&agent, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 1, "只 filesystem 被 wrap;remote(url)跳过");
+        assert!(rep.backup.is_some());
+        let after: Value =
+            serde_json::from_str(&fs::read_to_string(&agent.config_path).unwrap()).unwrap();
+        // server-id 用 cursor- 前缀;env 值绝不进 argv
+        let fs_args = after["mcpServers"]["filesystem"]["args"]
+            .as_array()
+            .unwrap();
+        let joined: String = fs_args
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("cursor-filesystem"));
+        assert!(joined.contains("--env-key"));
+        assert!(!joined.contains("shh"), "secret 值绝不进 wrap argv");
+        // remote 原样不动
+        assert!(after["mcpServers"]["remote"]["url"].is_string());
+
+        // uninstall → 逐字还原
+        let rep2 = run_json_agent_uninstall(&agent, false).unwrap();
+        assert_eq!(rep2.changed, 1);
+        let restored: Value =
+            serde_json::from_str(&fs::read_to_string(&agent.config_path).unwrap()).unwrap();
+        assert_eq!(
+            restored["mcpServers"]["filesystem"]["command"].as_str(),
+            Some("npx")
+        );
+        let rargs: Vec<String> = restored["mcpServers"]["filesystem"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        assert_eq!(
+            rargs,
+            vec!["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+        );
+        // env 逐字保留(reversible 需要)
+        assert_eq!(
+            restored["mcpServers"]["filesystem"]["env"]["FS_TOKEN"].as_str(),
+            Some("shh")
+        );
+    }
+
+    /// 幂等:apply 两次 → 第二次 0 改写(AlreadyWrapped 跳过)。
+    #[test]
+    fn json_agent_apply_is_idempotent() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent = JsonMcpAgent::windsurf(home);
+        fs::create_dir_all(home.join(".codeium").join("windsurf")).unwrap();
+        fs::write(
+            &agent.config_path,
+            json!({"mcpServers": {"fs": {"command": "npx", "args": ["x"]}}}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            run_json_agent_apply(&agent, "vigil-hub", false, true)
+                .unwrap()
+                .changed,
+            1
+        );
+        assert_eq!(
+            run_json_agent_apply(&agent, "vigil-hub", false, true)
+                .unwrap()
+                .changed,
+            0
+        );
+    }
+
+    /// 无配置文件 → 0 改写、无错、无备份(用户未用该 agent)。
+    #[test]
+    fn json_agent_no_config_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = JsonMcpAgent::cursor(dir.path());
+        let rep = run_json_agent_apply(&agent, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 0);
+        assert!(rep.backup.is_none());
+        assert!(
+            !run_json_agent_preview(&agent, "vigil-hub", true)
+                .unwrap()
+                .exists
+        );
+    }
+
+    /// 损坏 JSON → `MalformedConfig`,原文件未被改写(fail-safe,复用 read_claude_json 纪律)。
+    #[test]
+    fn json_agent_malformed_aborts_without_touching_file() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let agent = JsonMcpAgent::cursor(home);
+        fs::create_dir_all(home.join(".cursor")).unwrap();
+        fs::write(&agent.config_path, "}{ not json").unwrap();
+        let before = fs::read_to_string(&agent.config_path).unwrap();
+        assert!(matches!(
+            run_json_agent_apply(&agent, "vigil-hub", false, true),
+            Err(SetupError::MalformedConfig { .. })
+        ));
+        assert_eq!(fs::read_to_string(&agent.config_path).unwrap(), before);
     }
 }

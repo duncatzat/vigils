@@ -420,27 +420,45 @@ fn setup_mcp_dispatch(args: &CliSetupArgs) -> Result<std::process::ExitCode, set
         let rows = setup_mcp::run_doctor(&home, probe_timeout)?;
         Ok(print_mcp_doctor(&rows))
     } else if args.uninstall {
-        // 两个 agent 配置面都还原:Claude(`~/.claude.json`)+ Codex(`~/.codex/config.toml`)。
+        // 所有 agent 接入面都还原:Claude + Codex + Cursor + Windsurf(各独立文件,逐一诚实报告)。
         let rep = setup_mcp::run_uninstall(&home, args.dry_run)?;
-        let code = print_mcp_apply(&rep, "uninstall");
-        Ok(run_codex_leg(
+        let mut code = print_mcp_apply(&rep, "uninstall");
+        code = run_codex_leg(
             setup_mcp::run_codex_uninstall(&home, args.dry_run),
             "uninstall",
             code,
-        ))
+        );
+        for agent in json_mcp_agents(&home) {
+            code = run_json_agent_leg(
+                setup_mcp::run_json_agent_uninstall(&agent, args.dry_run),
+                agent.display_name,
+                "uninstall",
+                code,
+            );
+        }
+        Ok(code)
     } else if args.apply {
-        // 两个面都保护(turnkey:一条命令覆盖用户所有 agent 接入面)。
+        // 所有面都保护(turnkey:一条命令覆盖用户全部 agent 接入面)。
         let rep = setup_mcp::run_apply(&home, &exe, args.dry_run, args.user_scope_only, monitor)?;
-        let code = print_mcp_apply(&rep, "apply");
-        Ok(run_codex_leg(
+        let mut code = print_mcp_apply(&rep, "apply");
+        code = run_codex_leg(
             setup_mcp::run_codex_apply(&home, &exe, args.dry_run, monitor),
             "apply",
             code,
-        ))
+        );
+        for agent in json_mcp_agents(&home) {
+            code = run_json_agent_leg(
+                setup_mcp::run_json_agent_apply(&agent, &exe, args.dry_run, monitor),
+                agent.display_name,
+                "apply",
+                code,
+            );
+        }
+        Ok(code)
     } else {
         let rep = setup_mcp::run_preview(&home, &exe, monitor)?;
         let code = print_mcp_preview(&rep);
-        // 预览只读:Codex 配置 malformed 不硬 abort(什么都没写),优雅降级为一行提示而非突兀报错。
+        // 预览只读:某 agent 配置 malformed 不硬 abort(什么都没写),优雅降级为一行提示而非突兀报错。
         match setup_mcp::run_codex_preview(&home, &exe, monitor) {
             Ok(codex) => print_codex_preview(&codex),
             Err(e) => {
@@ -452,8 +470,30 @@ fn setup_mcp_dispatch(args: &CliSetupArgs) -> Result<std::process::ExitCode, set
                 println!("  (could not read it: {e} -- fix the file to preview/protect Codex MCP servers)");
             }
         }
+        for agent in json_mcp_agents(&home) {
+            match setup_mcp::run_json_agent_preview(&agent, &exe, monitor) {
+                Ok(r) => print_json_agent_preview(&r),
+                Err(e) => {
+                    println!();
+                    println!(
+                        "  {} config: {}",
+                        agent.display_name,
+                        agent.config_path.display()
+                    );
+                    println!("  (could not read it: {e} -- fix the file to preview/protect its MCP servers)");
+                }
+            }
+        }
         Ok(code)
     }
+}
+
+/// turnkey 覆盖的"JSON `mcpServers` 形态"agent 列表(Cursor + Windsurf)。新增同形态 agent 只在此扩列。
+fn json_mcp_agents(home: &std::path::Path) -> [setup_mcp::JsonMcpAgent; 2] {
+    [
+        setup_mcp::JsonMcpAgent::cursor(home),
+        setup_mcp::JsonMcpAgent::windsurf(home),
+    ]
 }
 
 /// 运行 Codex 接入面的一步(apply/uninstall)并**诚实处理半应用状态**(Codex review #7 MEDIUM):
@@ -488,6 +528,30 @@ fn run_codex_leg(
     }
 }
 
+/// 运行一个 JSON-agent 接入面(Cursor / Windsurf)的一步并**诚实处理半应用状态**(同 [`run_codex_leg`])。
+/// 成功 → 打印报告,返回 `prior_code`(保留前面 leg 可能的 FAILURE);失败 → 打印该 agent 步失败 +
+/// 恢复指引(其它 agent 面互不影响),返回 FAILURE。`prior_code` 链式传递 → 任一 leg 失败则总退出码 FAILURE。
+fn run_json_agent_leg(
+    res: Result<setup_mcp::JsonAgentApplyReport, setup::SetupError>,
+    agent_name: &str,
+    op: &str,
+    prior_code: std::process::ExitCode,
+) -> std::process::ExitCode {
+    match res {
+        Ok(r) => {
+            print_json_agent_apply(&r, op);
+            prior_code
+        }
+        Err(e) => {
+            eprintln!(
+                "  [{agent_name}] the {op} step FAILED (other agent surfaces unaffected): {e}"
+            );
+            eprintln!("  Fix {agent_name}'s MCP config, then re-run the same command.");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 fn run_setup_all(args: &CliSetupArgs) -> Result<std::process::ExitCode, setup::SetupError> {
     let home = dirs::home_dir().ok_or(setup::SetupError::MissingHomeDir)?;
     let exe = std::env::current_exe().map_err(|_| setup::SetupError::MissingCurrentExe)?;
@@ -515,18 +579,27 @@ fn run_setup_all(args: &CliSetupArgs) -> Result<std::process::ExitCode, setup::S
         monitor,
     ) {
         Ok((hook_rep, mcp_rep)) => {
-            let code = print_setup_all(&hook_rep, &mcp_rep, op);
-            // 第三个接入面:Codex(`~/.codex/config.toml`)。独立文件,hook + Claude-MCP 两步成功后再做;
-            // 失败经 `run_codex_leg` **诚实半应用报告**(不回滚已应用的前两面 —— 各面独立、各自可逆)。
-            // op 在 dry-run 时为 "preview";Codex 步只认 apply/uninstall(dry 措辞由报告里 dry_run 决定)。
+            let mut code = print_setup_all(&hook_rep, &mcp_rep, op);
+            // 其余接入面:Codex + Cursor + Windsurf。各独立文件,hook + Claude-MCP 成功后逐一做;失败经
+            // `run_*_leg` **诚实半应用报告**(不回滚已应用面 —— 各面独立、各自可逆)。op 在 dry-run 时为
+            // "preview";各步只认 apply/uninstall(dry 措辞由报告里 dry_run 决定)。
             let exe_str = exe.to_string_lossy().to_string();
-            let codex_op = if args.uninstall { "uninstall" } else { "apply" };
+            let mcp_op = if args.uninstall { "uninstall" } else { "apply" };
             let codex_res = if args.uninstall {
                 setup_mcp::run_codex_uninstall(&home, args.dry_run)
             } else {
                 setup_mcp::run_codex_apply(&home, &exe_str, args.dry_run, monitor)
             };
-            Ok(run_codex_leg(codex_res, codex_op, code))
+            code = run_codex_leg(codex_res, mcp_op, code);
+            for agent in json_mcp_agents(&home) {
+                let res = if args.uninstall {
+                    setup_mcp::run_json_agent_uninstall(&agent, args.dry_run)
+                } else {
+                    setup_mcp::run_json_agent_apply(&agent, &exe_str, args.dry_run, monitor)
+                };
+                code = run_json_agent_leg(res, agent.display_name, mcp_op, code);
+            }
+            Ok(code)
         }
         // hook 步就失败 → 什么都没改(hook 写盘前 gate,失败即未写):诚实"nothing changed"。
         Err(setup_mcp::AllError::Hook(e)) => {
@@ -926,6 +999,62 @@ fn print_codex_apply(r: &setup_mcp::CodexApplyReport, op: &str) {
     if op == "apply" && r.changed > 0 && !r.dry_run {
         println!(
             "  Restart Codex to pick up the change. Undo with: vigil-hub setup --mcp --uninstall"
+        );
+    }
+}
+
+/// 打印 JSON-agent 接入面(Cursor / Windsurf)只读预览(ASCII-safe)。附在前面各面预览之后。
+/// 复用 [`print_mcp_server_preview`](注入 `<prefix>-` server-id 派生,与 apply 真改写一致)。
+fn print_json_agent_preview(r: &setup_mcp::JsonAgentPreviewReport) {
+    println!();
+    println!("  {} config: {}", r.display_name, r.config_path.display());
+    if !r.exists {
+        println!(
+            "  (not found -- {} not configured, or no MCP servers yet)",
+            r.display_name
+        );
+        return;
+    }
+    if r.servers.is_empty() {
+        println!("  No MCP servers found in mcpServers.");
+        return;
+    }
+    println!(
+        "  {} scope (mcpServers) -- {} can be protected:",
+        r.display_name,
+        r.wrappable_count()
+    );
+    // server-id 派生须与 apply 一致(`<prefix>-<name>`)。prefix 是 &'static str,闭包捕获。
+    let prefix = r.id_prefix;
+    for s in &r.servers {
+        print_mcp_server_preview(&r.exe, |n| format!("{prefix}-{n}"), s, r.monitor);
+    }
+}
+
+/// 打印 JSON-agent 接入面 apply/uninstall 结果(ASCII-safe)。附在前面各面结果之后。
+fn print_json_agent_apply(r: &setup_mcp::JsonAgentApplyReport, op: &str) {
+    let dry = if r.dry_run { " (dry-run)" } else { "" };
+    let verb = if r.dry_run { "would" } else { "did" };
+    let what = if op == "uninstall" { "restore" } else { "wrap" };
+    println!(
+        "Vigil setup --mcp --{op}{dry} ({}): {verb} {what} {} MCP server(s) in {}",
+        r.display_name,
+        r.changed,
+        r.config_path.display()
+    );
+    if let Some(b) = &r.backup {
+        println!("  backup of the previous config: {}", b.display());
+    }
+    if r.changed == 0 && !r.dry_run {
+        println!(
+            "  (nothing to {what} in {} -- no matching servers)",
+            r.display_name
+        );
+    }
+    if op == "apply" && r.changed > 0 && !r.dry_run {
+        println!(
+            "  Restart {} to pick up the change. Undo with: vigil-hub setup --mcp --uninstall",
+            r.display_name
         );
     }
 }

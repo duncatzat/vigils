@@ -8,6 +8,31 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.1.29] — 2026-06-07
+
+Cursor and Windsurf are protected now too — four agent surfaces from one command.
+
+### Added
+
+- **`setup --mcp` now protects Cursor and Windsurf, not just Claude Code and Codex.** `vigil-hub setup
+  --mcp` (preview / `--apply` / `--uninstall`) and the all-in-one `setup --all` now also detect and wrap
+  the stdio MCP servers in Cursor's `~/.cursor/mcp.json` and Windsurf's
+  `~/.codeium/windsurf/mcp_config.json`. One command now protects all four agent surfaces you might
+  have. Both reuse the exact same gateway wrap (result redaction + raw-secret block + tamper-evident
+  audit, default monitor posture), reversibly — `--uninstall` restores the originals. Each server gets a
+  `cursor-<name>` / `windsurf-<name>` gateway id, namespace-disjoint from the Claude `user-`/`local-`
+  and Codex `codex-` ids so the same server name across agents never collides in the shared audit ledger.
+
+### Security
+
+- Cursor and Windsurf use the very same JSON `mcpServers` shape as Claude's user scope, so the new code
+  reuses the **same** classifier and safe-edit machinery (sentinel exact-match, dangerous-character
+  rejection, non-stdio skip, server-id validation, atomic write + backup). Two hardenings to the shared
+  path: a remote server declared with Windsurf's `serverUrl` field (not just `url`) is now correctly
+  skipped instead of mistaken for stdio; and a config file that exists but can't be read (e.g. a
+  permission error) is now reported as a real error instead of being silently treated as "not
+  configured" — so an inaccessible config is never silently left unprotected. Reviewed adversarially.
+
 ## [v0.1.28] — 2026-06-07
 
 One command now protects Codex too — not just Claude Code.
