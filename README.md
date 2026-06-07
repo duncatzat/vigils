@@ -115,7 +115,9 @@ Or grab a pre-built installer / binary for **Windows, macOS, or Linux** from any
 | **macOS** | `.dmg` | `vigil-hub` (in `vigils-cli-…-apple-darwin.tar.gz`) |
 | **Linux** | `.AppImage` / `.deb` / `.rpm` | `vigil-hub` (in `vigils-cli-…-linux-gnu.tar.gz`) |
 
-> Early releases are unsigned; your OS may show a Gatekeeper / SmartScreen prompt on first run.
+> Early releases aren't OS-code-signed yet; your OS may show a Gatekeeper / SmartScreen prompt
+> on first run — they're still independently verifiable (see below, or the full
+> [Verifying your download](https://duncatzat.github.io/vigils/getting-started/verifying-downloads.html) guide).
 
 **Verify what you downloaded** (optional). Every release asset carries a SHA-256 checksum
 (`<file>.sha256`, also checked automatically by the one-line installer) and a cryptographic
@@ -127,7 +129,9 @@ gh attestation verify vigils-cli-linux-x64.tar.gz --repo duncatzat/vigils
 
 This confirms the artifact was built by Vigils' official CI from this repository (SLSA provenance
 via Sigstore) — i.e. not swapped or tampered with after the build. The CLI archives, desktop
-installers, and the extension zip are all attested.
+installers, and the extension zip are all attested. Full guide (per-OS steps + the unsigned-app
+prompt): [**Verifying your download**](https://duncatzat.github.io/vigils/getting-started/verifying-downloads.html)
+([中文](https://duncatzat.github.io/vigils/getting-started/verifying-downloads.zh-CN.html)).
 
 The **Chrome extension** lives in `extensions/chrome-mv3/` — load it unpacked via
 `chrome://extensions` → *Developer mode* → *Load unpacked* (it talks to `vigil-native-host`).

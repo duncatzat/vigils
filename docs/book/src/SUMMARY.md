@@ -6,6 +6,7 @@
 # Getting Started
 
 - [Installation](./getting-started/installation.md)
+- [Verifying your download](./getting-started/verifying-downloads.md)
 - [Quickstart — Embedding the SDK](./getting-started/sdk-quickstart.md)
 - [Quickstart — Desktop App](./getting-started/desktop-quickstart.md)
 - [Agent Integration & Test](./getting-started/agent-integration.md)
@@ -40,4 +41,5 @@
 
 # 中文 (Chinese)
 
+- [验证你的下载](./getting-started/verifying-downloads.zh-CN.md)
 - [Agent 接入与测试指南](./getting-started/agent-integration.zh-CN.md)

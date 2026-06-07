@@ -4,7 +4,10 @@ Download the latest installers from the
 [**Releases page**](https://github.com/duncatzat/vigils/releases/latest). Replace
 `<version>` below with the release you downloaded (e.g. `0.1.7`).
 
-> Early releases are unsigned; your OS may show a Gatekeeper / SmartScreen prompt on first run.
+> Early releases aren't OS-code-signed yet, so your OS may show a Gatekeeper / SmartScreen
+> prompt on first run. Every artifact is still independently verifiable — see
+> [**Verifying your download**](./verifying-downloads.md) ([中文](./verifying-downloads.zh-CN.md))
+> for `gh attestation verify` (build provenance) and checksums.
 
 ## Desktop app (end users)
 
