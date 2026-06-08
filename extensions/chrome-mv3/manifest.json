@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Vigils Browser Guard",
   "short_name": "Vigils",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Vigils 浏览器守门:对你粘贴 / 输入 / 提交进 AI 网站的文本做密钥与 PII 硬指纹检测,经本机 Native Host(com.vigil.host)原地脱敏。原文仅在 Host 内存停留,分类完立即 drop。",
   "minimum_chrome_version": "120",
   "permissions": [
@@ -13,7 +13,16 @@
     "https://chatgpt.com/*",
     "https://claude.ai/*",
     "https://gemini.google.com/*",
-    "https://www.perplexity.ai/*"
+    "https://www.perplexity.ai/*",
+    "https://chat.deepseek.com/*",
+    "https://www.doubao.com/*",
+    "https://kimi.moonshot.cn/*",
+    "https://kimi.com/*",
+    "https://tongyi.aliyun.com/*",
+    "https://chatglm.cn/*",
+    "https://yuanbao.tencent.com/*",
+    "https://yiyan.baidu.com/*",
+    "https://xinghuo.xfyun.cn/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -25,7 +34,16 @@
         "https://chatgpt.com/*",
         "https://claude.ai/*",
         "https://gemini.google.com/*",
-        "https://www.perplexity.ai/*"
+        "https://www.perplexity.ai/*",
+        "https://chat.deepseek.com/*",
+        "https://www.doubao.com/*",
+        "https://kimi.moonshot.cn/*",
+        "https://kimi.com/*",
+        "https://tongyi.aliyun.com/*",
+        "https://chatglm.cn/*",
+        "https://yuanbao.tencent.com/*",
+        "https://yiyan.baidu.com/*",
+        "https://xinghuo.xfyun.cn/*"
       ],
       "js": ["content-script.js"],
       "run_at": "document_idle",

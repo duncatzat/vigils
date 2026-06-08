@@ -106,16 +106,25 @@
         return new Promise((resolve) => {
             let replied = false;
             try {
-                chrome.runtime.sendMessage(
+                // runtime 缺失守门:扩展上下文失效(reload/更新/卸载)时 chrome.runtime 可能
+                // 为 undefined。显式 fail-closed,而非依赖属性访问抛错(行为等价但更清晰)。
+                const runtime =
+                    typeof chrome === "object" && chrome ? chrome.runtime : undefined;
+                if (!runtime || typeof runtime.sendMessage !== "function") {
+                    replied = true;
+                    resolve({ action: "block", findings: [], _error: "no_runtime" });
+                    return;
+                }
+                runtime.sendMessage(
                     { type: "vigil_check", origin: ORIGIN, event_kind, text },
                     (resp) => {
                         if (replied) return;
                         replied = true;
-                        if (chrome.runtime.lastError) {
+                        if (runtime.lastError) {
                             resolve({
                                 action: "block",
                                 findings: [],
-                                _error: chrome.runtime.lastError.message,
+                                _error: runtime.lastError.message,
                             });
                             return;
                         }
@@ -192,7 +201,15 @@
     };
 
     /**
-     * 按当前 hostname 取站点特异 adapter;未注册 host 返 null 走 α1 通用逻辑。
+     * 按当前 hostname 取站点特异 adapter(仅用于 form-submit 主输入的精确定位)。
+     *
+     * **覆盖模型(adversarial review #2,显式声明防"静默漂移")**:manifest 注入的**所有**
+     * host 都受**通用** paste/input/keydown 守门保护 —— 这些路径基于 `adaptTarget` 作用于事件
+     * target,与站点无关,是**主要**保护层。`siteAdapters` 只是 form-submit 路径的深选择器
+     * **优化**。已核验深选择器的有 chatgpt/claude/gemini/perplexity 4 站;国内 AI 站点
+     * (deepseek/豆包/kimi/通义/智谱/元宝/文心/星火)目前**仅靠通用守门**覆盖(深选择器待真
+     * 站点 DOM 核验后补)。未注册 host 返 null → `collectSubmitPayload` 走 α1 form 聚合 / 降级
+     * block(fail-safe,绝不自动外发原文)。**此处对国内站点返回 null 是有意设计,非配置漂移。**
      */
     function getSiteAdapter() {
         const host = location.hostname;
@@ -208,6 +225,16 @@
      */
     function adaptTarget(target) {
         if (!target) return null;
+        // target 可能是 contenteditable 内部子节点(文本节点 / <span> 等)——上溯到可编辑宿主,
+        // 让 paste/input 落到正确的编辑器元素(富文本 / web component 内部结构常见)。
+        if (
+            !(target instanceof HTMLTextAreaElement) &&
+            !(target instanceof HTMLInputElement) &&
+            target instanceof Element
+        ) {
+            const editable = target.closest('[contenteditable="true"]');
+            if (editable instanceof HTMLElement) target = editable;
+        }
         // 1) <textarea> / <input type=text|search|url|email|password>(password 跳过 —— 不读明文)
         if (target instanceof HTMLTextAreaElement) {
             return {
@@ -216,6 +243,29 @@
                     target.value = v;
                     target.dispatchEvent(new Event("input", { bubbles: true }));
                 },
+                // 在光标/选区处插入(setRangeText),保留框内既有内容(修"粘贴脱敏覆盖整框")。
+                insertText: (v) => {
+                    const start =
+                        typeof target.selectionStart === "number"
+                            ? target.selectionStart
+                            : target.value.length;
+                    const end =
+                        typeof target.selectionEnd === "number"
+                            ? target.selectionEnd
+                            : start;
+                    target.setRangeText(v, start, end, "end");
+                    target.dispatchEvent(new Event("input", { bubbles: true }));
+                },
+                captureSelection: () => ({
+                    start:
+                        typeof target.selectionStart === "number"
+                            ? target.selectionStart
+                            : target.value.length,
+                    end:
+                        typeof target.selectionEnd === "number"
+                            ? target.selectionEnd
+                            : target.value.length,
+                }),
             };
         }
         if (target instanceof HTMLInputElement) {
@@ -228,6 +278,28 @@
                         target.value = v;
                         target.dispatchEvent(new Event("input", { bubbles: true }));
                     },
+                    insertText: (v) => {
+                        const start =
+                            typeof target.selectionStart === "number"
+                                ? target.selectionStart
+                                : target.value.length;
+                        const end =
+                            typeof target.selectionEnd === "number"
+                                ? target.selectionEnd
+                                : start;
+                        target.setRangeText(v, start, end, "end");
+                        target.dispatchEvent(new Event("input", { bubbles: true }));
+                    },
+                    captureSelection: () => ({
+                        start:
+                            typeof target.selectionStart === "number"
+                                ? target.selectionStart
+                                : target.value.length,
+                        end:
+                            typeof target.selectionEnd === "number"
+                                ? target.selectionEnd
+                                : target.value.length,
+                    }),
                 };
             }
             return null;
@@ -245,9 +317,105 @@
                     document.execCommand("selectAll", false, undefined);
                     document.execCommand("insertText", false, v);
                 },
+                // 光标处插入(不 selectAll),保留既有内容。
+                insertText: (v) => {
+                    target.focus();
+                    document.execCommand("insertText", false, v);
+                },
+                // 计算光标/选区在纯文本里的偏移(用 Range 量度 target 内文本长度)。
+                captureSelection: () => {
+                    const sel = window.getSelection();
+                    const text = target.textContent || "";
+                    if (
+                        !sel ||
+                        sel.rangeCount === 0 ||
+                        !sel.anchorNode ||
+                        !sel.focusNode ||
+                        !target.contains(sel.anchorNode) ||
+                        !target.contains(sel.focusNode)
+                    ) {
+                        return { start: text.length, end: text.length };
+                    }
+                    const selected = sel.getRangeAt(0);
+                    const beforeStart = document.createRange();
+                    beforeStart.selectNodeContents(target);
+                    beforeStart.setEnd(selected.startContainer, selected.startOffset);
+                    const beforeEnd = document.createRange();
+                    beforeEnd.selectNodeContents(target);
+                    beforeEnd.setEnd(selected.endContainer, selected.endOffset);
+                    return {
+                        start: beforeStart.toString().length,
+                        end: beforeEnd.toString().length,
+                    };
+                },
             };
         }
         return null;
+    }
+
+    /**
+     * 从事件取可适配的输入元素 —— 优先用 composedPath()(穿透 open shadow DOM /
+     * web component 内部),回退 ev.target。
+     */
+    function adaptEventTarget(ev) {
+        if (ev && typeof ev.composedPath === "function") {
+            for (const node of ev.composedPath()) {
+                const adapter = adaptTarget(node);
+                if (adapter) return { target: node, adapter };
+            }
+        }
+        const target = ev ? ev.target : null;
+        const adapter = adaptTarget(target);
+        return adapter ? { target, adapter } : null;
+    }
+
+    // ───────────────────────── 显示归一 + 友好提示 ─────────────────────────
+    //
+    // 后端 redacted_text 形如 `[REDACTED env_assignment]` / `[REDACTED len=12 by_key=k]`。
+    // 写回输入框 / 提示用户时归一为通用 `[REDACTED]`,并把 finding 规则名翻成友好标签。
+    // 注意:这是**显示侧**美化,真正脱敏已由后端完成;此处不参与任何安全决策。
+
+    function toDisplayRedactedText(text) {
+        return text
+            .replace(
+                /\[REDACTED (?:len=\d+ by_key=[A-Za-z0-9_.-]+|[a-z_]+)\]/g,
+                "[REDACTED]",
+            )
+            // 兜底清理历史破碎占位符(`[REDACTED] github_token]`);master 后端已不产出,留作纵深。
+            .replace(/\[REDACTED\]\s+[a-z_]+\]/g, "[REDACTED]");
+    }
+
+    function formatFindingLabel(kind) {
+        const labels = {
+            aws_access_key_id: "AWS Access Key",
+            github_token: "GitHub Token",
+            anthropic_api_key: "Anthropic API Key",
+            openai_api_key: "OpenAI API Key",
+            pem_private_key: "私钥",
+            jwt: "JWT",
+            env_assignment: "疑似密钥赋值",
+            slack_webhook: "Slack Webhook",
+            stripe_secret_key: "Stripe Secret Key",
+            google_api_key: "Google API Key",
+            gitlab_pat: "GitLab PAT",
+            database_url: "数据库连接密钥",
+            email: "邮箱地址",
+            internal_ipv4: "内网地址",
+        };
+        return labels[kind] || "敏感内容";
+    }
+
+    function formatFindingList(findings) {
+        const labels = Array.from(
+            new Set(
+                (Array.isArray(findings) ? findings : [])
+                    .map(formatFindingLabel)
+                    .filter(Boolean),
+            ),
+        );
+        if (labels.length === 0) return "敏感内容";
+        if (labels.length === 1) return labels[0];
+        return `${labels.slice(0, -1).join("、")} 和 ${labels[labels.length - 1]}`;
     }
 
     // ───────────────────────── manual input 监听 ─────────────────────────
@@ -270,8 +438,42 @@
         adapter.setText(value);
     }
 
-    function scheduleInputCheck(target) {
-        const adapter = adaptTarget(target);
+    // 粘贴写回:有选区快照时在快照位置精确替换(保留框内既有内容,修"脱敏覆盖整框"),
+    // 并把"扩展写入的确切全文"登记进 inputChecks.lastWritten —— 让随后由 setText 触发的
+    // input 事件被 scheduleInputCheck 的**精确匹配**(text === lastWritten)识别为自写而跳过,
+    // 不引入"包含 [REDACTED] 即跳过"的可绕过逻辑。无快照时退化为光标处 insertText。
+    function insertAtPasteSnapshot(target, adapter, value, snapshot) {
+        if (
+            snapshot &&
+            typeof snapshot.text === "string" &&
+            typeof snapshot.start === "number" &&
+            typeof snapshot.end === "number"
+        ) {
+            const start = Math.max(0, Math.min(snapshot.start, snapshot.text.length));
+            const end = Math.max(start, Math.min(snapshot.end, snapshot.text.length));
+            const next =
+                snapshot.text.slice(0, start) + value + snapshot.text.slice(end);
+            if (target instanceof Element) {
+                const st = inputChecks.get(target);
+                if (st) {
+                    st.lastWritten = next;
+                } else {
+                    inputChecks.set(target, {
+                        seq: 0,
+                        timer: 0,
+                        lastText: "",
+                        lastWritten: next,
+                    });
+                }
+            }
+            adapter.setText(next);
+            return;
+        }
+        adapter.insertText(value);
+    }
+
+    function scheduleInputCheck(target, adapter) {
+        adapter = adapter || adaptTarget(target);
         if (!adapter || !(target instanceof Element)) return;
         const text = adapter.getText();
         if (!text) return;
@@ -312,9 +514,17 @@
 
             if (resp.action === "allow") return;
             if (resp.action === "redact" && typeof resp.redacted_text === "string") {
-                writeFieldByExtension(target, latestAdapter, resp.redacted_text);
-                const kinds = (resp.findings || []).join(", ") || "secret";
-                showToast(`Vigil: 输入内容包含 ${kinds},已脱敏`, "warn");
+                // 写回显示归一文本(`[REDACTED]`);经 writeFieldByExtension 登记 lastWritten,
+                // 随后的自写 input 事件按精确匹配跳过(保留 master 的防绕过语义)。
+                writeFieldByExtension(
+                    target,
+                    latestAdapter,
+                    toDisplayRedactedText(resp.redacted_text),
+                );
+                showToast(
+                    `Vigil 已保护你：检测到 ${formatFindingList(resp.findings)}，已自动替换为 [REDACTED]。`,
+                    "warn",
+                );
                 return;
             }
 
@@ -329,7 +539,8 @@
         "input",
         (ev) => {
             try {
-                scheduleInputCheck(ev.target);
+                const adapted = adaptEventTarget(ev);
+                if (adapted) scheduleInputCheck(adapted.target, adapted.adapter);
             } catch (_) {
                 // 守住 paste/submit 稳定路径:input 增强失败时只放弃本次手动输入检查。
             }
@@ -342,14 +553,40 @@
     document.addEventListener(
         "paste",
         async (ev) => {
-            const target = /** @type {EventTarget | null} */ (ev.target);
-            const adapter = adaptTarget(target);
-            if (!adapter) return; // 非文本输入,放行
+            const adapted = adaptEventTarget(ev);
+            if (!adapted) return; // 非文本输入,放行
+            const { target, adapter } = adapted;
 
             const clip = ev.clipboardData;
             if (!clip) return;
             const text = clip.getData("text/plain") || "";
-            if (text.length === 0) return;
+            if (text.length === 0) {
+                // text/plain 为空但剪贴板含 text/html → 原生富文本粘贴会把(可能带密钥的)
+                // 文本绕过"写入前 preventDefault"硬保证(adversarial review MEDIUM)。
+                // fail-closed:拦截原生粘贴 + 提示改纯文本。图片/文件(Files)非文本密钥威胁,
+                // 放行以免误伤截图粘贴。
+                const hasHtml =
+                    clip.types &&
+                    Array.prototype.indexOf.call(clip.types, "text/html") !== -1;
+                if (hasHtml) {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    showToast(
+                        "Vigil: 富文本粘贴已拦截,请用纯文本粘贴(Ctrl+Shift+V)再试",
+                        "warn",
+                    );
+                }
+                return;
+            }
+            // preventDefault 前抓取选区快照(光标/选中范围)——用于在原位精确插入,
+            // 而非整框替换(修"粘贴脱敏覆盖整框")。
+            const selection =
+                typeof adapter.captureSelection === "function"
+                    ? adapter.captureSelection()
+                    : null;
+            const pasteSnapshot = selection
+                ? { text: adapter.getText(), start: selection.start, end: selection.end }
+                : null;
 
             // 先 preventDefault,避免在 check 期间原文已进入 DOM
             ev.preventDefault();
@@ -357,18 +594,22 @@
 
             const resp = await callBackground("paste", text);
             if (resp.action === "allow") {
-                // 允许 —— 恢复插入(Plain text;不还原 richtext 格式,MVP 简化)
-                if (typeof adapter.setText === "function") {
-                    // 对 textarea/input 用 insertAdjacentText;contenteditable 用 insertText
-                    const cur = adapter.getText();
-                    adapter.setText(cur + text);
-                }
+                // 允许 —— 在快照位置插入原文(Plain text;保留框内既有内容)
+                insertAtPasteSnapshot(target, adapter, text, pasteSnapshot);
                 return;
             }
             if (resp.action === "redact" && typeof resp.redacted_text === "string") {
-                adapter.setText(resp.redacted_text);
-                const kinds = (resp.findings || []).join(", ") || "secret";
-                showToast(`Vigil: 粘贴内容包含 ${kinds},已脱敏`, "warn");
+                // 在快照位置插入显示归一后的脱敏文本(不抹掉框内既有内容)
+                insertAtPasteSnapshot(
+                    target,
+                    adapter,
+                    toDisplayRedactedText(resp.redacted_text),
+                    pasteSnapshot,
+                );
+                showToast(
+                    `Vigil 已保护你：检测到 ${formatFindingList(resp.findings)}，已自动替换为 [REDACTED]。`,
+                    "warn",
+                );
                 return;
             }
             // block / 未知 action / 协议错误 —— fail-closed
@@ -474,21 +715,23 @@
                 if (primaryInput) {
                     const ad = adaptTarget(primaryInput);
                     if (ad) {
-                        ad.setText(resp.redacted_text);
-                        const kinds = (resp.findings || []).join(", ") || "secret";
+                        writeFieldByExtension(
+                            primaryInput,
+                            ad,
+                            toDisplayRedactedText(resp.redacted_text),
+                        );
                         const site = getSiteAdapter();
                         const siteLabel = site ? `[${site.label}] ` : "";
                         showToast(
-                            `Vigil: ${siteLabel}已脱敏 (${kinds}),请确认后再提交`,
+                            `Vigil 已保护你：${siteLabel}检测到 ${formatFindingList(resp.findings)},已自动脱敏。请确认后再提交。`,
                             "warn",
                         );
                         return;
                     }
                 }
                 // primaryInput 不可用 → 降级 block
-                const kinds = (resp.findings || []).join(", ") || "secret";
                 showToast(
-                    `Vigil: 提交内容包含 ${kinds};无法定位具体输入框以脱敏,请手工清理后再提交`,
+                    `Vigil: 提交内容包含 ${formatFindingList(resp.findings)};无法定位具体输入框以脱敏,请手工清理后再提交`,
                     "warn",
                 );
                 return;
@@ -522,9 +765,17 @@
             }
             if (resp.action === "redact" && typeof resp.redacted_text === "string") {
                 const ad = adaptTarget(target);
-                if (ad) ad.setText(resp.redacted_text);
-                const kinds = (resp.findings || []).join(", ") || "secret";
-                showToast(`Vigil: 内容包含 ${kinds},已脱敏,请确认后再提交`, "warn");
+                if (ad) {
+                    writeFieldByExtension(
+                        target,
+                        ad,
+                        toDisplayRedactedText(resp.redacted_text),
+                    );
+                }
+                showToast(
+                    `Vigil 已保护你：检测到 ${formatFindingList(resp.findings)},已自动脱敏。请确认后再提交。`,
+                    "warn",
+                );
                 return;
             }
             const reason = resp._error || (resp.findings || []).join(", ") || "block";
