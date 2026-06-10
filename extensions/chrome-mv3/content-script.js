@@ -95,6 +95,160 @@
         }, 4000);
     }
 
+    let safePromptEl = null;
+    let dismissSafePrompt = null;
+
+    function ensureSafePromptMounted() {
+        const parent = document.body || document.documentElement;
+        if (!parent) return false;
+        if (!safePromptEl) {
+            safePromptEl = document.createElement("div");
+            safePromptEl.setAttribute("data-vigil-safe-prompt", "");
+            safePromptEl.setAttribute("role", "dialog");
+            safePromptEl.setAttribute("aria-live", "polite");
+            Object.assign(safePromptEl.style, {
+                position: "fixed",
+                right: "16px",
+                bottom: "16px",
+                zIndex: "2147483647",
+                width: "min(420px, calc(100vw - 32px))",
+                padding: "14px",
+                borderRadius: "8px",
+                border: "1px solid rgba(148, 163, 184, 0.45)",
+                boxShadow: "0 18px 46px rgba(15, 23, 42, 0.3)",
+                fontFamily: "system-ui, -apple-system, sans-serif",
+                fontSize: "13px",
+                lineHeight: "1.45",
+                color: "#0f172a",
+                background: "#fff",
+            });
+        }
+        if (!safePromptEl.isConnected) {
+            parent.appendChild(safePromptEl);
+        }
+        return true;
+    }
+
+    function makePromptButton(label, variant) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = label;
+        Object.assign(btn.style, {
+            border: "1px solid #cbd5e1",
+            borderRadius: "6px",
+            padding: "7px 10px",
+            font: "inherit",
+            fontWeight: "650",
+            cursor: "pointer",
+            background: "#fff",
+            color: "#0f172a",
+        });
+        if (variant === "primary") {
+            btn.style.borderColor = "#1d4ed8";
+            btn.style.background = "#1d4ed8";
+            btn.style.color = "#fff";
+        }
+        return btn;
+    }
+
+    function closeSafePrompt() {
+        if (safePromptEl) {
+            safePromptEl.replaceChildren();
+            safePromptEl.remove();
+        }
+        dismissSafePrompt = null;
+    }
+
+    function showSafeVersionPrompt({ findings, onUse, onCancel }) {
+        if (dismissSafePrompt) dismissSafePrompt();
+        if (!ensureSafePromptMounted()) return;
+
+        const kinds = formatFindingList(findings);
+        const title = document.createElement("div");
+        title.textContent = "Vigil 检测到敏感内容，已生成安全版本";
+        Object.assign(title.style, {
+            fontWeight: "750",
+            fontSize: "14px",
+            marginBottom: "4px",
+        });
+
+        const desc = document.createElement("div");
+        desc.textContent = `检测到 ${kinds}。你可以一键替换为脱敏后的安全版本。`;
+        Object.assign(desc.style, {
+            color: "#475569",
+            marginBottom: "10px",
+        });
+
+        const changes = document.createElement("div");
+        changes.hidden = true;
+        Object.assign(changes.style, {
+            margin: "0 0 10px",
+            padding: "8px",
+            borderRadius: "6px",
+            background: "#f8fafc",
+            color: "#334155",
+        });
+
+        const changesLabel = document.createElement("div");
+        changesLabel.textContent = "改动类型";
+        Object.assign(changesLabel.style, {
+            fontWeight: "700",
+            marginBottom: "4px",
+        });
+        changes.appendChild(changesLabel);
+
+        const list = document.createElement("div");
+        const findingLabels = Array.isArray(findings)
+            ? findings.map(formatFindingLabel)
+            : [];
+        for (const label of Array.from(new Set(findingLabels))) {
+            const code = document.createElement("code");
+            code.textContent = label;
+            Object.assign(code.style, {
+                display: "inline-block",
+                margin: "0 6px 6px 0",
+                padding: "2px 6px",
+                borderRadius: "5px",
+                background: "#e2e8f0",
+            });
+            list.appendChild(code);
+        }
+        if (!list.childNodes.length) {
+            const fallback = document.createElement("code");
+            fallback.textContent = "敏感内容";
+            list.appendChild(fallback);
+        }
+        changes.appendChild(list);
+
+        const actions = document.createElement("div");
+        Object.assign(actions.style, {
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "8px",
+        });
+
+        const useBtn = makePromptButton("使用安全版本", "primary");
+        const viewBtn = makePromptButton("查看改动", "secondary");
+        const cancelBtn = makePromptButton("取消", "secondary");
+        actions.append(useBtn, viewBtn, cancelBtn);
+
+        useBtn.addEventListener("click", () => {
+            closeSafePrompt();
+            onUse();
+        });
+        viewBtn.addEventListener("click", () => {
+            changes.hidden = !changes.hidden;
+            viewBtn.textContent = changes.hidden ? "查看改动" : "收起改动";
+        });
+        cancelBtn.addEventListener("click", () => {
+            closeSafePrompt();
+            if (typeof onCancel === "function") onCancel();
+        });
+
+        safePromptEl.replaceChildren(title, desc, changes, actions);
+        dismissSafePrompt = closeSafePrompt;
+    }
+
     // ───────────────────────── SW 请求 ─────────────────────────
 
     /**
@@ -118,17 +272,24 @@
                 runtime.sendMessage(
                     { type: "vigil_check", origin: ORIGIN, event_kind, text },
                     (resp) => {
-                        if (replied) return;
-                        replied = true;
-                        if (runtime.lastError) {
-                            resolve({
-                                action: "block",
-                                findings: [],
-                                _error: runtime.lastError.message,
-                            });
+                        try {
+                            if (replied) return;
+                            replied = true;
+                            if (runtime.lastError) {
+                                resolve({
+                                    action: "block",
+                                    findings: [],
+                                    _error: runtime.lastError.message,
+                                });
+                                return;
+                            }
+                            resolve(
+                                resp || { action: "block", findings: [], _error: "no_response" },
+                            );
+                        } catch (err) {
+                            resolve({ action: "block", findings: [], _error: String(err) });
                             return;
                         }
-                        resolve(resp || { action: "block", findings: [], _error: "no_response" });
                     },
                 );
             } catch (err) {
@@ -388,9 +549,12 @@
     function formatFindingLabel(kind) {
         const labels = {
             aws_access_key_id: "AWS Access Key",
+            aws_access_key: "AWS Access Key",
             github_token: "GitHub Token",
             anthropic_api_key: "Anthropic API Key",
+            anthropic_key: "Anthropic API Key",
             openai_api_key: "OpenAI API Key",
+            openai_key: "OpenAI API Key",
             pem_private_key: "私钥",
             jwt: "JWT",
             env_assignment: "疑似密钥赋值",
@@ -514,17 +678,25 @@
 
             if (resp.action === "allow") return;
             if (resp.action === "redact" && typeof resp.redacted_text === "string") {
-                // 写回显示归一文本(`[REDACTED]`);经 writeFieldByExtension 登记 lastWritten,
-                // 随后的自写 input 事件按精确匹配跳过(保留 master 的防绕过语义)。
-                writeFieldByExtension(
-                    target,
-                    latestAdapter,
-                    toDisplayRedactedText(resp.redacted_text),
-                );
-                showToast(
-                    `Vigil 已保护你：检测到 ${formatFindingList(resp.findings)}，已自动替换为 [REDACTED]。`,
-                    "warn",
-                );
+                const safeText = toDisplayRedactedText(resp.redacted_text);
+                showSafeVersionPrompt({
+                    findings: resp.findings,
+                    onUse: () => {
+                        const currentAdapter = adaptTarget(target);
+                        if (!currentAdapter) return;
+                        if (currentAdapter.getText() !== latestAgain) {
+                            showToast("Vigil: 输入内容已变化,请重新触发安全检查。", "warn");
+                            return;
+                        }
+                        // 经 writeFieldByExtension 登记 lastWritten,随后的自写 input 事件
+                        // 按精确匹配跳过,保留 master 的防绕过语义。
+                        writeFieldByExtension(target, currentAdapter, safeText);
+                        showToast("Vigil 已使用安全版本替换输入内容。", "info");
+                    },
+                    onCancel: () => {
+                        showToast("Vigil 已取消本次安全替换。", "info");
+                    },
+                });
                 return;
             }
 
@@ -599,17 +771,27 @@
                 return;
             }
             if (resp.action === "redact" && typeof resp.redacted_text === "string") {
-                // 在快照位置插入显示归一后的脱敏文本(不抹掉框内既有内容)
-                insertAtPasteSnapshot(
-                    target,
-                    adapter,
-                    toDisplayRedactedText(resp.redacted_text),
-                    pasteSnapshot,
-                );
-                showToast(
-                    `Vigil 已保护你：检测到 ${formatFindingList(resp.findings)}，已自动替换为 [REDACTED]。`,
-                    "warn",
-                );
+                const safeText = toDisplayRedactedText(resp.redacted_text);
+                showSafeVersionPrompt({
+                    findings: resp.findings,
+                    onUse: () => {
+                        const currentAdapter = adaptTarget(target);
+                        if (!currentAdapter) return;
+                        if (
+                            pasteSnapshot &&
+                            currentAdapter.getText() !== pasteSnapshot.text
+                        ) {
+                            showToast("Vigil: 输入内容已变化,请重新粘贴安全版本。", "warn");
+                            return;
+                        }
+                        // 在快照位置插入显示归一后的脱敏文本(不抹掉框内既有内容)
+                        insertAtPasteSnapshot(target, currentAdapter, safeText, pasteSnapshot);
+                        showToast("Vigil 已插入安全版本。", "info");
+                    },
+                    onCancel: () => {
+                        showToast("Vigil 已取消本次粘贴。", "info");
+                    },
+                });
                 return;
             }
             // block / 未知 action / 协议错误 —— fail-closed
@@ -715,23 +897,38 @@
                 if (primaryInput) {
                     const ad = adaptTarget(primaryInput);
                     if (ad) {
-                        writeFieldByExtension(
-                            primaryInput,
-                            ad,
-                            toDisplayRedactedText(resp.redacted_text),
-                        );
+                        const safeText = toDisplayRedactedText(resp.redacted_text);
+                        const originalText = ad.getText();
                         const site = getSiteAdapter();
                         const siteLabel = site ? `[${site.label}] ` : "";
-                        showToast(
-                            `Vigil 已保护你：${siteLabel}检测到 ${formatFindingList(resp.findings)},已自动脱敏。请确认后再提交。`,
-                            "warn",
-                        );
+                        showSafeVersionPrompt({
+                            findings: resp.findings,
+                            onUse: () => {
+                                const currentAdapter = adaptTarget(primaryInput);
+                                if (!currentAdapter) return;
+                                if (currentAdapter.getText() !== originalText) {
+                                    showToast(
+                                        "Vigil: 提交内容已变化,请重新触发安全检查。",
+                                        "warn",
+                                    );
+                                    return;
+                                }
+                                writeFieldByExtension(primaryInput, currentAdapter, safeText);
+                                showToast(
+                                    `Vigil 已为${siteLabel || "当前输入"}应用安全版本，请确认后再提交。`,
+                                    "info",
+                                );
+                            },
+                            onCancel: () => {
+                                showToast("Vigil 已取消本次提交。", "info");
+                            },
+                        });
                         return;
                     }
                 }
                 // primaryInput 不可用 → 降级 block
                 showToast(
-                    `Vigil: 提交内容包含 ${formatFindingList(resp.findings)};无法定位具体输入框以脱敏,请手工清理后再提交`,
+                    `Vigil 检测到 ${formatFindingList(resp.findings)}，但无法定位具体输入框完成脱敏。请手工清理后再提交。`,
                     "warn",
                 );
                 return;
@@ -766,16 +963,28 @@
             if (resp.action === "redact" && typeof resp.redacted_text === "string") {
                 const ad = adaptTarget(target);
                 if (ad) {
-                    writeFieldByExtension(
-                        target,
-                        ad,
-                        toDisplayRedactedText(resp.redacted_text),
-                    );
+                    const safeText = toDisplayRedactedText(resp.redacted_text);
+                    const originalText = ad.getText();
+                    showSafeVersionPrompt({
+                        findings: resp.findings,
+                        onUse: () => {
+                            const currentAdapter = adaptTarget(target);
+                            if (!currentAdapter) return;
+                            if (currentAdapter.getText() !== originalText) {
+                                showToast(
+                                    "Vigil: 提交内容已变化,请重新触发安全检查。",
+                                    "warn",
+                                );
+                                return;
+                            }
+                            writeFieldByExtension(target, currentAdapter, safeText);
+                            showToast("Vigil 已应用安全版本，请确认后再提交。", "info");
+                        },
+                        onCancel: () => {
+                            showToast("Vigil 已取消本次提交。", "info");
+                        },
+                    });
                 }
-                showToast(
-                    `Vigil 已保护你：检测到 ${formatFindingList(resp.findings)},已自动脱敏。请确认后再提交。`,
-                    "warn",
-                );
                 return;
             }
             const reason = resp._error || (resp.findings || []).join(", ") || "block";

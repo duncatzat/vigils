@@ -18,11 +18,16 @@
     "https://www.doubao.com/*",
     "https://kimi.moonshot.cn/*",
     "https://kimi.com/*",
+    "https://www.kimi.com/*",
     "https://tongyi.aliyun.com/*",
+    "https://www.tongyi.com/*",
+    "https://www.qianwen.com/*",
     "https://chatglm.cn/*",
     "https://yuanbao.tencent.com/*",
     "https://yiyan.baidu.com/*",
-    "https://xinghuo.xfyun.cn/*"
+    "https://chat.baidu.com/*",
+    "https://xinghuo.xfyun.cn/*",
+    "https://spark.xfyun.cn/*"
   ],
   "background": {
     "service_worker": "background.js",
@@ -39,15 +44,20 @@
         "https://www.doubao.com/*",
         "https://kimi.moonshot.cn/*",
         "https://kimi.com/*",
+        "https://www.kimi.com/*",
         "https://tongyi.aliyun.com/*",
+        "https://www.tongyi.com/*",
+        "https://www.qianwen.com/*",
         "https://chatglm.cn/*",
         "https://yuanbao.tencent.com/*",
         "https://yiyan.baidu.com/*",
-        "https://xinghuo.xfyun.cn/*"
+        "https://chat.baidu.com/*",
+        "https://xinghuo.xfyun.cn/*",
+        "https://spark.xfyun.cn/*"
       ],
       "js": ["content-script.js"],
       "run_at": "document_idle",
-      "all_frames": false
+      "all_frames": true
     }
   ],
   "action": {
