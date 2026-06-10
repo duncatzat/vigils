@@ -96,9 +96,222 @@
     }
 
     let safePromptEl = null;
-    let dismissSafePrompt = null;
+    let promptTarget = null;
+    let promptRepositionTimer = 0;
+    const frameBaseShadow = new WeakMap();
+    const frameBaseAnimation = new WeakMap();
+    const targetActiveFrame = new WeakMap();
+    let vigilStyleEl = null;
 
-    function ensureSafePromptMounted() {
+    function setInputVigilState(target, state /* "guarded" | "redact" | "block" */) {
+        const frame = getInputFrameTarget(target);
+        if (!frame) return;
+        ensureVigilStyleMounted();
+
+        const prevFrame = targetActiveFrame.get(target);
+        if (prevFrame && prevFrame !== frame) clearInputVigilFrame(prevFrame);
+        if (target !== frame) clearInputVigilFrame(target);
+        clearNestedInputVigilFrames(frame);
+        targetActiveFrame.set(target, frame);
+
+        const colors = {
+            guarded: "#60a5fa",
+            redact: "#f59e0b",
+            block: "#dc2626",
+        };
+        const color = colors[state] || colors.guarded;
+        const radius = getFrameRadius(frame, target);
+
+        if (!frameBaseShadow.has(frame)) {
+            const currentShadow = window.getComputedStyle(frame).boxShadow;
+            frameBaseShadow.set(
+                frame,
+                currentShadow && currentShadow !== "none" ? currentShadow : "",
+            );
+        }
+        if (!frameBaseAnimation.has(frame)) {
+            frameBaseAnimation.set(frame, frame.style.animation || "");
+        }
+
+        const baseShadow = frameBaseShadow.get(frame);
+        const baseAnimation = frameBaseAnimation.get(frame);
+        const ringShadow = [
+            `inset 0 0 0 2px ${color}`,
+            `0 0 0 2px ${hexToRgba(color, state === "guarded" ? 0.08 : 0.12)}`,
+        ].join(", ");
+        const fullRingShadow = baseShadow ? `${ringShadow}, ${baseShadow}` : ringShadow;
+
+        frame.style.setProperty("--vigil-ring-shadow", fullRingShadow);
+        frame.style.setProperty("--vigil-ring-glow-alpha", "0");
+        frame.style.setProperty("outline", "none", "important");
+        frame.style.setProperty("border-radius", radius, "important");
+        frame.style.setProperty(
+            "box-shadow",
+            `var(--vigil-ring-shadow), 0 0 12px rgba(245, 158, 11, var(--vigil-ring-glow-alpha))`,
+            "important",
+        );
+        frame.style.setProperty(
+            "transition",
+            appendTransition(frame.style.transition),
+            "important",
+        );
+
+        if (state === "redact" && !prefersReducedMotion()) {
+            frame.style.setProperty(
+                "animation",
+                "vigil-redact-ring-breathe 1.6s ease-in-out infinite",
+                "important",
+            );
+        } else if (baseAnimation) {
+            frame.style.setProperty("animation", baseAnimation);
+        } else {
+            frame.style.removeProperty("animation");
+        }
+        frame.setAttribute("data-vigil-input-ring", "");
+    }
+
+    function ensureVigilStyleMounted() {
+        if (vigilStyleEl && vigilStyleEl.isConnected) return;
+        const parent = document.head || document.documentElement;
+        if (!parent) return;
+        vigilStyleEl = document.createElement("style");
+        vigilStyleEl.setAttribute("data-vigil-style", "");
+        vigilStyleEl.textContent = [
+            "@property --vigil-ring-glow-alpha {",
+            "  syntax: '<number>';",
+            "  inherits: false;",
+            "  initial-value: 0;",
+            "}",
+            "@keyframes vigil-redact-ring-breathe {",
+            "  0%, 100% { --vigil-ring-glow-alpha: 0; }",
+            "  50% { --vigil-ring-glow-alpha: 0.55; }",
+            "}",
+        ].join("\n");
+        parent.appendChild(vigilStyleEl);
+    }
+
+    function prefersReducedMotion() {
+        return (
+            typeof window.matchMedia === "function" &&
+            window.matchMedia("(prefers-reduced-motion: reduce)").matches
+        );
+    }
+
+    function clearInputVigilFrame(frame) {
+        if (
+            !frame.hasAttribute("data-vigil-input-ring") &&
+            !frameBaseShadow.has(frame) &&
+            !frameBaseAnimation.has(frame)
+        ) {
+            return;
+        }
+        const baseShadow = frameBaseShadow.get(frame);
+        const baseAnimation = frameBaseAnimation.get(frame);
+        frame.style.removeProperty("outline");
+        frame.style.removeProperty("box-shadow");
+        frame.style.removeProperty("animation");
+        frame.style.removeProperty("--vigil-ring-shadow");
+        frame.style.removeProperty("--vigil-ring-glow-alpha");
+        frame.removeAttribute("data-vigil-input-ring");
+        if (baseShadow) frame.style.setProperty("box-shadow", baseShadow, "important");
+        if (baseAnimation) frame.style.setProperty("animation", baseAnimation);
+    }
+
+    function clearNestedInputVigilFrames(frame) {
+        for (const el of frame.querySelectorAll("[data-vigil-input-ring]")) {
+            if (el !== frame) clearInputVigilFrame(el);
+        }
+    }
+
+    function getFrameRadius(frame, target) {
+        const frameRadius = window.getComputedStyle(frame).borderRadius;
+        if (frameRadius && frameRadius !== "0px") return frameRadius;
+        if (target instanceof HTMLElement) {
+            const targetRadius = window.getComputedStyle(target).borderRadius;
+            if (targetRadius && targetRadius !== "0px") return targetRadius;
+        }
+        return "12px";
+    }
+
+    function getInputFrameTarget(target) {
+        if (!(target instanceof HTMLElement)) return null;
+
+        const existingFrame = getExistingInputRingFrame(target);
+        if (existingFrame) return existingFrame;
+
+        const targetRect = target.getBoundingClientRect();
+        let node = target.parentElement;
+        let depth = 0;
+        while (node && depth < 7) {
+            if (isUsableFrame(node, targetRect) && isVisualInputFrame(node)) {
+                return node;
+            }
+            node = node.parentElement;
+            depth += 1;
+        }
+
+        const form = target.closest("form");
+        if (form instanceof HTMLElement && isUsableFrame(form, targetRect)) {
+            return form;
+        }
+
+        return target;
+    }
+
+    function getExistingInputRingFrame(target) {
+        let best = null;
+        let bestArea = 0;
+        for (const frame of document.querySelectorAll("[data-vigil-input-ring]")) {
+            if (!(frame instanceof HTMLElement) || !frame.contains(target)) continue;
+            const rect = frame.getBoundingClientRect();
+            const area = rect.width * rect.height;
+            if (area > bestArea) {
+                best = frame;
+                bestArea = area;
+            }
+        }
+        return best;
+    }
+
+    function isVisualInputFrame(node) {
+        const style = window.getComputedStyle(node);
+        const hasRadius = style.borderRadius && style.borderRadius !== "0px";
+        const hasBorder = style.borderStyle !== "none" && style.borderWidth !== "0px";
+        const hasShadow = style.boxShadow && style.boxShadow !== "none";
+        const hasBackground =
+            style.backgroundColor &&
+            style.backgroundColor !== "rgba(0, 0, 0, 0)" &&
+            style.backgroundColor !== "transparent";
+        return hasRadius || hasBorder || hasShadow || hasBackground;
+    }
+
+    function isUsableFrame(node, targetRect) {
+        const rect = node.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        if (rect.width < targetRect.width || rect.height < targetRect.height) return false;
+        if (rect.width > window.innerWidth - 8) return false;
+        if (rect.height > 280) return false;
+        return rect.width >= targetRect.width + 4 || rect.height >= targetRect.height + 4;
+    }
+
+    function hexToRgba(hex, alpha) {
+        const value = hex.replace("#", "");
+        const r = parseInt(value.slice(0, 2), 16);
+        const g = parseInt(value.slice(2, 4), 16);
+        const b = parseInt(value.slice(4, 6), 16);
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+
+    function appendTransition(existing) {
+        const extra = "outline-color 0.16s, box-shadow 0.16s, border-color 0.16s";
+        if (!existing) return extra;
+        if (existing.includes("outline-color") || existing.includes("box-shadow")) {
+            return existing;
+        }
+        return `${existing}, ${extra}`;
+    }
+
+    function ensureSafePromptMounted(target) {
         const parent = document.body || document.documentElement;
         if (!parent) return false;
         if (!safePromptEl) {
@@ -108,47 +321,46 @@
             safePromptEl.setAttribute("aria-live", "polite");
             Object.assign(safePromptEl.style, {
                 position: "fixed",
-                right: "16px",
-                bottom: "16px",
                 zIndex: "2147483647",
-                width: "min(420px, calc(100vw - 32px))",
-                padding: "14px",
-                borderRadius: "8px",
-                border: "1px solid rgba(148, 163, 184, 0.45)",
-                boxShadow: "0 18px 46px rgba(15, 23, 42, 0.3)",
+                maxWidth: "min(420px, calc(100vw - 32px))",
+                padding: "7px 8px",
+                borderRadius: "10px",
+                border: "1px solid rgba(245, 158, 11, 0.5)",
+                boxShadow: "0 12px 28px rgba(15, 23, 42, 0.22)",
                 fontFamily: "system-ui, -apple-system, sans-serif",
-                fontSize: "13px",
-                lineHeight: "1.45",
-                color: "#0f172a",
-                background: "#fff",
+                fontSize: "12px",
+                lineHeight: "1.35",
+                fontWeight: "600",
+                letterSpacing: "0",
+                color: "#111827",
+                background: "rgba(255, 251, 235, 0.86)",
+                backdropFilter: "blur(8px)",
+                userSelect: "none",
+                pointerEvents: "auto",
             });
         }
-        if (!safePromptEl.isConnected) {
-            parent.appendChild(safePromptEl);
-        }
+        if (!safePromptEl.isConnected) parent.appendChild(safePromptEl);
+        promptTarget = getInputFrameTarget(target);
+        positionSafePrompt();
         return true;
     }
 
-    function makePromptButton(label, variant) {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.textContent = label;
-        Object.assign(btn.style, {
-            border: "1px solid #cbd5e1",
-            borderRadius: "6px",
-            padding: "7px 10px",
-            font: "inherit",
-            fontWeight: "650",
-            cursor: "pointer",
-            background: "#fff",
-            color: "#0f172a",
-        });
-        if (variant === "primary") {
-            btn.style.borderColor = "#1d4ed8";
-            btn.style.background = "#1d4ed8";
-            btn.style.color = "#fff";
-        }
-        return btn;
+    function positionSafePrompt() {
+        if (!safePromptEl || !promptTarget) return;
+        const rect = promptTarget.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        const promptWidth = Math.min(safePromptEl.offsetWidth || 420, window.innerWidth - 32);
+        const promptHeight = safePromptEl.offsetHeight || 38;
+        const left = Math.max(
+            16,
+            Math.min(rect.right - promptWidth - 8, window.innerWidth - promptWidth - 16),
+        );
+        const top = Math.max(
+            16,
+            Math.min(rect.bottom - promptHeight - 8, window.innerHeight - promptHeight - 16),
+        );
+        safePromptEl.style.left = `${left}px`;
+        safePromptEl.style.top = `${top}px`;
     }
 
     function closeSafePrompt() {
@@ -156,98 +368,112 @@
             safePromptEl.replaceChildren();
             safePromptEl.remove();
         }
-        dismissSafePrompt = null;
+        promptTarget = null;
     }
 
-    function showSafeVersionPrompt({ findings, onUse, onCancel }) {
-        if (dismissSafePrompt) dismissSafePrompt();
-        if (!ensureSafePromptMounted()) return;
+    function showSafeVersionPrompt({ target, findings, onUse, onCancel }) {
+        closeSafePrompt();
+        if (target instanceof HTMLElement) setInputVigilState(target, "redact");
+        if (!ensureSafePromptMounted(target)) return;
 
-        const kinds = formatFindingList(findings);
-        const title = document.createElement("div");
-        title.textContent = "Vigil 检测到敏感内容，已生成安全版本";
-        Object.assign(title.style, {
-            fontWeight: "750",
-            fontSize: "14px",
-            marginBottom: "4px",
-        });
-
-        const desc = document.createElement("div");
-        desc.textContent = `检测到 ${kinds}。你可以一键替换为脱敏后的安全版本。`;
-        Object.assign(desc.style, {
-            color: "#475569",
-            marginBottom: "10px",
-        });
-
-        const changes = document.createElement("div");
-        changes.hidden = true;
-        Object.assign(changes.style, {
-            margin: "0 0 10px",
-            padding: "8px",
-            borderRadius: "6px",
-            background: "#f8fafc",
-            color: "#334155",
-        });
-
-        const changesLabel = document.createElement("div");
-        changesLabel.textContent = "改动类型";
-        Object.assign(changesLabel.style, {
+        const message = document.createElement("span");
+        message.textContent = "已检测到敏感字符是否脱敏";
+        Object.assign(message.style, {
+            color: "#111827",
             fontWeight: "700",
-            marginBottom: "4px",
-        });
-        changes.appendChild(changesLabel);
-
-        const list = document.createElement("div");
-        const findingLabels = Array.isArray(findings)
-            ? findings.map(formatFindingLabel)
-            : [];
-        for (const label of Array.from(new Set(findingLabels))) {
-            const code = document.createElement("code");
-            code.textContent = label;
-            Object.assign(code.style, {
-                display: "inline-block",
-                margin: "0 6px 6px 0",
-                padding: "2px 6px",
-                borderRadius: "5px",
-                background: "#e2e8f0",
-            });
-            list.appendChild(code);
-        }
-        if (!list.childNodes.length) {
-            const fallback = document.createElement("code");
-            fallback.textContent = "敏感内容";
-            list.appendChild(fallback);
-        }
-        changes.appendChild(list);
-
-        const actions = document.createElement("div");
-        Object.assign(actions.style, {
-            display: "flex",
-            flexWrap: "wrap",
-            gap: "8px",
+            whiteSpace: "nowrap",
         });
 
-        const useBtn = makePromptButton("使用安全版本", "primary");
-        const viewBtn = makePromptButton("查看改动", "secondary");
-        const cancelBtn = makePromptButton("取消", "secondary");
-        actions.append(useBtn, viewBtn, cancelBtn);
+        const sr = document.createElement("span");
+        sr.textContent = `，检测到 ${formatFindingList(findings)}`;
+        Object.assign(sr.style, {
+            position: "absolute",
+            width: "1px",
+            height: "1px",
+            padding: "0",
+            margin: "-1px",
+            overflow: "hidden",
+            clip: "rect(0, 0, 0, 0)",
+            whiteSpace: "nowrap",
+            border: "0",
+        });
 
-        useBtn.addEventListener("click", () => {
+        const confirmBtn = makeSafePromptButton("确认", "primary");
+        const cancelBtn = makeSafePromptButton("取消", "secondary");
+
+        const useSafeVersion = () => {
             closeSafePrompt();
             onUse();
-        });
-        viewBtn.addEventListener("click", () => {
-            changes.hidden = !changes.hidden;
-            viewBtn.textContent = changes.hidden ? "查看改动" : "收起改动";
-        });
-        cancelBtn.addEventListener("click", () => {
+            if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
+        };
+        const cancelSafeVersion = () => {
             closeSafePrompt();
+            if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
             if (typeof onCancel === "function") onCancel();
+        };
+
+        confirmBtn.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            useSafeVersion();
+        });
+        cancelBtn.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            cancelSafeVersion();
         });
 
-        safePromptEl.replaceChildren(title, desc, changes, actions);
-        dismissSafePrompt = closeSafePrompt;
+        Object.assign(safePromptEl.style, {
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+        });
+        safePromptEl.replaceChildren(message, confirmBtn, cancelBtn, sr);
+        safePromptEl.setAttribute(
+            "aria-label",
+            `已检测到敏感字符是否脱敏，检测到 ${formatFindingList(findings)}`,
+        );
+        positionSafePrompt();
     }
+
+    function makeSafePromptButton(label, variant) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = label;
+        Object.assign(btn.style, {
+            borderRadius: "7px",
+            padding: "3px 8px",
+            font: "inherit",
+            fontWeight: variant === "primary" ? "750" : "650",
+            lineHeight: "1.25",
+            cursor: "pointer",
+            whiteSpace: "nowrap",
+        });
+        if (variant === "primary") {
+            Object.assign(btn.style, {
+                border: "1px solid #d97706",
+                background: "#f59e0b",
+                color: "#111827",
+            });
+        } else {
+            Object.assign(btn.style, {
+                border: "1px solid #d6d3d1",
+                background: "rgba(255, 255, 255, 0.72)",
+                color: "#44403c",
+            });
+        }
+        return btn;
+    }
+
+    window.addEventListener(
+        "scroll",
+        () => {
+            clearTimeout(promptRepositionTimer);
+            promptRepositionTimer = setTimeout(positionSafePrompt, 16);
+        },
+        true,
+    );
+    window.addEventListener("resize", positionSafePrompt);
 
     // ───────────────────────── SW 请求 ─────────────────────────
 
@@ -639,6 +865,7 @@
     function scheduleInputCheck(target, adapter) {
         adapter = adapter || adaptTarget(target);
         if (!adapter || !(target instanceof Element)) return;
+        if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
         const text = adapter.getText();
         if (!text) return;
 
@@ -676,10 +903,14 @@
             const latestAgain = latestAdapter.getText();
             if (latestAgain !== latest) return;
 
-            if (resp.action === "allow") return;
+            if (resp.action === "allow") {
+                if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
+                return;
+            }
             if (resp.action === "redact" && typeof resp.redacted_text === "string") {
                 const safeText = toDisplayRedactedText(resp.redacted_text);
                 showSafeVersionPrompt({
+                    target,
                     findings: resp.findings,
                     onUse: () => {
                         const currentAdapter = adaptTarget(target);
@@ -701,6 +932,7 @@
             }
 
             writeFieldByExtension(target, latestAdapter, "");
+            if (target instanceof HTMLElement) setInputVigilState(target, "block");
             const reason = resp._error || (resp.findings || []).join(", ") || "block";
             showToast(`Vigil: 输入内容被阻断(${reason})`, "error");
         }, INPUT_DEBOUNCE_MS);
@@ -712,9 +944,25 @@
         (ev) => {
             try {
                 const adapted = adaptEventTarget(ev);
-                if (adapted) scheduleInputCheck(adapted.target, adapted.adapter);
+                if (adapted) {
+                    if (adapted.target instanceof HTMLElement) {
+                        setInputVigilState(adapted.target, "guarded");
+                    }
+                    scheduleInputCheck(adapted.target, adapted.adapter);
+                }
             } catch (_) {
                 // 守住 paste/submit 稳定路径:input 增强失败时只放弃本次手动输入检查。
+            }
+        },
+        true,
+    );
+
+    document.addEventListener(
+        "focusin",
+        (ev) => {
+            const adapted = adaptEventTarget(ev);
+            if (adapted && adapted.target instanceof HTMLElement) {
+                setInputVigilState(adapted.target, "guarded");
             }
         },
         true,
@@ -768,11 +1016,13 @@
             if (resp.action === "allow") {
                 // 允许 —— 在快照位置插入原文(Plain text;保留框内既有内容)
                 insertAtPasteSnapshot(target, adapter, text, pasteSnapshot);
+                if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
                 return;
             }
             if (resp.action === "redact" && typeof resp.redacted_text === "string") {
                 const safeText = toDisplayRedactedText(resp.redacted_text);
                 showSafeVersionPrompt({
+                    target,
                     findings: resp.findings,
                     onUse: () => {
                         const currentAdapter = adaptTarget(target);
@@ -795,6 +1045,7 @@
                 return;
             }
             // block / 未知 action / 协议错误 —— fail-closed
+            if (target instanceof HTMLElement) setInputVigilState(target, "block");
             const reason = resp._error || (resp.findings || []).join(", ") || "block";
             showToast(`Vigil: 粘贴被阻断(${reason})`, "error");
         },
@@ -902,6 +1153,7 @@
                         const site = getSiteAdapter();
                         const siteLabel = site ? `[${site.label}] ` : "";
                         showSafeVersionPrompt({
+                            target: primaryInput,
                             findings: resp.findings,
                             onUse: () => {
                                 const currentAdapter = adaptTarget(primaryInput);
@@ -934,6 +1186,7 @@
                 return;
             }
             const reason = resp._error || (resp.findings || []).join(", ") || "block";
+            if (primaryInput instanceof HTMLElement) setInputVigilState(primaryInput, "block");
             showToast(`Vigil: 提交被阻断(${reason})`, "error");
         },
         true,
@@ -966,6 +1219,7 @@
                     const safeText = toDisplayRedactedText(resp.redacted_text);
                     const originalText = ad.getText();
                     showSafeVersionPrompt({
+                        target,
                         findings: resp.findings,
                         onUse: () => {
                             const currentAdapter = adaptTarget(target);
@@ -988,6 +1242,7 @@
                 return;
             }
             const reason = resp._error || (resp.findings || []).join(", ") || "block";
+            if (target instanceof HTMLElement) setInputVigilState(target, "block");
             showToast(`Vigil: 提交被阻断(${reason})`, "error");
         },
         true,
