@@ -14,24 +14,24 @@ categories = ["network-programming", "api-bindings"]
 workspace = true
 
 [dependencies]
-vigil-types = { path = "../vigil-types", version = "0.2.0-beta.1" }
-vigil-audit = { path = "../vigil-audit", version = "0.2.0-beta.1" }
-vigil-firewall = { path = "../vigil-firewall", version = "0.2.0-beta.1" }
-vigil-redaction = { path = "../vigil-redaction", version = "0.2.0-beta.1" }
+vigil-types = { path = "../vigil-types", version = "0.2.0-beta.2" }
+vigil-audit = { path = "../vigil-audit", version = "0.2.0-beta.2" }
+vigil-firewall = { path = "../vigil-firewall", version = "0.2.0-beta.2" }
+vigil-redaction = { path = "../vigil-redaction", version = "0.2.0-beta.2" }
 # I07.5+ (ADR 0007 §I-7.1):共享 Native spawn env 政策 helper(apply_native_env_policy)。
 # ADR 0018 v0.13 split:改依赖 vigil-runner-types(pure types + env policy,0 vigil
 # deps,unblock SDK publish chain),不再拉 vigil-runner concrete impl(wasmtime 等)。
-vigil-runner-types = { path = "../vigil-runner-types", version = "0.2.0-beta.1" }
+vigil-runner-types = { path = "../vigil-runner-types", version = "0.2.0-beta.2" }
 # v0.5 P1 ADR 0014 α2:`pub fn Hub::resolve_approval` 用到的 typed 协议结构
 # (ResolveApprovalReq / ApprovalAction / ApprovalResolutionDto)。
 # vigil-ui-protocol 自身只依赖 vigil-types / vigil-audit / vigil-runner,
 # 与 vigil-mcp 现有 deps 无循环。
-vigil-ui-protocol = { path = "../vigil-ui-protocol", version = "0.2.0-beta.1" }
+vigil-ui-protocol = { path = "../vigil-ui-protocol", version = "0.2.0-beta.2" }
 # 可逆脱敏 Slice 2:复用 `SecretValue`(Zeroizing/non-Debug/单一 expose)的值卫生装
 # Hub-owned `SecretAliasMap`。**只取值包装**,不引 LeaseBroker 审批门控语义(设计 D2:
 # broker mint-time 3-tuple 绑定与"运行时选 tool"现实冲突)。不启 os-keychain feature
 # —— keyring 读取在 vigil-hub-cli(已带该 feature)。
-vigil-lease = { path = "../vigil-lease", version = "0.2.0-beta.1" }
+vigil-lease = { path = "../vigil-lease", version = "0.2.0-beta.2" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -46,7 +46,7 @@ once_cell = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 rusqlite = { workspace = true }
-vigil-policy = { path = "../vigil-policy", version = "0.2.0-beta.1" }
+vigil-policy = { path = "../vigil-policy", version = "0.2.0-beta.2" }
 # α2 集成测试 `tests/resolve_approval.rs` 用 Ledger 真实建 approval + 调
 # `Hub::resolve_approval` 全链路验证 approve / deny / cancel(已是 main dep,
 # 此处显式声明仅为 IDE / `cargo metadata` 可读性)。

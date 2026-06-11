@@ -8,7 +8,7 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
-## [Unreleased]
+## [v0.2.0-beta.2] — 2026-06-12 — Prompt-injection defense
 
 ### Added — prompt-injection defense (P0)
 
