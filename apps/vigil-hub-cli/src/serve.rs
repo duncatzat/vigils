@@ -96,6 +96,40 @@ pub struct ServeArgs {
     /// turnkey 无 GUI resolver 时,把本应人审批的风险调用自动放行 + 完整审计(不阻塞),而非阻塞
     /// `approval_wait` 300s 看似卡死。`Denied`/raw-secret/结果脱敏不变量仍在。默认 false = enforce。
     pub monitor: bool,
+
+    /// DEF-004:firewall 项目边界根(`deny-outside-project` / `approve-repo-write` 的
+    /// Inside/Outside 判定基准)。**必须**是经 `normalize_project_root` POSIX 归一后的
+    /// 字符串(CLI 层已处理),否则 Windows 下与 PathExtractor 输出前缀不可比 → 边界不绑。
+    /// 空 = 不配置边界(policy 引擎空 roots 守门让两条规则都不匹配,FsWrite 落
+    /// default-deny floor;monitor 姿态下 floor 被观察放行)。CLI 缺省 = 进程 CWD。
+    pub project_roots: Vec<String>,
+}
+
+/// DEF-004:把 CLI `--project-root` 解析成 [`ServeArgs::project_roots`]。
+///
+/// 空 = 缺省**进程 CWD**(serve/wrap 由 agent 在项目目录里启动,CWD 即项目根 —
+/// 与 git/cargo 等工具的目录语义一致)。每个 root 经 `normalize_project_root`
+/// POSIX 归一,保证与 PathExtractor 输出可比。CWD 不可得(极端:启动目录已删)
+/// 时返回空 → 边界不绑但 policy 空 roots 守门兜底 fail-closed,并 stderr 警告。
+pub fn resolve_project_roots(cli_roots: &[PathBuf]) -> Vec<String> {
+    if cli_roots.is_empty() {
+        match std::env::current_dir() {
+            Ok(cwd) => vec![vigil_firewall::extract::normalize_project_root(&cwd)],
+            Err(e) => {
+                eprintln!(
+                    "vigil-hub: cannot resolve CWD as project root ({e}); \
+                     project boundary rules (deny-outside-project / approve-repo-write) \
+                     will not match — pass --project-root <DIR> explicitly."
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        cli_roots
+            .iter()
+            .map(|p| vigil_firewall::extract::normalize_project_root(p))
+            .collect()
+    }
 }
 
 /// JSON 配置 schema(`--upstream-config` 指向的文件)。
@@ -237,10 +271,18 @@ pub fn build_hub_with_config(
     });
     let session_id = ledger.start_session("vigil-hub-serve", Some("vigil-hub"))?;
 
-    // 2. Firewall(默认策略集 + 空 project_roots)
+    // 2. Firewall(默认策略集 + project_roots 边界)
     //    dev_permissive_firewall 加一条最低 priority 的"catch-all → Approve"兜底 —
     //    让无 EffectKind 匹配的纯计算工具(如 mock echo/sum)走 ApprovalBroker
     //    而非 default-deny。生产模式保持 false。
+    //
+    // DEF-004:project_roots 装进 FirewallConfig,让 deny-outside-project /
+    // approve-repo-write 真正绑定边界(此前所有生产入口都是空 roots,Outside
+    // 语义反转把整盘判成"项目外")。roots 由 CLI 层归一(normalize_project_root)。
+    let firewall_config = FirewallConfig {
+        project_roots: args.project_roots.clone(),
+        ..FirewallConfig::default()
+    };
     let mut policy = PolicyEngine::new(default_ruleset());
     if args.dev_permissive_firewall {
         policy.add_rule(PolicyRule {
@@ -284,7 +326,7 @@ pub fn build_hub_with_config(
             Arc::new(vigil_firewall::Firewall::with_scanner(
                 ledger.clone(),
                 policy,
-                FirewallConfig::default(),
+                firewall_config,
                 scanner,
             ))
         }
@@ -298,11 +340,7 @@ pub fn build_hub_with_config(
             "vigil-hub serve: PiiScanner = noop \
              (default; pass --enable-privacy-filter + build with --features ort to activate)"
         );
-        Arc::new(Firewall::new(
-            ledger.clone(),
-            policy,
-            FirewallConfig::default(),
-        ))
+        Arc::new(Firewall::new(ledger.clone(), policy, firewall_config))
     };
 
     // 3. DescriptorOracle —— ledger-backed,call 时实时查 descriptor 状态(取代早期静态
@@ -610,6 +648,19 @@ pub fn run(args: ServeArgs) -> Result<(), ServeError> {
              and the desktop app will NOT see them; pass --ledger <shared path> or use `setup --mcp`"
         ),
     }
+    // DEF-004 可见性:把实际绑定的项目边界根打出来 —— 宿主 spawn 时 CWD 不是项目目录的话,
+    // 边界会静默绑错(enforce 下项目内写被误拦),打印让误绑可被肉眼发现。
+    if args.project_roots.is_empty() {
+        eprintln!(
+            "vigil-hub serve: project boundary = NONE (FsWrite falls to default-deny floor; \
+             pass --project-root <DIR> to enable boundary rules)"
+        );
+    } else {
+        eprintln!(
+            "vigil-hub serve: project boundary -> {}",
+            args.project_roots.join(", ")
+        );
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = std::io::BufReader::new(stdin.lock());
@@ -671,6 +722,58 @@ mod tests {
         assert!(
             !CheckpointLog::sidecar_for(&path).path().exists(),
             "空账本不应产 sidecar"
+        );
+    }
+
+    /// DEF-004 回归门:CLI 不带 `--project-root` 时缺省必须解析出**非空** CWD 根。
+    /// 任何回归(缺省又变回空 roots)会让 serve enforce 的项目边界整体失效 ——
+    /// 这正是 DEF-004 的原始 bug(所有生产入口空 roots → Inside/Outside 语义反转)。
+    #[test]
+    fn def004_resolve_project_roots_defaults_to_cwd_normalized() {
+        let roots = resolve_project_roots(&[]);
+        assert_eq!(roots.len(), 1, "缺省应解析出恰好 1 个根(进程 CWD)");
+        let root = &roots[0];
+        // POSIX 归一不变量:与 PathExtractor 输出同款,否则 is_under 前缀比较静默不匹配。
+        assert!(!root.is_empty(), "CWD 根不应为空字符串");
+        assert!(!root.contains('\\'), "归一后不应残留反斜杠: {root}");
+        assert!(
+            !root.starts_with(r"//?/") && !root.starts_with(r"\\?\"),
+            "归一后不应残留 Windows 扩展长度前缀: {root}"
+        );
+        // 非循环结构校验(hostile review):不与 normalize_project_root 输出比较 ——
+        // 那是被测函数自身的实现链,两边同时坏会伪绿。改验 CWD 末段目录名真出现在根里
+        // (大小写不敏感:canonicalize 可能修正盘符/目录真实大小写)。
+        let cwd = std::env::current_dir().unwrap();
+        // cargo test 的 CWD 是 package 目录,必有末段(unwrap 与本 crate test 配置一致)。
+        let leaf = cwd
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        assert!(
+            root.to_ascii_lowercase().ends_with(&leaf),
+            "根应以 CWD 末段 `{leaf}` 结尾: {root}"
+        );
+    }
+
+    /// DEF-004:显式 `--project-root`(含相对路径)也必须经同款 POSIX 归一。
+    #[test]
+    fn def004_resolve_project_roots_explicit_paths_normalized() {
+        let dir = tempdir().unwrap();
+        let roots = resolve_project_roots(&[dir.path().to_path_buf()]);
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            roots[0],
+            vigil_firewall::extract::normalize_project_root(dir.path()),
+            "显式根必须与 normalize_project_root 输出一致"
+        );
+        // 相对路径 "." 应被解析为绝对 CWD(而非原样保留相对形式)。
+        let rel = resolve_project_roots(&[PathBuf::from(".")]);
+        assert_eq!(rel.len(), 1);
+        assert!(
+            !rel[0].starts_with('.'),
+            "相对路径必须被解析为绝对路径: {}",
+            rel[0]
         );
     }
 }

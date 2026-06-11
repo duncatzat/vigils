@@ -24,6 +24,8 @@ fn default_args() -> ServeArgs {
         enable_privacy_filter: false,
         redact_tool_results: false,
         monitor: false,
+        // 本文件只测协议通路,不测项目边界;空 roots 由 policy 引擎守门兜底(DEF-004)。
+        project_roots: vec![],
     }
 }
 
@@ -64,6 +66,7 @@ fn b2_privacy_filter_unavailable_when_feature_off() {
         enable_privacy_filter: true, // flag on,但 feature off → fail-closed
         redact_tool_results: false,
         monitor: false,
+        project_roots: vec![],
     };
     match build_hub(&args) {
         Err(ServeError::PrivacyFilterUnavailable) => {}
@@ -245,6 +248,7 @@ fn b2_upstream_config_empty_argv_returns_invalid_upstream() {
         enable_privacy_filter: false,
         redact_tool_results: false,
         monitor: false,
+        project_roots: vec![],
     };
 
     match build_hub(&args) {
@@ -300,6 +304,7 @@ fn b2_stage2_attach_real_stdio_upstream_via_node() {
         enable_privacy_filter: false,
         redact_tool_results: false,
         monitor: false,
+        project_roots: vec![],
     };
 
     let (hub, ledger) = build_hub(&args).expect("build_hub with real upstream");
@@ -377,6 +382,7 @@ fn b2_stage2_strict_upstream_requires_handshake_regression() {
         enable_privacy_filter: false,
         redact_tool_results: false,
         monitor: false,
+        project_roots: vec![],
     };
 
     // build_hub 同步执行 initialize 握手:返回时严格 server 已 operational。

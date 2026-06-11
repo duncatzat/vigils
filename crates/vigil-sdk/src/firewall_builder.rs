@@ -48,7 +48,11 @@ impl FirewallBuilder {
         Self::default()
     }
 
-    /// 设置 POSIX 规范化的项目根目录前缀(firewall 用于判定 file effect 是否在项目内)。
+    /// 设置项目根目录前缀(firewall 用于判定 file effect 是否在项目内)。
+    ///
+    /// DEF-004:`build()` 时每个根经 `vigil_firewall::extract::normalize_project_root`
+    /// POSIX 归一(canonicalize + `\`→`/`,Windows 剥 `\\?\` 前缀)—— 与 firewall 内部
+    /// 路径提取同款归一链,消费者传原生形式(如 `C:\proj`)也能正确前缀比较。
     pub fn project_roots<I, S>(mut self, roots: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -88,8 +92,15 @@ impl FirewallBuilder {
         let ledger = Arc::new(ledger);
 
         let policy = PolicyEngine::new(default_ruleset());
+        // DEF-004:根经 firewall 同款归一链,否则(尤其 Windows)与路径提取输出前缀
+        // 不可比 → 边界静默不绑(消费者以为边界生效实则两条规则都不匹配)。
+        let project_roots = self
+            .project_roots
+            .iter()
+            .map(|r| vigil_firewall::extract::normalize_project_root(std::path::Path::new(r)))
+            .collect();
         let config = FirewallConfig {
-            project_roots: self.project_roots,
+            project_roots,
             allowed_hosts: self.allowed_hosts,
             ..Default::default()
         };

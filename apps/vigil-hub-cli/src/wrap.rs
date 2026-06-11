@@ -45,6 +45,9 @@ pub struct WrapArgs {
     /// turnkey 无 desktop resolver 时推荐开(否则风险工具阻塞 300s 看似卡死)。默认 false = enforce。
     /// 见 [`crate::serve::ServeArgs::monitor`] / [`vigil_mcp::HubConfig::monitor_mode`]。
     pub monitor: bool,
+    /// DEF-004:项目边界根(原始 CLI 值,未归一)。空 = 缺省 CWD。
+    /// 经 [`crate::serve::resolve_project_roots`] 归一后装进 firewall。
+    pub project_roots: Vec<PathBuf>,
 }
 
 /// 透明 shim 主入口:起被包裹 server 作唯一 upstream + Vigil 网关,跑 stdio 主循环。
@@ -86,6 +89,8 @@ pub fn run(args: &WrapArgs) -> Result<(), ServeError> {
         enable_privacy_filter: false,   // 硬指纹脱敏始终在;ORT 模型层 opt-in(--features ort)
         redact_tool_results: true,      // 可逆脱敏:结果里的 secret 回模型前再脱敏(网关核心价值)
         monitor: args.monitor,          // opt-in 非阻塞观察(turnkey 无 GUI resolver 时)
+        // DEF-004:边界根缺省 CWD(wrap 由 agent 在项目目录启动)。
+        project_roots: serve::resolve_project_roots(&args.project_roots),
     };
 
     // 稳定 server 身份(Codex R1 BLOCKER):显式 --server-id;缺省由 argv sha256 派生抗碰撞 id。
@@ -144,8 +149,15 @@ pub fn run(args: &WrapArgs) -> Result<(), ServeError> {
         "ENFORCE posture: risky tool calls pause for approval (run the desktop app to approve, \
          else they time out denied) -- pass --monitor for non-blocking audit-only"
     };
+    // DEF-004 可见性:打印实际绑定的项目边界根(宿主 spawn 的 CWD 不是项目目录时,
+    // 边界会静默绑错 —— enforce 下项目内写被误拦,打印让误绑可被肉眼发现)。
+    let boundary = if serve_args.project_roots.is_empty() {
+        "NONE".to_string()
+    } else {
+        serve_args.project_roots.join(", ")
+    };
     eprintln!(
-        "vigil-hub wrap: guarding MCP server `{server}` cmd `{cmd}` (PID {pid}); audit ledger -> {ledger}. {posture}.",
+        "vigil-hub wrap: guarding MCP server `{server}` cmd `{cmd}` (PID {pid}); audit ledger -> {ledger}; project boundary -> {boundary}. {posture}.",
         server = entry.name,
         cmd = entry.argv.first().map(String::as_str).unwrap_or("?"),
         pid = std::process::id(),

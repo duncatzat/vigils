@@ -128,6 +128,10 @@ struct CliWrapArgs {
     /// resolver 时推荐;否则风险工具阻塞 ~300s 看似卡死)。默认 enforce(阻塞人审批)。
     #[arg(long)]
     monitor: bool,
+    /// 项目边界根(可重复):firewall `deny-outside-project` / `approve-repo-write` 的判定基准。
+    /// 省略 = 当前工作目录(CWD)。
+    #[arg(long = "project-root")]
+    project_root: Vec<PathBuf>,
     /// 由 `vigil-hub setup --mcp` 写入的托管标记(被本命令**忽略**;仅供 setup 识别其托管的 wrap 条目)。
     #[arg(long = "vigil-managed-mcp", hide = true)]
     #[allow(dead_code)]
@@ -263,6 +267,10 @@ struct CliServeArgs {
     /// agent/LLM(默认 off = 既有 out-of-band 仅审计)。堵住工具输出把 secret 回吐给远端 LLM。
     #[arg(long = "redact-tool-results")]
     redact_tool_results: bool,
+    /// 项目边界根(可重复):firewall `deny-outside-project` / `approve-repo-write` 的判定基准。
+    /// 省略 = 当前工作目录(CWD)。DEF-004 之前生产入口边界为空,这两条规则形同虚设。
+    #[arg(long = "project-root")]
+    project_root: Vec<PathBuf>,
 }
 
 impl From<CliServeArgs> for ServeArgs {
@@ -276,6 +284,7 @@ impl From<CliServeArgs> for ServeArgs {
             redact_tool_results: c.redact_tool_results,
             // `serve` 子命令保持既有 enforce(default-deny + 阻塞审批);monitor 是 wrap turnkey 专用。
             monitor: false,
+            project_roots: serve::resolve_project_roots(&c.project_root),
         }
     }
 }
@@ -400,6 +409,7 @@ fn main() -> std::process::ExitCode {
                 env_keys: args.env_key,
                 inherit_env: args.inherit_env,
                 monitor: args.monitor,
+                project_roots: args.project_root,
             };
             match wrap::run(&wrap_args) {
                 Ok(()) => std::process::ExitCode::SUCCESS,

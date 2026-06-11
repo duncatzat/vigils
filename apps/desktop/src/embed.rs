@@ -84,7 +84,10 @@ pub fn gui_build_hub(ledger: Arc<Ledger>) -> Result<Arc<Hub>, EmbedError> {
 
     // 2. Firewall —— 无 allowed_hosts / project_roots / 自定义 PiiScanner;
     //    走 FirewallConfig::default + 内置 NoopEngine DefaultScanner
-    //    (`vigil-firewall.default-features = false` 保证不拉 ort)
+    //    (`vigil-firewall.default-features = false` 保证不拉 ort)。
+    //    DEF-004:GUI 从开始菜单启动,CWD 不可预测(可能是 system32),**有意**不绑
+    //    CWD 边界。空 roots 语义(policy 引擎守门后)= Inside/Outside 双双不匹配,
+    //    FsWrite 落 default-deny floor —— 仍 fail-closed,且 reason 诚实。
     let firewall = Arc::new(Firewall::new(
         ledger.clone(),
         policy,

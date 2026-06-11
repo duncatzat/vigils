@@ -8,6 +8,38 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [Unreleased]
+
+### ⚠️ 行为变更
+
+- **DEF-004:firewall 项目边界从未真正生效 —— 新增 `--project-root` flag,缺省为网关工作目录。**
+  真机测试中发现。
+  - **bug 本体**:所有生产入口(`serve` / `wrap` / demo / 桌面 embed)启动 firewall 时项目根
+    集合为**空**,而 policy 引擎的 `Outside` 条件对空集合恒判 true —— 内置规则
+    `deny-outside-project`(priority 150)把**整个文件系统**判成"项目外",对称的
+    `approve-repo-write`(priority 80)永不匹配,Inside/Outside 边界语义整体反转:凡被识别为
+    文件写的调用在**所有姿态**被硬 deny(monitor 只降级 default-deny *floor*,不降级显式
+    Deny 规则),且审计 reason 谎报"writes OUTSIDE project"。长期未暴露是因为多数被 wrap 的
+    第三方工具名不在 effect 提取词表内 —— 提取不出 FsWrite,规则根本不触发,调用落 floor
+    被 monitor 观察放行。
+  - **policy 引擎 fail-safe 守门**:空 roots 时 `Outside` 不再断言"项目外"(返不匹配),写操作
+    落 default-deny floor —— 仍 fail-closed,且 reason 诚实为 "no rule matched" 而非伪造的
+    越界。风险评分器同语义(空 roots 不再 +30 "越界写"评分),其根匹配在 Windows 下补齐
+    大小写不敏感,与 policy 引擎对齐。
+  - **`serve` / `wrap` 新增可重复的 `--project-root <DIR>`**;省略时缺省 = 进程工作目录
+    (agent 在项目目录里启动网关,与 git/cargo 的目录语义一致)。根按路径提取器同款 POSIX
+    形式归一(canonicalize、`\` → `/`、剥 `\\?\` 前缀)—— 否则 Windows 下前缀比较静默不
+    匹配,边界形同虚设。
+  - **enforce 姿态下的可见变更**:边界**内**的写操作现在走 `approve-repo-write` 审批通道
+    (此前被硬 deny);边界**外**的写仍被 `deny-outside-project` 拦截,reason 如实指向真实
+    越界路径。
+  - **启动 banner 打印绑定的边界根**(`project boundary -> <roots>` / `NONE`),从错误目录
+    spawn 的网关一眼可见。
+  - SDK `FirewallBuilder::project_roots` 在 `build()` 时同样归一,消费者传 `C:\proj` 原生
+    形式也能正确前缀比较。
+  - demo / 桌面 embed **有意**保持空 roots(自包含模拟 / GUI 无工作目录语义),由引擎守门
+    兜底。已通过对抗式审查。
+
 ## [v0.1.34] — 2026-06-09
 
 真机测试 Claude Code / Codex 接入时发现的缺陷修复。

@@ -444,6 +444,14 @@ fn condition_matches(
                 .ok_or_else(|| PolicyError::UnknownContextKey {
                     key: roots_key.clone(),
                 })?;
+            // DEF-004 fail-safe:空 roots 时无法断言"项目外"——否则整个文件系统都算
+            // Outside,deny-outside-project 误拦一切写,而对称的 Inside(approve-repo-write)
+            // 永不匹配,边界语义整体反转。返 false 让调用落到 default-deny floor
+            // (仍 fail-closed,且 reason 诚实为"no rule matched"而非伪造的"项目外")。
+            // 注意:这不是 fail-open——生产入口必须同时配置非空 roots(serve/wrap 默认 CWD)。
+            if roots.is_empty() {
+                return Ok(false);
+            }
             let items = read_path_field(effects, *field)?;
             Ok(items.iter().any(|p| !under_any_root(p, roots)))
         }
@@ -649,6 +657,54 @@ mod tests {
         assert_eq!(
             e.evaluate(&eff_outside, &ctx).unwrap().action,
             PolicyAction::Deny
+        );
+    }
+
+    /// DEF-004 回归:空 project_roots 时 Outside 不得断言"项目外"。
+    /// 此前空 roots 让 `any(!under_any_root)` 恒 true → deny-outside-project 把
+    /// 整个文件系统判成项目外;修复后 Outside/Inside 双双不匹配,调用落
+    /// default-deny floor(reason = "no rule matched",诚实且 fail-closed)。
+    #[test]
+    fn empty_roots_outside_does_not_match_falls_to_default_deny() {
+        let mut ctx = PolicyContext::default();
+        ctx.roots.insert("project_roots".into(), vec![]); // 空 roots(此前生产入口的真实形态)
+
+        let eff = mk_effects(
+            vec![EffectKind::FsWrite],
+            vec!["/anywhere/file.txt"],
+            vec![],
+        );
+
+        let r_in = PolicyRule {
+            id: "approve-inside".into(),
+            match_effects: vec![EffectKind::FsWrite],
+            conditions: vec![Condition::Inside {
+                field: EffectField::PathsWrite,
+                roots_key: "project_roots".into(),
+            }],
+            action: PolicyAction::Approve,
+            priority: 0,
+        };
+        let r_out = PolicyRule {
+            id: "deny-outside".into(),
+            match_effects: vec![EffectKind::FsWrite],
+            conditions: vec![Condition::Outside {
+                field: EffectField::PathsWrite,
+                roots_key: "project_roots".into(),
+            }],
+            action: PolicyAction::Deny,
+            priority: 10,
+        };
+
+        let e = PolicyEngine::new(vec![r_in, r_out]);
+        let res = e.evaluate(&eff, &ctx).unwrap();
+        // 两条规则都不匹配 → default-deny floor(非 deny-outside 伪命中)
+        assert_eq!(res.action, PolicyAction::Deny);
+        assert_eq!(res.policy_ids, vec![DEFAULT_DENY_POLICY_ID.to_string()]);
+        assert!(
+            res.reasons.iter().any(|r| r.contains("no rule matched")),
+            "空 roots 必须落 floor,不得伪造 Outside 命中: {:?}",
+            res.reasons
         );
     }
 

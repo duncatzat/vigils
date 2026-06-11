@@ -448,6 +448,30 @@ fn path_hits_protected(arg: &str, protected: &str) -> bool {
     a == p || a.starts_with(&format!("{}/", p)) || a.starts_with(&format!("{}\\", p))
 }
 
+/// DEF-004:把 project root 归一成与 [`PathExtractor`] 输出同款的 POSIX 风格规范化字符串。
+///
+/// serve/wrap CLI 入口用它处理 `--project-root`(含 CWD 缺省),保证 root 与 effect
+/// 提取出的 `paths_write` 前缀**可比**:Windows 下 `dunce::canonicalize` 解出真实
+/// 盘符/大小写 + 剥 `\\?\` 前缀 + `\`→`/`。不经此归一,`is_under` 的前缀比较会因
+/// 分隔符/前缀差异静默不匹配 → 边界配置形同虚设(这是 DEF-004 最易错处)。
+///
+/// 相对路径先基于 CWD 变绝对(canonicalize 失败时退手工 `..` 展开,不强求目录存在)。
+///
+/// 边界情形:root 真实存在时 canonicalize 会**解出 symlink**,而新建文件的写目标走
+/// `manual_normalize`(不解 symlink)—— 经 symlink 访问的项目根可能导致项目内写被误判
+/// Outside(false-deny,fail-closed 方向,非绕过)。此时请把真实路径传给 `--project-root`。
+pub fn normalize_project_root(p: &Path) -> String {
+    let abs: PathBuf = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    };
+    let normalized = dunce::canonicalize(&abs).unwrap_or_else(|_| manual_normalize(&abs));
+    to_posix(&normalized)
+}
+
 fn manual_normalize(p: &Path) -> PathBuf {
     use std::path::Component::*;
     let mut out: Vec<std::path::Component> = Vec::new();

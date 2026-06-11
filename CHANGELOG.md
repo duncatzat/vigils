@@ -8,6 +8,44 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [Unreleased]
+
+### ⚠️ Behavior change
+
+- **DEF-004: the firewall's project boundary now actually binds — `--project-root` flag,
+  defaulting to the gateway's working directory.** Found in real-machine testing.
+  - **The bug**: every production entrypoint (`serve` / `wrap` / demo / desktop embed) started
+    the firewall with an *empty* set of project roots, and the policy engine's `Outside`
+    condition is vacuously true on an empty set — so the built-in `deny-outside-project` rule
+    (priority 150) treated the **entire filesystem** as "outside the project", while its
+    counterpart `approve-repo-write` (priority 80) could never match. The Inside/Outside
+    boundary semantics were inverted wholesale: any call recognized as a filesystem write was
+    hard-denied in **every** posture (monitor only downgrades the default-deny *floor*, not
+    explicit Deny rules), with an audit reason that falsely claimed "writes OUTSIDE project".
+    It went unnoticed for so long because most wrapped third-party tool names aren't in the
+    effect-extraction vocabulary — no FsWrite extracted, rule never fired, calls fell to the
+    floor and were observe-allowed under monitor.
+  - **Fail-safe guard in the policy engine**: with empty roots, `Outside` no longer asserts
+    "outside the project" (it doesn't match), so writes fall to the default-deny floor —
+    still fail-closed, and the audit reason is now the honest "no rule matched" instead of a
+    fabricated boundary violation. The risk scorer follows the same semantics (no more +30
+    "outside-project write" score on empty roots), and its root matching is now
+    case-insensitive on Windows, aligned with the policy engine.
+  - **`serve` / `wrap` accept a repeatable `--project-root <DIR>`**; omitted, the boundary
+    defaults to the process working directory (agents launch the gateway inside the project,
+    matching git/cargo directory semantics). Roots are normalized to the same POSIX form the
+    path extractor emits (canonicalized, `\` → `/`, `\\?\` prefix stripped) — without this,
+    prefix comparison on Windows silently never matches and the boundary is inert.
+  - **Visible change under enforce**: writes *inside* the boundary now route to the
+    `approve-repo-write` approval queue (previously hard-denied); writes *outside* are still
+    blocked by `deny-outside-project`, with the reason pointing at a real boundary violation.
+  - **The startup banner prints the bound boundary** (`project boundary -> <roots>` / `NONE`),
+    so a gateway spawned from the wrong directory is visible at a glance.
+  - SDK `FirewallBuilder::project_roots` normalizes roots in `build()` the same way, so
+    native-form paths (`C:\proj`) from consumers compare correctly.
+  - demo / desktop embed intentionally keep empty roots (self-contained simulation / no
+    meaningful CWD for a GUI); the engine guard covers them. Adversarially reviewed.
+
 ## [v0.1.34] — 2026-06-09
 
 Bug fixes from real-machine testing of the Claude Code / Codex integration.

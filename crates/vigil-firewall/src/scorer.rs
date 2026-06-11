@@ -81,14 +81,18 @@ impl RiskScorer {
                 20,
                 format!("writes local files: {}", effects.paths_write.len()),
             ));
-            let outside: Vec<&String> = effects
-                .paths_write
-                .iter()
-                .filter(|p| !self.under_any_root(p))
-                .collect();
-            if !outside.is_empty() {
-                s += 30;
-                reasons.push((30, format!("writes OUTSIDE project: {}", outside[0])));
+            // DEF-004:空 roots 时无法断言"项目外",跳过越界加分——否则所有写
+            // 都被 +30 且 reason 谎称 OUTSIDE(与 policy Outside 守门同语义)。
+            if !self.project_roots.is_empty() {
+                let outside: Vec<&String> = effects
+                    .paths_write
+                    .iter()
+                    .filter(|p| !self.under_any_root(p))
+                    .collect();
+                if !outside.is_empty() {
+                    s += 30;
+                    reasons.push((30, format!("writes OUTSIDE project: {}", outside[0])));
+                }
             }
         }
 
@@ -146,7 +150,14 @@ impl RiskScorer {
     }
 
     fn under_any_root(&self, p: &str) -> bool {
+        // DEF-004:与 vigil-policy `is_under` 同语义 —— Windows 路径大小写不敏感。
+        // 不存在的写目标走 manual_normalize 保留调用方原始盘符大小写(如 `d:/...`),
+        // 若此处大小写敏感比较,会对项目内写误报 "writes OUTSIDE project" +30。
+        #[cfg(target_os = "windows")]
+        let p = &p.to_ascii_lowercase();
         self.project_roots.iter().any(|r| {
+            #[cfg(target_os = "windows")]
+            let r = &r.to_ascii_lowercase();
             if p == r {
                 return true;
             }

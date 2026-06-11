@@ -132,6 +132,9 @@ pub fn run(args: &DemoArgs) -> Result<(), DemoError> {
     let session_id = ledger.start_session("vigil-demo", Some("vigil-hub-demo"))?;
 
     let policy = PolicyEngine::new(default_ruleset());
+    // DEF-004:demo 是自包含模拟(planted 场景走 namespaced tool 指纹,不依赖
+    // Inside/Outside 项目边界规则),**有意**不绑 CWD 边界,保持 default(空 roots)。
+    // 空 roots 语义由 policy 引擎守门兜底:Outside 不匹配 → 落 default-deny floor。
     let firewall = Arc::new(Firewall::new(
         ledger.clone(),
         policy,
