@@ -50,6 +50,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 getrandom = { workspace = true }
 rusqlite = { workspace = true }
+# TASK-004 hook 共同批准:create_approval 需 DecisionRecord(decision_id/invocation_id = UUID v4)。
+uuid = { workspace = true }
 # `vigil-hub setup` 一键接入:跨平台定位用户 agent 配置目录(~/.claude 等)。
 dirs = "6"
 # `setup --mcp` 同时保护 Codex 的 `~/.codex/config.toml`(TOML `[mcp_servers.*]`)。用

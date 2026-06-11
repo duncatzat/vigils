@@ -51,6 +51,11 @@ pub enum InjectionMethod {
     Pipe,
     /// 临时文件（最后手段，需在进程结束时抹除）。
     TempFile,
+    /// PreToolUse hook 在 shell 命令内联替换 `secret://<alias>` 占位符（执行边界注入，
+    /// TASK-005）。真值经 lease 授权解析后写回 `updatedInput.command`，模型仍只见占位符；
+    /// 与 gateway 侧的 [`InjectionMethod::ChildEnv`] 区分（hook 无法对宿主子进程设 OS env，
+    /// 只能改写命令本身），故单列一档便于审计区分注入来源。
+    HookCommand,
 }
 
 // 手写 Debug：本类型不存真实 secret 值（值在 vigil-lease 运行时缓存），

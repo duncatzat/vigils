@@ -10,9 +10,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use vigil_hub_cli::demo::{self, DemoArgs};
 use vigil_hub_cli::hook::{self, HookArgs};
+use vigil_hub_cli::posture;
 use vigil_hub_cli::quickstart;
 use vigil_hub_cli::serve::{self, ServeArgs};
 use vigil_hub_cli::setup::{self, SetupArgs};
+use vigil_hub_cli::setup_hooks;
 use vigil_hub_cli::setup_mcp::{self, McpServerClass};
 use vigil_hub_cli::wrap::{self, WrapArgs};
 use vigil_hub_cli::{add_remote, AddRemoteArgs};
@@ -41,11 +43,13 @@ enum Command {
     /// 走 Vigil 真实运行时代码(firewall / 脱敏 / 审计),只模拟外部 model/tool;不联系任何 LLM,
     /// 不需账号/key/网络。`--tamper` 额外演示篡改账本被检测(可证伪)。
     Demo(CliDemoArgs),
-    /// Claude Code `PreToolUse` hook adapter(P1-α1,guard-only):从 stdin 读 PreToolUse 事件,
-    /// 对带 secret 的**原生**工具调用 fail-closed deny(exit 2 + stderr)并审计;干净调用放行(exit 0)。
+    /// agent CLI `PreToolUse` hook adapter(guard-only):从 stdin 读 PreToolUse 事件,
+    /// 对带 secret 的**原生**工具调用 fail-closed deny 并审计;干净调用放行(exit 0)。
+    /// 支持 Claude Code(默认,deny=exit 2+stderr)与 Codex/Gemini/Cursor
+    /// (`--cli <kind>`,deny=exit 0+stdout JSON 决策)。
     ///
-    /// settings.json 注册示例(matcher `*` = **所有**工具 —— 裸 secret 纵深防御需覆盖 `mcp__*`,
-    /// 故不要把 matcher 限定到 `Bash|Edit|...`,否则 hook 对 MCP 工具根本不触发):
+    /// Claude settings.json 注册示例(matcher `*` = **所有**工具 —— 裸 secret 纵深防御需覆盖
+    /// `mcp__*`,故不要把 matcher 限定到 `Bash|Edit|...`,否则 hook 对 MCP 工具根本不触发):
     /// ```json
     /// {"hooks":{"PreToolUse":[{"matcher":"*",
     ///   "hooks":[{"type":"command","command":"vigil-hub hook --ledger C:\\Vigil\\ledger.sqlite"}]}]}}
@@ -74,6 +78,32 @@ enum Command {
     /// 引导首跑(**只读**):检测你机器上的 AI agent + MCP server 与保护状态,并给出
     /// 「看 demo → 一键保护 → 验证」三步。**不改任何配置**(检测=只读 preview)。
     Quickstart,
+    /// 查看 / 切换安全姿态档位(三档:low / medium / high)。控制**占位符 × 原生工具**的处置:
+    /// low=放行(默认) / medium=共同批准(ask) / high=拦截。裸 secret 在**任何**档位恒拦(硬底线不可降级)。
+    ///
+    /// 用法:`vigil-hub posture show` / `vigil-hub posture set medium`。
+    Posture(CliPostureArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct CliPostureArgs {
+    #[command(subcommand)]
+    command: PostureCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum PostureCommand {
+    /// 显示当前档位(读 posture 配置;文件缺失 = 默认 low)。
+    Show,
+    /// 切换到指定档位(原子写配置 + 审计变更事件)。
+    Set {
+        /// 目标档位:low / medium / high。
+        #[arg(value_enum)]
+        profile: posture::PostureProfile,
+        /// 审计账本路径(记录 posture 变更;默认 `<本机数据目录>/Vigil/ledger.sqlite3`,与 hook 同账本)。
+        #[arg(long)]
+        ledger: Option<PathBuf>,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -103,11 +133,28 @@ struct CliHookArgs {
     /// 省略 = 不审计(仍做安全决策;stderr 提示)。
     #[arg(long)]
     ledger: Option<PathBuf>,
+    /// 事件来源 CLI(决定事件名归一映射与 deny 输出形状:claude=exit 2+stderr;
+    /// codex/gemini/cursor=exit 0+stdout JSON 决策)。省略 = claude(向后兼容既有注册)。
+    #[arg(long, value_enum, default_value_t = hook::CliKind::Claude)]
+    cli: hook::CliKind,
     /// 由 `vigil-hub setup` 写入的托管标记(被本命令**忽略**;仅供 setup 识别/卸载其托管条目)。
     #[arg(long = "vigil-managed", hide = true)]
     #[allow(dead_code)]
     // clap 解析后不读取;存在只为接受该 flag,不让 Claude Code 调用报未知参数
     vigil_managed: bool,
+    /// 开启 α2 执行边界注入(TASK-005):Bash 等边界工具里的 `secret://<alias>` 占位符,
+    /// 经 lease 授权解析为真值后写回 `updatedInput`(仅 Claude 支持;模型 transcript 仍见占位符)。
+    /// 仅在该 CLI 支持 `updatedInput` 且版本达标时由 setup 写入;省略 = 不注入(占位符落三档姿态)。
+    #[arg(long)]
+    inject: bool,
+    /// 注入用 alias→secret_ref 映射文件(JSON 对象 `{"<alias>": "<secret_ref>"}`)。
+    /// **仅含映射,不含真值**(真值在 OS Keychain,按 secret_ref 取);未声明的 alias 注入时 fail-closed deny。
+    /// 与 `--inject` 配套;`--inject` 开但本文件缺失/损坏 → 空映射(任何占位符都 undeclared → deny,诚实暴露误配)。
+    #[arg(long = "secrets")]
+    secrets: Option<PathBuf>,
+    /// 注入 lease 的 TTL(秒)。hook 是 one-shot,mint→resolve 微秒级,短 TTL 即可。默认 300。
+    #[arg(long = "inject-ttl-secs", default_value_t = 300)]
+    inject_ttl_secs: i64,
 }
 
 #[derive(clap::Args, Debug)]
@@ -349,21 +396,32 @@ fn main() -> std::process::ExitCode {
             }
         }
         Some(Command::Hook(args)) => {
-            // Claude Code PreToolUse adapter:stdin 读事件 → 决策。
-            // **deny 必须用 exit 2**(blocking error,stderr 回喂模型);exit 1 在 Claude Code
-            // 约定里是 **non-blocking**(fail-open),绝不能用作拦截。Allow = exit 0 静默放行。
+            // agent CLI PreToolUse adapter:stdin 读事件 → 决策 → 按 CLI 分流输出。
+            // Claude deny 必须 exit 2(blocking;exit 1 是 non-blocking fail-open,绝不能用作拦截);
+            // Codex/Gemini/Cursor deny 走 exit 0 + stdout JSON 决策。形状映射在 hook::respond
+            // (纯函数,进默认测试矩阵),这里只做 IO。
+            // posture_path / co_approval_wait_secs 走默认(canonical 路径 + 按 CLI 预算);
+            // 显式覆盖仅测试注入用。
+            // α2 注入配置:仅 `--inject` 时构造(否则 None = 占位符落三档姿态,无行为回归)。
+            let injection =
+                build_injection_config(args.inject, args.secrets.as_deref(), args.inject_ttl_secs);
             let hook_args = HookArgs {
                 ledger_path: args.ledger,
+                cli: args.cli,
+                injection,
+                ..HookArgs::default()
             };
             let stdin = std::io::stdin();
             let mut reader = stdin.lock();
-            match hook::run(&hook_args, &mut reader) {
-                hook::HookOutcome::Allow => std::process::ExitCode::SUCCESS,
-                hook::HookOutcome::Deny(reason) => {
-                    eprintln!("{reason}");
-                    std::process::ExitCode::from(2)
-                }
+            let outcome = hook::run(&hook_args, &mut reader);
+            let resp = hook::respond(&outcome, args.cli);
+            if let Some(out) = &resp.stdout {
+                println!("{out}");
             }
+            if let Some(err) = &resp.stderr {
+                eprintln!("{err}");
+            }
+            std::process::ExitCode::from(resp.exit_code)
         }
         Some(Command::Setup(args)) => {
             if args.all {
@@ -392,7 +450,23 @@ fn main() -> std::process::ExitCode {
                     ledger: args.ledger,
                 };
                 match setup::run(&setup_args) {
-                    Ok(report) => print_setup_report(&setup_args, &report),
+                    Ok(report) => {
+                        let code = print_setup_report(&setup_args, &report);
+                        // 其余 agent 的 hook 注册面(Codex/Gemini/Cursor):检测到才注册,逐面诚实
+                        // 报告。ledger 用 Claude 面已解析出的同一路径(审计链单账本)。
+                        let op = if setup_args.status {
+                            setup_hooks::AgentHookOp::Status
+                        } else if setup_args.uninstall {
+                            setup_hooks::AgentHookOp::Uninstall {
+                                dry_run: setup_args.dry_run,
+                            }
+                        } else {
+                            setup_hooks::AgentHookOp::Install {
+                                dry_run: setup_args.dry_run,
+                            }
+                        };
+                        run_agent_hook_legs(&report.ledger, op, code)
+                    }
                     Err(e) => {
                         eprintln!("vigil-hub setup failed: {e}");
                         std::process::ExitCode::FAILURE
@@ -435,6 +509,47 @@ fn main() -> std::process::ExitCode {
             match quickstart::run(&home, exe_str) {
                 0 => std::process::ExitCode::SUCCESS,
                 _ => std::process::ExitCode::FAILURE,
+            }
+        }
+        Some(Command::Posture(args)) => run_posture(args),
+    }
+}
+
+/// `vigil-hub posture show|set`:查看 / 切换三档安全姿态。
+/// `set` 走 [`posture::store_posture`](原子写)+ best-effort 审计(default ledger 或 `--ledger`;
+/// 仅档位真变化时记录)。配置目录定位失败 = fail-soft 错误退出(不影响既有保护:hook 端
+/// 文件缺失自落默认 low)。
+fn run_posture(args: CliPostureArgs) -> std::process::ExitCode {
+    let Some(path) = posture::default_posture_path() else {
+        eprintln!("vigil-hub posture: cannot locate the posture config directory");
+        return std::process::ExitCode::FAILURE;
+    };
+    match args.command {
+        PostureCommand::Show => {
+            let loaded = posture::load_posture(&path);
+            if let Some(w) = &loaded.warning {
+                eprintln!("vigil-hub posture: {w}");
+            }
+            println!("{}", loaded.profile.as_str());
+            std::process::ExitCode::SUCCESS
+        }
+        PostureCommand::Set { profile, ledger } => {
+            let old = posture::load_posture(&path).profile;
+            match posture::store_posture(&path, profile) {
+                Ok(()) => {
+                    // 审计 best-effort,仅档位真变化时记录(default ledger 或 --ledger 覆盖)。
+                    if old != profile {
+                        if let Some(lp) = ledger.or_else(setup::default_ledger_path) {
+                            posture::audit_posture_switch(&lp, old, profile);
+                        }
+                    }
+                    println!("posture: {} -> {}", old.as_str(), profile.as_str());
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("vigil-hub posture: failed to store posture ({e})");
+                    std::process::ExitCode::FAILURE
+                }
             }
         }
     }
@@ -698,6 +813,73 @@ fn run_verify(ledger: Option<PathBuf>) -> std::process::ExitCode {
     }
 }
 
+/// 构造 α2 注入配置(`vigil-hub hook --inject`)。
+///
+/// - `inject=false` → `None`:不注入,占位符落三档姿态决策(默认,无行为回归)。
+/// - `inject=true` → `Some`:真值后端固定 [`KeyringSecretStore`](service `"vigil"`,与
+///   `serve`/`add-remote-mcp` 同一 keychain 命名空间);alias→secret_ref 映射从 `secrets_path`
+///   的 JSON 对象加载。**fail-closed 误配语义**:文件缺失/读失败/非对象/值非字符串一律降级为
+///   **空映射**(enabled 仍 true)—— 任何 `secret://<alias>` 都成"未声明"→ hook deny,把误配
+///   响亮暴露,绝不静默放过未解析占位符。映射文件**只含 alias→ref,不含真值**(真值在 keychain)。
+fn build_injection_config(
+    inject: bool,
+    secrets_path: Option<&std::path::Path>,
+    ttl_secs: i64,
+) -> Option<hook::InjectionConfig> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    if !inject {
+        return None;
+    }
+
+    // 加载 alias→secret_ref 映射(best-effort;任何异常 → 空映射 + 警告,fail-closed deny)。
+    let mut secrets: HashMap<String, String> = HashMap::new();
+    if let Some(path) = secrets_path {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(serde_json::Value::Object(map)) => {
+                    for (alias, v) in map {
+                        match v.as_str() {
+                            Some(secret_ref) => {
+                                secrets.insert(alias, secret_ref.to_string());
+                            }
+                            // 值非字符串 = 形状不符;跳过该条(该 alias 注入时会 fail-closed deny)。
+                            None => eprintln!(
+                                "vigil-hook: secrets entry `{alias}` is not a string secret_ref; ignored"
+                            ),
+                        }
+                    }
+                }
+                Ok(_) => eprintln!(
+                    "vigil-hook: secrets file is not a JSON object; injection will deny all aliases (fail-closed)"
+                ),
+                Err(e) => eprintln!(
+                    "vigil-hook: secrets file parse failed ({e}); injection will deny all aliases (fail-closed)"
+                ),
+            },
+            Err(e) => eprintln!(
+                "vigil-hook: secrets file read failed ({e}); injection will deny all aliases (fail-closed)"
+            ),
+        }
+    } else {
+        eprintln!(
+            "vigil-hook: --inject set without --secrets; injection will deny all aliases (fail-closed)"
+        );
+    }
+
+    // 真值后端:OS Keychain(service "vigil",与 serve/add-remote-mcp 同命名空间)。
+    let store: Arc<dyn vigil_lease::SecretStore> =
+        Arc::new(vigil_lease::KeyringSecretStore::new("vigil"));
+
+    Some(hook::InjectionConfig {
+        enabled: true,
+        secrets,
+        store,
+        ttl_secs,
+    })
+}
+
 /// `setup --all`:一条命令同时接入 hook + MCP 网关 wrap(兑现 download→直接保护)。
 /// `--uninstall` 撤销两者;`--dry-run` 预览两者;MCP 侧默认 monitor(`--enforce` 升级硬拦)。
 fn run_setup_all(args: &CliSetupArgs) -> Result<std::process::ExitCode, setup::SetupError> {
@@ -747,6 +929,18 @@ fn run_setup_all(args: &CliSetupArgs) -> Result<std::process::ExitCode, setup::S
                 };
                 code = run_json_agent_leg(res, agent.display_name, mcp_op, code);
             }
+            // 其余 agent CLI 的 hook 注册面(Codex/Gemini/Cursor 原生工具输入侧守门),
+            // 与上面 MCP wrap 面正交(hook 拦原生工具,wrap 管 MCP server)。
+            let hook_op = if args.uninstall {
+                setup_hooks::AgentHookOp::Uninstall {
+                    dry_run: args.dry_run,
+                }
+            } else {
+                setup_hooks::AgentHookOp::Install {
+                    dry_run: args.dry_run,
+                }
+            };
+            code = run_agent_hook_legs(&ledger, hook_op, code);
             Ok(code)
         }
         // hook 步就失败 → 什么都没改(hook 写盘前 gate,失败即未写):诚实"nothing changed"。
@@ -784,6 +978,77 @@ fn run_setup_all(args: &CliSetupArgs) -> Result<std::process::ExitCode, setup::S
             Ok(std::process::ExitCode::FAILURE)
         }
     }
+}
+
+/// 其余 agent CLI 的 hook 注册面(Codex/Gemini/Cursor):逐面执行 + 诚实打印。单面失败不
+/// 中断其它面(各面独立文件、各自可逆),但最终退出码降级 FAILURE(诚实半应用,同 `run_codex_leg`
+/// 模式)。未检测到的 agent 一行说明后跳过,不为不存在的 agent 创建配置。
+fn run_agent_hook_legs(
+    ledger: &std::path::Path,
+    op: setup_hooks::AgentHookOp,
+    mut code: std::process::ExitCode,
+) -> std::process::ExitCode {
+    let (home, exe) = match (dirs::home_dir(), std::env::current_exe()) {
+        (Some(h), Ok(e)) => (h, e),
+        // Claude 面能跑到这里说明 home/exe 可解析;此分支仅防御性兜底。
+        _ => {
+            eprintln!("  agent hooks: cannot resolve home/exe; skipped");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    println!();
+    println!("Other agent CLIs (hook registration):");
+    for spec in setup_hooks::all_agent_specs(&home) {
+        let display = spec.display_name;
+        match setup_hooks::run_agent_hook(&spec, &exe, ledger, op) {
+            Ok(rep) => {
+                if !rep.detected {
+                    println!("  {display}: not detected -- skipped");
+                    continue;
+                }
+                use setup::ProtectionState;
+                let verdict = match op {
+                    setup_hooks::AgentHookOp::Status => match rep.state {
+                        ProtectionState::Active => "ACTIVE".to_string(),
+                        ProtectionState::Stale => {
+                            "INSTALLED but STALE (re-run `vigil-hub setup` to refresh)".to_string()
+                        }
+                        ProtectionState::NotInstalled => "not installed".to_string(),
+                    },
+                    setup_hooks::AgentHookOp::Install { dry_run } => {
+                        let did = if !rep.changed {
+                            "already up to date"
+                        } else if dry_run {
+                            "[dry-run] would register hook"
+                        } else {
+                            "hook registered"
+                        };
+                        format!("{did} ({})", rep.config_path.display())
+                    }
+                    setup_hooks::AgentHookOp::Uninstall { dry_run } => {
+                        let did = if !rep.changed {
+                            "nothing to remove"
+                        } else if dry_run {
+                            "[dry-run] would remove Vigil hook"
+                        } else {
+                            "Vigil hook removed"
+                        };
+                        format!("{did} ({})", rep.config_path.display())
+                    }
+                };
+                println!("  {display}: {verdict}");
+                for w in &rep.warnings {
+                    println!("    WARNING: {w}");
+                }
+            }
+            Err(e) => {
+                // 单面失败:诚实报告 + 继续其它面(各面独立);退出码降级让脚本可感知。
+                eprintln!("  {display}: FAILED -- {e}");
+                code = std::process::ExitCode::FAILURE;
+            }
+        }
+    }
+    code
 }
 
 /// 打印 `setup --all` 合并报告(ASCII-safe)。两段(hook / mcp)各自诚实陈述 + 末尾下一步。

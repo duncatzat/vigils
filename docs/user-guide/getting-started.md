@@ -106,6 +106,45 @@ bash scripts/test-local/bench.sh
 
 如果你的机器数值偏离基线 >2x,可能是 SSD / CPU / AV 干扰,参考 [troubleshooting.md](troubleshooting.md)。
 
+## 场景 6:agent CLI 原生工具 secret 防护(hook,默认安装面)
+
+场景 3 的 MCP 网关只看得到 **MCP 工具**。但 agent 跑 `Bash`、读写文件用的是**原生工具**——这些**绕过** MCP
+网关直接进 LLM。`vigil-hub hook` 把 secret 防护扩到这些原生工具,是 **`setup` 的默认安装面**。
+
+### 6.1 一键注册(默认 = hook)
+
+```bash
+# 默认安装面 = agent CLI hook(Claude 主面 + 检测到的 Codex/Gemini/Cursor 自动注册)
+vigil-hub setup
+# 只想保护 MCP 工具流?显式用 MCP wrap(场景 3 的网关):
+vigil-hub setup --mcp --apply
+# 两者都要(hook + MCP wrap 一步合一):
+vigil-hub setup --all
+```
+
+`setup` 写各 agent 的 hook 配置(Claude `~/.claude/settings.json` 等),注册 `PreToolUse`(输入守门)+
+`PostToolUse`(结果再脱敏面)。重复跑幂等;`setup --uninstall` 干净移除(只删 Vigil 自有 entry)。
+
+### 6.2 预期行为
+
+- **裸真凭据进任何工具调用 → 拦截**(最高价值):让 agent 跑 `echo ghp_…`(真 token 形态),hook
+  **deny**,reason 只说 `github_token`(**绝不回显真值**)。**任何姿态档位恒拦**(硬底线)。
+- **`secret://<alias>` 占位符 × 原生工具**:由**三档安全姿态**决定处置:
+  - **Low(默认)= 放行**:只拦极高风险,占位符当普通数据放行(最小干扰)。
+  - **Medium = 共同批准(ask)**:进 Vigil approval queue,desktop/CLI 与 agent 原生 UI **两边都能批准,先批者生效**。
+  - **High = 拦截**:占位符 × 原生工具一律 deny。
+  - 切换:`vigil-hub posture set medium`(`posture show` 看当前档)。
+
+### 6.3 执行边界注入 + 结果再脱敏(α2,进阶)
+
+把声明的 `secret://<alias>` 在 **PreToolUse 注入真值**进实际执行的命令(模型 transcript 仍只见占位符),
+命令结果回 LLM 前在 **PostToolUse 逆向脱敏**回占位符——**模型上下文任何阶段只见占位符,真值零落审计**。
+
+> **当前边界**:注入走 OS keyring 真值后端,**录入 secret 的 turnkey CLI 入口仍在路上**(下一增量);
+> 现阶段需手动给 hook 命令带 `--inject --secrets <map.json>`。仅 **Claude**(实证支持 `updatedInput`/
+> `updatedToolOutput`)启用注入与再脱敏。再脱敏仅覆盖边界工具**直接**结果(二次落盘传播见
+> `docs/research/privacy-interception-architecture.md`)。
+
 ## 下一步
 
 - 读 [troubleshooting.md](troubleshooting.md) 看常见问题解法

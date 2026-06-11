@@ -8,9 +8,62 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
-## [Unreleased]
+## [v0.2.0-beta.1] — 2026-06-11 — Hook-first 数据流控制平面(公开测试版)
 
-### ⚠️ 行为变更
+> **首个公开测试版。** Vigil 从"仅 MCP 网关"成长为本地**数据流控制平面**:`vigil-hub hook`
+> 把 secret 防护扩到 agent CLI 的**原生**工具调用(Bash / Edit / …),覆盖
+> Claude Code + Codex + Gemini + Cursor —— 不再局限于 MCP server。我们以 beta 形式发布以收集
+> 真实反馈:跑 `vigil-hub setup`、试试三档姿态,把任何意外告诉我们。欢迎提 bug。
+
+### ⚠️ 行为变更(影响默认行为)
+
+- **默认安装面现在是 hook。** `vigil-hub setup`(无 flag)默认注册 agent CLI hook(Claude 为
+  主面,外加检测到的 Codex / Gemini / Cursor),不再默认 MCP wrap。**MCP wrap 降级为显式
+  `setup --mcp`**(代码与行为完全保留 —— 只想保护 MCP 工具流时用它)。`setup --all` 仍一步两者全做。
+- **默认姿态为 Low。** 到达原生工具的 `secret://` 占位符在 Low 档**放行**(α1 时是恒 deny)。
+  三档:**Low**(仅拦最高风险 —— 裸硬指纹 secret;账本篡改档位已在决策表预留但检测尚未接线)/
+  **Medium**(+ 占位符 *ask*)/
+  **High**(= 旧 enforce,全量 deny)。**裸真凭据在任何档位恒 deny**(不可降级的硬底线)。
+  用 `vigil-hub posture set|show` 切换。
+- **hook 的 `ask` 现在是共同批准。** Medium 档下,占位符的 *ask* 进入 Vigil 审批队列有界等待;
+  **Vigil(desktop / CLI)与工具链自身 UI 两边都能批准** —— 先批者生效(审批状态机原子仲裁),
+  超时回退工具链提示。MCP wrap 的审批队列行为不变。
+
+### 新增
+
+- **多 agent hook adapter**(`hook.rs`):归一层,把事件名与字段名跨 Claude / Codex / Gemini /
+  Cursor 归一,再按 CLI 分流响应(Claude `deny` = exit 2 + stderr;Codex / Gemini / Cursor =
+  exit 0 + 各自 JSON 契约)。裸 secret 在**任何**工具(含 `mcp__*`)恒 deny —— 唯一的纵深防御线。
+- **多 agent hook 注册**(`setup_hooks.rs`):Codex(`$CODEX_HOME/hooks.json`)、Gemini
+  (`~/.gemini/settings.json`)、Cursor 各面,均幂等,`--uninstall` 仅删 Vigil 自有 entry。若
+  Codex `config.toml` 含 `[features] hooks = false`,setup **仅警告、绝不改写**。Claude 面完整化
+  (PreToolUse + **PostToolUse** + timeout)。
+- **`vigil-hub posture show|set <low|medium|high>`**:三档姿态的 turnkey 入口(原子写配置 +
+  每次变更一条审计事件)。
+- **执行边界注入(α2)**:PreToolUse 时,边界工具(Bash / shell)内的 `secret://<alias>` 占位符
+  经 lease 授权解析为真值,**内联重写**进 `updatedInput` 交宿主执行 —— **模型 transcript 始终只见
+  占位符**。仅 Claude(实证支持 `updatedInput`)。真值绝不进审计 / stderr / note(仅 sha256 指纹)。
+- **PostToolUse 结果再脱敏**:边界工具结果回 LLM 前,声明 secret 的真值经**逆向替换**回
+  `secret://<alias>`(+ 硬指纹 scrub 作纵深防御),经 Claude `updatedToolOutput` 改写。声明的
+  secret 无法解析、或自检发现残留 → **fail-closed 裁剪**。
+
+### 安全不变量
+
+- **fail-closed by construction**:hook 永不返错或 panic;解析失败、注入失败、再脱敏失败、缺
+  ledger 一律收敛为 deny 或裁剪(`deny` 走 exit 2 —— exit 1 是 fail-open,绝不用作拦截)。
+- **零明文**:真值仅在单点暴露,直达注入目的地 / 再脱敏替换;审计、reason、note、stderr 全程
+  只含 alias 名 + sha256。字节级 E2E 验证真值不落盘。
+
+### 已知范围边界(本测试版)
+
+- 再脱敏**仅**覆盖边界工具的**直接**结果;不追踪 secret 的**二次传播**(边界命令落盘 → 非边界
+  工具读出)。完整覆盖需 egress 侧(模型 API 代理)拦截。
+- inject / re-redact 走 OS keyring 真值后端,但 **keyring 填充尚无 turnkey CLI 入口**(下一增量);
+  注入当前需手动用 `--inject --secrets` 注册 hook 命令。
+- 完整真机**双 CLI**(Claude Code + Codex 实跑)inject / re-redact 往返 E2E 待受控环境验证;
+  二进制层与单测已覆盖全部决策与协议形状。
+
+### 本版同时包含 —— bug 修复
 
 - **DEF-004:firewall 项目边界从未真正生效 —— 新增 `--project-root` flag,缺省为网关工作目录。**
   真机测试中发现。

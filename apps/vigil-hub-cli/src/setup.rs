@@ -40,9 +40,14 @@ const LEDGER_ENV_VAR: &str = "VIGIL_LEDGER_PATH";
 /// Vigil 托管 hook 的专属标记 flag —— 唯一识别 Vigil 写的条目(避免宽/脆匹配)。
 /// hook 子命令接受并忽略它(纯标记)。识别/卸载只认 command 含此精确 token。
 pub const VIGIL_HOOK_MARKER: &str = "--vigil-managed";
-/// hook 默认超时(秒)。Claude Code command hook 默认 600s;我们设 60s —— hook 只读 stdin+扫描,
-/// 远快于此,且超时是 non-blocking(fail-open),短超时让异常更早暴露而非长挂起。
-const HOOK_TIMEOUT_SECS: u64 = 60;
+/// hook 默认超时(秒)。Claude Code command hook 默认 600s;我们显式设 60s:既给共同批准
+/// (co-approval,TASK-004)留出"hook 内有界等待 Vigil 侧裁决"的窗口(等待预算 45s + 输出余量),
+/// 又不至于让异常 hook 长挂起。超时是 non-blocking(fail-open),短于默认让异常更早暴露。
+pub(crate) const HOOK_TIMEOUT_SECS: u64 = 60;
+/// Vigil 在 Claude `settings.json` 注册的 hook 事件集。PreToolUse = 输入侧守门(secret 拦截 +
+/// posture 决策);PostToolUse = 结果再脱敏面(TASK-006 消费;在此前 hook 对该事件 pass-through,
+/// 注册无副作用,属前向兼容)。新增事件须同步 [`ensure_mergeable_shape`] 的形状校验。
+const CLAUDE_HOOK_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
 
 /// `setup` 子命令参数。
 #[derive(Debug, Clone, Default)]
@@ -140,7 +145,7 @@ impl std::fmt::Display for SetupError {
 /// - 跨平台:换行/回车/NUL 一律拒(任何 shell 都危险)。
 /// - Windows:双引号包裹**挡不住** `%VAR%`(cmd)/`$()`·`$env:`·反引号(PowerShell)/cmd 元字符,
 ///   故额外拒绝这些字符。Unix 走单引号转义已字面化,无需额外拒绝,但统一拒换行类。
-fn validate_path_for_command(p: &Path, which: &'static str) -> Result<(), SetupError> {
+pub(crate) fn validate_path_for_command(p: &Path, which: &'static str) -> Result<(), SetupError> {
     let s = p.display().to_string();
     for c in s.chars() {
         if matches!(c, '\n' | '\r' | '\0') {
@@ -219,7 +224,7 @@ pub fn default_ledger_path() -> Option<PathBuf> {
 /// - Windows(cmd):双引号包裹。Windows 路径不能含 `"`,双引号内 `&|<>^` 不被解释;`%VAR%`(cmd)/
 ///   `$()`·反引号(PowerShell)等会展开的字符由 [`validate_path_for_command`] 在写入前**直接拒绝**
 ///   (不靠引号),故此处只需基础包裹。
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     #[cfg(not(windows))]
     {
         let escaped = s.replace('\'', "'\\''");
@@ -232,19 +237,32 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-/// 渲染 hook 的 command 字符串:`<exe> hook --vigil-managed --ledger <ledger>`,路径均 shell-转义。
-fn hook_command(exe: &Path, ledger: &Path) -> String {
+/// 渲染 hook 的 command 字符串:`<exe> hook --vigil-managed [--cli <kind>] --ledger <ledger>`,
+/// 路径均 shell-转义。`cli`=None 走 Claude 默认 —— **不带** `--cli`,保持既有注册的 canonical
+/// 串不漂移(否则升级后所有已装用户被误报 Stale 并触发一次无意义重写);其它 agent 显式
+/// `--cli <kind>` 让 hook 选对事件名归一映射与响应输出形状(`setup_hooks` 消费)。
+pub(crate) fn hook_command_with_cli(exe: &Path, ledger: &Path, cli: Option<&str>) -> String {
+    let cli_part = match cli {
+        Some(kind) => format!(" --cli {kind}"),
+        None => String::new(),
+    };
     format!(
-        "{} hook {} --ledger {}",
+        "{} hook {}{} --ledger {}",
         shell_quote(&exe.display().to_string()),
         VIGIL_HOOK_MARKER,
+        cli_part,
         shell_quote(&ledger.display().to_string()),
     )
 }
 
+/// Claude 的 canonical hook command(向后兼容形状,无 `--cli`)。
+fn hook_command(exe: &Path, ledger: &Path) -> String {
+    hook_command_with_cli(exe, ledger, None)
+}
+
 /// 一条 PreToolUse entry 是否由 Vigil 托管:其任一 hook 的 command 把 [`VIGIL_HOOK_MARKER`] 作为
 /// **独立 argv token** 出现(精确 token 匹配,非子串 —— 避免 `--vigil-managed-old` 等误判;Codex R2 LOW)。
-fn is_vigil_entry(entry: &Value) -> bool {
+pub(crate) fn is_vigil_entry(entry: &Value) -> bool {
     entry
         .get("hooks")
         .and_then(Value::as_array)
@@ -260,7 +278,7 @@ fn is_vigil_entry(entry: &Value) -> bool {
 }
 
 /// command 串里 [`VIGIL_HOOK_MARKER`] 是否作为独立 token 出现(按空白切分精确比对)。
-fn command_is_vigil_managed(command: &str) -> bool {
+pub(crate) fn command_is_vigil_managed(command: &str) -> bool {
     command.split_whitespace().any(|t| t == VIGIL_HOOK_MARKER)
 }
 
@@ -273,7 +291,7 @@ fn vigil_entry(command: &str) -> Value {
 }
 
 /// 校验既有配置形状,**只接受**能安全合并的形状,否则返 [`SetupError::UnsupportedConfigShape`]。
-/// 检查:顶层是 object;`hooks`(若存在)是 object;`hooks.PreToolUse`(若存在)是 array。
+/// 检查:顶层是 object;`hooks`(若存在)是 object;我们要写的每个事件键(若存在)是 array。
 fn ensure_mergeable_shape(settings: &Value, path: &Path) -> Result<(), SetupError> {
     let bad = |field| {
         Err(SetupError::UnsupportedConfigShape {
@@ -288,9 +306,14 @@ fn ensure_mergeable_shape(settings: &Value, path: &Path) -> Result<(), SetupErro
         if !hooks.is_object() {
             return bad("hooks");
         }
-        if let Some(pre) = hooks.get("PreToolUse") {
-            if !pre.is_array() {
-                return bad("hooks.PreToolUse");
+        for (event, field) in [
+            ("PreToolUse", "hooks.PreToolUse"),
+            ("PostToolUse", "hooks.PostToolUse"),
+        ] {
+            if let Some(arr) = hooks.get(event) {
+                if !arr.is_array() {
+                    return bad(field);
+                }
             }
         }
     }
@@ -298,42 +321,48 @@ fn ensure_mergeable_shape(settings: &Value, path: &Path) -> Result<(), SetupErro
 }
 
 /// 幂等地把 Vigil hook 合并进 `settings`(形状须已 [`ensure_mergeable_shape`] 校验过)。
-/// 返回 `(changed, new_settings)`。剥掉**所有** Vigil 托管条目,追加唯一 canonical;非 Vigil 条目原样保留。
-/// `changed` = 原本不是"恰好一条且等于 canonical"(覆盖:新装 / ledger/exe 漂移替换 / 去重)。
+/// 返回 `(changed, new_settings)`。对 [`CLAUDE_HOOK_EVENTS`] 每个事件:剥掉**所有** Vigil 托管条目,
+/// 追加唯一 canonical;非 Vigil 条目原样保留。`changed` = 任一事件原本不是"恰好一条且等于 canonical"
+/// (覆盖:新装 / ledger/exe 漂移替换 / 去重 / 旧版只注册了 PreToolUse 的升级补全)。
 fn merge_install(mut settings: Value, command: &str) -> (bool, Value) {
     let canonical = vigil_entry(command);
+    let mut changed = false;
 
-    let existing: Vec<Value> = settings
-        .get("hooks")
-        .and_then(|h| h.get("PreToolUse"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    for event in CLAUDE_HOOK_EVENTS {
+        let existing: Vec<Value> = settings
+            .get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
 
-    let vigil_existing: Vec<&Value> = existing.iter().filter(|e| is_vigil_entry(e)).collect();
-    let already_correct = vigil_existing.len() == 1 && vigil_existing[0] == &canonical;
+        let vigil_existing: Vec<&Value> = existing.iter().filter(|e| is_vigil_entry(e)).collect();
+        let already_correct = vigil_existing.len() == 1 && vigil_existing[0] == &canonical;
+        changed |= !already_correct;
 
-    let mut new_arr: Vec<Value> = existing
-        .iter()
-        .filter(|e| !is_vigil_entry(e))
-        .cloned()
-        .collect();
-    new_arr.push(canonical);
+        let mut new_arr: Vec<Value> = existing
+            .iter()
+            .filter(|e| !is_vigil_entry(e))
+            .cloned()
+            .collect();
+        new_arr.push(canonical.clone());
 
-    // 写回:顶层与 hooks 已校验为 object;仅替换 PreToolUse 键,保留用户 PostToolUse 等。
-    let obj = match settings.as_object_mut() {
-        Some(o) => o,
-        // 不可达(已 ensure_mergeable_shape),但避免 expect:退化为重建仅含我们条目的配置。
-        None => return (true, json!({ "hooks": { "PreToolUse": new_arr } })),
-    };
-    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
-    if let Some(ho) = hooks.as_object_mut() {
-        ho.insert("PreToolUse".to_string(), Value::Array(new_arr));
+        // 写回:顶层与 hooks 已校验为 object;仅替换本事件键,用户其它事件原样保留。
+        let obj = match settings.as_object_mut() {
+            Some(o) => o,
+            // 不可达(已 ensure_mergeable_shape),但避免 expect:退化为重建仅含我们条目的配置。
+            None => return (true, json!({ "hooks": { event: new_arr } })),
+        };
+        let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+        if let Some(ho) = hooks.as_object_mut() {
+            ho.insert(event.to_string(), Value::Array(new_arr));
+        }
     }
-    (!already_correct, settings)
+    (changed, settings)
 }
 
-/// 幂等地移除 Vigil hook。返回 `(changed, new_settings)`。清掉 Vigil 造成的空 PreToolUse/hooks。
+/// 幂等地移除 Vigil hook(扫 `hooks` 下**所有**事件键,不限 [`CLAUDE_HOOK_EVENTS`] —— 旧版本注册过的
+/// 事件也要清干净)。返回 `(changed, new_settings)`。清掉 Vigil 造成的空事件数组 / 空 hooks 容器。
 /// 形状不符的配置一律 no-op(保守:不动它)。
 fn merge_uninstall(mut settings: Value) -> (bool, Value) {
     let Some(obj) = settings.as_object_mut() else {
@@ -342,15 +371,18 @@ fn merge_uninstall(mut settings: Value) -> (bool, Value) {
     let Some(hooks) = obj.get_mut("hooks").and_then(Value::as_object_mut) else {
         return (false, settings);
     };
-    let Some(pre) = hooks.get_mut("PreToolUse").and_then(Value::as_array_mut) else {
-        return (false, settings);
-    };
-    let before = pre.len();
-    pre.retain(|e| !is_vigil_entry(e));
-    let changed = pre.len() != before;
-    let pre_empty = pre.is_empty();
-    if pre_empty {
-        hooks.remove("PreToolUse");
+    let mut changed = false;
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(arr) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
+            continue; // 非数组事件值:不动它(保守)
+        };
+        let before = arr.len();
+        arr.retain(|e| !is_vigil_entry(e));
+        changed |= arr.len() != before;
+        if arr.is_empty() {
+            hooks.remove(&event);
+        }
     }
     if hooks.is_empty() {
         obj.remove("hooks");
@@ -361,7 +393,8 @@ fn merge_uninstall(mut settings: Value) -> (bool, Value) {
 // ─────────────────────────── IO 编排(原子写 + 备份 + abort-on-malformed)───────────────
 
 /// 读 settings:不存在 → `Ok(None)`;存在但非法 JSON → `Err(MalformedConfig)`(abort)。
-fn read_settings(path: &Path) -> Result<Option<Value>, SetupError> {
+/// `pub(crate)`:`setup_hooks` 读各 agent 的 hooks 配置复用同一 abort-on-malformed 语义。
+pub(crate) fn read_settings(path: &Path) -> Result<Option<Value>, SetupError> {
     match std::fs::read_to_string(path) {
         Ok(s) => {
             if s.trim().is_empty() {
@@ -604,8 +637,9 @@ pub fn run_with(
     })
 }
 
-/// 诚实判定保护状态:有托管条目且其 command == 当前 canonical 且 exe 存在 → Active;
-/// 有托管条目但不符/exe 缺失 → Stale;无 → NotInstalled。
+/// 诚实判定保护状态:[`CLAUDE_HOOK_EVENTS`] **每个事件**都恰好一条托管条目且 == 当前 canonical
+/// 且 exe 存在 → Active;有任何托管条目但不满足上述(漂移 / 缺事件 / exe 缺失)→ Stale;
+/// 完全无托管条目 → NotInstalled。旧版只注册了 PreToolUse 的安装会被诚实报 Stale(提示重跑 setup 补全)。
 fn protection_state(
     settings: Option<&Value>,
     canonical_command: &str,
@@ -614,21 +648,24 @@ fn protection_state(
     let Some(s) = settings else {
         return ProtectionState::NotInstalled;
     };
-    let Some(pre) = s
-        .get("hooks")
-        .and_then(|h| h.get("PreToolUse"))
-        .and_then(Value::as_array)
-    else {
-        return ProtectionState::NotInstalled;
-    };
-    let vigil: Vec<&Value> = pre.iter().filter(|e| is_vigil_entry(e)).collect();
-    if vigil.is_empty() {
+    let canonical = vigil_entry(canonical_command);
+    let mut any_vigil = false;
+    let mut all_canonical = true;
+    for event in CLAUDE_HOOK_EVENTS {
+        let vigil: Vec<&Value> = s
+            .get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter(|e| is_vigil_entry(e)).collect())
+            .unwrap_or_default();
+        any_vigil |= !vigil.is_empty();
+        // 恰好一条且等于 canonical 才算该事件就位。
+        all_canonical &= vigil.len() == 1 && vigil[0] == &canonical;
+    }
+    if !any_vigil {
         return ProtectionState::NotInstalled;
     }
-    // 恰好一条 + command 等于当前 canonical + exe 存在 → Active。
-    let canonical_ok =
-        vigil.len() == 1 && vigil[0] == &vigil_entry(canonical_command) && exe.exists();
-    if canonical_ok {
+    if all_canonical && exe.exists() {
         ProtectionState::Active
     } else {
         ProtectionState::Stale
@@ -667,10 +704,40 @@ mod tests {
         let c = cmd(&exe(), &ledger());
         let (changed, out) = merge_install(json!({}), &c);
         assert!(changed);
-        let arr = out["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert!(is_vigil_entry(&arr[0]));
-        assert_eq!(arr[0]["matcher"], "*");
+        // 注册面完整化:PreToolUse(输入守门)+ PostToolUse(结果再脱敏面)两个事件都注册。
+        for event in CLAUDE_HOOK_EVENTS {
+            let arr = out["hooks"][event].as_array().unwrap();
+            assert_eq!(arr.len(), 1, "{event} must have exactly one entry");
+            assert!(
+                is_vigil_entry(&arr[0]),
+                "{event} entry must be Vigil-managed"
+            );
+            assert_eq!(arr[0]["matcher"], "*");
+            assert_eq!(
+                arr[0]["hooks"][0]["timeout"],
+                json!(HOOK_TIMEOUT_SECS),
+                "{event} timeout must be explicit (co-approval wait window contract)"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_pretooluse_only_install_is_upgraded_and_reported_stale_before() {
+        // 旧版只注册了 PreToolUse:status 应诚实报 Stale(注册面不完整),重跑 setup 补全 PostToolUse。
+        let c = cmd(&exe(), &ledger());
+        let legacy = json!({ "hooks": { "PreToolUse": [vigil_entry(&c)] } });
+        assert_eq!(
+            protection_state(Some(&legacy), &c, &exe()),
+            ProtectionState::Stale,
+            "missing PostToolUse registration must not be reported Active"
+        );
+        let (changed, out) = merge_install(legacy, &c);
+        assert!(changed, "upgrade must report a change");
+        assert!(out["hooks"]["PostToolUse"].as_array().unwrap().len() == 1);
+        assert_eq!(
+            protection_state(Some(&out), &c, &exe()),
+            ProtectionState::Active
+        );
     }
 
     #[test]

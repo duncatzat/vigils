@@ -237,6 +237,7 @@ fn core_enums_serialize_as_pascal_case_stable_tokens() {
         (InjectionMethod::ChildEnv, r#""ChildEnv""#),
         (InjectionMethod::Pipe, r#""Pipe""#),
         (InjectionMethod::TempFile, r#""TempFile""#),
+        (InjectionMethod::HookCommand, r#""HookCommand""#),
     ];
     for (v, expected) in injection_cases {
         assert_eq!(serde_json::to_string(v).unwrap(), *expected);

@@ -97,7 +97,10 @@ jobs:
           tag_name: ${{ steps.resolve.outputs.tag }}
           name: Vigils ${{ steps.resolve.outputs.tag }}
           draft: false
-          prerelease: false
+          # pre-release tags (e.g. v0.2.0-beta.1, v0.2.0-rc.1) carry a `-`; mark them as
+          # pre-release on GitHub so a beta isn't listed as the latest stable. A final tag
+          # (v0.2.0) has no `-` and is published as a normal release.
+          prerelease: ${{ contains(steps.resolve.outputs.tag, '-') }}
           generate_release_notes: false
           body_path: ${{ steps.notes.outputs.path }}
 

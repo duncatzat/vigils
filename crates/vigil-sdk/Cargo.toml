@@ -23,14 +23,14 @@ ort = ["vigil-firewall/ort", "vigil-redaction/ort"]
 
 [dependencies]
 # Stable SDK re-exports;path-dep,locked to workspace version
-vigil-types = { path = "../vigil-types", version = "0.1.0" }
-vigil-firewall = { path = "../vigil-firewall", version = "0.1.0" }
-vigil-redaction = { path = "../vigil-redaction", version = "0.1.0" }
-vigil-mcp = { path = "../vigil-mcp", version = "0.1.0" }
+vigil-types = { path = "../vigil-types", version = "0.2.0-beta.1" }
+vigil-firewall = { path = "../vigil-firewall", version = "0.2.0-beta.1" }
+vigil-redaction = { path = "../vigil-redaction", version = "0.2.0-beta.1" }
+vigil-mcp = { path = "../vigil-mcp", version = "0.2.0-beta.1" }
 # v0.16 FirewallBuilder facade:内部装配用(Ledger / PolicyEngine + default_ruleset)。
 # **不** re-export —— 仅 firewall_builder 内化使用,守 SDK 边界。
-vigil-audit = { path = "../vigil-audit", version = "0.1.0" }
-vigil-policy = { path = "../vigil-policy", version = "0.1.0" }
+vigil-audit = { path = "../vigil-audit", version = "0.2.0-beta.1" }
+vigil-policy = { path = "../vigil-policy", version = "0.2.0-beta.1" }
 # decide_call 便捷方法生成 invocation_id(UUIDv4);内部用,不进 SDK public API。
 uuid = { workspace = true }
 # decide_call 的 args 形参类型(serde_json::Value 已是 ToolInvocation.args 的公开类型,不扩面)。

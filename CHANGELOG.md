@@ -8,9 +8,78 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
-## [Unreleased]
+## [v0.2.0-beta.1] — 2026-06-11 — Hook-first data-flow control plane (public beta)
 
-### ⚠️ Behavior change
+> **First public beta.** Vigil grows from "MCP gateway only" into a local **data-flow control
+> plane**: `vigil-hub hook` extends secret protection to an agent CLI's **native** tool calls
+> (Bash / Edit / …), covering Claude Code + Codex + Gemini + Cursor — not just MCP servers.
+> We're shipping it as a beta to gather real-world feedback: run `vigil-hub setup`, try the
+> postures, and tell us anything surprising. Bug reports welcome.
+
+### ⚠️ Behavior change (BREAKING for defaults)
+
+- **Default install surface is now the hook.** `vigil-hub setup` (no flags) registers the
+  agent-CLI hook by default (Claude as the primary surface, plus any detected Codex / Gemini /
+  Cursor) instead of MCP wrapping. **MCP wrap is demoted to the explicit `setup --mcp`** (its
+  code and behavior are fully preserved — use it when you only want to protect an MCP tool
+  flow). `setup --all` still does both in one step.
+- **Default posture is Low.** A `secret://` placeholder reaching a native tool is **allowed**
+  at Low (α1 used to always deny). Three tiers: **Low** (deny only the highest risk — bare
+  hard-fingerprint secrets — plus a reserved ledger-tamper tier whose detection isn't wired
+  yet) / **Medium** (+ placeholder *ask*) / **High**
+  (= the old enforce, deny everything). A **bare real credential is denied in every tier** (a
+  non-negotiable floor). Switch with `vigil-hub posture set|show`.
+- **A hook `ask` is now co-approval.** At Medium, a placeholder's *ask* enters Vigil's approval
+  queue with a bounded wait; **both** Vigil (desktop / CLI) **and** the tool chain's own UI can
+  approve — first approver wins (atomic state-machine arbitration), and it falls back to the
+  tool-chain prompt on timeout. The MCP-wrap approval-queue behavior is unchanged.
+
+### Added
+
+- **Multi-agent hook adapter** (`hook.rs`): a normalization layer that maps event and field
+  names across Claude / Codex / Gemini / Cursor, then routes the response per CLI (Claude
+  `deny` = exit 2 + stderr; Codex / Gemini / Cursor = exit 0 + each one's JSON contract). A
+  bare secret is denied on **any** tool (including `mcp__*`) — the single defense-in-depth line.
+- **Multi-agent hook registration** (`setup_hooks.rs`): Codex (`$CODEX_HOME/hooks.json`),
+  Gemini (`~/.gemini/settings.json`), and Cursor surfaces, each idempotent, with `--uninstall`
+  removing only Vigil's own entries. If Codex `config.toml` has `[features] hooks = false`,
+  setup **warns and never rewrites it**. The Claude surface is completed (PreToolUse +
+  **PostToolUse** + timeout).
+- **`vigil-hub posture show|set <low|medium|high>`**: a turnkey entry to the three tiers
+  (atomic config write + an audit event for every change).
+- **Execution-boundary injection (α2)**: on PreToolUse, a `secret://<alias>` placeholder inside
+  a boundary tool (Bash / shell) is resolved to its real value via a lease and rewritten
+  **inline** into `updatedInput` for the host to execute — **the model transcript only ever
+  sees the placeholder**. Claude only (the CLI proven to honor `updatedInput`). Real values
+  never reach audit / stderr / notes (sha256 fingerprints only).
+- **PostToolUse result re-redaction**: before a boundary tool's result returns to the LLM, the
+  real values of declared secrets are reverse-substituted back to `secret://<alias>` (plus a
+  hard-fingerprint scrub as defense-in-depth), via Claude's `updatedToolOutput`. A declared
+  secret that can't be resolved, or any residue found on self-check, triggers a **fail-closed
+  truncation**.
+
+### Security invariants
+
+- **Fail-closed by construction**: the hook never returns an error or panics; a parse failure,
+  an injection failure, a re-redaction failure, or a missing ledger all converge to
+  deny-or-truncate (`deny` is exit 2 — exit 1 is fail-open and is never used to block).
+- **Zero plaintext**: a real value is exposed at a single point and flows straight to its
+  injection target / re-redaction substitution; audit, reasons, notes, and stderr only ever
+  carry the alias name + a sha256. Byte-level E2E confirms real values never hit disk.
+
+### Known scope limitations (this beta)
+
+- Re-redaction covers only a boundary tool's **direct** result; it does not track a secret's
+  **second-order** propagation (a boundary command writes to disk → a non-boundary tool reads
+  it back). Full coverage needs egress-side (model-API proxy) interception.
+- inject / re-redact use the OS keyring as the value backend, but **keyring population has no
+  turnkey CLI entry yet** (the next increment); injection currently requires registering the
+  hook command with `--inject --secrets` by hand.
+- A full real-machine **dual-CLI** (Claude Code + Codex live) inject / re-redact round-trip is
+  still pending a controlled environment; the binary layer and unit tests already cover every
+  decision and protocol shape.
+
+### Also in this release — bug fixes
 
 - **DEF-004: the firewall's project boundary now actually binds — `--project-root` flag,
   defaulting to the gateway's working directory.** Found in real-machine testing.
