@@ -157,6 +157,17 @@ pub const EVENT_RAW_SECRET_ATTEMPT_DETECTED: &str = "raw_secret_attempt_detected
 /// result,只在审计链上留痕 + 累加 `Hub::leak_detected_count()`。
 pub const EVENT_SECRET_LEAK_DETECTED: &str = "secret.leak_detected";
 
+/// P0 注入防护 Slice C:DeBERTa 注入分类软信号阈值。`p_injection ≥ 此值`才记软信号 + bump risk。
+/// 取 0.8(高置信)而非默认 0.5 —— deberta 实测 precision 0.863,误报多为"讨论注入的安全文档"
+/// (语义指纹陷阱);软信号场景宁可漏边缘注入,也别让安全文档/代码频繁误升 risk。
+/// **不** cfg gate:`audit_descriptor_meta_instructions` 在无 ort 时也引用本符号(deberta_hit 恒 false)。
+const INJECTION_CLASSIFIER_THRESHOLD: f32 = 0.8;
+
+/// P0 注入防护 Slice C:deberta 命中后给 session risk 加的分值。与启发式
+/// [`vigil_redaction::META_INSTRUCTION_RISK_DELTA`](=8)同级。同一段文本启发式 + deberta
+/// 双命中时**取 max 不累加**(单次投毒不应因被两个检测器同时命中而双倍计分)。
+const INJECTION_CLASSIFIER_RISK_DELTA: i64 = 8;
+
 /// 可逆脱敏 Slice 2:agent 在 tool args 里引用了**无法解析**的 `secret://<alias>`
 /// (未声明 / 跨 server 越权 / 落 object key 位)被决策前门 fail-closed deny 时的审计事件。
 /// `secret.` 非保留前缀(见 [`EVENT_SECRET_LEAK_DETECTED`]),合法。payload 只带 alias 名
@@ -336,6 +347,12 @@ pub struct Hub {
     /// 未来 feedback loop(lease 收敛)的最小可观察性前置 —— 当前版本只产生审计事件
     /// + 本计数器;真正"命中 N 次自动 revoke lease"延至 Hub 集成 SecretBroker 后实装。
     leak_detected_count: AtomicU64,
+    /// P0 注入防护 Slice C(T7):DeBERTa 序列分类器(serve 路径 warm session)。
+    /// `None` = 未启用(默认 / flag off / 无 `--features ort`)。`Some` = serve 启动时
+    /// warm-load 一次,descriptor/result 软信号扫描复用此常驻 session(避免每次推理重载 738MB)。
+    /// **软信号铁律**:命中只 bump session risk + 审计,绝不 deny / 绝不返 Err。
+    #[cfg(feature = "ort")]
+    injection_classifier: Option<Arc<vigil_redaction::InjectionClassifier>>,
 }
 
 impl std::fmt::Debug for Hub {
@@ -402,7 +419,22 @@ impl Hub {
             session_id: Mutex::new(None),
             secret_aliases,
             leak_detected_count: AtomicU64::new(0),
+            #[cfg(feature = "ort")]
+            injection_classifier: None,
         }
+    }
+
+    /// P0 注入防护 Slice D:注入 warm-loaded DeBERTa 分类器(serve 启动期一次性 load + warmup)。
+    /// 仅 `--enable-injection-classifier` + `--features ort` 双满足时 serve 才调用本 builder;
+    /// 否则 `injection_classifier` 字段恒 `None`,所有软信号扫描静默跳过(0 推理开销)。
+    #[cfg(feature = "ort")]
+    #[must_use]
+    pub fn with_injection_classifier(
+        mut self,
+        classifier: Arc<vigil_redaction::InjectionClassifier>,
+    ) -> Self {
+        self.injection_classifier = Some(classifier);
+        self
     }
 
     /// ISS-016:返回本 Hub 进程生命周期内 upstream response 扫到 secret leak 的
@@ -478,15 +510,79 @@ impl Hub {
         Ok(g.clone().unwrap_or_else(|| "system".to_string()))
     }
 
-    /// P0 注入防护 Slice 3(T6):对 tool descriptor 的 description(+ input schema 内
-    /// 递归收集的所有 `description` 字段)做元指令扫描,命中则写软信号审计事件。
+    /// P0 注入防护 Slice C:对 `text` 跑 DeBERTa 注入分类,返 `p_injection`(若启用且推理成功)。
+    /// 软信号 fail-safe:无 classifier / 空文本 / 推理失败一律返 `None`(绝不 panic / 绝不 brick
+    /// caller 流程)。**零回显**:本函数不碰审计,只返概率;sha256 锚点由 caller 负责。
+    #[cfg(feature = "ort")]
+    fn injection_classify_opt(&self, text: &str) -> Option<f32> {
+        // CPU 放大防护(hostile review LOW):模型本身截断到 512 token,但 tokenizer 仍对全文做
+        // BPE 切分;恶意 upstream 返超大 result 会放大 CPU。注入指令通常在开头(与 injection.rs
+        // 的 512-token 尾部截断同理),故送 tokenizer 前先 cap 到 16KB 前缀。
+        const MAX_BYTES: usize = 16 * 1024;
+
+        let classifier = self.injection_classifier.as_ref()?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        // 截到 ≤ MAX_BYTES 的最近 UTF-8 边界(避免切多字节 char 中间 → &str 索引 panic)。
+        let scan = if text.len() > MAX_BYTES {
+            let mut end = MAX_BYTES;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
+        } else {
+            text
+        };
+        // 软信号:推理失败(tokenize / session.run / shape)静默吞掉,绝不影响 caller 决策流。
+        classifier.classify(scan).ok()
+    }
+
+    /// P0 注入防护 Slice C:对 upstream tool result **原文**跑 deberta 注入分类,命中阈值则
+    /// bump session risk + 写零回显软信号审计。**绝不** deny / 改写 result(改写仅属凭据脱敏
+    /// 路径)。无 classifier / 空 result / 推理失败 / 未达阈值一律静默返回(软信号 fail-safe)。
+    #[cfg(feature = "ort")]
+    fn audit_result_injection(&self, invocation: &ToolInvocation, result_text: &str) {
+        let Some(score) = self.injection_classify_opt(result_text) else {
+            return;
+        };
+        if score < INJECTION_CLASSIFIER_THRESHOLD {
+            return;
+        }
+        let _ = self
+            .ledger
+            .bump_session_risk(&invocation.session_id, INJECTION_CLASSIFIER_RISK_DELTA);
+        let _ = self.ledger.append_event(
+            &invocation.session_id,
+            "tool_result.injection_suspected",
+            &json!({
+                "invocation_id": invocation.invocation_id,
+                "server_id": invocation.server_id,
+                "tool_name": invocation.tool_name,
+                // 零回显:deberta 概率(2 位)+ result sha 前缀,绝不带 result 原文。
+                "deberta_score": round2(score),
+                "risk_delta": INJECTION_CLASSIFIER_RISK_DELTA,
+                "signal": "soft",
+                "result_sha256_prefix": sha256_hex_prefix(result_text),
+            }),
+            Some(&format!(
+                "result_injection_suspected server:{} tool:{} score:{:.2}",
+                invocation.server_id, invocation.tool_name, score
+            )),
+        );
+    }
+
+    /// P0 注入防护 Slice 3(T6)+ Slice C(T7):对 tool descriptor 的 description(+ input
+    /// schema 内递归收集的所有 `description` 字段)做**双检测器**元指令扫描 —— 启发式正则
+    /// (Slice 3)+ DeBERTa 序列分类(Slice C,仅 `--features ort` + warm session 时);任一
+    /// 命中即 bump session risk(两层取 max 不累加)+ 写软信号审计事件。
     ///
-    /// **零回显铁律**(项目「untrusted input not in errors」):审计 payload 绝不含
-    /// description 原文,只记 server_id / tool_name / 命中数 + 被扫文本的 sha256 前缀
-    /// (供 replay 时定位是哪份 descriptor,而不泄露投毒文本本身)。
+    /// **零回显铁律**(项目「untrusted input not in errors」):审计 payload 绝不含 description
+    /// 原文,只记 server_id / tool_name / 启发式命中数 / deberta 概率(2 位)+ 被扫文本的
+    /// sha256 前缀(供 replay 定位是哪份 descriptor,而不泄露投毒文本本身)。
     ///
-    /// **软信号**:本函数不返回 Err、不影响 caller 的 pin/approve 流程;扫描纯字符串不会
-    /// panic,审计写失败也吞掉(fail-safe,绝不 brick 首次 pin)。
+    /// **软信号铁律**:本函数不返回 Err、不影响 caller 的 pin/approve 流程,**绝不 deny**;
+    /// 扫描/推理失败都吞掉(fail-safe,绝不 brick 首次 pin)。
     fn audit_descriptor_meta_instructions(
         &self,
         server_id: &str,
@@ -507,32 +603,62 @@ impl Hub {
             return;
         }
 
-        let findings = vigil_redaction::scan_meta_instructions(&corpus);
-        if findings.is_empty() {
+        // 检测器 1:启发式元指令正则(确定性、窄覆盖)
+        let heuristic_hits = vigil_redaction::scan_meta_instructions(&corpus).len();
+
+        // 检测器 2:DeBERTa 序列分类(feature gate;无 ort 恒 None → 行为退化为纯启发式,
+        // 与 Slice 3 一致)。warm session 在 serve 启动期已 load,此处只做一次推理。
+        #[cfg(feature = "ort")]
+        let deberta_score = self.injection_classify_opt(&corpus);
+        #[cfg(not(feature = "ort"))]
+        let deberta_score: Option<f32> = None;
+        let deberta_hit = matches!(deberta_score, Some(s) if s >= INJECTION_CLASSIFIER_THRESHOLD);
+
+        // 两检测器都未命中 → 不审计、不 bump(保持 Slice 3 行为:无命中即静默)。
+        if heuristic_hits == 0 && !deberta_hit {
             return;
         }
 
-        // 零回显:只对被扫文本取 sha256 前缀作定位锚点,不带原文。
-        let mut hasher = Sha256::new();
-        hasher.update(corpus.as_bytes());
-        let corpus_sha = hex::encode(hasher.finalize());
-        let corpus_sha_prefix = &corpus_sha[..16.min(corpus_sha.len())];
+        // 软信号 risk delta:两层针对**同一段 corpus**,取 max 不累加(单次投毒不应被双倍计分)。
+        let risk_delta = {
+            let h = if heuristic_hits > 0 {
+                vigil_redaction::META_INSTRUCTION_RISK_DELTA as i64
+            } else {
+                0
+            };
+            let d = if deberta_hit {
+                INJECTION_CLASSIFIER_RISK_DELTA
+            } else {
+                0
+            };
+            h.max(d)
+        };
 
         let session_id = self
             .current_session_id()
             .unwrap_or_else(|_| "system".to_string());
+
+        // 先 bump risk(软信号累积,跨进程经 sessions.risk_score 可见),再写零回显审计事件。
+        if risk_delta > 0 {
+            let _ = self.ledger.bump_session_risk(&session_id, risk_delta);
+        }
         let _ = self.ledger.append_event(
             &session_id,
             "tool_descriptor.meta_instruction",
             &json!({
                 "server_id": server_id,
                 "tool_name": tool_name,
-                "match_count": findings.len(),
-                "corpus_sha256_prefix": corpus_sha_prefix,
+                "match_count": heuristic_hits,
+                // 零回显:deberta 概率(2 位)+ corpus sha 前缀,绝不带 descriptor 原文。
+                "deberta_score": deberta_score.map(round2),
+                "deberta_hit": deberta_hit,
+                "risk_delta": risk_delta,
+                "signal": "soft",
+                "corpus_sha256_prefix": sha256_hex_prefix(&corpus),
             }),
             Some(&format!(
-                "descriptor_meta_instruction server:{server_id} tool:{tool_name} matches:{}",
-                findings.len()
+                "descriptor_meta_instruction server:{server_id} tool:{tool_name} \
+                 heuristic:{heuristic_hits} deberta_hit:{deberta_hit}"
             )),
         );
     }
@@ -1362,6 +1488,12 @@ impl Hub {
                             });
                         }
                     }
+
+                    // P0 注入防护 Slice C:对 upstream result **原文**跑 deberta 注入分类(软信号)。
+                    // 远端 MCP 工具结果可能携带"投毒指令"诱导 agent;命中只 bump risk + 审计,
+                    // **绝不** deny / 改写 result(改写仅属上面的凭据脱敏路径;注入是软信号)。
+                    #[cfg(feature = "ort")]
+                    self.audit_result_injection(invocation, &result_text);
                 }
 
                 span.executed(&format!(
@@ -1388,6 +1520,21 @@ impl Hub {
             }
         }
     }
+}
+
+/// 对文本取 sha256 hex 前 16 字符作**零回显**定位锚点(审计里替代原文,供 replay 定位投毒
+/// descriptor/result 而不泄露内容本身)。descriptor + result 两处复用,故抽为自由函数。
+fn sha256_hex_prefix(s: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    let full = hex::encode(hasher.finalize());
+    full[..16.min(full.len())].to_string()
+}
+
+/// 把 deberta 概率截到 2 位小数后入审计,避免浮点尾噪(如 0.8000001)污染审计可读性。
+/// descriptor + result 两处复用。
+fn round2(x: f32) -> f32 {
+    (x * 100.0).round() / 100.0
 }
 
 /// 递归收集 JSON 内任意层级 key 为 `"description"` 的字符串值,追加进 `out`。

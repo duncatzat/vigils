@@ -22,6 +22,7 @@ fn default_args() -> ServeArgs {
         dev_permissive_firewall: false,
         // T7 ISS-008 Phase 2:默认 false,与 v0.4 行为兼容(走 NoopEngine 默认 scanner)。
         enable_privacy_filter: false,
+        enable_injection_classifier: false,
         redact_tool_results: false,
         monitor: false,
         // 本文件只测协议通路,不测项目边界;空 roots 由 policy 引擎守门兜底(DEF-004)。
@@ -64,6 +65,7 @@ fn b2_privacy_filter_unavailable_when_feature_off() {
         auto_approve_first_seen: false,
         dev_permissive_firewall: false,
         enable_privacy_filter: true, // flag on,但 feature off → fail-closed
+        enable_injection_classifier: false,
         redact_tool_results: false,
         monitor: false,
         project_roots: vec![],
@@ -73,6 +75,24 @@ fn b2_privacy_filter_unavailable_when_feature_off() {
         other => panic!(
             "默认 feature off 时 enable_privacy_filter=true 必须返 PrivacyFilterUnavailable,\
              实际 {:?}",
+            other.map(|_| "Ok(Hub)").map_err(|e| format!("{e:?}"))
+        ),
+    }
+}
+
+/// P0 注入防护 Slice D:默认 feature off + `enable_injection_classifier=true` →
+/// `ServeError::InjectionClassifierUnavailable`。对称 privacy filter 的 fail-closed 守门:
+/// 任何"flag on 但静默跳过注入检测"的回归会让本测试失败(用户感知"已启用注入检测"实际未生效)。
+#[cfg(not(feature = "ort"))]
+#[test]
+fn b2_injection_classifier_unavailable_when_feature_off() {
+    let mut args = default_args();
+    args.enable_injection_classifier = true; // flag on,但 feature off → fail-closed
+    match build_hub(&args) {
+        Err(ServeError::InjectionClassifierUnavailable) => {}
+        other => panic!(
+            "默认 feature off 时 enable_injection_classifier=true 必须返 \
+             InjectionClassifierUnavailable,实际 {:?}",
             other.map(|_| "Ok(Hub)").map_err(|e| format!("{e:?}"))
         ),
     }
@@ -246,6 +266,7 @@ fn b2_upstream_config_empty_argv_returns_invalid_upstream() {
         auto_approve_first_seen: false,
         dev_permissive_firewall: false,
         enable_privacy_filter: false,
+        enable_injection_classifier: false,
         redact_tool_results: false,
         monitor: false,
         project_roots: vec![],
@@ -302,6 +323,7 @@ fn b2_stage2_attach_real_stdio_upstream_via_node() {
         auto_approve_first_seen: true, // dev 模式让 descriptor 自动批准
         dev_permissive_firewall: false,
         enable_privacy_filter: false,
+        enable_injection_classifier: false,
         redact_tool_results: false,
         monitor: false,
         project_roots: vec![],
@@ -380,6 +402,7 @@ fn b2_stage2_strict_upstream_requires_handshake_regression() {
         auto_approve_first_seen: true, // dev:首见 descriptor 自动批准,让工具能浮现
         dev_permissive_firewall: false,
         enable_privacy_filter: false,
+        enable_injection_classifier: false,
         redact_tool_results: false,
         monitor: false,
         project_roots: vec![],

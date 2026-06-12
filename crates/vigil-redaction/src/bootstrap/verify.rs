@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::error::BootstrapError;
-use super::manifest::{Manifest, ModelPaths};
+use super::manifest::{is_onnx_artifact, Manifest, ModelPaths};
 
 /// sha256 流式校验缓冲(64 KB)。大文件不一次性 load,内存占用恒定 ~64 KB。
 const HASH_READ_BUF: usize = 64 * 1024;
@@ -146,7 +146,9 @@ pub fn check_existing(target_dir: &Path, manifest: &Manifest) -> Option<ModelPat
             return None;
         }
         match f.name.as_str() {
-            "model_q4f16.onnx" => onnx = Some(path),
+            // SSOT:与 mod.rs 下载 assign 同经 is_onnx_artifact —— 此前只认 model_q4f16.onnx,
+            // 漏 deberta 的 model.onnx → check_existing 恒返 None → 每次 serve 重下载 738MB。
+            n if is_onnx_artifact(n) => onnx = Some(path),
             "tokenizer.json" => tokenizer = Some(path),
             "config.json" => config = Some(path),
             _ => {} // manifest 含其它额外文件不影响三件套就绪判定

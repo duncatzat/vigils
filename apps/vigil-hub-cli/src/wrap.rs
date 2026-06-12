@@ -87,8 +87,10 @@ pub fn run(args: &WrapArgs) -> Result<(), ServeError> {
         auto_approve_first_seen: true,
         dev_permissive_firewall: false, // 生产 default-deny(call 决策仍零信任)
         enable_privacy_filter: false,   // 硬指纹脱敏始终在;ORT 模型层 opt-in(--features ort)
-        redact_tool_results: true,      // 可逆脱敏:结果里的 secret 回模型前再脱敏(网关核心价值)
-        monitor: args.monitor,          // opt-in 非阻塞观察(turnkey 无 GUI resolver 时)
+        // 注入分类器仅 serve 直跑 opt-in;wrap turnkey 不默认拉 738MB 模型(用户可改用 serve 直跑)。
+        enable_injection_classifier: false,
+        redact_tool_results: true, // 可逆脱敏:结果里的 secret 回模型前再脱敏(网关核心价值)
+        monitor: args.monitor,     // opt-in 非阻塞观察(turnkey 无 GUI resolver 时)
         // DEF-004:边界根缺省 CWD(wrap 由 agent 在项目目录启动)。
         project_roots: serve::resolve_project_roots(&args.project_roots),
     };

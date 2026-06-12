@@ -318,6 +318,11 @@ struct CliServeArgs {
     /// 省略 = 当前工作目录(CWD)。DEF-004 之前生产入口边界为空,这两条规则形同虚设。
     #[arg(long = "project-root")]
     project_root: Vec<PathBuf>,
+    /// P0 注入防护 Slice D:启用 DeBERTa prompt-injection 软信号检测(serve warm session)。
+    /// 需编译期 `--features ort`。flag on + feature off → 启动失败 InjectionClassifierUnavailable;
+    /// flag off → 不加载。命中只 bump risk + 审计,绝不 deny。
+    #[arg(long = "enable-injection-classifier")]
+    enable_injection_classifier: bool,
 }
 
 impl From<CliServeArgs> for ServeArgs {
@@ -328,6 +333,7 @@ impl From<CliServeArgs> for ServeArgs {
             auto_approve_first_seen: c.auto_approve_first_seen,
             dev_permissive_firewall: c.dev_permissive_firewall,
             enable_privacy_filter: c.enable_privacy_filter,
+            enable_injection_classifier: c.enable_injection_classifier,
             redact_tool_results: c.redact_tool_results,
             // `serve` 子命令保持既有 enforce(default-deny + 阻塞审批);monitor 是 wrap turnkey 专用。
             monitor: false,

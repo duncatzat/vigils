@@ -215,6 +215,65 @@ pub fn placeholder_manifest() -> Manifest {
     }
 }
 
+/// DeBERTa prompt-injection 分类器下载 manifest(Slice B)。
+///
+/// 模型:`protectai/deberta-v3-base-prompt-injection-v2`(Apache-2.0),HF 官方
+/// `onnx/` 子目录 **FP32** 现成导出(不自量化)。三件套布局与 OpenAI Privacy Filter
+/// 不同:onnx 文件名是 `model.onnx`(非 `model_q4f16.onnx`),且**无** external-data
+/// 旁文件(单文件 738 MB,FP32 权重全在 model.onnx 内)。
+///
+/// size / sha256 为 **实测值**(2026-06-12 `curl` HF resolve + `sha256sum` + `stat`):
+/// - `model.onnx` 738,563,188 B,sha256 `f0ea7f23…`(与 HF lfs oid 对账一致)
+/// - `tokenizer.json` 8,648,886 B
+/// - `config.json` 1,014 B
+///
+/// 注:DeBERTa fast tokenizer.json 自包含 vocab,运行时不依赖 spm.model,故 manifest
+/// **不含** spm.model(InjectionClassifier 只读 tokenizer.json / config.json / model.onnx)。
+pub fn injection_classifier_manifest() -> Manifest {
+    Manifest {
+        model_name: "deberta-injection".to_string(),
+        version: "v2".to_string(),
+        chunk_count: 16,
+        model_id: "deberta-v3-base-prompt-injection-v2".to_string(),
+        // 二分类 SAFE/INJECTION 自成 label space,与 8class PII label space 解耦
+        label_space_version: "injection-binary-v1".to_string(),
+        default: false,
+        files: vec![
+            ManifestFile {
+                name: "model.onnx".to_string(),
+                size_bytes: 738563188,
+                sha256: "f0ea7f239f765aedbde7c9e163a7cb38a79c5b8853d3f76db5152172047b228c".to_string(),
+                primary_url: "https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2/resolve/main/onnx/model.onnx".to_string(),
+                fallback_urls: vec![],
+            },
+            ManifestFile {
+                name: "tokenizer.json".to_string(),
+                size_bytes: 8648886,
+                sha256: "752fe5f0d5678ad563e1bd2ecc1ddf7a3ba7e2024d0ac1dba1a72975e26dff2f".to_string(),
+                primary_url: "https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2/resolve/main/onnx/tokenizer.json".to_string(),
+                fallback_urls: vec![],
+            },
+            ManifestFile {
+                name: "config.json".to_string(),
+                size_bytes: 1014,
+                sha256: "3093743035223c46b1497a72e939e56fa0a50afbd7bafbf7eb8aad060b8d23f8".to_string(),
+                primary_url: "https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2/resolve/main/onnx/config.json".to_string(),
+                fallback_urls: vec![],
+            },
+        ],
+    }
+}
+
+/// `ModelPaths.onnx` slot 接受的 onnx 文件名(OpenAI q4f16 量化 / DeBERTa FP32 两套布局共用)。
+///
+/// **SSOT**:下载 assign([`super::ensure_with_manifest`])与就绪检查
+/// ([`super::verify::check_existing`])都经此判定,杜绝文件名 match 两处漂移 —— 曾因
+/// check_existing 漏 `model.onnx`(只认 `model_q4f16.onnx`)导致 deberta 每次 serve 启动
+/// check_existing 返 None → 重下载 738MB。新增模型的 onnx 文件名只改这一处。
+pub(crate) fn is_onnx_artifact(name: &str) -> bool {
+    matches!(name, "model_q4f16.onnx" | "model.onnx")
+}
+
 // ─────────────────────────── v0.7-α3 Phase 3 Design 守门测试 ───────────────────────────
 
 #[cfg(test)]
@@ -238,6 +297,18 @@ mod tests_v07_alpha3 {
         assert_eq!(m.model_id, "", "缺字段应走 serde default 空串");
         assert_eq!(m.label_space_version, "");
         assert!(!m.default, "缺字段应 default = false");
+    }
+
+    /// SSOT 守门:is_onnx_artifact 覆盖两套布局的 onnx 文件名(OpenAI q4f16 + DeBERTa FP32),
+    /// 拒绝其它。mod.rs 下载 assign 与 verify::check_existing 都依赖它 —— 漏任一名字会让对应
+    /// 模型每次 serve 重下载 738MB(deberta model.onnx 曾踩此坑)。
+    #[test]
+    fn is_onnx_artifact_covers_both_layouts() {
+        assert!(is_onnx_artifact("model_q4f16.onnx"), "OpenAI q4f16 onnx");
+        assert!(is_onnx_artifact("model.onnx"), "DeBERTa FP32 onnx");
+        assert!(!is_onnx_artifact("tokenizer.json"));
+        assert!(!is_onnx_artifact("config.json"));
+        assert!(!is_onnx_artifact("model.bin"));
     }
 
     /// 新 schema(顶层 models array)deser 应直接走新路径。
@@ -363,5 +434,39 @@ mod tests_v07_alpha3 {
         assert_eq!(m.model_id, "openai-privacy-filter-v1");
         assert_eq!(m.label_space_version, "8class-v1");
         assert!(m.default, "单模型 placeholder 应 default = true");
+    }
+
+    /// Slice B:DeBERTa 注入分类器 manifest 结构守门 —— 三件套 + deberta 文件名
+    /// (model.onnx 而非 model_q4f16.onnx)+ HF resolve URL + 非空 sha256。
+    #[test]
+    fn injection_classifier_manifest_three_files_with_deberta_layout() {
+        let m = injection_classifier_manifest();
+        assert_eq!(m.model_id, "deberta-v3-base-prompt-injection-v2");
+        assert_eq!(m.label_space_version, "injection-binary-v1");
+        assert!(!m.default, "注入分类器非默认 PII 模型,default = false");
+        assert_eq!(
+            m.files.len(),
+            3,
+            "deberta 三件套:model.onnx/tokenizer/config"
+        );
+
+        let names: Vec<&str> = m.files.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"model.onnx"), "onnx 文件名应为 model.onnx");
+        assert!(names.contains(&"tokenizer.json"));
+        assert!(names.contains(&"config.json"));
+        // 不得误带 OpenAI 的 q4f16 文件名(布局区分守门)
+        assert!(!names.contains(&"model_q4f16.onnx"));
+
+        for f in &m.files {
+            assert!(f.size_bytes > 0, "{} size 必须实测非 0", f.name);
+            assert_eq!(f.sha256.len(), 64, "{} sha256 应是 64 hex", f.name);
+            assert!(
+                f.primary_url.starts_with(
+                    "https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2/"
+                ),
+                "{} URL 应指向官方 HF 仓库",
+                f.name
+            );
+        }
     }
 }

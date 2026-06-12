@@ -14,12 +14,12 @@ categories = ["api-bindings", "authentication"]
 workspace = true
 
 [dependencies]
-vigil-types = { path = "../vigil-types", version = "0.2.0-beta.2" }
-vigil-policy = { path = "../vigil-policy", version = "0.2.0-beta.2" }
-vigil-audit = { path = "../vigil-audit", version = "0.2.0-beta.2" }
+vigil-types = { path = "../vigil-types", version = "0.2.0-beta.3" }
+vigil-policy = { path = "../vigil-policy", version = "0.2.0-beta.3" }
+vigil-audit = { path = "../vigil-audit", version = "0.2.0-beta.3" }
 # ISS-010: T0 preflight 扫描(vigil-firewall 在 evaluate 前调 scan_text 产 PII findings)。
 # 依赖方向 T1 → T0 合法(vigil-redaction 纯函数、无反向依赖)。
-vigil-redaction = { path = "../vigil-redaction", version = "0.2.0-beta.2" }
+vigil-redaction = { path = "../vigil-redaction", version = "0.2.0-beta.3" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

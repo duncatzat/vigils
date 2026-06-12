@@ -8,6 +8,38 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.2.0-beta.3] — 2026-06-12 — DeBERTa injection classifier (serve path)
+
+### Added — DeBERTa prompt-injection classifier (opt-in, serve path)
+
+The heuristic injection defense (beta.2) now has an optional **second detector**: a fine-tuned
+DeBERTa sequence classifier (`protectai/deberta-v3-base-prompt-injection-v2`, Apache-2.0) that
+catches natural-language jailbreaks the 5 regex rules miss (measured recall **+0.28** over the
+heuristic alone). It runs as a **warm-session soft signal on the MCP gateway serve path**, never
+in the short-lived hook (the 738 MB model can't reload per hook spawn).
+
+- **Opt-in, zero default footprint**: requires building with `--features ort` *and*
+  `vigil-hub serve --enable-injection-classifier`. Default builds carry zero ORT dependencies.
+  The model (738 MB FP32) is fetched once on first start (16-chunk parallel + sha256 verify).
+- **Two scan points**: tool descriptors (at descriptor pin) and tool results, each fused with the
+  heuristic detector. On hit it bumps session risk (heuristic + DeBERTa delta taken as **max, not
+  summed**) and writes a zero-echo audit event. **Still a pure soft signal — it never denies and
+  never rewrites the result** (rewrite belongs only to the secret-redaction path).
+- **Fail-closed plumbing**: `--enable-injection-classifier` without `--features ort` aborts startup
+  (never silently degrades), mirroring the privacy-filter contract.
+
+### Fixed
+
+- **`check_existing` re-download bug**: the model-cache readiness check only recognized the OpenAI
+  `model_q4f16.onnx` filename, so the DeBERTa `model.onnx` cache always missed → every `serve`
+  start re-downloaded 738 MB. Fixed via a shared `is_onnx_artifact` SSOT (download assign +
+  readiness check use one matcher) with end-to-end + unit regression guards.
+
+> **Deployment note (ORT)**: the `ort` feature uses `load-dynamic` — it needs the correct
+> `onnxruntime.dll` (ORT 1.24) reachable by the executable (same directory / PATH). A wrong-version
+> DLL elsewhere on the system path can hang initialization. This is an existing ORT requirement
+> (shared with the privacy filter), not specific to the classifier.
+
 ## [v0.2.0-beta.2] — 2026-06-12 — Prompt-injection defense
 
 ### Added — prompt-injection defense (P0)

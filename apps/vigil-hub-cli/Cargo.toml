@@ -71,6 +71,7 @@ vigil-audit = { path = "../../crates/vigil-audit", features = ["test-util"] }
 tempfile = { workspace = true }
 
 [features]
-# ISS-008 Phase 2 T5:透传到 vigil-firewall/ort → vigil-redaction/ort,
-# 启用 OrtPiiScanner 注入。默认 feature 矩阵 0 ort 痕迹。
-ort = ["vigil-firewall/ort"]
+# ISS-008 Phase 2 T5:透传到 vigil-firewall/ort → vigil-redaction/ort,启用 OrtPiiScanner 注入。
+# P0 Slice D 追加 vigil-mcp/ort:激活 Hub::with_injection_classifier + injection.rs(DeBERTa)。
+# 默认 feature 矩阵 0 ort 痕迹(两条传播都默认 off)。
+ort = ["vigil-firewall/ort", "vigil-mcp/ort"]

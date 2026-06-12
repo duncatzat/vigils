@@ -211,6 +211,69 @@ fn test_etag_304_short_circuit() {
     );
 }
 
+/// 回归守门(deberta model.onnx):check_existing 必须认 `model.onnx` 文件名(deberta FP32 布局)。
+/// 此前 verify::check_existing 的 match 只认 `model_q4f16.onnx` → deberta check_existing 恒返
+/// None → 每次 serve 启动重下载 738MB。复用 q4f16 fixture 字节但以 model.onnx 落盘 + manifest,
+/// 断言 ensure_with_manifest 走 0 网络命中(server 命中即 panic)。
+#[test]
+fn test_check_existing_accepts_deberta_model_onnx() {
+    let tmp = TempDir::new().expect("tmp");
+    let onnx_bytes = fixture_bytes("model_q4f16.onnx");
+    std::fs::write(tmp.path().join("model.onnx"), &onnx_bytes).unwrap();
+    std::fs::write(
+        tmp.path().join("tokenizer.json"),
+        fixture_bytes("tokenizer.json"),
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("config.json"), fixture_bytes("config.json")).unwrap();
+
+    // server 命中即 panic → 证明走 check_existing 命中(0 网络),而非重下载
+    let (base_url, _h, counter, server) = spawn_stub_server(|_req, _n| {
+        panic!("server should NOT be hit when deberta model.onnx cache is sha256-valid");
+    });
+
+    // deberta 布局 manifest:onnx 文件名 model.onnx(非 q4f16)
+    let manifest = Manifest {
+        model_name: "deberta-injection".to_string(),
+        version: "v2".to_string(),
+        chunk_count: 16,
+        files: vec![
+            ManifestFile {
+                name: "model.onnx".to_string(),
+                size_bytes: onnx_bytes.len() as u64,
+                sha256: fixture_sha256("model_q4f16.onnx"),
+                primary_url: format!("{base_url}/model.onnx"),
+                fallback_urls: vec![],
+            },
+            ManifestFile {
+                name: "tokenizer.json".to_string(),
+                size_bytes: fixture_bytes("tokenizer.json").len() as u64,
+                sha256: fixture_sha256("tokenizer.json"),
+                primary_url: format!("{base_url}/tokenizer.json"),
+                fallback_urls: vec![],
+            },
+            ManifestFile {
+                name: "config.json".to_string(),
+                size_bytes: fixture_bytes("config.json").len() as u64,
+                sha256: fixture_sha256("config.json"),
+                primary_url: format!("{base_url}/config.json"),
+                fallback_urls: vec![],
+            },
+        ],
+        ..Default::default()
+    };
+    let result = ensure_with_manifest(Some(tmp.path()), &manifest);
+    drop(server);
+
+    let paths = result.expect("check_existing 应命中 model.onnx,不应重下载");
+    assert!(paths.onnx.exists(), "onnx slot 应填 model.onnx");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "model.onnx 缓存 sha256 有效时应 0 网络命中(回归守门:此前漏 model.onnx 致重下载 738MB)"
+    );
+}
+
 // ────────────────────────────── (c) ──────────────────────────────
 
 #[test]

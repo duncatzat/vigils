@@ -8,6 +8,33 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.2.0-beta.3] — 2026-06-12 — DeBERTa 注入分类器(serve 路径)
+
+### 新增 —— DeBERTa 提示注入分类器(opt-in,serve 路径)
+
+beta.2 的启发式注入防护现在有了可选的**第二检测器**:微调的 DeBERTa 序列分类器
+(`protectai/deberta-v3-base-prompt-injection-v2`,Apache-2.0),抓住 5 条正则漏掉的自然语言越狱
+(实测 recall 较纯启发式 **+0.28**)。它作为 **MCP 网关 serve 路径上的 warm-session 软信号**运行,
+绝不进短生命周期的 hook(738 MB 模型无法每次 hook spawn 重载)。
+
+- **opt-in,默认零痕迹**:需要 `--features ort` 编译*且* `vigil-hub serve --enable-injection-classifier`。
+  默认构建零 ORT 依赖。模型(738 MB FP32)首次启动时拉取一次(16 chunk 并发 + sha256 校验)。
+- **两个扫描点**:工具描述(descriptor pin 时)与工具结果,各自与启发式检测器融合。命中时提升
+  session 风险分(启发式 + DeBERTa delta **取 max,非累加**)+ 写零回显审计事件。**仍是纯软信号——
+  绝不 deny、绝不改写 result**(改写仅属凭据脱敏路径)。
+- **fail-closed 接线**:`--enable-injection-classifier` 但未 `--features ort` 会中止启动(绝不静默
+  降级),与 privacy filter 的契约一致。
+
+### 修复
+
+- **`check_existing` 重下载 bug**:模型缓存就绪检查只认 OpenAI 的 `model_q4f16.onnx` 文件名,
+  DeBERTa 的 `model.onnx` 缓存恒 miss → 每次 `serve` 启动重下载 738 MB。修复:抽共享
+  `is_onnx_artifact` SSOT(下载 assign + 就绪检查共用一个匹配器),加端到端 + 单元回归守门。
+
+> **部署注意(ORT)**:`ort` feature 用 `load-dynamic`——需要正确版本的 `onnxruntime.dll`
+> (ORT 1.24)能被可执行文件找到(同目录 / PATH)。系统路径上其它位置的错误版本 DLL 会让初始化卡住。
+> 这是 ORT 既有要求(与 privacy filter 共享),非分类器特有。
+
 ## [v0.2.0-beta.2] — 2026-06-12 — 提示注入防护
 
 ### 新增 —— 提示注入防护(P0)

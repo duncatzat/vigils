@@ -32,7 +32,9 @@ pub mod verify;
 mod tests;
 
 pub use error::BootstrapError;
-pub use manifest::{placeholder_manifest, Manifest, ManifestFile, ModelPaths};
+pub use manifest::{
+    injection_classifier_manifest, placeholder_manifest, Manifest, ManifestFile, ModelPaths,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -60,6 +62,22 @@ use std::path::{Path, PathBuf};
 pub fn ensure_model_available(target_dir: Option<&Path>) -> Result<ModelPaths, BootstrapError> {
     // v0.5 P2:用占位 Manifest;v0.5.1 注入真值(URL/sha256)
     let manifest = placeholder_manifest();
+    ensure_with_manifest(target_dir, &manifest)
+}
+
+/// P0 注入防护 Slice D:确保 DeBERTa prompt-injection 分类器三件套就绪。
+///
+/// 与 [`ensure_model_available`](OpenAI PII NER 模型)**解耦**:走
+/// [`injection_classifier_manifest`](`deberta-injection-v2/` 独立目录),两套模型的
+/// `model.onnx` 不会互相覆盖。`vigil-hub serve --enable-injection-classifier` 启动期调用,
+/// 失败 fail-closed(绝不静默跳过 —— 用户感知"已启用注入检测"实际未生效是安全事故)。
+///
+/// 本函数纯下载/校验逻辑(reqwest blocking),**不**依赖 `ort` feature;真正用模型推理的
+/// [`InjectionClassifier`](crate::InjectionClassifier) 才需 `--features ort`。
+pub fn ensure_injection_model_available(
+    target_dir: Option<&Path>,
+) -> Result<ModelPaths, BootstrapError> {
+    let manifest = injection_classifier_manifest();
     ensure_with_manifest(target_dir, &manifest)
 }
 
@@ -116,7 +134,10 @@ pub(crate) fn ensure_with_manifest(
         let _ = verify::cleanup_partials(&target_dir_buf);
 
         match f.name.as_str() {
-            "model_q4f16.onnx" => onnx = Some(outcome.final_path),
+            // OpenAI Privacy Filter 用 q4f16 量化 onnx;DeBERTa 注入分类器用 FP32 model.onnx
+            // (两套布局共用 ModelPaths.onnx slot)。SSOT:与 verify::check_existing 同经
+            // is_onnx_artifact 判定,杜绝文件名 match 漂移。
+            n if manifest::is_onnx_artifact(n) => onnx = Some(outcome.final_path),
             "tokenizer.json" => tokenizer = Some(outcome.final_path),
             "config.json" => config = Some(outcome.final_path),
             _ => {} // manifest 额外文件忽略不进 ModelPaths

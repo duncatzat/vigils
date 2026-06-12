@@ -103,6 +103,15 @@ pub struct ServeArgs {
     /// 空 = 不配置边界(policy 引擎空 roots 守门让两条规则都不匹配,FsWrite 落
     /// default-deny floor;monitor 姿态下 floor 被观察放行)。CLI 缺省 = 进程 CWD。
     pub project_roots: Vec<String>,
+
+    /// P0 注入防护 Slice D:启用 DeBERTa prompt-injection 软信号检测(serve warm session)。
+    /// fail-closed 同 [`enable_privacy_filter`](Self::enable_privacy_filter):
+    /// - flag on + feature on → 启动期 ensure 模型 + warm-load + warmup,descriptor/result 软信号扫描
+    /// - flag on + feature off → [`ServeError::InjectionClassifierUnavailable`](绝不静默跳过)
+    /// - flag off → 不加载(0 推理开销)
+    ///
+    /// **软信号铁律**:命中只 bump session risk + 审计,**绝不** deny。
+    pub enable_injection_classifier: bool,
 }
 
 /// DEF-004:把 CLI `--project-root` 解析成 [`ServeArgs::project_roots`]。
@@ -233,6 +242,21 @@ pub enum ServeError {
     /// ~7s,首请求 SLA 不再受影响。
     #[error("privacy filter init failed: {0}")]
     PrivacyFilterInit(#[from] vigil_redaction::engine::EngineError),
+
+    /// P0 注入防护 Slice D:运行期 `--enable-injection-classifier` 请求 DeBERTa 注入分类器,
+    /// 但当前二进制**未**用 `--features ort` 编译。fail-closed 启动失败,绝不静默跳过
+    /// (否则用户感知"已启用注入检测"实际未生效是安全事故)。
+    #[error(
+        "injection classifier requested via --enable-injection-classifier, \
+         but vigil-hub-cli was not built with `--features ort`"
+    )]
+    InjectionClassifierUnavailable,
+
+    /// P0 注入防护 Slice D:DeBERTa 分类器装载失败(Session init / config 解析 / tokenizer)。
+    /// 与 [`PrivacyFilterInit`](Self::PrivacyFilterInit)同级 fail-closed;独立 variant 便于诊断
+    /// 是哪个引擎失败(`EngineError` 已被 `PrivacyFilterInit` `#[from]`,故此处手动 `map_err`)。
+    #[error("injection classifier init failed: {0}")]
+    InjectionClassifierInit(vigil_redaction::engine::EngineError),
 
     /// v0.5 P2 ADR 0012:`ensure_model_available` 启动期失败(下载 / sha256 / 磁盘 /
     /// 全 mirror 不可达)。BootstrapError 5 变体 fail-closed,**绝不**降级 NoopEngine,
@@ -381,13 +405,41 @@ pub fn build_hub_with_config(
         None => SecretAliasMap::default(),
     };
 
-    let hub = Arc::new(Hub::new(
-        ledger.clone(),
-        firewall,
-        oracle,
-        hub_cfg,
-        secret_aliases,
-    ));
+    #[cfg_attr(not(feature = "ort"), allow(unused_mut))]
+    let mut hub_inner = Hub::new(ledger.clone(), firewall, oracle, hub_cfg, secret_aliases);
+
+    // P0 注入防护 Slice D:DeBERTa 注入分类器 warm-load(fail-closed 双分支,复刻上面
+    // enable_privacy_filter 的 fail-closed 纪律 —— flag on + feature off 绝不静默降级)。
+    if args.enable_injection_classifier {
+        #[cfg(feature = "ort")]
+        {
+            // 独立 manifest(deberta-injection-v2/ 目录)→ ensure 三件套(并发 16 chunk + sha256)。
+            let model_paths = vigil_redaction::ensure_injection_model_available(None)
+                .map_err(ServeError::BootstrapFailed)?;
+            let classifier =
+                vigil_redaction::InjectionClassifier::from_model_dir(model_paths.dir())
+                    .map_err(ServeError::InjectionClassifierInit)?;
+            // warmup:把 graph optimize / kernel JIT 的 cold-path 前移到启动期(fire-and-forget)。
+            let _ = classifier.warmup();
+            eprintln!(
+                "vigil-hub serve: InjectionClassifier = deberta (warm; dir={})",
+                model_paths.dir().display()
+            );
+            hub_inner = hub_inner.with_injection_classifier(Arc::new(classifier));
+        }
+        #[cfg(not(feature = "ort"))]
+        {
+            // fail-closed:flag on 但二进制未编译 ort feature。
+            return Err(ServeError::InjectionClassifierUnavailable);
+        }
+    } else {
+        eprintln!(
+            "vigil-hub serve: InjectionClassifier = off \
+             (default; pass --enable-injection-classifier + build with --features ort to activate)"
+        );
+    }
+
+    let hub = Arc::new(hub_inner);
     // set_session_id_for_test 是 lib API 的命名纪律瑕疵(见 feedback);serve 是
     // 生产入口,但 Hub 目前对外只暴露这一个 session 注入方法。v0.3 Stage 2 再
     // 把它改名为 `set_session_id`(同时 `_for_test` 作为 guard 仅 cfg(test) 暴露)。

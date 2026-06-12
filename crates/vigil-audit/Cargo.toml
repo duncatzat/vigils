@@ -19,10 +19,10 @@ workspace = true
 test-util = []
 
 [dependencies]
-vigil-types = { path = "../vigil-types", version = "0.2.0-beta.2" }
+vigil-types = { path = "../vigil-types", version = "0.2.0-beta.3" }
 # I01 扩展依赖:fail-closed 入口自检(ADR 0002 §D1)。
 # I00 的 "只能依赖 vigil-types" 约束是 I00 阶段性规则,I01 按 ADR 0002 明确放开。
-vigil-redaction = { path = "../vigil-redaction", version = "0.2.0-beta.2" }
+vigil-redaction = { path = "../vigil-redaction", version = "0.2.0-beta.3" }
 
 # I01 核心依赖
 rusqlite = { workspace = true }

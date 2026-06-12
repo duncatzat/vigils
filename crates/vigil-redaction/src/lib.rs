@@ -70,6 +70,14 @@ pub mod engine;
 pub use engine::OrtEngine;
 pub use engine::{EngineError, MockEngine, NoopEngine, RedactionEngine};
 
+// DeBERTa prompt-injection 序列二分类引擎(Slice A)。
+// 整模块 #[cfg(feature = "ort")] gate(injection.rs 顶部),默认 feature 0 痕迹。
+// 与 OrtEngine(token 级 NER)正交:返回标量 p_injection,不接 RedactionEngine trait。
+#[cfg(feature = "ort")]
+pub mod injection;
+#[cfg(feature = "ort")]
+pub use injection::InjectionClassifier;
+
 // v0.7-α3 Phase 3 Design(ADR 0017)— ModelDescriptor trait + canonical mapping
 // scaffold。**crate-public**(自 R1 起;支持 examples / firewall S4 集成),
 // 但 **不在 SDK Phase 1 暴露**(ADR 0015 边界保留;v0.8 才稳定 SDK)。
@@ -89,7 +97,9 @@ pub use ensemble::EngineAttribution;
 #[cfg(feature = "ort")]
 pub mod bootstrap;
 #[cfg(feature = "ort")]
-pub use bootstrap::{ensure_model_available, BootstrapError, ModelPaths};
+pub use bootstrap::{
+    ensure_injection_model_available, ensure_model_available, BootstrapError, ModelPaths,
+};
 
 // `scan_text_with_engine`:`scan_text` 的引擎注入版,行为保留 EmptyInput +
 // fail-closed 不变量;详见 `scan::scan_text_with_engine` rustdoc。
