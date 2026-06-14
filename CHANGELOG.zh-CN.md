@@ -8,6 +8,23 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.2.0-beta.5] — 2026-06-15 — ORT-init 超时对称(privacy filter)
+
+### 修复 —— ORT-init 超时兜底现覆盖两条模型路径
+
+对 beta.4 的交叉评审(hostile sub-agent + Codex,两路独立得出)发现:beta.4 新增的 warm-load
+超时/abort 兜底**只**保护了**注入分类器**路径。**privacy filter**(`--enable-privacy-filter`)
+经同样的 `load-dynamic` `dlopen` 初始化 ORT,仍可能 hang 在错误/stub `onnxruntime.dll` 上、死握
+Windows loader lock —— 这正是 beta.4 要修的故障,却在 privacy-filter 路径上原样残留。
+
+- **共享 `run_ort_init_with_timeout` helper**:两条 ORT init 路径(注入分类器 + privacy filter)
+  现在都在工作线程上、同一主线程超时下运行。对称兜底,无路径遗漏。
+- **worker panic 与超时区分**:worker panic(channel `Disconnected`)现在映射为干净的 fail-closed
+  `OrtInitPanicked` 错误,而非被误判为 loader-lock 超时而 `abort()`。只有真超时(很可能是 loader
+  lock)才仍然 abort。
+- 超时诊断现在也会指出慢盘/远端盘 cold-load 是可能原因(不再一口咬定 stub dll);移除了一处过时
+  文档引用;`set_var` 时序不变量已注释;新增 2 个回归守门测试。
+
 ## [v0.2.0-beta.4] — 2026-06-14 — 注入分类器部署加固
 
 ### 修复 / 加固 —— DeBERTa ORT 部署(问题 B)

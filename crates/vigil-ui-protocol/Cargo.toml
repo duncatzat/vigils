@@ -14,11 +14,11 @@ categories = ["data-structures", "api-bindings"]
 workspace = true
 
 [dependencies]
-vigil-types = { path = "../vigil-types", version = "0.2.0-beta.4" }
-vigil-audit = { path = "../vigil-audit", version = "0.2.0-beta.4" }
+vigil-types = { path = "../vigil-types", version = "0.2.0-beta.5" }
+vigil-audit = { path = "../vigil-audit", version = "0.2.0-beta.5" }
 # ADR 0018 v0.13 split:改依赖 vigil-runner-types(pure types,0 vigil deps),
 # 不再拉 vigil-runner concrete(wasmtime/sandbox-linux),unblock SDK publish。
-vigil-runner-types = { path = "../vigil-runner-types", version = "0.2.0-beta.4" }
+vigil-runner-types = { path = "../vigil-runner-types", version = "0.2.0-beta.5" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

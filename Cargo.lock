@@ -5922,7 +5922,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vigil-audit"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "criterion",
  "hex",
@@ -5942,7 +5942,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-browser"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "once_cell",
  "regex",
@@ -5955,7 +5955,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-desktop"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "clap",
  "dirs 6.0.0",
@@ -5982,7 +5982,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-firewall"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "dunce",
  "hex",
@@ -6006,7 +6006,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-http-auth"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -6023,7 +6023,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-http-transport"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -6057,7 +6057,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-hub-cli"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "clap",
  "dirs 6.0.0",
@@ -6090,7 +6090,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-lease"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "hex",
  "keyring",
@@ -6108,7 +6108,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-mcp"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "hex",
  "once_cell",
@@ -6133,7 +6133,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-native-host"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "clap",
  "dirs 6.0.0",
@@ -6147,7 +6147,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-policy"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -6157,7 +6157,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-redaction"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "criterion",
  "dirs 5.0.1",
@@ -6179,7 +6179,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-runner"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "cap-std",
  "dunce",
@@ -6200,7 +6200,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-runner-types"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "dunce",
  "serde",
@@ -6209,7 +6209,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-sandbox-linux"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "landlock",
  "libc",
@@ -6219,7 +6219,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-sdk"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "serde_json",
  "uuid",
@@ -6233,7 +6233,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-types"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -6241,7 +6241,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-ui-protocol"
-version = "0.2.0-beta.4"
+version = "0.2.0-beta.5"
 dependencies = [
  "serde",
  "serde_jcs",

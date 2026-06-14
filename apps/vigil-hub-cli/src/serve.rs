@@ -264,6 +264,19 @@ pub enum ServeError {
     #[cfg(feature = "ort")]
     #[error("model bootstrap failed: {0}")]
     BootstrapFailed(#[from] vigil_redaction::BootstrapError),
+
+    /// 优化问题 B(Codex 交叉审查 MEDIUM):ort 初始化工作线程 **panic**(channel Disconnected,
+    /// **非**超时)。panic unwind 已正常释放栈,**不**持 Windows loader lock → 可干净
+    /// fail-closed 返 Err,而非走超时分支的 `abort()`。`what` 标明是哪条 ort 路径
+    /// (injection classifier / privacy filter),静态字面量、不含任何敏感值。
+    #[cfg(feature = "ort")]
+    #[error(
+        "{what} init worker panicked (not a timeout — check model / onnxruntime.dll integrity)"
+    )]
+    OrtInitPanicked {
+        /// 出错的 ort 路径名(静态字面量,非敏感)
+        what: &'static str,
+    },
 }
 
 /// 优化问题 B:DeBERTa 装载超时上限(秒)。正常 warm-load(ensure 命中 + from_model_dir + warmup)
@@ -277,8 +290,10 @@ const ORT_INIT_TIMEOUT_SECS: u64 = 45;
 /// dll(实测 2.8KB 假 dll)导致的 init hang。
 ///
 /// 纪律:① 用户已显式设 `ORT_DYLIB_PATH` → 尊重不覆盖;② 仅当 exe 同目录存在**合理大小**
-/// (>1MB,排除 KB 级 stub)的 dylib 才设;③ 找不到则不设 —— 交给 ort 默认查找 + 下游超时兜底
-/// 报错(`InjectionClassifierTimeout`)。
+/// (>1MB,排除 KB 级 stub)的 dylib 才设 —— 注:大小启发式**不**校验版本/ABI,放错版本的
+/// 大 dll 仍可能被选中,需 operator 保证是 ORT 1.24;③ 找不到则不设 —— 交给 ort 默认查找 +
+/// 下游 [`run_ort_init_with_timeout`] 超时兜底(真超时 `abort()` / worker panic 返
+/// [`ServeError::OrtInitPanicked`])。
 #[cfg(feature = "ort")]
 fn prepare_ort_dylib_path() {
     if std::env::var_os("ORT_DYLIB_PATH").is_some() {
@@ -306,9 +321,64 @@ fn prepare_ort_dylib_path() {
     {
         std::env::set_var("ORT_DYLIB_PATH", &candidate);
         eprintln!(
-            "vigil-hub serve: ORT_DYLIB_PATH = {} (exe-local; avoids system stub dll)",
+            "vigil-hub serve: ORT_DYLIB_PATH = {} (exe-local; avoids system stub dll; \
+             size>1MB heuristic only — ensure it is ORT 1.24)",
             candidate.display()
         );
+    }
+}
+
+/// 优化问题 B(hostile + Codex 交叉审查 H-1):ort 初始化结局三态。`run_ort_init_with_timeout`
+/// 返回此枚举,封死"只保护一条 ort 路径"的不对称缺口。
+#[cfg(feature = "ort")]
+enum OrtInitOutcome {
+    /// build 自身干净返 Err(env 缺 / 模型缺 / Session init 失败 —— 可恢复诊断)。
+    Failed(vigil_redaction::engine::EngineError),
+    /// worker 线程 **panic**(channel `Disconnected`;**非**超时)。panic unwind 已释放栈、
+    /// 不持 loader lock → 调用方干净 fail-closed 返 Err,**不** abort。
+    Panicked,
+}
+
+/// 优化问题 B(hostile + Codex 交叉审查 H-1):把"ort 初始化(dlopen + Session 创建)放工作
+/// 线程 + 主线程 `recv_timeout` 超时"封装成**共享** helper —— injection classifier 与
+/// privacy filter 两条 ort 路径**都**经此,补齐此前仅 injection 有兜底、privacy 路径 ort init
+/// hang 原样残留的不对称缺口。
+///
+/// 三种结局:
+/// - `Ok(value)` —— build 成功(已含调用方在闭包内的 warmup 等副作用)。
+/// - `Err(OrtInitOutcome::Failed(e))` —— build 干净返 Err。
+/// - `Err(OrtInitOutcome::Panicked)` —— worker panic(`Disconnected`;非超时)。Codex 审查
+///   MEDIUM:`Disconnected` 不能与超时混判,否则误诊断 + 不必要 abort;panic 不持 loader
+///   lock,可干净返 Err。
+/// - **真超时不返回**:worker 极可能 hang 在 ort `LoadLibrary` 持 **Windows loader lock**,
+///   优雅退出(ExitProcess)会等 loader lock → 死锁(实测进程残留,连 `taskkill /F` 都杀不掉)。
+///   故 `abort()`(经 `__fastfail` 内核级立即终止,绕过 loader lock)。
+///
+/// `what` 仅用于超时诊断打印(静态字面量,非敏感)。
+#[cfg(feature = "ort")]
+fn run_ort_init_with_timeout<T: Send + 'static>(
+    what: &'static str,
+    build: impl FnOnce() -> Result<T, vigil_redaction::engine::EngineError> + Send + 'static,
+) -> Result<T, OrtInitOutcome> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(build()); // 接收端超时/panic 后本 send 失败,无害
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(ORT_INIT_TIMEOUT_SECS)) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(OrtInitOutcome::Failed(e)),
+        // worker 未 send 即退出(panic):栈已 unwind,不持 loader lock → 干净返 Err。
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(OrtInitOutcome::Panicked),
+        // 真超时:worker 极可能 hang 在 loader lock,只能 abort 绕过(见上文)。
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "vigil-hub serve: {what} init timed out (~{ORT_INIT_TIMEOUT_SECS}s) — likely a \
+                 wrong/stub onnxruntime.dll on the system path, or model cold-load on a very slow / \
+                 remote disk. Place the correct ORT 1.24 onnxruntime.dll next to the executable or \
+                 set ORT_DYLIB_PATH, then retry. Aborting."
+            );
+            std::process::abort();
+        }
     }
 }
 
@@ -344,6 +414,13 @@ pub fn build_hub_with_config(
     // 优化问题 B:在**任何 ort 路径**(privacy filter / injection classifier)前稳住 onnxruntime
     // dylib 来源 —— ort load-dynamic 默认走系统 LoadLibrary,Windows 上可能命中 System32 的
     // 错误/stub onnxruntime.dll → init 静默 hang。优先用 exe 同目录的 dll(未设 ORT_DYLIB_PATH 时)。
+    //
+    // **并发安全不变量(必须维持 —— hostile L-1 + Codex HIGH-2)**:此处 `set_var(ORT_DYLIB_PATH)`
+    // 与下方 privacy 分支的 `set_var(VIGIL_PRIVACY_FILTER_MODEL_DIR)` 必须在**任何 `thread::spawn`
+    // 之前**完成 —— `set_var` 在有其他线程并发读环境时是 data-race UB(glibc setenv/getenv)。
+    // 当前到此点为止全程单线程(ledger open 无后台线程;模型下载用 `thread::scope` 已 join);
+    // 唯一的 ort 工作线程由 `run_ort_init_with_timeout` 在更后面才 spawn → set_var happens-before
+    // 成立。谁在这两个 set_var 之前新增 `thread::spawn`,谁就破坏此不变量。
     #[cfg(feature = "ort")]
     if args.enable_injection_classifier || args.enable_privacy_filter {
         prepare_ort_dylib_path();
@@ -397,8 +474,19 @@ pub fn build_hub_with_config(
                 model_paths.dir().display()
             );
 
-            let scanner = vigil_firewall::ort_scanner_arc_from_env()
-                .map_err(ServeError::PrivacyFilterInit)?;
+            // 优化问题 B(H-1):privacy filter 的 ort init 与 injection 同样可能 hang 在错误
+            // onnxruntime.dll 的 LoadLibrary;经共享 `run_ort_init_with_timeout` 套上同款超时 /
+            // panic 兜底,补齐此前的不对称缺口(此前此处直接同步 init,无任何兜底)。
+            let scanner = run_ort_init_with_timeout(
+                "privacy filter",
+                vigil_firewall::ort_scanner_arc_from_env,
+            )
+            .map_err(|o| match o {
+                OrtInitOutcome::Failed(e) => ServeError::PrivacyFilterInit(e),
+                OrtInitOutcome::Panicked => ServeError::OrtInitPanicked {
+                    what: "privacy filter",
+                },
+            })?;
             // 启动 banner:stderr 一行标识当前 PiiScanner 类型,运维可观测
             eprintln!("vigil-hub serve: PiiScanner = ort (T0 Privacy Filter active)");
             Arc::new(vigil_firewall::Firewall::with_scanner(
@@ -471,36 +559,21 @@ pub fn build_hub_with_config(
             let model_paths = vigil_redaction::ensure_injection_model_available(None)
                 .map_err(ServeError::BootstrapFailed)?;
             // 优化问题 B:from_model_dir 内部触发 ort dlopen + Session 创建 —— 若系统误加载了
-            // 错误版本 onnxruntime.dll 会静默 hang。放工作线程跑 + 主线程 timeout join,把 hang
-            // 转成清晰的启动报错(InjectionClassifierTimeout)而非无限卡住。warmup 一并纳入超时。
+            // 错误版本 onnxruntime.dll 会静默 hang。经共享 `run_ort_init_with_timeout`(工作线程
+            // + 主线程 timeout)把真超时转 abort(loader-lock 安全)、worker panic 转清晰
+            // fail-closed 报错。warmup 一并纳入超时窗口。
             let dir = model_paths.dir().to_path_buf();
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let built =
-                    vigil_redaction::InjectionClassifier::from_model_dir(&dir).inspect(|c| {
-                        let _ = c.warmup(); // graph optimize / kernel JIT cold-path 前移到启动期
-                    });
-                let _ = tx.send(built); // 接收端超时退出后本 send 失败,无害
-            });
-            let classifier = match rx
-                .recv_timeout(std::time::Duration::from_secs(ORT_INIT_TIMEOUT_SECS))
-            {
-                Ok(Ok(c)) => c,
-                Ok(Err(e)) => return Err(ServeError::InjectionClassifierInit(e)),
-                Err(_) => {
-                    // 工作线程极可能 hang 在 ort `LoadLibrary`(系统错误/stub onnxruntime.dll)
-                    // 持 **Windows loader lock**。优雅退出(return Err → ExitProcess)会等
-                    // loader lock → 死锁:实测进程残留,且连 taskkill /F 都杀不掉。`abort()`
-                    // 经 __fastfail 内核级立即终止进程,绕过 loader lock。
-                    eprintln!(
-                            "vigil-hub serve: injection classifier init timed out (~{ORT_INIT_TIMEOUT_SECS}s) \
-                             — likely a wrong/stub onnxruntime.dll on the system path. Place the \
-                             correct ORT 1.24 onnxruntime.dll next to the executable or set \
-                             ORT_DYLIB_PATH, then retry. Aborting."
-                        );
-                    std::process::abort();
-                }
-            };
+            let classifier = run_ort_init_with_timeout("injection classifier", move || {
+                vigil_redaction::InjectionClassifier::from_model_dir(&dir).inspect(|c| {
+                    let _ = c.warmup(); // graph optimize / kernel JIT cold-path 前移到启动期
+                })
+            })
+            .map_err(|o| match o {
+                OrtInitOutcome::Failed(e) => ServeError::InjectionClassifierInit(e),
+                OrtInitOutcome::Panicked => ServeError::OrtInitPanicked {
+                    what: "injection classifier",
+                },
+            })?;
             eprintln!(
                 "vigil-hub serve: InjectionClassifier = deberta (warm; dir={})",
                 model_paths.dir().display()
@@ -907,5 +980,27 @@ mod tests {
             "相对路径必须被解析为绝对路径: {}",
             rel[0]
         );
+    }
+
+    /// 交叉审查 MEDIUM 守门(Codex):ort-init worker **panic**(channel Disconnected)必须
+    /// 映射为 [`OrtInitOutcome::Panicked`](干净 fail-closed),**绝不**误入超时分支的
+    /// `abort()`。若有人回归成 `Err(_) => abort()`,本测试会让进程直接 abort → 测试框架
+    /// 报 crash 立即暴露(panic=unwind 前提下 worker panic 不持 loader lock,可干净返回)。
+    #[cfg(feature = "ort")]
+    #[test]
+    fn ort_init_worker_panic_maps_to_panicked_not_abort() {
+        let outcome =
+            run_ort_init_with_timeout::<()>("test-panic", || panic!("simulated init panic"));
+        assert!(matches!(outcome, Err(OrtInitOutcome::Panicked)));
+    }
+
+    /// ort-init helper 正常路径:build 成功值原样透传(不被超时/panic 分支误吞)。
+    #[cfg(feature = "ort")]
+    #[test]
+    fn ort_init_success_passes_through() {
+        let outcome = run_ort_init_with_timeout("test-ok", || {
+            Ok::<_, vigil_redaction::engine::EngineError>(42u32)
+        });
+        assert!(matches!(outcome, Ok(42)));
     }
 }

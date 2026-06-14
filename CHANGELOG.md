@@ -8,6 +8,26 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.2.0-beta.5] — 2026-06-15 — ORT-init timeout symmetry (privacy filter)
+
+### Fixed — ORT-init timeout guard now covers both model paths
+
+A cross-review of beta.4 (hostile sub-agent + Codex, reached independently) found that the
+warm-load timeout/abort guard added in beta.4 only protected the **injection classifier** path.
+The **privacy filter** (`--enable-privacy-filter`) initializes ORT through the same `load-dynamic`
+`dlopen` and could still hang on a wrong/stub `onnxruntime.dll`, holding the Windows loader lock —
+the exact failure beta.4 set out to fix, left unguarded on the privacy-filter path.
+
+- **Shared `run_ort_init_with_timeout` helper**: both ORT init paths (injection classifier and
+  privacy filter) now run on a worker thread under the same main-thread timeout. Symmetric guard,
+  no path left behind.
+- **Worker-panic vs. timeout disambiguation**: a worker that panics (channel `Disconnected`) is now
+  mapped to a clean fail-closed `OrtInitPanicked` error, instead of being misread as a loader-lock
+  timeout and `abort()`ed. Only a true timeout (likely the loader lock) still aborts.
+- The timeout diagnostic now also names a slow/remote-disk cold-load as a possible cause (not only a
+  stub dll); a stale doc reference was removed; the `set_var` ordering invariant is documented; and
+  2 regression guard tests were added.
+
 ## [v0.2.0-beta.4] — 2026-06-14 — Injection classifier deployment hardening
 
 ### Fixed / Hardened — DeBERTa ORT deployment (problem B)
