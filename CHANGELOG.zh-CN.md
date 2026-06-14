@@ -8,6 +8,24 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.2.0-beta.4] — 2026-06-14 — 注入分类器部署加固
+
+### 修复 / 加固 —— DeBERTa ORT 部署(问题 B)
+
+DeBERTa 分类器用 ORT `load-dynamic`,运行时经系统 loader 解析 `onnxruntime.dll`。Windows 上可能
+命中系统路径的错误/stub `onnxruntime.dll`(如 System32 的 2.8 KB 占位)→ ORT init 静默 hang,死握
+Windows loader lock 到进程都杀不掉。
+
+- **ORT_DYLIB_PATH 自动定位**:serve 启动时若未设 `ORT_DYLIB_PATH`,Vigil 自动指向 exe 同目录
+  合理大小(>1 MB)的 `onnxruntime` dylib,绕开系统 loader 的 stub-dll 陷阱;同时保护 privacy filter。
+- **warm-load 超时 + abort**:模型装载放工作线程,主线程 45s 超时。超时后 `abort()`(内核级
+  `__fastfail`)立即终止进程 —— 优雅 `return Err` 会在 hang 线程持的 loader lock 上死锁。
+
+> **部署注意(deberta,opt-in `--features ort`)**:ORT 用 `load-dynamic`(build 不链接 ORT ——
+> 避开 `ort-sys` 的 ureq build bug 与 MSVC 静态链接 ABI 不匹配两个坑)。请在可执行文件同目录提供
+> 匹配的 **ORT 1.24** `onnxruntime.dll` / `.so` / `.dylib`,或设 `ORT_DYLIB_PATH`。(若改用
+> `download-binaries`,还需额外 `tls-*` feature + 兼容的 MSVC 工具链。)
+
 ## [v0.2.0-beta.3] — 2026-06-12 — DeBERTa 注入分类器(serve 路径)
 
 ### 新增 —— DeBERTa 提示注入分类器(opt-in,serve 路径)

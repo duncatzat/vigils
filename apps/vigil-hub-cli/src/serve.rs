@@ -266,6 +266,52 @@ pub enum ServeError {
     BootstrapFailed(#[from] vigil_redaction::BootstrapError),
 }
 
+/// 优化问题 B:DeBERTa 装载超时上限(秒)。正常 warm-load(ensure 命中 + from_model_dir + warmup)
+/// 在几秒内;远超此值几乎必然是 ort 误加载错误 onnxruntime.dll 后的 init hang。45s 给真慢磁盘
+/// + 738MB FP32 模型 cold-load 留足余量。
+#[cfg(feature = "ort")]
+const ORT_INIT_TIMEOUT_SECS: u64 = 45;
+
+/// 优化问题 B:在任何 ort API 调用前,优先把 `ORT_DYLIB_PATH` 指向**可执行文件同目录**的
+/// onnxruntime dylib,绕开 ort load-dynamic 默认走系统 LoadLibrary 误命中 System32 错误/stub
+/// dll(实测 2.8KB 假 dll)导致的 init hang。
+///
+/// 纪律:① 用户已显式设 `ORT_DYLIB_PATH` → 尊重不覆盖;② 仅当 exe 同目录存在**合理大小**
+/// (>1MB,排除 KB 级 stub)的 dylib 才设;③ 找不到则不设 —— 交给 ort 默认查找 + 下游超时兜底
+/// 报错(`InjectionClassifierTimeout`)。
+#[cfg(feature = "ort")]
+fn prepare_ort_dylib_path() {
+    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+        return; // 尊重用户显式指定
+    }
+    let dylib_name = if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else {
+        "libonnxruntime.so"
+    };
+    let candidate = match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(dylib_name)))
+    {
+        Some(c) => c,
+        None => return,
+    };
+    // 大小启发式:真 ORT ~10-15MB;排除 System32 KB 级 stub / 0 字节占位。
+    if candidate
+        .metadata()
+        .map(|m| m.len() > 1_000_000)
+        .unwrap_or(false)
+    {
+        std::env::set_var("ORT_DYLIB_PATH", &candidate);
+        eprintln!(
+            "vigil-hub serve: ORT_DYLIB_PATH = {} (exe-local; avoids system stub dll)",
+            candidate.display()
+        );
+    }
+}
+
 /// 构建 Hub + Ledger。供 serve 主入口和 test 共用。
 ///
 /// **session 语义**:每次 `serve` 启动开新 session(source=`"vigil-hub-serve"`)。
@@ -294,6 +340,14 @@ pub fn build_hub_with_config(
         None => Ledger::open_in_memory()?,
     });
     let session_id = ledger.start_session("vigil-hub-serve", Some("vigil-hub"))?;
+
+    // 优化问题 B:在**任何 ort 路径**(privacy filter / injection classifier)前稳住 onnxruntime
+    // dylib 来源 —— ort load-dynamic 默认走系统 LoadLibrary,Windows 上可能命中 System32 的
+    // 错误/stub onnxruntime.dll → init 静默 hang。优先用 exe 同目录的 dll(未设 ORT_DYLIB_PATH 时)。
+    #[cfg(feature = "ort")]
+    if args.enable_injection_classifier || args.enable_privacy_filter {
+        prepare_ort_dylib_path();
+    }
 
     // 2. Firewall(默认策略集 + project_roots 边界)
     //    dev_permissive_firewall 加一条最低 priority 的"catch-all → Approve"兜底 —
@@ -416,11 +470,37 @@ pub fn build_hub_with_config(
             // 独立 manifest(deberta-injection-v2/ 目录)→ ensure 三件套(并发 16 chunk + sha256)。
             let model_paths = vigil_redaction::ensure_injection_model_available(None)
                 .map_err(ServeError::BootstrapFailed)?;
-            let classifier =
-                vigil_redaction::InjectionClassifier::from_model_dir(model_paths.dir())
-                    .map_err(ServeError::InjectionClassifierInit)?;
-            // warmup:把 graph optimize / kernel JIT 的 cold-path 前移到启动期(fire-and-forget)。
-            let _ = classifier.warmup();
+            // 优化问题 B:from_model_dir 内部触发 ort dlopen + Session 创建 —— 若系统误加载了
+            // 错误版本 onnxruntime.dll 会静默 hang。放工作线程跑 + 主线程 timeout join,把 hang
+            // 转成清晰的启动报错(InjectionClassifierTimeout)而非无限卡住。warmup 一并纳入超时。
+            let dir = model_paths.dir().to_path_buf();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let built =
+                    vigil_redaction::InjectionClassifier::from_model_dir(&dir).inspect(|c| {
+                        let _ = c.warmup(); // graph optimize / kernel JIT cold-path 前移到启动期
+                    });
+                let _ = tx.send(built); // 接收端超时退出后本 send 失败,无害
+            });
+            let classifier = match rx
+                .recv_timeout(std::time::Duration::from_secs(ORT_INIT_TIMEOUT_SECS))
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => return Err(ServeError::InjectionClassifierInit(e)),
+                Err(_) => {
+                    // 工作线程极可能 hang 在 ort `LoadLibrary`(系统错误/stub onnxruntime.dll)
+                    // 持 **Windows loader lock**。优雅退出(return Err → ExitProcess)会等
+                    // loader lock → 死锁:实测进程残留,且连 taskkill /F 都杀不掉。`abort()`
+                    // 经 __fastfail 内核级立即终止进程,绕过 loader lock。
+                    eprintln!(
+                            "vigil-hub serve: injection classifier init timed out (~{ORT_INIT_TIMEOUT_SECS}s) \
+                             — likely a wrong/stub onnxruntime.dll on the system path. Place the \
+                             correct ORT 1.24 onnxruntime.dll next to the executable or set \
+                             ORT_DYLIB_PATH, then retry. Aborting."
+                        );
+                    std::process::abort();
+                }
+            };
             eprintln!(
                 "vigil-hub serve: InjectionClassifier = deberta (warm; dir={})",
                 model_paths.dir().display()

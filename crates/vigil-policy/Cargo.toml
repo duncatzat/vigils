@@ -14,7 +14,7 @@ categories = ["api-bindings", "authentication"]
 workspace = true
 
 [dependencies]
-vigil-types = { path = "../vigil-types", version = "0.2.0-beta.3" }
+vigil-types = { path = "../vigil-types", version = "0.2.0-beta.4" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

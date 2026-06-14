@@ -8,6 +8,28 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.2.0-beta.4] — 2026-06-14 — Injection classifier deployment hardening
+
+### Fixed / Hardened — DeBERTa ORT deployment (problem B)
+
+The DeBERTa classifier uses ORT `load-dynamic`, which resolves `onnxruntime.dll` via the system
+loader at runtime. On Windows this can hit a wrong/stub `onnxruntime.dll` on the system path
+(e.g. a 2.8 KB placeholder in System32) → ORT init silently hangs, holding the Windows loader lock
+so hard the process can't even be killed.
+
+- **ORT_DYLIB_PATH auto-pin**: at serve startup, if `ORT_DYLIB_PATH` is unset, Vigil points it at a
+  reasonably-sized (>1 MB) `onnxruntime` dylib next to the executable, bypassing the system loader's
+  stub-dll trap. Also protects the privacy filter.
+- **Warm-load timeout + abort**: model load runs on a worker thread with a 45 s timeout on the main
+  thread. On timeout, `abort()` (kernel-level `__fastfail`) terminates the process immediately — a
+  graceful `return Err` would deadlock on the loader lock held by the hung thread.
+
+> **Deployment note (deberta, opt-in `--features ort`)**: ORT uses `load-dynamic` (build does not
+> link ORT — this avoids both the `ort-sys` ureq build bug and MSVC static-link ABI mismatches).
+> Provide a matching **ORT 1.24** `onnxruntime.dll` / `.so` / `.dylib` next to the executable, or set
+> `ORT_DYLIB_PATH`. (Using `download-binaries` instead would additionally require a `tls-*` feature
+> and a compatible MSVC toolchain.)
+
 ## [v0.2.0-beta.3] — 2026-06-12 — DeBERTa injection classifier (serve path)
 
 ### Added — DeBERTa prompt-injection classifier (opt-in, serve path)
