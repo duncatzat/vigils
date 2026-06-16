@@ -57,6 +57,43 @@ pub enum UiResponse {
     PrivacyFindings(PrivacyFindingsDto),
     /// ISS-018 — Safe Export 渲染结果(MD / HTML 字符串内容)
     SessionExport(SessionExportDto),
+    /// 链头已锚定到 checkpoint sidecar;data 为 None 表示空账本/链头未前进/内存库
+    CheckpointAnchored(Option<CheckpointAnchorDto>),
+    /// ONNX 模型状态列表
+    OnnxModelList(Vec<OnnxModelInfo>),
+    /// ONNX 模型下载/校验任务已接受(background job id)
+    OnnxModelEnsured(String),
+}
+
+/// Checkpoint anchor 成功后的返回摘要。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointAnchorDto {
+    /// 锚定的事件 ID
+    pub event_id: i64,
+    /// 锚定的事件哈希
+    pub event_hash: String,
+    /// 锚定时间(Unix 秒)
+    pub anchored_at: i64,
+}
+
+/// ONNX 模型状态摘要(供 Settings 模型管理面板展示)。
+///
+/// **零回显**:只暴露模型名、版本、大小等元数据,不暴露任何路径中的用户信息
+/// (路径本身由后端解析,UI 只显示存在性与字节大小)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnnxModelInfo {
+    /// 模型逻辑 ID(如 `privacy-filter` / `deberta-injection`)。
+    pub model_id: String,
+    /// 模型展示名。
+    pub display_name: String,
+    /// 模型版本。
+    pub version: String,
+    /// 本地是否三件套全部就绪。
+    pub installed: bool,
+    /// 已下载字节总数(未安装时为 0)。
+    pub size_bytes: u64,
+    /// 是否正在后台下载/校验中。
+    pub busy: bool,
 }
 
 // ---------------- DTO ----------------

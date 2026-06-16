@@ -19,18 +19,19 @@ mod response;
 
 pub use command::{
     ApprovalAction, ApproveServerCommandDriftReq, ApproveToolDriftReq, ApproveToolReq,
-    BindServerSandboxProfileReq, Capability, ExportFormat, ExportSessionReplayReq, FtsSearchReq,
-    GetApprovalDetailReq, GetEventDetailReq, GetSandboxProfileReq, GetServerOnboardingReq,
-    ListPendingApprovalsReq, ListPrivacyFindingsReq, ListRecentEventsReq, ListSessionsReq,
-    RejectServerCommandDriftReq, RejectToolDriftReq, ReplaySessionReq, ResolveApprovalReq,
-    UiCommand, UpsertSandboxProfileReq,
+    BindServerSandboxProfileReq, Capability, EnsureOnnxModelReq, ExportFormat,
+    ExportSessionReplayReq, FtsSearchReq, GetApprovalDetailReq, GetEventDetailReq,
+    GetSandboxProfileReq, GetServerOnboardingReq, ListPendingApprovalsReq, ListPrivacyFindingsReq,
+    ListRecentEventsReq, ListSessionsReq, RegisterServerReq, RejectServerCommandDriftReq,
+    RejectToolDriftReq, ReplaySessionReq, ResolveApprovalReq, UiCommand, UpdateHubConfigReq,
+    UpsertSandboxProfileReq,
 };
 pub use error::UiError;
 pub use response::{
-    ApprovalDetailDto, ApprovalResolutionDto, ApprovalSummary, ChainVerifyReport, EventDetail,
-    EventSummary, PrivacyFindingDto, PrivacyFindingsDto, RedactionScanSummaryDto,
-    SandboxProfileUpsertDto, SecretBindingSummary, SessionExportDto, SessionReplay, SessionSummary,
-    UiResponse,
+    ApprovalDetailDto, ApprovalResolutionDto, ApprovalSummary, ChainVerifyReport,
+    CheckpointAnchorDto, EventDetail, EventSummary, OnnxModelInfo, PrivacyFindingDto,
+    PrivacyFindingsDto, RedactionScanSummaryDto, SandboxProfileUpsertDto, SecretBindingSummary,
+    SessionExportDto, SessionReplay, SessionSummary, UiResponse,
 };
 
 /// 当前迭代号。
@@ -124,6 +125,22 @@ mod tests {
             UiCommand::BindServerSandboxProfile(BindServerSandboxProfileReq {
                 server_id: "s".into(),
                 profile_id: Some("p".into()),
+            }),
+            UiCommand::RegisterServer(RegisterServerReq {
+                server_id: "s".into(),
+                transport: "stdio".into(),
+                command: Some(vec!["npx".into(), "-y".into(), "@modelcontextprotocol/server-filesystem".into()]),
+                url: None,
+            }),
+            UiCommand::AnchorCheckpoint,
+            UiCommand::UpdateHubConfig(UpdateHubConfigReq {
+                monitor_mode: Some(true),
+                auto_approve_first_seen_tools: Some(false),
+                redact_tool_results: None,
+                outbox_enabled: Some(true),
+                approval_wait_secs: Some(300),
+                upstream_list_timeout_secs: Some(10),
+                upstream_call_timeout_secs: Some(30),
             }),
         ];
         let _ = RunnerKind::Native;

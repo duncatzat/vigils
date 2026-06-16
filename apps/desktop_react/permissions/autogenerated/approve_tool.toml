@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-approve-tool"
+description = "Enables the approve_tool command without any pre-configured scope."
+commands.allow = ["approve_tool"]
+
+[[permission]]
+identifier = "deny-approve-tool"
+description = "Denies the approve_tool command without any pre-configured scope."
+commands.deny = ["approve_tool"]

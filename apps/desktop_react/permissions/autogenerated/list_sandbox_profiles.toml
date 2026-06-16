@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-sandbox-profiles"
+description = "Enables the list_sandbox_profiles command without any pre-configured scope."
+commands.allow = ["list_sandbox_profiles"]
+
+[[permission]]
+identifier = "deny-list-sandbox-profiles"
+description = "Denies the list_sandbox_profiles command without any pre-configured scope."
+commands.deny = ["list_sandbox_profiles"]

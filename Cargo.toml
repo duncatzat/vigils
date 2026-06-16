@@ -17,6 +17,7 @@ members = [
     "crates/vigil-sandbox-linux",
     "crates/vigil-sdk",
     "apps/desktop",
+    "apps/desktop_react",
     "apps/native-host",
     "apps/vigil-hub-cli",
 ]

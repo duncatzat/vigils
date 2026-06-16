@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-replay-session"
+description = "Enables the replay_session command without any pre-configured scope."
+commands.allow = ["replay_session"]
+
+[[permission]]
+identifier = "deny-replay-session"
+description = "Denies the replay_session command without any pre-configured scope."
+commands.deny = ["replay_session"]

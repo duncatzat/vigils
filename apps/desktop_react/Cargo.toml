@@ -1,0 +1,51 @@
+[package]
+name = "vigil-desktop-react"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "vigil-desktop-react"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "vigil-desktop-react"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+gui = [
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:tokio",
+    "dep:dirs",
+    "vigil-desktop/gui",
+]
+
+[dependencies]
+vigil-desktop = { path = "../desktop", default-features = false }
+vigil-types = { path = "../../crates/vigil-types" }
+vigil-ui-protocol = { path = "../../crates/vigil-ui-protocol" }
+vigil-audit = { path = "../../crates/vigil-audit" }
+vigil-runner-types = { path = "../../crates/vigil-runner-types" }
+vigil-mcp = { path = "../../crates/vigil-mcp", default-features = false }
+vigil-firewall = { path = "../../crates/vigil-firewall", default-features = false }
+vigil-policy = { path = "../../crates/vigil-policy" }
+vigil-redaction = { path = "../../crates/vigil-redaction", features = ["ort"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+# Tauri runtime (gated by gui feature)
+tauri = { version = "2", optional = true, default-features = false, features = ["wry"] }
+tokio = { workspace = true, optional = true }
+dirs = { version = "6", optional = true }
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true, default-features = false, features = [] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

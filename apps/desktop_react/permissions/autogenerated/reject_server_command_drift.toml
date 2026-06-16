@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reject-server-command-drift"
+description = "Enables the reject_server_command_drift command without any pre-configured scope."
+commands.allow = ["reject_server_command_drift"]
+
+[[permission]]
+identifier = "deny-reject-server-command-drift"
+description = "Denies the reject_server_command_drift command without any pre-configured scope."
+commands.deny = ["reject_server_command_drift"]

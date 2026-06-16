@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-verify-chain"
+description = "Enables the verify_chain command without any pre-configured scope."
+commands.allow = ["verify_chain"]
+
+[[permission]]
+identifier = "deny-verify-chain"
+description = "Denies the verify_chain command without any pre-configured scope."
+commands.deny = ["verify_chain"]

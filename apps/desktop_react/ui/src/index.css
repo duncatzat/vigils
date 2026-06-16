@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+    --vigils-bg-deep: #f8fafc;
+    --vigils-bg-panel: #ffffff;
+    --vigils-bg-tertiary: #f1f5f9;
+    --vigils-bg-surface: #e2e8f0;
+    --vigils-cyan: #0891b2;
+    --vigils-green: #059669;
+    --vigils-red: #dc2626;
+    --vigils-purple: #7c3aed;
+    --vigils-yellow: #ca8a04;
+    --vigils-text-primary: #0f172a;
+    --vigils-text-secondary: #475569;
+    --vigils-text-muted: #94a3b8;
+  }
+
+  .dark {
+    color-scheme: dark;
+    --vigils-bg-deep: #0a0a0f;
+    --vigils-bg-panel: #111118;
+    --vigils-bg-tertiary: #1a1f2e;
+    --vigils-bg-surface: #232837;
+    --vigils-cyan: #05d9e8;
+    --vigils-green: #00ff9d;
+    --vigils-red: #ff2a6d;
+    --vigils-purple: #a855f7;
+    --vigils-yellow: #facc15;
+    --vigils-text-primary: #e2e8f0;
+    --vigils-text-secondary: #64748b;
+    --vigils-text-muted: #475569;
+  }
+
+  html,
+  body,
+  #root {
+    @apply h-full w-full bg-vigils-bg-deep text-vigils-text-primary;
+    font-family: Inter, system-ui, sans-serif;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--vigils-bg-deep);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--vigils-bg-surface);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--vigils-text-muted);
+  }
+}
+
+@layer components {
+  .vigil-card {
+    @apply rounded-2xl border border-vigils-bg-surface bg-vigils-bg-panel;
+  }
+
+  .vigil-card-hover {
+    @apply transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_8px_32px_rgba(5,217,232,0.06)];
+  }
+  .vigil-card-hover:hover {
+    border-color: color-mix(in srgb, var(--vigils-cyan) 30%, transparent);
+  }
+
+  .vigil-btn-primary {
+    @apply rounded-lg bg-vigils-cyan px-4 py-2 font-bold text-vigils-bg-deep transition-all hover:brightness-110;
+  }
+
+  .vigil-btn-ghost {
+    @apply rounded-lg border border-vigils-bg-surface px-4 py-2 text-vigils-text-secondary transition-all hover:text-vigils-cyan;
+  }
+  .vigil-btn-ghost:hover {
+    border-color: color-mix(in srgb, var(--vigils-cyan) 40%, transparent);
+  }
+
+  .vigil-input {
+    @apply rounded-md border border-vigils-bg-surface bg-vigils-bg-deep px-3 py-2 text-sm text-vigils-text-primary outline-none;
+  }
+  .vigil-input:focus {
+    border-color: color-mix(in srgb, var(--vigils-cyan) 50%, transparent);
+  }
+
+  .vigil-table-header {
+    @apply text-left text-xs font-medium uppercase tracking-wider text-vigils-text-muted;
+  }
+
+  .vigil-table-cell {
+    @apply py-3 text-sm text-vigils-text-secondary;
+  }
+}

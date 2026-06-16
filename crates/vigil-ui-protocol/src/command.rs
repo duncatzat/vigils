@@ -56,8 +56,20 @@ pub enum UiCommand {
     /// **payload 已在 events 入库时由 vigil-redaction 脱敏**,渲染层只读不改;
     /// 输出 content 由 caller 触发浏览器 download。
     ExportSessionReplay(ExportSessionReplayReq),
+    /// 将当前链头锚定到 sidecar checkpoint 文件(写命令)
+    AnchorCheckpoint,
+    /// 实时更新运行中 Hub 的保护策略配置(写命令)
+    UpdateHubConfig(UpdateHubConfigReq),
+
+    // --- ONNX Model Management ---
+    /// 列出本地 ONNX 模型状态(只读)
+    ListOnnxModels,
+    /// 触发指定 ONNX 模型的下载/校验(写命令;后台执行)
+    EnsureOnnxModel(EnsureOnnxModelReq),
 
     // --- Server Registry ---
+    /// 登记新 server(写命令)
+    RegisterServer(RegisterServerReq),
     /// 列已登记的 servers
     ListServers,
     /// 取某 server 的 onboarding 数据(transport / argv / env keys)
@@ -112,9 +124,14 @@ impl UiCommand {
             | ListDriftedTools
             | ListDriftedServers
             | ListSandboxProfiles
-            | GetSandboxProfile(_) => Capability::Read,
+            | GetSandboxProfile(_)
+            | ListOnnxModels => Capability::Read,
             // Write
-            ResolveApproval(_)
+            AnchorCheckpoint
+            | UpdateHubConfig(_)
+            | EnsureOnnxModel(_)
+            | RegisterServer(_)
+            | ResolveApproval(_)
             | ApproveTool(_)
             | ApproveToolDrift(_)
             | RejectToolDrift(_)
@@ -260,6 +277,19 @@ pub struct ReplaySessionReq {
     pub verify: bool,
 }
 
+/// RegisterServer 参数。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterServerReq {
+    /// server id
+    pub server_id: String,
+    /// 传输类型("stdio" 或 "http")
+    pub transport: String,
+    /// Stdio 启动时的 argv；Http 时为 None
+    pub command: Option<Vec<String>>,
+    /// Http 传输时的 URL；Stdio 时为 None
+    pub url: Option<String>,
+}
+
 /// GetServerOnboarding 参数。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GetServerOnboardingReq {
@@ -331,4 +361,34 @@ pub struct BindServerSandboxProfileReq {
     pub server_id: String,
     /// profile id;None = 解绑
     pub profile_id: Option<String>,
+}
+
+/// ONNX 模型下载/校验请求。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnsureOnnxModelReq {
+    /// 模型逻辑 ID,当前支持 `"privacy-filter"` 与 `"deberta-injection"`。
+    pub model_id: String,
+}
+
+/// Hub 保护策略配置补丁(运行时热更新)。
+///
+/// 所有字段均为 `Option`,未提供字段保持原值不变;提供字段立即替换当前 Hub 运行值。
+/// 覆盖可由 UI 安全切换的策略开关与时效参数,不涉及涉密参数。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateHubConfigReq {
+    /// `monitor_mode`:true = 观察放行(default-deny floor 与 Approve 路径均降级),
+    /// false = enforce(默认)。
+    pub monitor_mode: Option<bool>,
+    /// `auto_approve_first_seen_tools`:true = tools/list 首次见 descriptor 自动批准。
+    pub auto_approve_first_seen_tools: Option<bool>,
+    /// `redact_tool_results`:true = 上游结果命中硬指纹时 in-band 脱敏后再返给 agent。
+    pub redact_tool_results: Option<bool>,
+    /// `outbox_enabled`:true = 对 CommSend/NetOutbound 效应启用 outbox 预览与审批绑定。
+    pub outbox_enabled: Option<bool>,
+    /// `approval_wait`:等待人工审批的最长时间(秒)。UI 应限制为合理正整数(如 1..=3600)。
+    pub approval_wait_secs: Option<u64>,
+    /// `upstream_list_timeout`:上游 `tools/list` 超时(秒)。
+    pub upstream_list_timeout_secs: Option<u64>,
+    /// `upstream_call_timeout`:上游 `tools/call` 超时(秒)。
+    pub upstream_call_timeout_secs: Option<u64>,
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-approval-detail"
+description = "Enables the get_approval_detail command without any pre-configured scope."
+commands.allow = ["get_approval_detail"]
+
+[[permission]]
+identifier = "deny-get-approval-detail"
+description = "Denies the get_approval_detail command without any pre-configured scope."
+commands.deny = ["get_approval_detail"]

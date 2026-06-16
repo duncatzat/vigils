@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Vigils",
+  "version": "0.2.0-beta.9",
+  "identifier": "ai.vigils.desktop",
+  "mainBinaryName": "vigil-desktop-react",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "cd ui && npm run build",
+    "devUrl": "http://localhost:8080",
+    "frontendDist": "./ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Vigils — local control plane for AI agents",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: asset:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost",
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi", "deb", "rpm", "appimage", "dmg", "app"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.ico"
+    ],
+    "createUpdaterArtifacts": false
+  }
+}

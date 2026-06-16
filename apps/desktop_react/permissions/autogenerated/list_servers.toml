@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-servers"
+description = "Enables the list_servers command without any pre-configured scope."
+commands.allow = ["list_servers"]
+
+[[permission]]
+identifier = "deny-list-servers"
+description = "Denies the list_servers command without any pre-configured scope."
+commands.deny = ["list_servers"]

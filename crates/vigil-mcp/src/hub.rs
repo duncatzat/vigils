@@ -106,6 +106,27 @@ pub enum HubError {
     Invalid(String),
 }
 
+/// Hub 配置补丁(运行时热更新)。
+///
+/// 所有字段均为 `Option`,未提供字段保持原值不变。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HubConfigPatch {
+    /// `monitor_mode` 开关。
+    pub monitor_mode: Option<bool>,
+    /// `auto_approve_first_seen_tools` 开关。
+    pub auto_approve_first_seen_tools: Option<bool>,
+    /// `redact_tool_results` 开关。
+    pub redact_tool_results: Option<bool>,
+    /// `outbox_enabled` 开关。
+    pub outbox_enabled: Option<bool>,
+    /// `approval_wait` 秒数。
+    pub approval_wait_secs: Option<u64>,
+    /// `upstream_list_timeout` 秒数。
+    pub upstream_list_timeout_secs: Option<u64>,
+    /// `upstream_call_timeout` 秒数。
+    pub upstream_call_timeout_secs: Option<u64>,
+}
+
 /// Hub 配置。
 #[derive(Debug, Clone)]
 pub struct HubConfig {
@@ -349,7 +370,7 @@ pub struct Hub {
     /// 调用都过早检查后各 spawn 一个进程再 drop 的副作用泄漏。**不**阻塞请求热路径(请求只锁
     /// `upstreams` map,与本锁无关);attach 是启动/低频操作,串行可接受。
     attach_lock: Mutex<()>,
-    config: HubConfig,
+    config: std::sync::RwLock<HubConfig>,
     session_id: Mutex<Option<String>>,
     /// 可逆脱敏 Slice 2:`secret://<alias>` → 真值映射(运行时 only,绝不入账本)。
     /// `build_hub` 从 `upstreams.json` 的 `secrets` map 填充;空 map = fail-closed
@@ -369,7 +390,12 @@ pub struct Hub {
 
 impl std::fmt::Debug for Hub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Hub").field("config", &self.config).finish()
+        let config = self
+            .config
+            .read()
+            .map(|c| c.clone())
+            .unwrap_or_else(|_| HubConfig::default());
+        f.debug_struct("Hub").field("config", &config).finish()
     }
 }
 
@@ -427,7 +453,7 @@ impl Hub {
             router: Mutex::new(ToolRouter::default()),
             upstreams: Mutex::new(HashMap::new()),
             attach_lock: Mutex::new(()),
-            config,
+            config: std::sync::RwLock::new(config),
             session_id: Mutex::new(None),
             secret_aliases,
             leak_detected_count: AtomicU64::new(0),
@@ -461,7 +487,40 @@ impl Hub {
     /// 等组装层不再做 timing hack(如 v0.3 Stage 3 的 `dev_permissive_firewall →
     /// approval_wait=3s` 已被 Phase 1 短轮询 fallback 取代)。
     pub fn approval_wait(&self) -> std::time::Duration {
-        self.config.approval_wait
+        self.config
+            .read()
+            .map(|c| c.approval_wait)
+            .unwrap_or_else(|_| HubConfig::default().approval_wait)
+    }
+
+    /// 运行时热更新 Hub 保护策略配置。
+    ///
+    /// 只覆盖 `HubConfigPatch` 中显式提供的字段,其余保持当前值。上写锁替换,
+    /// 后续请求立即生效。失败时(锁污染)返回 `HubError::LockPoisoned`。
+    pub fn update_config(&self, patch: HubConfigPatch) -> Result<(), HubError> {
+        let mut cfg = self.config.write().map_err(|_| HubError::LockPoisoned)?;
+        if let Some(v) = patch.monitor_mode {
+            cfg.monitor_mode = v;
+        }
+        if let Some(v) = patch.auto_approve_first_seen_tools {
+            cfg.auto_approve_first_seen_tools = v;
+        }
+        if let Some(v) = patch.redact_tool_results {
+            cfg.redact_tool_results = v;
+        }
+        if let Some(v) = patch.outbox_enabled {
+            cfg.outbox_enabled = v;
+        }
+        if let Some(v) = patch.approval_wait_secs {
+            cfg.approval_wait = Duration::from_secs(v);
+        }
+        if let Some(v) = patch.upstream_list_timeout_secs {
+            cfg.upstream_list_timeout = Duration::from_secs(v);
+        }
+        if let Some(v) = patch.upstream_call_timeout_secs {
+            cfg.upstream_call_timeout = Duration::from_secs(v);
+        }
+        Ok(())
     }
 
     /// v0.5 P1 ADR 0014 α2 — Approval 解析 thin-wrapper(对应 `Capability::Write`)。
@@ -867,7 +926,12 @@ impl Hub {
         //      **非致命**:握手失败(server 不说 MCP / 启动超时)→ 记日志仍 attach,优雅降级
         //      —— 一个坏/慢上游不拖垮整个网关;它的工具不会出现在 tools/list(因 tools/list
         //      对它的调用同样失败被跳过),tools/call 也无从路由到它,故无害。
-        if let Err(e) = upstream.initialize_handshake(self.config.upstream_call_timeout) {
+        let upstream_call_timeout = self
+            .config
+            .read()
+            .map(|c| c.upstream_call_timeout)
+            .unwrap_or_else(|_| HubConfig::default().upstream_call_timeout);
+        if let Err(e) = upstream.initialize_handshake(upstream_call_timeout) {
             // `StdioError` 的 Display 里 `Upstream.message` 已指纹化;但 `Protocol(_)` 变体仍可能
             // 内嵌上游原始字节。对整串再过一道 scrub 作纵深防御,确保初始化诊断绝不把上游 secret
             // 原样带进本进程 stderr(wrap/serve 场景下可能被 agent harness 捕获)。
@@ -959,7 +1023,12 @@ impl Hub {
             let Some(up) = upstreams.get(&server.server_id).cloned() else {
                 continue; // 尚未 attach_upstream,跳过
             };
-            let result = match up.call("tools/list", None, self.config.upstream_list_timeout) {
+            let upstream_list_timeout = self
+                .config
+                .read()
+                .map(|c| c.upstream_list_timeout)
+                .unwrap_or_else(|_| HubConfig::default().upstream_list_timeout);
+            let result = match up.call("tools/list", None, upstream_list_timeout) {
                 Ok(v) => v,
                 Err(_) => continue, // 不可达的上游不影响其它;I10 做重试
             };
@@ -1008,7 +1077,12 @@ impl Hub {
                             description,
                             &schema,
                         );
-                        if self.config.auto_approve_first_seen_tools {
+                        let auto_approve_first_seen_tools = self
+                            .config
+                            .read()
+                            .map(|c| c.auto_approve_first_seen_tools)
+                            .unwrap_or_else(|_| HubConfig::default().auto_approve_first_seen_tools);
+                        if auto_approve_first_seen_tools {
                             self.ledger
                                 .approve_tool_descriptor(&server.server_id, tool_name)?;
                         }
@@ -1266,7 +1340,12 @@ impl Hub {
                 // (诚实:审计显示 monitor 放行,非"deny 后却执行")。enforce 不变(默认仍 deny)。
                 // floor 用**保留 policy id**(vigil_policy 已禁止任何规则占用此 id)→ 此判定唯一识别
                 // "无规则匹配的兜底拒绝",不会被一条 id 恰为 default-deny 的显式 Deny 规则伪造(Codex HIGH)。
-                if self.config.monitor_mode
+                let monitor_mode = self
+                    .config
+                    .read()
+                    .map(|c| c.monitor_mode)
+                    .unwrap_or_else(|_| HubConfig::default().monitor_mode);
+                if monitor_mode
                     && decision.policy_ids == [vigil_firewall::DEFAULT_DENY_POLICY_ID]
                 {
                     let dec = DecisionRecord {
@@ -1308,7 +1387,8 @@ impl Hub {
                 // 若效应含 CommSend / NetOutbound 且开启 outbox:先 draft,绑定本 approval。
                 // **monitor 模式也走此 draft**(Codex D2 review finding):outbox 是高风险出站内容的
                 // 「冻结 + 脱敏预览」审计/控制面,不能因 monitor 非阻塞就跳过(否则丢失可观测性)。
-                let outbox_id = if self.config.outbox_enabled
+                let cfg = self.config.read().map_err(|_| HubError::LockPoisoned)?;
+                let outbox_id = if cfg.outbox_enabled
                     && (effects.effects.contains(&EffectKind::CommSend)
                         || effects.effects.contains(&EffectKind::NetOutbound))
                 {
@@ -1347,7 +1427,7 @@ impl Hub {
                     .policy_ids
                     .iter()
                     .any(|p| p == "approve-descriptor-drift");
-                if self.config.monitor_mode && !is_descriptor_drift {
+                if cfg.monitor_mode && !is_descriptor_drift {
                     self.ledger.approve(
                         &approval.approval_id,
                         vigil_types::ApprovalScope::Once,
@@ -1360,9 +1440,11 @@ impl Hub {
                 }
 
                 // 阻塞等待审批
+                let approval_wait = cfg.approval_wait;
+                drop(cfg);
                 let resolution = self
                     .ledger
-                    .wait_for_resolution(&approval.approval_id, self.config.approval_wait)?;
+                    .wait_for_resolution(&approval.approval_id, approval_wait)?;
                 let Some(res) = resolution else {
                     if let Some(oid) = &outbox_id {
                         let _ = self.ledger.mark_outbox_expired(oid);
@@ -1493,10 +1575,18 @@ impl Hub {
             "name": route.upstream_tool_name,
             "arguments": detok_args,
         });
+        let (upstream_call_timeout, redact_tool_results) = self
+            .config
+            .read()
+            .map(|c| (c.upstream_call_timeout, c.redact_tool_results))
+            .unwrap_or_else(|_| {
+                let d = HubConfig::default();
+                (d.upstream_call_timeout, d.redact_tool_results)
+            });
         let upstream_result = up.call(
             "tools/call",
             Some(up_args),
-            self.config.upstream_call_timeout,
+            upstream_call_timeout,
         );
 
         match upstream_result {
@@ -1549,7 +1639,7 @@ impl Hub {
                             "server_id": invocation.server_id,
                             "tool_name": invocation.tool_name,
                             "decision_id": decision.decision_id,
-                            "redacted": self.config.redact_tool_results,
+                            "redacted": redact_tool_results,
                         });
                         let (redacted_payload, redacted_summary) =
                             vigil_redaction::redact(&event_payload);
@@ -1559,7 +1649,7 @@ impl Hub {
                             &redacted_payload,
                             Some(&redacted_summary),
                         );
-                        if self.config.redact_tool_results {
+                        if redact_tool_results {
                             // in-band:命中后彻底脱敏整个 result 再返回。
                             // ⚠️ `redact(&Value)` 只脱敏 object **值**、保留 **键** —— 若 secret 落在
                             // key 位(如 `{"ghp_xxx": ...}`)会漏(Codex review NEEDS-FIX)。故对序列化串

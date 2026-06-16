@@ -4,7 +4,7 @@
 //! 读操作也走同一把锁(I01 范围,桌面本地应用 QPS 极低);I03+ 若需要高并发读,
 //! 可改为 "writer conn + reader pool" 双连接模型,但 hash 写仍维持单写者。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -12,6 +12,7 @@ use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::checkpoint::{Checkpoint, CheckpointLog};
 use crate::error::{AuditError, Result};
 use crate::hash::{compute_event_hash, compute_event_hash_v2, CURRENT_CHAIN_VERSION};
 
@@ -94,6 +95,8 @@ pub(crate) fn now_secs() -> i64 {
 #[derive(Debug)]
 pub struct Ledger {
     pub(crate) conn: Mutex<Connection>,
+    // 账本文件路径;内存库为 None,用于 checkpoint sidecar 定位。
+    path: Option<PathBuf>,
     // span Drop 在兜底写 `tool_call.abandoned` 时若失败(极少见,如磁盘已满或底层
     // IO 抽搐),本计数器原子递增。提供最低限度的可观察性,避免静默丢事件。
     // 正常路径(executed/execute_failed/decision_recorded)的错误走 Result,不计入。
@@ -248,16 +251,16 @@ impl Ledger {
             }
         }
         let conn = Connection::open(path)?;
-        Self::init(conn)
+        Self::init(conn, Some(path.to_path_buf()))
     }
 
     /// 打开一个内存账本(测试使用)。
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        Self::init(conn)
+        Self::init(conn, None)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection, path: Option<PathBuf>) -> Result<Self> {
         // 尝试启用 WAL。内存库(`:memory:`)会返回 "memory";磁盘库会返回 "wal"。
         // 我们不接受磁盘库退化为 "delete":那意味着本机 SQLite 版本 / 权限异常,
         // 审计不变量将失守 —— fail-closed。
@@ -281,6 +284,7 @@ impl Ledger {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            path,
             drop_failure_count: AtomicU64::new(0),
             approval_broker: crate::approvals::ApprovalBroker::default(),
         })
@@ -604,6 +608,19 @@ impl Ledger {
             expected_prev = event_hash;
         }
         Ok(())
+    }
+
+    /// 将当前链头锚定到 sidecar checkpoint 文件。
+    ///
+    /// - 磁盘账本:写入 `<ledger>.checkpoints`。
+    /// - 内存账本:返回 `Ok(None)`(无 sidecar 可写)。
+    /// - 空账本或链头未前进:返回 `Ok(None)`。
+    pub fn anchor_checkpoint(&self) -> Result<Option<Checkpoint>> {
+        let Some(ref path) = self.path else {
+            return Ok(None);
+        };
+        let log = CheckpointLog::sidecar_for(path);
+        log.emit(self)
     }
 
     /// 按 session 时间线回放全部事件(方案 §7.4 "回放不展示原始 prompt,展示事件重建")。

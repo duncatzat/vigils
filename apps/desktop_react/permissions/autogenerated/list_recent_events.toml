@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-recent-events"
+description = "Enables the list_recent_events command without any pre-configured scope."
+commands.allow = ["list_recent_events"]
+
+[[permission]]
+identifier = "deny-list-recent-events"
+description = "Denies the list_recent_events command without any pre-configured scope."
+commands.deny = ["list_recent_events"]

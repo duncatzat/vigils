@@ -25,6 +25,11 @@ node_modules/
 /dist/
 # Tauri 自动生成 schema(每次 cargo build 重生,SSOT 是 capabilities/default.json)
 apps/desktop/gen/
+apps/desktop_react/gen/
+
+# React desktop Vite/Tauri 构建产物与重复 lock 文件
+apps/desktop_react/ui/dist/
+apps/desktop_react/ui/package-lock *.json
 
 # 工具运行时目录(AI 辅助 / spec-workflow / Serena / Claude / Codex session)
 /.serena/

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-privacy-findings"
+description = "Enables the list_privacy_findings command without any pre-configured scope."
+commands.allow = ["list_privacy_findings"]
+
+[[permission]]
+identifier = "deny-list-privacy-findings"
+description = "Denies the list_privacy_findings command without any pre-configured scope."
+commands.deny = ["list_privacy_findings"]

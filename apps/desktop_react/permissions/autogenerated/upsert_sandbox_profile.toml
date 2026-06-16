@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-upsert-sandbox-profile"
+description = "Enables the upsert_sandbox_profile command without any pre-configured scope."
+commands.allow = ["upsert_sandbox_profile"]
+
+[[permission]]
+identifier = "deny-upsert-sandbox-profile"
+description = "Denies the upsert_sandbox_profile command without any pre-configured scope."
+commands.deny = ["upsert_sandbox_profile"]

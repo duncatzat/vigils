@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-drifted-servers"
+description = "Enables the list_drifted_servers command without any pre-configured scope."
+commands.allow = ["list_drifted_servers"]
+
+[[permission]]
+identifier = "deny-list-drifted-servers"
+description = "Denies the list_drifted_servers command without any pre-configured scope."
+commands.deny = ["list_drifted_servers"]

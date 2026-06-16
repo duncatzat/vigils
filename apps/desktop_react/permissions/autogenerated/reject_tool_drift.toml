@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reject-tool-drift"
+description = "Enables the reject_tool_drift command without any pre-configured scope."
+commands.allow = ["reject_tool_drift"]
+
+[[permission]]
+identifier = "deny-reject-tool-drift"
+description = "Denies the reject_tool_drift command without any pre-configured scope."
+commands.deny = ["reject_tool_drift"]

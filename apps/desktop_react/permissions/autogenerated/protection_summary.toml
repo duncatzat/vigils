@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-protection-summary"
+description = "Enables the protection_summary command without any pre-configured scope."
+commands.allow = ["protection_summary"]
+
+[[permission]]
+identifier = "deny-protection-summary"
+description = "Denies the protection_summary command without any pre-configured scope."
+commands.deny = ["protection_summary"]

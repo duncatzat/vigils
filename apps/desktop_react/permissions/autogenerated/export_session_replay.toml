@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-export-session-replay"
+description = "Enables the export_session_replay command without any pre-configured scope."
+commands.allow = ["export_session_replay"]
+
+[[permission]]
+identifier = "deny-export-session-replay"
+description = "Denies the export_session_replay command without any pre-configured scope."
+commands.deny = ["export_session_replay"]
