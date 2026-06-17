@@ -1,108 +1,81 @@
 <script setup lang="ts">
 /**
- * I08b-α2 App shell — 侧边栏 + router-view。
+ * Vigils Desktop — App shell (原型图风格)。
  *
- * 安全契约(AGENTS.md + ADR 0008):
- * - 全局 NConfigProvider 使用 darkTheme(用户需求默认深色模式)
- * - NDialogProvider + NMessageProvider 供子组件 useDialog / useMessage
- * - 禁 v-html / innerHTML(ESLint rule 守门)
- *
- * v0.14 GUI Theme C(2026-05-16):theme toggle 启用 dark / light / system(prefers)
- * 三模式,localStorage 持久化。default = "dark"(原行为保留)。
+ * - 左侧图标 + 文字导航
+ * - 顶栏: Logo / 页面标题 / 状态 pill / 语言选择
+ * - 主题/语言详情进 Settings 页
  */
-import { NConfigProvider, NLayout, NLayoutSider, NMenu, NDialogProvider, NMessageProvider, NButton, darkTheme, lightTheme } from "naive-ui";
+import {
+  NConfigProvider,
+  NDialogProvider,
+  NMessageProvider,
+  darkTheme,
+  lightTheme,
+  NSelect,
+} from "naive-ui";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
-import { computed, h, ref, onMounted, onUnmounted } from "vue";
+import { computed, ref, onMounted, onUnmounted, type Component } from "vue";
 import { useI18n } from "vue-i18n";
+import { useSettingsStore } from "@/stores/settings";
 import { useGlobalShortcuts } from "@/composables/useGlobalShortcuts";
 import ShortcutHelpModal from "@/components/ShortcutHelpModal.vue";
-import { setLocale, SUPPORTED_LOCALES, type SupportedLocale } from "@/i18n";
+
+const router = useRouter();
+
+import IconProtection from "@/components/icons/IconProtection.vue";
+import IconApprovals from "@/components/icons/IconApprovals.vue";
+import IconActivity from "@/components/icons/IconActivity.vue";
+import IconSessions from "@/components/icons/IconSessions.vue";
+import IconServers from "@/components/icons/IconServers.vue";
+import IconPrivacy from "@/components/icons/IconPrivacy.vue";
+import IconSandbox from "@/components/icons/IconSandbox.vue";
+import IconSettings from "@/components/icons/IconSettings.vue";
 
 const route = useRoute();
-const router = useRouter();
-const { t, locale } = useI18n();
+const { t } = useI18n();
+const settings = useSettingsStore();
+const helpOpen = ref(false);
+useGlobalShortcuts({ router, helpOpen });
 
-// v0.14 Theme D:语言切换(zh-CN ↔ en-US 二态循环)
-function cycleLocale(): void {
-  const idx = SUPPORTED_LOCALES.findIndex((l) => l.code === locale.value);
-  const next = SUPPORTED_LOCALES[(idx + 1) % SUPPORTED_LOCALES.length];
-  setLocale(next.code as SupportedLocale);
-}
-const currentLocaleShort = computed(() => {
-  const entry = SUPPORTED_LOCALES.find((l) => l.code === locale.value);
-  return entry?.short ?? "EN";
-});
-const currentLocaleLabel = computed(() => {
-  const entry = SUPPORTED_LOCALES.find((l) => l.code === locale.value);
-  return entry?.label ?? "English";
-});
+// Naive UI 主题跟随 settings.effectiveTheme(dark/light/system)
+const activeTheme = computed(() => (settings.effectiveTheme === "light" ? lightTheme : darkTheme));
 
-// v0.14 Theme B:全局快捷键(g-chord 导航 / `/` 搜索 / `?` 帮助)
-const shortcutHelpOpen = ref(false);
-useGlobalShortcuts({ router, helpOpen: shortcutHelpOpen });
+const themeOverrides = computed(() => ({
+  common: {
+    primaryColor: "#05D9E8",
+    primaryColorHover: "#67E8F9",
+    primaryColorPressed: "#04B6C2",
+    primaryColorSuppl: "#05D9E8",
+    infoColor: "#05D9E8",
+    infoColorHover: "#67E8F9",
+    successColor: "#00FF9D",
+    successColorHover: "#33FFB1",
+    warningColor: "#FACC15",
+    errorColor: "#FF2A6D",
+    errorColorHover: "#FF5589",
+    bodyColor: settings.isLight ? "#ffffff" : "#0B0B0F",
+    cardColor: settings.isLight ? "#f8fafc" : "#13131A",
+    modalColor: settings.isLight ? "#ffffff" : "#13131A",
+    popoverColor: settings.isLight ? "#ffffff" : "#13131A",
+    tableColor: settings.isLight ? "#ffffff" : "#13131A",
+    tableHeaderColor: settings.isLight ? "#f1f5f9" : "#1A1A24",
+    tagColor: settings.isLight ? "#e2e8f0" : "#1A1A24",
+    textColorBase: settings.isLight ? "#0f172a" : "#E2E8F0",
+    textColor1: settings.isLight ? "#0f172a" : "#E2E8F0",
+    textColor2: settings.isLight ? "#334155" : "#94a3b8",
+    textColor3: settings.isLight ? "#64748b" : "#64748B",
+    borderColor: settings.isLight ? "#e2e8f0" : "#1E1E28",
+    dividerColor: settings.isLight ? "#e2e8f0" : "#1E1E28",
+  },
+}));
 
-// ─────────────────────── v0.14 Theme C:三模式 toggle ───────────────────────
-type ThemeMode = "dark" | "light" | "system";
-const THEME_STORAGE_KEY = "vigil-theme-mode";
-
-const themeMode = ref<ThemeMode>(loadTheme());
-
-function loadTheme(): ThemeMode {
-  try {
-    const stored = localStorage.getItem(THEME_STORAGE_KEY);
-    if (stored === "dark" || stored === "light" || stored === "system") return stored;
-  } catch {
-    // localStorage 不可用(privacy mode / sandbox 等),fallback 默认
-  }
-  return "dark";
-}
-
-function persistTheme(mode: ThemeMode): void {
-  try {
-    localStorage.setItem(THEME_STORAGE_KEY, mode);
-  } catch {
-    // 同上 ignore
-  }
-}
-
-const prefersDark = ref(
-  typeof window !== "undefined" && typeof window.matchMedia === "function"
-    ? window.matchMedia("(prefers-color-scheme: dark)").matches
-    : true,
-);
-
-// reactive Naive UI theme(dark = darkTheme,light = lightTheme,system = follow prefers)
-const activeTheme = computed(() => {
-  if (themeMode.value === "dark") return darkTheme;
-  if (themeMode.value === "light") return lightTheme;
-  // system
-  return prefersDark.value ? darkTheme : lightTheme;
-});
-
-function cycleTheme(): void {
-  // 三态循环:dark → light → system → dark ...
-  const order: ThemeMode[] = ["dark", "light", "system"];
-  const idx = order.indexOf(themeMode.value);
-  themeMode.value = order[(idx + 1) % order.length];
-  persistTheme(themeMode.value);
-}
-
-const themeIcon = computed(() => {
-  if (themeMode.value === "dark") return "🌙";
-  if (themeMode.value === "light") return "☀️";
-  return "🖥️"; // system
-});
-
-const themeLabel = computed(() => {
-  if (themeMode.value === "dark") return t("sidebar.theme_dark");
-  if (themeMode.value === "light") return t("sidebar.theme_light");
-  return t("sidebar.theme_system");
-});
-
-// 监听 system color scheme 改变(仅 themeMode = "system" 时影响 activeTheme)
+// system 模式下监听系统主题变化,实时切换
 let mediaQueryList: MediaQueryList | null = null;
-const onSystemThemeChange = (e: MediaQueryListEvent): void => {
-  prefersDark.value = e.matches;
+const onSystemThemeChange = (): void => {
+  if (settings.themeMode === "system") {
+    settings.applyTheme();
+  }
 };
 onMounted(() => {
   if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
@@ -117,116 +90,128 @@ onUnmounted(() => {
   }
 });
 
-// 菜单与 router 4 条路由一一对应(R2 NICE 修复:同步占位项)。
-// 未实装路由指向 NotImplemented,菜单显示为 disabled 以让用户知晓存在但暂不可点。
-// v0.14 Theme D:菜单 label 走 i18n,locale 变化时 computed 重渲染
-const menuOptions = computed(() => [
-  {
-    // D19:Protection Overview 首项(默认落地页,= CLI inspect protection)
-    label: () => h(RouterLink, { to: "/protection" }, () => t("nav.protection")),
-    key: "protection",
-  },
-  {
-    label: () => h(RouterLink, { to: "/approvals" }, () => t("nav.approvals")),
-    key: "approvals",
-  },
-  {
-    label: () => h(RouterLink, { to: "/activity" }, () => t("nav.activity")),
-    key: "activity",
-  },
-  {
-    label: () => h(RouterLink, { to: "/servers" }, () => t("nav.servers")),
-    key: "servers",
-  },
-  {
-    label: () => h(RouterLink, { to: "/sessions" }, () => t("nav.sessions")),
-    key: "sessions",
-  },
-  {
-    label: () => h(RouterLink, { to: "/privacy" }, () => t("nav.privacy")),
-    key: "privacy",
-  },
+// 顶栏主题下拉选项
+const themeOptions = computed(() => [
+  { label: t("theme.dark"), value: "dark" },
+  { label: t("theme.light"), value: "light" },
+  { label: t("theme.system"), value: "system" },
 ]);
 
-const selectedKey = computed(() => {
-  const name = (route.name as string | undefined) ?? "protection";
-  return name;
+interface NavItem {
+  key: string;
+  name: string;
+  label: string;
+  icon: Component;
+}
+
+const navItems = computed<NavItem[]>(() => [
+  { key: "protection", name: "protection", label: t("nav.protection"), icon: IconProtection },
+  { key: "approvals", name: "approvals", label: t("nav.approvals"), icon: IconApprovals },
+  { key: "activity", name: "activity", label: t("nav.activity"), icon: IconActivity },
+  { key: "sessions", name: "sessions", label: t("nav.sessions"), icon: IconSessions },
+  { key: "servers", name: "servers", label: t("nav.servers"), icon: IconServers },
+  { key: "privacy", name: "privacy", label: t("nav.privacy"), icon: IconPrivacy },
+  { key: "sandbox", name: "sandbox", label: t("nav.sandbox"), icon: IconSandbox },
+  { key: "settings", name: "settings", label: t("nav.settings"), icon: IconSettings },
+]);
+
+const activeNav = computed(() => (route.name as string | undefined) ?? "protection");
+
+const pageTitle = computed(() => {
+  const metaTitle = route.meta.title as string | undefined;
+  return metaTitle ? t(metaTitle) : "Vigils";
 });
+
+const languageOptions = [
+  { label: "English", value: "en-US" },
+  { label: "中文", value: "zh-CN" },
+];
+
+function navClass(name: string): string {
+  const base =
+    "flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors duration-200";
+  if (activeNav.value === name) {
+    return `${base} bg-vigils-cyan/10 text-vigils-cyan border-l-2 border-vigils-cyan`;
+  }
+  return `${base} text-vigils-text-secondary hover:bg-vigils-bg-tertiary hover:text-vigils-text-primary`;
+}
 </script>
 
 <template>
-  <NConfigProvider :theme="activeTheme">
+  <NConfigProvider :theme="activeTheme" :theme-overrides="themeOverrides">
     <NMessageProvider>
       <NDialogProvider>
-        <NLayout has-sider class="h-screen">
-          <NLayoutSider
-            bordered
-            :width="180"
-            :collapsed-width="56"
-            :collapse-mode="'width'"
-            class="bg-vigil-panel"
-          >
-            <div class="p-4 border-b border-vigil-border">
-              <div class="text-sm font-semibold text-vigil-text">{{ t("sidebar.app_title") }}</div>
-              <div class="text-xs opacity-60">{{ t("sidebar.app_subtitle") }}</div>
+        <div class="flex h-screen bg-vigils-bg-page text-vigils-text-primary overflow-hidden">
+          <!-- Sidebar -->
+          <aside class="w-56 flex-shrink-0 flex flex-col bg-vigils-bg-deep border-r border-vigils-border">
+            <div class="h-14 flex items-center gap-3 px-5 border-b border-vigils-border">
+              <img src="/logo.png" alt="Vigils" class="h-8 w-8 rounded-lg object-contain" />
+              <span class="text-sm font-bold tracking-widest text-vigils-text-primary">VIGILS</span>
             </div>
-            <NMenu :options="menuOptions" :value="selectedKey" />
-            <!-- v0.14 Theme C + B + D:sidebar 底部 toggle 区 -->
-            <div class="sidebar-footer">
-              <NButton
-                size="small"
-                quaternary
-                block
-                data-testid="shortcut-help-toggle"
-                title="Keyboard shortcuts (press ?)"
-                @click="shortcutHelpOpen = true"
+
+            <nav class="flex-1 overflow-y-auto p-3 space-y-1">
+              <RouterLink
+                v-for="item in navItems"
+                :key="item.key"
+                :to="{ name: item.name }"
+                :class="navClass(item.name)"
               >
-                <span class="theme-toggle-content">{{ t("sidebar.shortcuts_button") }}</span>
-              </NButton>
-              <NButton
-                size="small"
-                quaternary
-                block
-                data-testid="locale-toggle"
-                :title="t('sidebar.language_tooltip', { label: currentLocaleLabel })"
-                @click="cycleLocale"
-              >
-                <span class="theme-toggle-content">🌐 {{ currentLocaleShort }}</span>
-              </NButton>
-              <NButton
-                size="small"
-                quaternary
-                block
-                data-testid="theme-toggle"
-                :title="t('sidebar.theme_tooltip', { label: themeLabel })"
-                @click="cycleTheme"
-              >
-                <span class="theme-toggle-content">{{ themeIcon }} {{ themeLabel }}</span>
-              </NButton>
+                <span class="flex items-center justify-center w-5 h-5">
+                  <component :is="item.icon" />
+                </span>
+                <span>{{ item.label }}</span>
+              </RouterLink>
+            </nav>
+          </aside>
+
+          <!-- Main -->
+          <main class="flex-1 flex flex-col min-w-0 bg-vigils-bg-page">
+            <header
+              class="h-14 flex items-center justify-between px-6 border-b border-vigils-border bg-vigils-bg-deep/50 backdrop-blur"
+            >
+              <h1 class="text-base font-semibold text-vigils-text-primary">{{ pageTitle }}</h1>
+
+              <div class="flex items-center gap-4">
+                <!-- Status pill -->
+                <div
+                  class="flex items-center gap-2 px-3 py-1 rounded-full border border-vigils-border bg-vigils-bg-panel text-xs font-medium text-vigils-cyan"
+                >
+                  <span class="w-1.5 h-1.5 rounded-full bg-vigils-cyan animate-pulse" />
+                  <span class="uppercase tracking-wider">{{ t(`settings.posture_${settings.defaultPosture}_label`) }}</span>
+                </div>
+
+                <!-- Theme selector -->
+                <NSelect
+                  :value="settings.themeMode"
+                  :options="themeOptions"
+                  size="small"
+                  style="width: 90px;"
+                  @update:value="settings.setTheme"
+                />
+
+                <!-- Language selector -->
+                <NSelect
+                  :value="settings.locale"
+                  :options="languageOptions"
+                  size="small"
+                  style="width: 100px;"
+                  @update:value="settings.setLocaleCode"
+                />
+              </div>
+            </header>
+
+            <div class="flex-1 overflow-auto p-6">
+              <RouterView />
             </div>
-          </NLayoutSider>
-          <NLayout>
-            <RouterView />
-          </NLayout>
-        </NLayout>
-        <!-- v0.14 Theme B:全局快捷键 help modal -->
-        <ShortcutHelpModal v-model:show="shortcutHelpOpen" />
+          </main>
+        </div>
+
+        <ShortcutHelpModal v-model:show="helpOpen" />
       </NDialogProvider>
     </NMessageProvider>
   </NConfigProvider>
 </template>
 
 <style scoped>
-.sidebar-footer {
-  position: absolute;
-  bottom: 12px;
-  left: 8px;
-  right: 8px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.theme-toggle-content {
-  font-size: 12px;
-}
+/* RouterLink 下划线由全局 tailwind.css 统一去除 */
 </style>

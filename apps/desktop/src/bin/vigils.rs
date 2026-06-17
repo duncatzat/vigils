@@ -47,7 +47,7 @@ use std::sync::Arc;
 
 use tauri::{Emitter, Manager, State};
 use vigil_audit::{
-    EventHit, Ledger, ProtectionSummary, ServerOnboardingData, StoredServerProfile,
+    CheckpointLog, EventHit, Ledger, ProtectionSummary, ServerOnboardingData, StoredServerProfile,
     ToolApprovalCard,
 };
 use vigil_desktop::dispatch;
@@ -234,6 +234,25 @@ async fn protection_summary(state: State<'_, AppState>) -> Result<ProtectionSumm
         .ledger
         .protection_summary(RECENT_LIMIT)
         .map_err(|e| e.to_string())
+}
+
+/// 手动触发审计检查点锚定(`Settings → Checkpoint anchor`)。
+///
+/// 绑定到 ledger 同目录 sidecar(`<ledger>.checkpoints`),追加当前链头事件作为锚点。
+/// 空账本或链头未前进时返回 `None`,表示没有新的前缀可锚;成功时返回锚点 event_id。
+#[tauri::command]
+async fn anchor_checkpoint(state: State<'_, AppState>) -> Result<Option<i64>, String> {
+    let ledger_path = vigil_desktop::ledger_path::resolve_ledger_path(
+        std::env::var(vigil_desktop::ledger_path::LEDGER_ENV_VAR)
+            .ok()
+            .as_deref(),
+        dirs::data_local_dir().as_deref(),
+    )
+    .map_err(|e| format!("resolve_ledger_path failed: {e}"))?;
+
+    let log = CheckpointLog::sidecar_for(&ledger_path);
+    let checkpoint = log.emit(state.ledger.as_ref()).map_err(|e| e.to_string())?;
+    Ok(checkpoint.map(|cp| cp.event_id))
 }
 
 /// `invoke('list_privacy_findings', { req })` → UiCommand::ListPrivacyFindings →
@@ -713,6 +732,8 @@ fn main() {
             export_session_replay,
             // D19(Protection Overview —— 1 read)
             protection_summary,
+            // Settings: 手动锚定审计检查点
+            anchor_checkpoint,
         ])
         .setup(move |app| {
             let _main_window = app.get_webview_window("main");

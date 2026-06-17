@@ -19,11 +19,13 @@ import type { Router } from "vue-router";
 
 /** g-prefix chord 映射:key → route name */
 const NAV_CHORDS: Record<string, string> = {
-  a: "activity",
+  d: "dashboard",
   q: "approvals",
-  s: "servers",
-  r: "sessions",
-  p: "privacy",
+  a: "audit",
+  g: "agents",
+  i: "integrations",
+  s: "assets",
+  t: "settings",
 };
 
 const CHORD_TIMEOUT_MS = 1200;
@@ -156,16 +158,18 @@ export function useGlobalShortcuts(opts: {
  */
 export const SHORTCUT_REFERENCE = [
   // ── Navigation ──
-  { keys: "g a", descKey: "shortcuts.go_activity", groupKey: "shortcuts.group_navigation" },
+  { keys: "g d", descKey: "shortcuts.go_dashboard", groupKey: "shortcuts.group_navigation" },
   { keys: "g q", descKey: "shortcuts.go_approvals", groupKey: "shortcuts.group_navigation" },
-  { keys: "g s", descKey: "shortcuts.go_servers", groupKey: "shortcuts.group_navigation" },
-  { keys: "g r", descKey: "shortcuts.go_sessions", groupKey: "shortcuts.group_navigation" },
-  { keys: "g p", descKey: "shortcuts.go_privacy", groupKey: "shortcuts.group_navigation" },
+  { keys: "g a", descKey: "shortcuts.go_audit", groupKey: "shortcuts.group_navigation" },
+  { keys: "g g", descKey: "shortcuts.go_agents", groupKey: "shortcuts.group_navigation" },
+  { keys: "g i", descKey: "shortcuts.go_integrations", groupKey: "shortcuts.group_navigation" },
+  { keys: "g s", descKey: "shortcuts.go_assets", groupKey: "shortcuts.group_navigation" },
+  { keys: "g t", descKey: "shortcuts.go_settings", groupKey: "shortcuts.group_navigation" },
   // ── Global ──
   { keys: "/", descKey: "shortcuts.focus_search", groupKey: "shortcuts.group_global" },
   { keys: "?", descKey: "shortcuts.toggle_help", groupKey: "shortcuts.group_global" },
   { keys: "Esc", descKey: "shortcuts.close", groupKey: "shortcuts.group_global" },
-  // ── ApprovalQueue page ──
+  // ── Approvals page ──
   { keys: "j / ↓", descKey: "shortcuts.next_approval", groupKey: "shortcuts.group_approval_queue" },
   { keys: "k / ↑", descKey: "shortcuts.prev_approval", groupKey: "shortcuts.group_approval_queue" },
   { keys: "Enter", descKey: "shortcuts.open_drawer", groupKey: "shortcuts.group_approval_queue" },

@@ -43,10 +43,8 @@ function detectInitialLocale(): SupportedLocale {
   } catch {
     // localStorage disabled — 用 navigator 兜底
   }
-  // navigator.language 通常 "zh-CN" / "en-US" / "ja-JP" 等;
-  // 任何 zh-* 都映射到 zh-CN,其余回 en-US
-  const nav = (typeof navigator !== "undefined" ? navigator.language : "") || "";
-  return nav.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
+  // 默认 en-US,与原型图语言保持一致;用户可在顶栏语言选择器切换。
+  return "en-US";
 }
 
 export const i18n = createI18n({

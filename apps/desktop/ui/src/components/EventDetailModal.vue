@@ -84,7 +84,7 @@ const payloadPretty = computed(() => {
       <!-- Payload JSON pretty-print;{{ }} 插值天然转义 XSS -->
       <NCard :title="t('eventModal.payload_title')" size="small">
         <pre
-          class="text-xs whitespace-pre-wrap break-all max-h-[32rem] overflow-auto font-mono bg-vigil-bg p-3 rounded border border-vigil-border"
+          class="text-xs whitespace-pre-wrap break-all max-h-[32rem] overflow-auto font-mono bg-vigils-bg-deep p-3 rounded border border-vigils-bg-surface"
           data-testid="payload-pre"
         >{{ payloadPretty }}</pre>
       </NCard>

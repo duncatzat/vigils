@@ -1,57 +1,60 @@
 import { createRouter, createWebHashHistory, type RouteRecordRaw } from "vue-router";
 
 /**
- * I08b-α2 Router 骨架。
- *
- * - α2 实装:ApprovalQueue(`/approvals`)
- * - α3/α4/α5 占位:显式指向 `NotImplemented.vue` 而非虚假指向 ApprovalQueue
- *   (R1 NICE 修复:避免"功能已存在"错觉)
- *
- * 用 hash history(Tauri 打包 SPA 本地路径友好,避免 file:// 协议冲突)。
+ * Vigils Desktop — 路由结构(与原型图导航一一对应)。
  */
 const routes: RouteRecordRaw[] = [
   {
-    // D19:默认落地 = Protection Overview(首屏即见"Vigil 拦下了什么",面向采用)。
     path: "/",
-    redirect: "/protection",
+    redirect: { name: "protection" },
   },
-  // D19 — Protection Overview(= CLI inspect protection 的 GUI 等价物)
   {
     path: "/protection",
     name: "protection",
     component: () => import("@/pages/ProtectionOverview.vue"),
-    meta: { title: "Protection Overview" },
+    meta: { title: "protection.page_title" },
   },
   {
     path: "/approvals",
     name: "approvals",
-    component: () => import("@/pages/ApprovalQueue.vue"),
-    meta: { title: "Approval Queue" },
+    component: () => import("@/pages/Approvals.vue"),
+    meta: { title: "approval.page_title" },
   },
   {
     path: "/activity",
     name: "activity",
     component: () => import("@/pages/ActivityFeed.vue"),
-    meta: { title: "Activity Feed" },
-  },
-  {
-    path: "/servers",
-    name: "servers",
-    component: () => import("@/pages/ServerRegistry.vue"),
-    meta: { title: "Server Registry" },
+    meta: { title: "activity.page_title" },
   },
   {
     path: "/sessions",
     name: "sessions",
-    component: () => import("@/pages/SessionReplay.vue"),
-    meta: { title: "Session Replay" },
+    component: () => import("@/pages/Sessions.vue"),
+    meta: { title: "session.page_title" },
   },
-  // ISS-017 — Privacy Findings 聚合面板
+  {
+    path: "/servers",
+    name: "servers",
+    component: () => import("@/pages/Servers.vue"),
+    meta: { title: "server.page_title" },
+  },
   {
     path: "/privacy",
     name: "privacy",
     component: () => import("@/pages/PrivacyFindings.vue"),
-    meta: { title: "Privacy Findings" },
+    meta: { title: "privacy.page_title" },
+  },
+  {
+    path: "/sandbox",
+    name: "sandbox",
+    component: () => import("@/pages/Sandbox.vue"),
+    meta: { title: "sandbox.page_title" },
+  },
+  {
+    path: "/settings",
+    name: "settings",
+    component: () => import("@/pages/Settings.vue"),
+    meta: { title: "settings.page_title" },
   },
 ];
 

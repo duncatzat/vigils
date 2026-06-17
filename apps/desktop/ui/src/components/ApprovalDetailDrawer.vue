@@ -288,7 +288,7 @@ function statusLabel(s: ApprovalStatus): string {
                 {{ t("detail.effect_raw_summary") }}
               </summary>
               <pre
-                class="mt-2 text-xs whitespace-pre-wrap break-all max-h-96 overflow-auto font-mono bg-vigil-bg p-3 rounded border border-vigil-border"
+                class="mt-2 text-xs whitespace-pre-wrap break-all max-h-96 overflow-auto font-mono bg-vigils-bg-deep p-3 rounded border border-vigils-bg-surface"
                 data-testid="effect-vector-pre"
               >{{ effectVectorPretty }}</pre>
             </details>

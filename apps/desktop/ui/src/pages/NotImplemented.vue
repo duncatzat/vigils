@@ -18,10 +18,10 @@ const title = computed<string>(() => {
 
 <template>
   <div class="p-6">
-    <NCard class="bg-vigil-panel border-vigil-border">
+    <NCard class="bg-vigils-bg-panel border-vigils-bg-surface">
       <NSpace vertical :size="12">
         <NTag type="warning">{{ t("notImplemented.badge") }}</NTag>
-        <h2 class="text-lg font-semibold text-vigil-text">{{ title }}</h2>
+        <h2 class="text-lg font-semibold text-vigils-text-primary">{{ title }}</h2>
         <p class="text-sm opacity-70">
           {{ t("notImplemented.body") }}
         </p>

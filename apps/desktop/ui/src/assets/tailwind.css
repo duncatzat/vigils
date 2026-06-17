@@ -2,16 +2,83 @@
 @tailwind components;
 @tailwind utilities;
 
-/* I08b-α1 极简样式 — β 阶段扩展 */
+/* Vigils Desktop — 设计 token(CSS 变量)。
+   默认深色(原型图)；.light 类覆盖为浅色主题。 */
+:root {
+  --vigils-cyan: #05d9e8;
+  --vigils-cyan-light: #67e8f9;
+  --vigils-green: #00ff9d;
+  --vigils-purple: #a855f7;
+  --vigils-red: #ff2a6d;
+  --vigils-yellow: #facc15;
+  --vigils-bg-deep: #0b0b0f;
+  --vigils-bg-page: #0b0b0f;
+  --vigils-bg-panel: #13131a;
+  --vigils-bg-tertiary: #1a1a24;
+  --vigils-bg-surface: #252532;
+  --vigils-border: #1e1e28;
+  --vigils-input: #0a0a0f;
+  --vigils-text-primary: #e2e8f0;
+  --vigils-text-secondary: #64748b;
+  --vigils-text-muted: #475569;
+}
+
+html.light {
+  --vigils-bg-deep: #f8fafc;
+  --vigils-bg-page: #f1f5f9;
+  --vigils-bg-panel: #ffffff;
+  --vigils-bg-tertiary: #e2e8f0;
+  --vigils-bg-surface: #cbd5e1;
+  --vigils-border: #e2e8f0;
+  --vigils-input: #ffffff;
+  --vigils-text-primary: #0f172a;
+  --vigils-text-secondary: #475569;
+  --vigils-text-muted: #94a3b8;
+}
+
 html,
 body {
   margin: 0;
   padding: 0;
-  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei",
-    sans-serif;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "PingFang SC", "Microsoft YaHei", sans-serif;
   height: 100vh;
+  background-color: var(--vigils-bg-deep);
+  color: var(--vigils-text-primary);
+}
+
+/* 去除链接默认下划线(RouterLink 等) */
+a,
+a:hover,
+a:focus {
+  text-decoration: none;
 }
 
 #app {
   height: 100vh;
+}
+
+/* 统一代码/终端字体 */
+code,
+pre,
+kbd,
+.font-mono {
+  font-family: "JetBrains Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+}
+
+/* 自定义滚动条(暗色控制台风格) */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--vigils-bg-deep);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--vigils-bg-surface);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vigils-text-muted);
 }

@@ -30,6 +30,7 @@
     "allow-verify-chain",
     "allow-list-privacy-findings",
     "allow-export-session-replay",
-    "allow-protection-summary"
+    "allow-protection-summary",
+    "allow-anchor-checkpoint"
   ]
 }
