@@ -44,6 +44,9 @@ const COLUMN_MIGRATIONS: &[(&str, &str, &str)] = &[
     // "issuer_missing_legacy_row")。**不得**改为 NOT NULL —— ADD COLUMN 对非空
     // 表加 NOT NULL 无默认值会失败,破坏迁移幂等性。
     ("oauth_token_metadata", "issuer", "TEXT"),
+    // Finding 7(hostile review):metadata 行绑定的审计事件 id(读侧按此特定 id 取事件 +
+    // verify_chain 校验,获得与账本其余状态同级篡改可检测性)。nullable —— legacy 行 NULL → 放行。
+    ("oauth_token_metadata", "binding_event_id", "INTEGER"),
     // V1.1(ADR 0007 §I-7.1 / ADR 0005 第二独立 drift 维度):裸命令解析后绝对路径 pin。
     // nullable —— legacy 行(列新增前的审批)NULL,首次本机 spawn 建立基线(见 §3.2 4 护栏)。
     ("server_profiles", "resolved_program_path", "TEXT"),
@@ -139,6 +142,11 @@ pub const EVENT_TYPE_RAW_SECRET_BLOCKED: &str = "raw_secret_attempt_detected";
 pub const EVENT_TYPE_TOOL_RESULT_LEAK: &str = "secret.leak_detected";
 /// 见 [`EVENT_TYPE_RAW_SECRET_BLOCKED`]。
 pub const EVENT_TYPE_SECRET_ALIAS_UNRESOLVED: &str = "secret.alias_unresolved";
+/// Finding 7(hostile review):`register_oauth_token_metadata` 写行时同步追加的**绑定事件**,
+/// 把 metadata 的安全字段(token_ref / issuer / authorization_server / resource / scope / kind)
+/// 绑进审计哈希链,使该行获得与账本其余状态同等的篡改可检测性。读侧
+/// `get_oauth_token_metadata` 比对最新此类事件检测行篡改。crate-内部机制(非跨 crate API)。
+pub(crate) const EVENT_TYPE_OAUTH_METADATA_BOUND: &str = "oauth.token_metadata_bound";
 
 /// `inspect protection` 的"保护成效"汇总(只读聚合,proof-of-value 面)。
 ///

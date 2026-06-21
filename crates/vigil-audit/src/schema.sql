@@ -177,7 +177,11 @@ CREATE TABLE IF NOT EXISTS oauth_token_metadata (
   -- 新库直接带列;legacy I10a 磁盘行通过 COLUMN_MIGRATIONS ADD COLUMN 后为 NULL,
   -- 读侧统一 fail-closed(TokenStoreError "issuer_missing_legacy_row")。
   -- 刻意 nullable(**不**得改 NOT NULL)—— ADD COLUMN NOT NULL 对非空表会失败。
-  issuer               TEXT
+  issuer               TEXT,
+  -- Finding 7(hostile review):本行安全字段绑定到的审计事件 event_id(oauth.token_metadata_bound)。
+  -- 读侧按**此特定 id** 取事件 + verify_chain 校验,使行获得与账本其余状态同级篡改可检测性。
+  -- nullable:legacy(本特性前 onboard)行 NULL → 读侧放行(无法回溯);新行恒带有效 id。
+  binding_event_id     INTEGER
 );
 
 -- I08 Sandbox profile 持久化(ADR 0008 §D6)

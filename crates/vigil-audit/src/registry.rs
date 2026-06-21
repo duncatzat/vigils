@@ -1427,19 +1427,41 @@ impl Ledger {
         }
         let scope_json = serde_json::to_string(scope_set)?;
         let now = crate::ledger::now_secs();
+
+        // Finding 7(hostile review):把 metadata 安全字段绑进审计哈希链 —— 此前本行是唯一完全在
+        // 链外的安全关键状态(纯 INSERT,`verify_chain` 检测不到改 issuer/AS)。**先 append 绑定事件**
+        // 拿 event_id,**再**把行写入并带上该 id —— 使行**永远**携带有效绑定引用(杜绝"INSERT 后 /
+        // 绑定前被 kill"的非原子窗口;若在 append 后 / INSERT 前 kill,只留一条无行引用的孤儿事件,
+        // 无害且绝不被读)。读侧按**此特定 id** 取事件 + `verify_chain` 校验检测篡改(同级于账本其余
+        // 状态;仅完整一致重写整条链才能绕过 —— unkeyed chain 固有限制,需外部 anchoring,hash.rs 头注)。
+        let bound = self.append_event_internal(
+            "system",
+            crate::ledger::EVENT_TYPE_OAUTH_METADATA_BOUND,
+            &serde_json::json!({
+                "token_ref": token_ref,
+                "resource": resource,
+                "authorization_server": authorization_server,
+                "issuer": issuer,
+                "scope_set": scope_set,
+                "token_kind": token_kind,
+            }),
+            None,
+        )?;
+
         let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
         guard.execute(
             "INSERT INTO oauth_token_metadata
                (token_ref, resource, authorization_server, scope_set_json,
-                token_kind, expires_at, created_at, issuer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                token_kind, expires_at, created_at, issuer, binding_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(token_ref) DO UPDATE SET
                resource = excluded.resource,
                authorization_server = excluded.authorization_server,
                scope_set_json = excluded.scope_set_json,
                token_kind = excluded.token_kind,
                expires_at = excluded.expires_at,
-               issuer = excluded.issuer",
+               issuer = excluded.issuer,
+               binding_event_id = excluded.binding_event_id",
             rusqlite::params![
                 token_ref,
                 resource,
@@ -1449,6 +1471,7 @@ impl Ledger {
                 expires_at,
                 now,
                 issuer,
+                bound.event_id,
             ],
         )?;
         Ok(())
@@ -1500,35 +1523,83 @@ impl Ledger {
         &self,
         token_ref: &str,
     ) -> Result<Option<vigil_http_auth_metadata::OAuthTokenMetadataRow>> {
-        let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
-        let row = guard
-            .query_row(
-                "SELECT token_ref, resource, authorization_server, scope_set_json,
-                        token_kind, expires_at, created_at, issuer
+        let row = {
+            let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
+            guard
+                .query_row(
+                    "SELECT token_ref, resource, authorization_server, scope_set_json,
+                        token_kind, expires_at, created_at, issuer, binding_event_id
                  FROM oauth_token_metadata WHERE token_ref = ?1",
-                rusqlite::params![token_ref],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, Option<i64>>(5)?,
-                        r.get::<_, i64>(6)?,
-                        r.get::<_, Option<String>>(7)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((token_ref, resource, authz, scope_json, kind, expires_at, created_at, issuer)) =
-            row
+                    rusqlite::params![token_ref],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, Option<i64>>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                            r.get::<_, Option<i64>>(8)?,
+                        ))
+                    },
+                )
+                .optional()?
+        }; // 释放 conn 锁 —— latest_oauth_binding 会再次 lock,避免死锁
+        let Some((
+            tref,
+            resource,
+            authz,
+            scope_json,
+            kind,
+            expires_at,
+            created_at,
+            issuer,
+            binding_event_id,
+        )) = row
         else {
             return Ok(None);
         };
         let scope_set: Vec<String> = serde_json::from_str(&scope_json)?;
+
+        // Finding 7(hostile review):行已绑定(binding_event_id 非 NULL)→ 校验,使 OAuth metadata
+        // 获得与账本其余状态**同级**的篡改可检测性:
+        //  (1) `verify_chain()`:events 被 naive 删/改(未一致重写)→ 链断 → Err。
+        //  (2) 按**存储的 event_id** 取**特定**绑定事件(非"取最新",杜绝攻击者 append 高 id 伪事件
+        //      自动当选);事件缺失(被删)→ fail-closed。
+        //  (3) 行字段与该事件 payload JCS 比对,不一致 → fail-closed(疑似行被改 issuer/AS)。
+        // 合起来:naive 单点篡改被检出;仅完整一致重写整条链(unkeyed chain 固有限制,需外部
+        // anchoring,hash.rs 头注)才能绕过 —— 与账本其余状态同级,非更弱。
+        // binding_event_id NULL = legacy 行(本特性前 onboard / 测试 raw 插入)→ 放行(无法回溯)。
+        if let Some(eid) = binding_event_id {
+            // 注(hostile re-review note c,tracked LOW):verify_chain 全链 O(n),而本读路径经
+            // resolve_access_token 在**每次工具调用**触发 → 长生命周期账本上 O(n²)。当前阶段账本
+            // 小可忽略;规模化优化 = 只验到 binding_event_id 的**前缀**(绑定事件早,前缀有界),或
+            // tail-event_hash 缓存上次 verify 结果。fail-closed 方向正确(账本被篡改即停信任),故非阻塞。
+            self.verify_chain()?;
+            let bound = self
+                .event_payload_by_id(eid)?
+                .ok_or(AuditError::InvalidInput {
+                    reason: "oauth_binding_event_missing",
+                })?;
+            let expected = serde_json::json!({
+                "token_ref": tref,
+                "resource": resource,
+                "authorization_server": authz,
+                "issuer": issuer,
+                "scope_set": scope_set,
+                "token_kind": kind,
+            });
+            if serde_jcs::to_vec(&bound)? != serde_jcs::to_vec(&expected)? {
+                return Err(AuditError::InvalidInput {
+                    reason: "oauth_metadata_integrity_mismatch",
+                });
+            }
+        }
+
         Ok(Some(vigil_http_auth_metadata::OAuthTokenMetadataRow {
-            token_ref,
+            token_ref: tref,
             resource,
             authorization_server: authz,
             scope_set,
@@ -1537,6 +1608,26 @@ impl Ledger {
             created_at,
             issuer,
         }))
+    }
+
+    /// Finding 7:按 `event_id` 取**绑定事件** payload(读侧按行存储的 `binding_event_id` 取**特定**
+    /// 事件,而非"取最新" —— 杜绝攻击者 append 一条高 id 伪绑定事件自动当选)。查询额外约束
+    /// `event_type = oauth.token_metadata_bound`(hostile re-review note 2):若行的 binding_event_id
+    /// 被改指向**别的**事件,类型不符 → `None` → 调用方 fail-closed(意图显式 + 多一道防御)。
+    /// `None` = 该 id 无匹配绑定事件(被删 / 被重指向)→ fail-closed。
+    fn event_payload_by_id(&self, event_id: i64) -> Result<Option<serde_json::Value>> {
+        let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
+        let pj: Option<String> = guard
+            .query_row(
+                "SELECT payload_json FROM events WHERE event_id = ?1 AND event_type = ?2",
+                rusqlite::params![event_id, crate::ledger::EVENT_TYPE_OAUTH_METADATA_BOUND],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        match pj {
+            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            None => Ok(None),
+        }
     }
 
     /// **仅测试用**:绕过 `register_oauth_token_metadata` 的 kind / issuer 校验,

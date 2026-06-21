@@ -911,6 +911,220 @@ fn register_oauth_token_metadata_rejects_empty_issuer() {
     ));
 }
 
+/// (21) Finding 7(hostile review):`register_oauth_token_metadata` 把行的安全字段绑进审计哈希链;
+/// 行与最新绑定事件一致时 `get_oauth_token_metadata` 正常返回(verify 通过路径)。
+#[test]
+fn finding7_oauth_metadata_binding_happy_path() {
+    let l = Ledger::open_in_memory().unwrap();
+    l.register_oauth_token_metadata(
+        "token://oauth/access/r/c",
+        "https://mcp.example.com/",
+        "https://auth.example.com/",
+        &["mcp:tools.read".into()],
+        "access",
+        None,
+        "https://auth.example.com",
+    )
+    .unwrap();
+    let row = l
+        .get_oauth_token_metadata("token://oauth/access/r/c")
+        .expect("binding 匹配应正常读")
+        .expect("行存在");
+    assert_eq!(row.issuer.as_deref(), Some("https://auth.example.com"));
+}
+
+/// (22) Finding 7 ★安全回归:DB 攻击者绕过 Ledger API,用第二个 raw rusqlite 连接直改
+/// `oauth_token_metadata` 行的 issuer(而审计链里的绑定事件仍是旧值)→ `get_oauth_token_metadata`
+/// 检测行≠链 → **fail-closed**(绝不返回被篡改的 issuer)。模拟真实 DB 篡改,**非 test-util**,CI 内跑。
+#[test]
+fn finding7_tampered_metadata_row_fails_closed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ledger.db");
+    let tref = "token://oauth/access/r/c";
+    {
+        let l = Ledger::open(&path).unwrap();
+        l.register_oauth_token_metadata(
+            tref,
+            "https://mcp.example.com/",
+            "https://auth.example.com/",
+            &["mcp:tools.read".into()],
+            "access",
+            None,
+            "https://auth.example.com", // 真 issuer
+        )
+        .unwrap();
+        l.checkpoint().unwrap();
+    }
+    // DB 攻击者:绕过 Ledger,raw SQL 把 issuer 改成恶意 AS(绑定事件不动)。
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE oauth_token_metadata SET issuer = ?1 WHERE token_ref = ?2",
+                rusqlite::params!["https://evil.example.com", tref],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "篡改应命中 1 行");
+    }
+    let l = Ledger::open(&path).unwrap();
+    let err = l
+        .get_oauth_token_metadata(tref)
+        .expect_err("行被改 issuer 而绑定未变 → 必须 fail-closed");
+    assert!(
+        matches!(
+            err,
+            AuditError::InvalidInput {
+                reason: "oauth_metadata_integrity_mismatch"
+            }
+        ),
+        "期望 integrity mismatch,实际 {err:?}"
+    );
+}
+
+/// (23) Finding 7 向后兼容:无绑定事件的 legacy 行(本特性前 onboard / 直插)→ 放行
+/// (无法回溯校验,不破坏既有 token)。raw 插一行(不经 register → 无绑定事件),get 正常返回。
+#[test]
+fn finding7_legacy_row_without_binding_passes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ledger.db");
+    let tref = "token://oauth/access/legacy/x";
+    {
+        let l = Ledger::open(&path).unwrap();
+        l.checkpoint().unwrap(); // 刷 schema 到主库,raw 连接可见
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO oauth_token_metadata
+               (token_ref, resource, authorization_server, scope_set_json,
+                token_kind, expires_at, created_at, issuer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                tref,
+                "https://mcp.example.com/",
+                "https://auth.example.com/",
+                "[\"mcp:tools.read\"]",
+                "access",
+                Option::<i64>::None,
+                0_i64,
+                "https://auth.example.com",
+            ],
+        )
+        .unwrap();
+    }
+    let l = Ledger::open(&path).unwrap();
+    let row = l
+        .get_oauth_token_metadata(tref)
+        .expect("legacy 行(无绑定)应放行")
+        .expect("行存在");
+    assert_eq!(row.token_ref, tref);
+}
+
+/// (24) Finding 7 ★安全回归(hostile re-review exploit 1):DB 攻击者 **删掉绑定事件** 试图
+/// downgrade 到"无绑定 = legacy 放行" → 读侧按行存的 `binding_event_id` 取不到事件 → **fail-closed**
+/// (绝不因事件消失而把被绑定的行降级当 legacy 放行)。
+#[test]
+fn finding7_deleted_binding_event_fails_closed() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ledger.db");
+    let tref = "token://oauth/access/r/c";
+    {
+        let l = Ledger::open(&path).unwrap();
+        l.register_oauth_token_metadata(
+            tref,
+            "https://mcp.example.com/",
+            "https://auth.example.com/",
+            &["mcp:tools.read".into()],
+            "access",
+            None,
+            "https://auth.example.com",
+        )
+        .unwrap();
+        l.checkpoint().unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let eid: i64 = conn
+            .query_row(
+                "SELECT binding_event_id FROM oauth_token_metadata WHERE token_ref = ?1",
+                rusqlite::params![tref],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "DELETE FROM events WHERE event_id = ?1",
+            rusqlite::params![eid],
+        )
+        .unwrap();
+    }
+    let l = Ledger::open(&path).unwrap();
+    let err = l
+        .get_oauth_token_metadata(tref)
+        .expect_err("删绑定事件必须 fail-closed,绝不 downgrade 到 legacy 放行");
+    assert!(
+        matches!(
+            err,
+            AuditError::InvalidInput {
+                reason: "oauth_binding_event_missing"
+            }
+        ),
+        "实际 {err:?}"
+    );
+}
+
+/// (25) Finding 7 ★安全回归(hostile re-review exploit 2 的 naive 变体):DB 攻击者 **改绑定事件的
+/// payload**(伪装成匹配未来 evil 行)但**不一致重算 hash** → `verify_chain` 检出链断 → **fail-closed**。
+/// (完整一致重写整条链才能绕过 = unkeyed chain 固有限制,与账本其余状态同级,需外部 anchoring。)
+#[test]
+fn finding7_tampered_binding_event_fails_closed_via_verify_chain() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ledger.db");
+    let tref = "token://oauth/access/r/c";
+    {
+        let l = Ledger::open(&path).unwrap();
+        l.register_oauth_token_metadata(
+            tref,
+            "https://mcp.example.com/",
+            "https://auth.example.com/",
+            &["mcp:tools.read".into()],
+            "access",
+            None,
+            "https://auth.example.com",
+        )
+        .unwrap();
+        l.checkpoint().unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let eid: i64 = conn
+            .query_row(
+                "SELECT binding_event_id FROM oauth_token_metadata WHERE token_ref = ?1",
+                rusqlite::params![tref],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // 改 payload 的 issuer 为恶意 AS,但保留旧 event_hash(不一致重算)。
+        let evil = format!(
+            r#"{{"authorization_server":"https://auth.example.com/","issuer":"https://evil.example.com","resource":"https://mcp.example.com/","scope_set":["mcp:tools.read"],"token_kind":"access","token_ref":"{tref}"}}"#
+        );
+        let n = conn
+            .execute(
+                "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+                rusqlite::params![evil, eid],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+    let l = Ledger::open(&path).unwrap();
+    let err = l
+        .get_oauth_token_metadata(tref)
+        .expect_err("改绑定事件 payload 不重算 hash → verify_chain 必检出 → fail-closed");
+    assert!(
+        matches!(err, AuditError::ChainBroken { .. }),
+        "期望 ChainBroken(verify_chain 检出),实际 {err:?}"
+    );
+}
+
 /// ISS-20260621-004 回归:多个独立连接**并发** `Ledger::open` 同一新磁盘库,不得有任何连接
 /// 因撞锁失败。根因:`init()` 此前在 `PRAGMA journal_mode = WAL`(取排他锁)**之前**未设
 /// busy_timeout,并发 open 撞锁会因 busy_timeout 仍是默认 0 而**立即** "database is locked"
