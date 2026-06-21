@@ -43,6 +43,9 @@ use vigil_audit::Ledger;
 use vigil_firewall::scorer::DescriptorOracle;
 use vigil_firewall::{Firewall, FirewallConfig};
 // 可逆脱敏 Slice 2:从 `upstreams.json` 的 `secrets` map 读 env:/keyring: 源装 SecretAliasMap。
+use vigil_http_transport::{
+    HttpJwksSource, JwksSignatureVerifier, ReqwestHttpClient, StreamableHttpUpstream,
+};
 use vigil_lease::{KeyringSecretStore, SecretStore, SecretValue};
 use vigil_mcp::protocol::{read_message, write_message, ProtocolError};
 use vigil_mcp::{
@@ -429,13 +432,117 @@ pub struct SecretDecl {
     pub server: String,
 }
 
-/// 单条 upstream 定义(Stage 1 仅 stdio)。
-#[derive(Debug, Clone, Deserialize)]
-pub struct UpstreamEntry {
-    /// server 名(在 Vigil 内部唯一,namespace 暴露给 agent 时也用这个)
-    pub name: String,
-    /// 子进程 argv(第一个元素是可执行,后续参数)
-    pub argv: Vec<String>,
+/// 远端 HTTP MCP 上游的鉴权来源(ADR 0021 §3.3)。token 经 planner 注入,类型上不可 passthrough。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HttpAuth {
+    /// 无鉴权(public MCP / 本地 mock)。
+    #[default]
+    None,
+    /// 静态 Bearer / PAT —— `source` 走 `env:<VAR>` 或 `keyring:<svc>/<acct>`(**拒** literal,
+    /// 同 secrets 纪律);token 启动期读出后只活内存 `SecretValue`,绝不入审计 / 错误(Slice 4)。
+    Bearer {
+        /// 真值来源(`env:` / `keyring:`)。
+        source: String,
+    },
+    /// OAuth access token —— 复用 `add-remote-mcp` 持久化的 token(以 resource + client_id 引用)。
+    OAuth {
+        /// 受保护资源 URL(token 绑定的 audience)。
+        resource: String,
+        /// OAuth client_id。
+        client_id: String,
+    },
+}
+
+/// MCP HTTP 传输修订提示(ADR 0021 §1.2)。
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpTransportHint {
+    /// Streamable HTTP(2025-03,现行,默认)。
+    Streamable,
+    /// Legacy HTTP+SSE 双 endpoint(2024-11,Slice 5)。
+    LegacySse,
+}
+
+/// 单条 upstream 定义。**加性**:旧 `{name,argv}` config 仍命中 [`UpstreamEntry::Stdio`] → 零破坏;
+/// 新增 `{name,url,..}` 命中 [`UpstreamEntry::Http`]。
+///
+/// 用**自定义 [`Deserialize`]**(经 [`UpstreamEntryRaw`] flat 中间体)做 `argv` XOR `url` 显式分流:
+/// `{name,argv,url}` 歧义、两者皆缺、stdio 上误挂 `auth`/`transport_hint` 全 **fail-closed 报错**
+/// (MF#3:非静默丢字段)。注:`#[serde(untagged)]` + 每变体 `deny_unknown_fields` **serde 不支持**
+/// (untagged 下 deny_unknown_fields 致 derive 不生成 `Deserialize` impl,实测 E0277),故手写。
+#[derive(Debug, Clone)]
+pub enum UpstreamEntry {
+    /// stdio 子进程上游(argv 启动)。
+    Stdio {
+        /// server 名(Vigil 内部唯一 + namespace 暴露给 agent)。
+        name: String,
+        /// 子进程 argv(argv[0]=可执行,后续参数)。
+        argv: Vec<String>,
+    },
+    /// 远端 HTTP MCP 上游(Streamable HTTP,ADR 0021 Slice 1+)。
+    Http {
+        /// server 名。
+        name: String,
+        /// MCP endpoint(生产仅 `https://`;`http://` 仅 loopback 本地 mock)。
+        url: String,
+        /// 鉴权来源(默认 [`HttpAuth::None`])。
+        auth: HttpAuth,
+        /// 传输修订提示(默认 Streamable)。
+        transport_hint: Option<HttpTransportHint>,
+    },
+}
+
+/// [`UpstreamEntry`] 的 flat 反序列化中间体:`deny_unknown_fields` 拒未知键;`argv`/`url` 用
+/// `Option` 区分"是否给出",由 [`UpstreamEntry`] 的手写 `Deserialize` 做 XOR 分流。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamEntryRaw {
+    name: String,
+    #[serde(default)]
+    argv: Option<Vec<String>>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    auth: Option<HttpAuth>,
+    #[serde(default)]
+    transport_hint: Option<HttpTransportHint>,
+}
+
+impl<'de> Deserialize<'de> for UpstreamEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let raw = UpstreamEntryRaw::deserialize(deserializer)?;
+        match (raw.argv, raw.url) {
+            (Some(argv), None) => {
+                // stdio:不接受 http-only 字段(防误配被静默忽略)。
+                if raw.auth.is_some() || raw.transport_hint.is_some() {
+                    return Err(D::Error::custom(
+                        "`auth`/`transport_hint` are only valid for http upstreams (this entry has `argv` = stdio)",
+                    ));
+                }
+                Ok(UpstreamEntry::Stdio {
+                    name: raw.name,
+                    argv,
+                })
+            }
+            (None, Some(url)) => Ok(UpstreamEntry::Http {
+                name: raw.name,
+                url,
+                auth: raw.auth.unwrap_or_default(),
+                transport_hint: raw.transport_hint,
+            }),
+            (Some(_), Some(_)) => Err(D::Error::custom(
+                "upstream entry has both `argv` (stdio) and `url` (http); specify exactly one",
+            )),
+            (None, None) => Err(D::Error::custom(
+                "upstream entry needs either `argv` (stdio) or `url` (http)",
+            )),
+        }
+    }
 }
 
 /// `serve` 错误(transparent wrap 下游各子系统)。
@@ -933,7 +1040,19 @@ pub fn build_hub_with_config(
     //    serve 模式传空 env(走 MCP env 白名单);wrap 模式由 caller 自己 attach 并透传 env。
     if let Some(cfg) = &upstreams_cfg {
         for entry in &cfg.upstreams {
-            attach_stdio_upstream(&ledger, &hub, entry, &[])?;
+            match entry {
+                UpstreamEntry::Stdio { name, argv } => {
+                    attach_stdio_upstream(&ledger, &hub, name, argv, &[])?;
+                }
+                UpstreamEntry::Http {
+                    name,
+                    url,
+                    auth,
+                    transport_hint,
+                } => {
+                    attach_http_upstream(&ledger, &hub, name, url, auth, *transport_hint)?;
+                }
+            }
         }
     }
 
@@ -1027,17 +1146,18 @@ fn resolve_secret_source(alias: &str, source: &str) -> Result<SecretValue, Serve
 pub fn attach_stdio_upstream(
     ledger: &Arc<Ledger>,
     hub: &Arc<Hub>,
-    entry: &UpstreamEntry,
+    name: &str,
+    argv: &[String],
     env: &[(String, String)],
 ) -> Result<(), ServeError> {
     // argv 必须非空(下游 spawn 会拒,但在此提前 fail-closed 给更清晰错)
-    if entry.argv.is_empty() {
+    if argv.is_empty() {
         return Err(ServeError::InvalidUpstream {
-            name: entry.name.clone(),
+            name: name.to_string(),
             reason: "argv is empty",
         });
     }
-    if entry.name.is_empty() {
+    if name.is_empty() {
         return Err(ServeError::InvalidUpstream {
             name: String::new(),
             reason: "name is empty",
@@ -1045,7 +1165,7 @@ pub fn attach_stdio_upstream(
     }
 
     // 1. 算 command_hash(与 Hub::attach_upstream 内部算法一致,避免 drift 误判)
-    let command_hash = compute_argv_hash(&entry.argv)?;
+    let command_hash = compute_argv_hash(argv)?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1053,9 +1173,9 @@ pub fn attach_stdio_upstream(
         .unwrap_or(0);
 
     let profile = ServerProfile {
-        server_id: entry.name.clone(),
+        server_id: name.to_string(),
         transport: TransportKind::Stdio,
-        command: Some(entry.argv.clone()),
+        command: Some(argv.to_vec()),
         url: None,
         first_seen_at: now,
         command_hash: Some(command_hash),
@@ -1067,14 +1187,351 @@ pub fn attach_stdio_upstream(
     // 2. register(幂等 — 同 command_hash 不会重复插入,返 Ok(false))
     ledger.register_server(&profile)?;
     // 3. approve 到 Limited(serve 模式:config 里声明 = 用户信任)
-    ledger.approve_server(&entry.name, TrustLevel::Limited)?;
+    ledger.approve_server(name, TrustLevel::Limited)?;
 
     // 4. Hub-owned gate-before-spawn(V1.1):resolve → argv-drift → resolved-program-drift → spawn → attach
     //    单一路径替代旧的 StdioUpstream::spawn + attach_upstream 两步,确保进程在双 drift gate
     //    通过**之前绝不 spawn**(封死 public 裸 argv spawn 旁路)。
-    hub.spawn_attach_stdio_upstream(&entry.name, &entry.argv, env)?;
+    hub.spawn_attach_stdio_upstream(name, argv, env)?;
 
     Ok(())
+}
+
+/// 远端 HTTP MCP 上游 onboarding(ADR 0021 Slice 1)。
+///
+/// 先 [`validate_http_upstream_config`](纯:scheme / **SSRF** / auth-format / transport),
+/// 再构造 [`StreamableHttpUpstream`] + register/approve + `hub.attach_upstream` —— 挂上即
+/// 继承全部传输无关安全不变量(firewall/detokenize/redaction/audit)。
+///
+/// Slice 1 只 wire **Bearer**(`env:`/`keyring:` 静态 token);OAuth / 无鉴权(public)留后续,
+/// 命中即 fail-closed 报错(绝不静默忽略一个 HTTP upstream config)。
+fn attach_http_upstream(
+    ledger: &Arc<Ledger>,
+    hub: &Arc<Hub>,
+    name: &str,
+    url: &str,
+    auth: &HttpAuth,
+    transport_hint: Option<HttpTransportHint>,
+) -> Result<(), ServeError> {
+    let invalid = |reason: &'static str| ServeError::InvalidUpstream {
+        name: name.to_string(),
+        reason,
+    };
+    // 1. 纯校验(scheme / SSRF / auth-format / transport)。
+    let parsed = validate_http_upstream_config(name, url, auth, transport_hint)?;
+
+    // 2. 构造 upstream(Slice 1:Bearer wired;OAuth/None 留后续)。
+    let sender: Arc<dyn vigil_http_auth::AuthorizedSender> =
+        Arc::new(ReqwestHttpClient::new().map_err(|_| invalid("failed to build https client"))?);
+    let upstream: Arc<dyn vigil_mcp::McpUpstream> = match auth {
+        HttpAuth::Bearer { source } => {
+            // 启动期读真值(env:/keyring:);token 只活内存 SecretValue,绝不入审计/错误。
+            let token = resolve_secret_source(name, source)?;
+            Arc::new(StreamableHttpUpstream::with_bearer(
+                name, parsed, token, sender,
+            ))
+        }
+        HttpAuth::OAuth {
+            resource,
+            client_id,
+        } => {
+            // OAuth serve 期接线:从 `add-remote-mcp` 已落库 token metadata 重建 ExpectedBinding
+            // (含 JWKS 验证器),经 AS re-discovery 拿 jwks_uri ——**无需浏览器**(token 已在库)。
+            // prod deps:一个 ReqwestHttpClient 同时充当 discovery HttpClient 与 sealed
+            // AuthorizedSender;keyring service "vigil"(与 add_remote.rs 落库一致)。DI seam =
+            // [`build_oauth_upstream`](供 mock-AS 单测验 positive / issuer-drift 安全分支)。
+            let client = Arc::new(
+                ReqwestHttpClient::new().map_err(|_| invalid("failed to build https client"))?,
+            );
+            let http: Arc<dyn vigil_http_auth::HttpClient> = client.clone();
+            let oauth_sender: Arc<dyn vigil_http_auth::AuthorizedSender> = client;
+            let secret_store: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new("vigil"));
+            build_oauth_upstream(
+                ledger,
+                name,
+                parsed,
+                resource,
+                client_id,
+                http,
+                secret_store,
+                oauth_sender,
+            )?
+        }
+        HttpAuth::None => Arc::new(StreamableHttpUpstream::with_none(name, parsed, sender)),
+    };
+
+    // 3. register(幂等)→ approve(Limited)→ attach(HTTP 无 argv → 空 argv,drift gate no-op)。
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let profile = ServerProfile {
+        server_id: name.to_string(),
+        transport: TransportKind::Http,
+        command: None,
+        url: Some(url.to_string()),
+        first_seen_at: now,
+        command_hash: None,
+        descriptor_hash: None,
+        trust_level: TrustLevel::Untrusted,
+        sandbox_profile_id: None,
+    };
+    ledger.register_server(&profile)?;
+    ledger.approve_server(name, TrustLevel::Limited)?;
+    hub.attach_upstream(name, &[], upstream)?;
+    Ok(())
+}
+
+/// 构造 OAuth `StreamableHttpUpstream`(DI seam —— `http`=discovery+JWKS client、`secret_store`=
+/// token 库、`sender`=sealed 发送器;prod 由 [`attach_http_upstream`] 注入 ReqwestHttpClient +
+/// KeyringSecretStore("vigil"),单测注入 MockHttpClient + InMemorySecretStore)。
+///
+/// 从 `add-remote-mcp` 已落库 token metadata 重建 [`vigil_http_auth::ExpectedBinding`](含 JWKS
+/// 验证器):`get_metadata` 取 issuer / AS url / scope → AS re-discovery 拿 `jwks_uri` → 建 verifier。
+/// **fail-closed**:metadata 缺失(没 onboard)/ resource 与 mcp_url 异源 / AS 或 jwks_uri 命中
+/// SSRF denylist / AS 不可达 / **issuer 漂移**(AS 改 issuer = 可疑,拒)→ 不构造(绝不放未验证
+/// 上游;错误 verifier = 接受伪造 token,安全最敏感一环)。仅支持 JWT access token
+/// (`introspection=None`);opaque token 走 introspection 留后续。
+///
+/// **信任边界(hostile review Finding 7,tracked follow-up)**:整条验证信任链(issuer / AS /
+/// resource)从 `oauth_token_metadata` SQLite 行重建,而该行**未**进 `vigil-audit` 哈希链 —— 能写
+/// ledger DB **且**能写 keyring 者可篡改信任锚伪造 token(本地篡改,高门槛威胁)。审计链绑定 / 行
+/// MAC 是跨 onboarding + audit 的独立 slice,留后续。
+#[allow(clippy::too_many_arguments)]
+fn build_oauth_upstream(
+    ledger: &Arc<Ledger>,
+    name: &str,
+    mcp_url: url::Url,
+    resource: &str,
+    client_id: &str,
+    http: Arc<dyn vigil_http_auth::HttpClient>,
+    secret_store: Arc<dyn SecretStore>,
+    sender: Arc<dyn vigil_http_auth::AuthorizedSender>,
+) -> Result<Arc<dyn vigil_mcp::McpUpstream>, ServeError> {
+    let invalid = |reason: &'static str| ServeError::InvalidUpstream {
+        name: name.to_string(),
+        reason,
+    };
+    let token_store = Arc::new(vigil_http_auth::TokenStore::new(
+        secret_store,
+        ledger.clone(),
+    ));
+    let token_ref = vigil_http_auth::token_ref_for_access(resource, client_id);
+
+    // 持久化 metadata(issuer / AS url / scope)。None = 没 onboard → 指向 add-remote-mcp。
+    let meta = token_store
+        .get_metadata(&token_ref)
+        .map_err(|_| invalid("oauth token metadata query failed"))?
+        .ok_or_else(|| {
+            invalid("oauth upstream not onboarded — run `add-remote-mcp` first (same --ledger)")
+        })?;
+
+    // Finding 3(hostile review,defense-in-depth):onboarded resource 与 config mcp_url 必同源,
+    // 否则 attach 期即 fail-closed(而非首次 call 才被 planner same-origin 拒;明确 audience 绑定)。
+    let resource_url: url::Url = meta
+        .resource
+        .parse()
+        .map_err(|_| invalid("onboarded oauth resource is not a valid URL"))?;
+    if resource_url.origin() != mcp_url.origin() {
+        return Err(invalid(
+            "oauth upstream url origin != onboarded resource origin (audience mismatch)",
+        ));
+    }
+
+    // Finding 1(hostile review,HIGH):AS 发现端点必须过 SSRF gate —— authorization_server 取自
+    // 持久化行(可被篡改 / 来自恶意 resource 的 PRM),不 gate 则启动期请求可被引向内网 / 云元数据。
+    assert_url_safe(name, &meta.authorization_server)?;
+
+    // AS re-discovery → jwks_uri(启动期一次 network);issuer 漂移防御(AS 改 issuer = 可疑)。
+    let jwks_src = Arc::new(HttpJwksSource::new(http));
+    let as_meta = jwks_src
+        .fetch_as_metadata(&meta.authorization_server)
+        .map_err(|_| invalid("oauth AS metadata discovery failed at startup"))?;
+    if as_meta.issuer != meta.issuer {
+        return Err(invalid(
+            "oauth AS issuer changed since onboarding (refusing — possible AS compromise)",
+        ));
+    }
+
+    // Finding 1(hostile review,HIGH):jwks_uri 取自 AS 响应体(恶意 AS 可填内网 / 元数据 IP)——
+    // 建 verifier(其惰性 fetch 此 URL)前先过 SSRF gate。
+    assert_url_safe(name, &as_meta.jwks_uri)?;
+
+    // JWKS 签名验证器 + ExpectedBinding(issuer/aud/scope/签名校验在 resolve_access_token 内)。
+    let key_verifier: Arc<dyn vigil_http_auth::JwtKeyVerifier> = Arc::new(
+        JwksSignatureVerifier::new(jwks_src, as_meta.jwks_uri.clone()),
+    );
+    let expected = vigil_http_auth::ExpectedBinding {
+        resource: meta.resource.clone(),
+        issuer: meta.issuer.clone(),
+        scopes: meta.scope_set.clone(),
+        key_verifier,
+        introspection: None,
+    };
+
+    Ok(Arc::new(StreamableHttpUpstream::with_oauth(
+        name,
+        mcp_url,
+        token_store,
+        token_ref,
+        expected,
+        sender,
+    )))
+}
+
+/// 对一个 URL 做 SSRF 安全校验(scheme gate + host→IP denylist),返解析后的 [`url::Url`]。
+///
+/// 供 mcp `url`(attach 期 [`validate_http_upstream_config`])与 **OAuth AS / JWKS 发现端点**
+/// (serve 期 [`build_oauth_upstream`] 重建 verifier)**复用** —— 后者若不 gate,恶意 / 被篡改的 AS
+/// 可经 `authorization_server` 或响应里的 `jwks_uri` 把 Vigil 启动期请求引向内网 / 云元数据
+/// (`169.254.169.254`)端点(hostile review Finding 1)。生产仅 `https`;`http` 仅 loopback(本地
+/// mock)。域名 DNS 解析后对解析出的 IP 复核;DNS-rebind 的**连接期**复核留 Slice 3。
+fn assert_url_safe(name: &str, url: &str) -> Result<url::Url, ServeError> {
+    use std::net::ToSocketAddrs;
+    let invalid = |reason: &'static str| ServeError::InvalidUpstream {
+        name: name.to_string(),
+        reason,
+    };
+    let parsed = url::Url::parse(url).map_err(|_| invalid("url is not a valid absolute URL"))?;
+    let host = parsed.host_str().unwrap_or("");
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+                || host == "0:0:0:0:0:0:0:1";
+            if !is_loopback {
+                return Err(invalid(
+                    "http:// upstream allowed only for loopback (use https://)",
+                ));
+            }
+        }
+        _ => {
+            return Err(invalid(
+                "upstream url scheme must be https (or http loopback)",
+            ))
+        }
+    }
+    // SSRF denylist(MF#2):拒私网/链路本地/元数据(loopback 是显式本地-mock 例外)。
+    // 经 `url::Host` 分流:IP 字面量直接判定(无 DNS,正确处理 IPv6 / v4-mapped);域名才 DNS 解析。
+    let blocked_ip =
+        invalid("upstream url resolves to a private/link-local/reserved IP (SSRF guard)");
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            if is_blocked_ssrf_ip(&std::net::IpAddr::V4(v4)) {
+                return Err(blocked_ip);
+            }
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            if is_blocked_ssrf_ip(&std::net::IpAddr::V6(v6)) {
+                return Err(blocked_ip);
+            }
+        }
+        Some(url::Host::Domain(d)) => {
+            let port = parsed.port_or_known_default().unwrap_or(443);
+            let addrs: Vec<std::net::IpAddr> = (d, port)
+                .to_socket_addrs()
+                .map_err(|_| invalid("upstream host failed to resolve"))?
+                .map(|sa| sa.ip())
+                .collect();
+            if addrs.is_empty() {
+                return Err(invalid("upstream host resolved to no address"));
+            }
+            if addrs.iter().any(is_blocked_ssrf_ip) {
+                return Err(blocked_ip);
+            }
+        }
+        None => return Err(invalid("upstream url has no host")),
+    }
+    Ok(parsed)
+}
+
+/// 纯校验 HTTP upstream config(无副作用,offline 可测):name / URL scheme gate /
+/// **SSRF denylist(MF#2)** / auth 源格式 / 传输修订。返解析后的 [`url::Url`]。
+///
+/// **SSRF 边界(诚实口径,ADR 0021 hostile review)**:此校验在 **attach 期**对 URL host 判定一次,
+/// 配合 `ReqwestHttpClient` 的 `redirect(Policy::none())`(client.rs,防 3xx 把 token-bearing 请求
+/// 重定向到内网/元数据)。**剩余**:域名的 DNS-rebind(attach 解析公网、连接时解析内网)——连接 IP
+/// pinning 留 **Slice 3**;在此之前 token-bearing HTTP 上游应仅指向可信 URL。Bearer 路径的
+/// planner same-origin 校验对静态 token 是**恒真**的(resource 即 upstream URL),非独立 audience
+/// 绑定 —— Bearer 安全依赖此 SSRF + redirect 控制,而非 token 自身的 audience。
+fn validate_http_upstream_config(
+    name: &str,
+    url: &str,
+    auth: &HttpAuth,
+    transport_hint: Option<HttpTransportHint>,
+) -> Result<url::Url, ServeError> {
+    let invalid = |reason: &'static str| ServeError::InvalidUpstream {
+        name: name.to_string(),
+        reason,
+    };
+    if name.is_empty() {
+        return Err(invalid("name is empty"));
+    }
+    // URL scheme gate + SSRF denylist(提取为 `assert_url_safe`,OAuth AS / JWKS 发现端点亦复用)。
+    let parsed = assert_url_safe(name, url)?;
+    // auth 源格式(token 解析在 attach 期做)。
+    match auth {
+        HttpAuth::None => {}
+        HttpAuth::Bearer { source } => {
+            if !(source.starts_with("env:") || source.starts_with("keyring:")) {
+                return Err(invalid(
+                    "bearer source must be env:<VAR> or keyring:<svc>/<acct> (literal rejected)",
+                ));
+            }
+        }
+        HttpAuth::OAuth {
+            resource,
+            client_id,
+        } => {
+            if resource.is_empty() || client_id.is_empty() {
+                return Err(invalid(
+                    "oauth auth requires non-empty resource and client_id",
+                ));
+            }
+        }
+    }
+    // 传输修订:Streamable(默认)支持;legacy_sse 留 Slice 5。
+    if matches!(transport_hint, Some(HttpTransportHint::LegacySse)) {
+        return Err(invalid(
+            "legacy HTTP+SSE transport lands in ADR 0021 Slice 5",
+        ));
+    }
+    Ok(parsed)
+}
+
+/// SSRF denylist(ADR 0021 §4.2 / MF#2):`ip` 是否应拒(私网 / 链路本地 / 保留段 / 云元数据)。
+/// **loopback 例外**(`127/8` / `::1` 允许本地 mock)。DNS-rebind 复核留 Slice 3。
+fn is_blocked_ssrf_ip(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    // loopback 例外**先于** v4 解包(否则 `::1` → to_ipv4 → 0.0.0.1 被误判 blocked)。
+    if ip.is_loopback() {
+        return false; // 127/8 / ::1 显式本地-mock 例外
+    }
+    // IPv4-mapped(`::ffff:a.b.c.d`)**与** IPv4-compatible(`::a.b.c.d`,deprecated)均按 V4 判定
+    // —— 防 `::ffff:169.254.169.254` / `::169.254.169.254` 绕过 V6 分支(hostile review HIGH + LOW)。
+    // `to_ipv4()` 覆盖两形;`::1`/`::` 已分别由上方 is_loopback / 下方 is_unspecified 兜住。
+    if let IpAddr::V6(v6) = ip {
+        if let Some(v4) = v6.to_ipv4() {
+            return is_blocked_ssrf_ip(&IpAddr::V4(v4));
+        }
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()        // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local() // 169.254/16(含云元数据 169.254.169.254)
+                || v4.is_unspecified() // 0.0.0.0
+                || v4.is_broadcast()
+                || v4.octets()[0] == 0 // 0.0.0.0/8
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40) // 100.64/10 CGNAT
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_unspecified()
+                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b) // 64:ff9b::/96 NAT64
+        }
+    }
 }
 
 /// stdio 主循环:逐条 JSON-RPC → `Hub::handle_request` → 写响应。
@@ -1219,6 +1676,337 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use vigil_audit::{Anchored, CheckpointLog};
+
+    // ── ADR 0021 Slice 1:UpstreamEntry untagged schema + HTTP upstream 校验 ──
+    #[test]
+    fn upstream_entry_parses_legacy_stdio() {
+        let e: UpstreamEntry =
+            serde_json::from_str(r#"{"name":"fs","argv":["npx","server"]}"#).unwrap();
+        assert!(matches!(e, UpstreamEntry::Stdio { .. }));
+    }
+
+    #[test]
+    fn upstream_entry_parses_http_defaults() {
+        let e: UpstreamEntry =
+            serde_json::from_str(r#"{"name":"gh","url":"https://mcp.github.com"}"#).unwrap();
+        match e {
+            UpstreamEntry::Http {
+                name,
+                url,
+                auth,
+                transport_hint,
+            } => {
+                assert_eq!(name, "gh");
+                assert_eq!(url, "https://mcp.github.com");
+                assert!(matches!(auth, HttpAuth::None));
+                assert!(transport_hint.is_none());
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_entry_http_bearer_and_oauth_parse() {
+        let b: UpstreamEntry = serde_json::from_str(
+            r#"{"name":"gh","url":"https://x","auth":{"bearer":{"source":"env:GH"}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            b,
+            UpstreamEntry::Http {
+                auth: HttpAuth::Bearer { .. },
+                ..
+            }
+        ));
+        let o: UpstreamEntry = serde_json::from_str(
+            r#"{"name":"gh","url":"https://x","auth":{"oauth":{"resource":"https://x","client_id":"c"}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            o,
+            UpstreamEntry::Http {
+                auth: HttpAuth::OAuth { .. },
+                ..
+            }
+        ));
+    }
+
+    /// 测试夹具:onboard 一个 OAuth token(`OAuthTokenMetadata.{authorization_server,issuer}` 用
+    /// `as_url`/`stored_issuer`,落 in-memory ledger + InMemorySecretStore)+ mock AS discovery 返
+    /// `discovered_issuer` + `jwks_uri`(AS 响应体里的 JWKS 端点),跑 [`build_oauth_upstream`]。
+    /// loopback `as_url`+`jwks_uri` + `stored==discovered` = positive;`discovered!=stored` = issuer
+    /// 漂移;`as_url` 或 `jwks_uri`=元数据 IP = SSRF reject。**hermetic**:MockHttpClient 供 AS
+    /// metadata,sender 仅构造不 send,无真网络 / DNS。
+    fn onboard_and_build_oauth(
+        as_url: &str,
+        jwks_uri: &str,
+        stored_issuer: &str,
+        discovered_issuer: &str,
+    ) -> Result<Arc<dyn vigil_mcp::McpUpstream>, ServeError> {
+        use vigil_http_auth::{
+            token_ref_for_access, HttpMethod, HttpResponse, MockHttpClient, OAuthTokenMetadata,
+            TokenKind, TokenStore,
+        };
+        use vigil_lease::InMemorySecretStore;
+
+        let ledger = Arc::new(Ledger::open_in_memory().unwrap());
+        let resource = "https://mcp.example.com/";
+        let client_id = "cid";
+
+        // onboard:token + metadata 落库(同一 ledger,与 serve 读取一致)。
+        let secret_store: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::new());
+        let token_ref = token_ref_for_access(resource, client_id);
+        let ts = TokenStore::new(secret_store.clone(), ledger.clone());
+        let meta = OAuthTokenMetadata {
+            token_ref,
+            resource: resource.to_string(),
+            authorization_server: as_url.to_string(),
+            issuer: stored_issuer.to_string(),
+            scope_set: vec!["mcp:tools.read".to_string()],
+            token_kind: TokenKind::Access,
+            expires_at: None,
+            created_at: 0,
+        };
+        ts.put_access_token(&meta, SecretValue::new("dummy.jwt.token"))
+            .unwrap();
+
+        // mock AS discovery:GET {as_url}/.well-known/oauth-authorization-server → 200。jwks_uri 与
+        // AS 同源(loopback 用例过 SSRF gate)。注:SSRF-reject 用例在 discovery 前即 fail,mock 不被命中。
+        let http_mock = MockHttpClient::new();
+        http_mock.register(
+            HttpMethod::Get,
+            &format!("{as_url}/.well-known/oauth-authorization-server"),
+            HttpResponse {
+                status: 200,
+                body: format!(r#"{{"issuer":"{discovered_issuer}","jwks_uri":"{jwks_uri}"}}"#)
+                    .into_bytes(),
+            },
+        );
+        let http: Arc<dyn vigil_http_auth::HttpClient> = Arc::new(http_mock);
+        // build 只构造 upstream(不 send);用真 ReqwestHttpClient 当 sender 占位,绝不被调用。
+        let sender: Arc<dyn vigil_http_auth::AuthorizedSender> =
+            Arc::new(ReqwestHttpClient::new().unwrap());
+
+        build_oauth_upstream(
+            &ledger,
+            "remote",
+            "https://mcp.example.com/rpc".parse().unwrap(),
+            resource,
+            client_id,
+            http,
+            secret_store,
+            sender,
+        )
+    }
+
+    /// OAuth serve 接线 **positive**:onboard(ledger 有 metadata)+ AS issuer 匹配 + AS/jwks 过
+    /// SSRF gate(loopback)→ 构造成功的 HTTP 上游(`transport()=Http`)。证 wiring 真打通。
+    #[test]
+    fn build_oauth_upstream_succeeds_when_onboarded_and_as_matches() {
+        let up = onboard_and_build_oauth(
+            "https://127.0.0.1:8765",
+            "https://127.0.0.1:8765/jwks",
+            "https://127.0.0.1:8765",
+            "https://127.0.0.1:8765",
+        )
+        .unwrap();
+        assert_eq!(up.transport(), TransportKind::Http);
+        assert_eq!(up.server_id(), "remote");
+    }
+
+    /// OAuth serve 接线 **issuer 漂移 fail-closed**:onboard issuer=A,AS discovery 现返 issuer=B →
+    /// 拒(可疑 AS;错误 verifier = 接受伪造 token,安全最敏感一环)。
+    #[test]
+    fn build_oauth_upstream_refuses_on_issuer_drift() {
+        let err = onboard_and_build_oauth(
+            "https://127.0.0.1:8765",
+            "https://127.0.0.1:8765/jwks",
+            "https://127.0.0.1:8765",
+            "https://evil.example.com",
+        )
+        .unwrap_err();
+        match err {
+            ServeError::InvalidUpstream { reason, .. } => {
+                assert!(reason.contains("issuer changed"), "reason: {reason}")
+            }
+            other => panic!("预期 InvalidUpstream(issuer drift),实际 {other:?}"),
+        }
+    }
+
+    /// Finding 1(hostile review,HIGH)回归之一:**AS 发现端点**是云元数据 IP(169.254.169.254)→
+    /// SSRF gate 在 discovery 前 fail-closed(证 OAuth AS 发现端点也走 SSRF denylist,非只 mcp url)。
+    #[test]
+    fn build_oauth_upstream_refuses_ssrf_as_endpoint() {
+        let err = onboard_and_build_oauth(
+            "https://169.254.169.254",
+            "https://169.254.169.254/jwks",
+            "https://169.254.169.254",
+            "https://169.254.169.254",
+        )
+        .unwrap_err();
+        match err {
+            ServeError::InvalidUpstream { reason, .. } => {
+                assert!(reason.contains("SSRF"), "reason: {reason}")
+            }
+            other => panic!("预期 InvalidUpstream(SSRF),实际 {other:?}"),
+        }
+    }
+
+    /// Finding 1(hostile review,HIGH)回归之二:**AS 通过 gate,但响应体里的 `jwks_uri` 指向元数据
+    /// IP**(良性公开 AS 可填内网 JWKS)→ 建 verifier 前的 jwks_uri SSRF gate fail-closed。pin 住该
+    /// gate(reviewer 指出:positive 只用安全 jwks_uri,reject 分支若被未来重构悄悄删除也不会变红)。
+    #[test]
+    fn build_oauth_upstream_refuses_ssrf_jwks_uri_from_as_body() {
+        let err = onboard_and_build_oauth(
+            "https://127.0.0.1:8765",       // AS 端点安全(过 gate)
+            "https://169.254.169.254/jwks", // 但 AS 响应体里的 jwks_uri 指向云元数据
+            "https://127.0.0.1:8765",
+            "https://127.0.0.1:8765", // issuer 不漂移 → 走到 jwks_uri gate
+        )
+        .unwrap_err();
+        match err {
+            ServeError::InvalidUpstream { reason, .. } => {
+                assert!(reason.contains("SSRF"), "reason: {reason}")
+            }
+            other => panic!("预期 InvalidUpstream(jwks_uri SSRF),实际 {other:?}"),
+        }
+    }
+
+    /// MF#3:`{name,argv,url}` 歧义 —— 两变体 deny_unknown_fields 都拒 → 整体报错(非静默 Stdio 丢 url)。
+    #[test]
+    fn upstream_entry_ambiguous_argv_plus_url_rejected() {
+        let r: Result<UpstreamEntry, _> =
+            serde_json::from_str(r#"{"name":"x","argv":["a"],"url":"https://y"}"#);
+        assert!(
+            r.is_err(),
+            "ambiguous {{name,argv,url}} must be rejected, got {r:?}"
+        );
+    }
+
+    /// 未知字段同样被拒(每变体 deny_unknown_fields)。
+    #[test]
+    fn upstream_entry_unknown_field_rejected() {
+        let r: Result<UpstreamEntry, _> =
+            serde_json::from_str(r#"{"name":"x","argv":["a"],"bogus":1}"#);
+        assert!(r.is_err(), "unknown field must be rejected, got {r:?}");
+    }
+
+    // 校验用 IP 字面量(offline,不做 DNS)。
+    #[test]
+    fn validate_rejects_non_loopback_http() {
+        let err = validate_http_upstream_config("gh", "http://10.0.0.5", &HttpAuth::None, None)
+            .unwrap_err();
+        assert!(matches!(err, ServeError::InvalidUpstream { .. }));
+    }
+
+    #[test]
+    fn validate_allows_loopback_http() {
+        // loopback http 过 scheme gate + SSRF(loopback 例外)→ Ok。
+        let u =
+            validate_http_upstream_config("m", "http://127.0.0.1:9000/mcp", &HttpAuth::None, None)
+                .unwrap();
+        assert_eq!(u.scheme(), "http");
+    }
+
+    #[test]
+    fn validate_accepts_valid_public_https() {
+        let u =
+            validate_http_upstream_config("gh", "https://1.1.1.1", &HttpAuth::None, None).unwrap();
+        assert_eq!(u.host_str(), Some("1.1.1.1"));
+    }
+
+    #[test]
+    fn validate_rejects_literal_bearer() {
+        let err = validate_http_upstream_config(
+            "gh",
+            "https://1.1.1.1",
+            &HttpAuth::Bearer {
+                source: "literal:abc".into(),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServeError::InvalidUpstream { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_legacy_sse() {
+        let err = validate_http_upstream_config(
+            "gh",
+            "https://1.1.1.1",
+            &HttpAuth::None,
+            Some(HttpTransportHint::LegacySse),
+        )
+        .unwrap_err();
+        match err {
+            ServeError::InvalidUpstream { reason, .. } => assert!(reason.contains("Slice 5")),
+            other => panic!("expected Slice-5 InvalidUpstream, got {other:?}"),
+        }
+    }
+
+    /// MF#2 SSRF:私网 / 元数据 IP 被拒(scheme https 也拦)。
+    #[test]
+    fn validate_rejects_private_and_metadata_ip() {
+        for bad in [
+            "https://10.0.0.5",
+            "https://192.168.1.1",
+            "https://172.16.0.1",
+            "https://169.254.169.254",
+        ] {
+            let err = validate_http_upstream_config("x", bad, &HttpAuth::None, None).unwrap_err();
+            match err {
+                ServeError::InvalidUpstream { reason, .. } => {
+                    assert!(reason.contains("SSRF"), "{bad}: {reason}")
+                }
+                other => panic!("{bad}: expected InvalidUpstream, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn is_blocked_ssrf_ip_classifies() {
+        use std::net::IpAddr;
+        let blocked = |s: &str| is_blocked_ssrf_ip(&s.parse::<IpAddr>().unwrap());
+        assert!(blocked("10.0.0.5"));
+        assert!(blocked("192.168.1.1"));
+        assert!(blocked("172.16.0.1"));
+        assert!(blocked("169.254.169.254")); // 云元数据
+        assert!(blocked("0.0.0.0"));
+        assert!(blocked("100.64.0.1")); // CGNAT
+        assert!(blocked("fc00::1")); // ULA
+        assert!(blocked("fe80::1")); // link-local
+        assert!(!blocked("1.1.1.1")); // 公网
+        assert!(!blocked("8.8.8.8"));
+        assert!(!blocked("127.0.0.1")); // loopback 例外
+        assert!(!blocked("::1"));
+        // IPv4-mapped IPv6 必须解包按 V4 判定(hostile review HIGH)。
+        assert!(blocked("::ffff:169.254.169.254")); // 云元数据 via mapped
+        assert!(blocked("::ffff:10.0.0.1"));
+        assert!(blocked("::ffff:192.168.1.1"));
+        assert!(blocked("64:ff9b::a00:1")); // NAT64 64:ff9b::/96 → 10.0.0.1
+        assert!(!blocked("::ffff:1.1.1.1")); // mapped 公网 → 放行
+        assert!(!blocked("::ffff:127.0.0.1")); // mapped loopback → 放行(例外)
+                                               // IPv4-compatible ::a.b.c.d(deprecated)也须解包(hostile review LOW residual)。
+        assert!(blocked("::169.254.169.254")); // compatible 元数据
+        assert!(blocked("::10.0.0.5"));
+        assert!(!blocked("::1")); // loopback 例外(reorder 后仍正确,先于 v4 解包)
+    }
+
+    /// MF#2 / hostile review HIGH:`https://[::ffff:169.254.169.254]` 经 url::Host::Ipv6 → 解包 → 拒。
+    #[test]
+    fn validate_rejects_v4_mapped_ipv6_metadata() {
+        let err = validate_http_upstream_config(
+            "x",
+            "https://[::ffff:169.254.169.254]",
+            &HttpAuth::None,
+            None,
+        )
+        .unwrap_err();
+        match err {
+            ServeError::InvalidUpstream { reason, .. } => assert!(reason.contains("SSRF")),
+            other => panic!("expected SSRF InvalidUpstream, got {other:?}"),
+        }
+    }
 
     #[test]
     fn shutdown_anchor_emits_checkpoint_for_disk_ledger() {

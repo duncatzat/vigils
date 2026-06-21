@@ -49,7 +49,9 @@ pub use oauth::{
     build_authorization_url, exchange_code_for_token, exchange_refresh_token_for_token,
     introspect_token, new_pkce_pair, IntrospectionResponse, PkcePair, TokenResponse,
 };
-pub use planner::{plan_authorized_request, AuthorizedHttpRequest, PassthroughReport};
+pub use planner::{
+    plan_authorized_request, plan_unauthorized_request, AuthorizedHttpRequest, PassthroughReport,
+};
 pub use prm::{fetch_and_validate_prm, validate_prm_struct, ProtectedResourceMetadata};
 pub use store::{
     token_ref_for_access, token_ref_for_refresh, OAuthTokenMetadata, TokenKind, TokenStore,

@@ -295,10 +295,10 @@ impl AuthorizedSender for TestTlsHttpClient {
     fn send_authorized(&self, req: &AuthorizedHttpRequest) -> Result<HttpResponse, HttpAuthError> {
         send_via_reqwest(
             &self.inner,
-            req.method,
-            req.url.as_str(),
-            &req.headers,
-            req.body.as_deref(),
+            req.method(),
+            req.url().as_str(),
+            req.headers(),
+            req.body(),
             None,
         )
     }
@@ -310,10 +310,10 @@ impl AuthorizedSender for TestTlsHttpClient {
     ) -> Result<HttpResponse, HttpAuthError> {
         send_via_reqwest(
             &self.inner,
-            req.method,
-            req.url.as_str(),
-            &req.headers,
-            req.body.as_deref(),
+            req.method(),
+            req.url().as_str(),
+            req.headers(),
+            req.body(),
             Some(timeout),
         )
     }

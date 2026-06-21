@@ -287,6 +287,83 @@ fn b2_upstream_config_empty_argv_returns_invalid_upstream() {
     }
 }
 
+/// ADR 0021 Slice 1:HTTP **Bearer** upstream 经 config 真 attach 进 Hub(end-to-end wiring)。
+/// 用公网 IP 字面量(SSRF 放行,无 DNS)+ env token;attach 不发任何网络请求 → Ok(Hub)。
+#[test]
+fn b3_http_bearer_upstream_attaches_via_config() {
+    use std::io::Write as _;
+    std::env::set_var("VIGIL_TEST_HTTP_BEARER_ATTACH", "ghp_testtoken123");
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let cfg = json!({
+        "upstreams": [
+            {
+                "name": "remote",
+                "url": "https://1.1.1.1",
+                "auth": { "bearer": { "source": "env:VIGIL_TEST_HTTP_BEARER_ATTACH" } }
+            }
+        ]
+    });
+    writeln!(tmp.as_file(), "{}", serde_json::to_string(&cfg).unwrap()).unwrap();
+    let args = ServeArgs {
+        ledger_path: None,
+        upstreams_config: Some(tmp.path().to_path_buf()),
+        auto_approve_first_seen: false,
+        dev_permissive_firewall: false,
+        enable_privacy_filter: false,
+        enable_injection_classifier: false,
+        redact_tool_results: false,
+        ml_best_effort: false,
+        monitor: false,
+        project_roots: vec![],
+    };
+    let r = build_hub(&args);
+    std::env::remove_var("VIGIL_TEST_HTTP_BEARER_ATTACH");
+    match r {
+        Ok(_) => {} // attach 成功:HTTP Bearer upstream 已进 Hub(transport=Http)。
+        other => panic!("预期 Ok(Hub),实际 {:?}", other.map(|_| "Ok(Hub)")),
+    }
+}
+
+/// HTTP **OAuth** upstream:serve 期已接线,但**未 onboard**(无持久化 token metadata)时
+/// **fail-closed**(绝不静默 attach 未验证上游)。metadata 检查在任何 network 之前 → 本测 hermetic
+/// (不触网:get_metadata 只查 ledger SQLite,None → 直接报 "not onboarded")。
+#[test]
+fn b3_http_oauth_upstream_fails_closed_when_not_onboarded() {
+    use std::io::Write as _;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let cfg = json!({
+        "upstreams": [
+            {
+                "name": "remote",
+                "url": "https://1.1.1.1",
+                "auth": { "oauth": { "resource": "https://1.1.1.1", "client_id": "c" } }
+            }
+        ]
+    });
+    writeln!(tmp.as_file(), "{}", serde_json::to_string(&cfg).unwrap()).unwrap();
+    let args = ServeArgs {
+        ledger_path: None,
+        upstreams_config: Some(tmp.path().to_path_buf()),
+        auto_approve_first_seen: false,
+        dev_permissive_firewall: false,
+        enable_privacy_filter: false,
+        enable_injection_classifier: false,
+        redact_tool_results: false,
+        ml_best_effort: false,
+        monitor: false,
+        project_roots: vec![],
+    };
+    match build_hub(&args) {
+        Err(ServeError::InvalidUpstream { reason, .. }) => {
+            assert!(reason.contains("onboarded"), "reason: {reason}")
+        }
+        other => panic!(
+            "预期 OAuth 未 onboard fail-closed InvalidUpstream,实际 {:?}",
+            other.map(|_| "Ok")
+        ),
+    }
+}
+
 #[test]
 fn b2_stage2_attach_real_stdio_upstream_via_node() {
     // Stage 2 端到端(在 Rust 测试内):用 Node 启 mock-mcp-server,验证 attach 全链路。

@@ -172,7 +172,7 @@ impl HttpUpstream {
     }
 }
 
-fn now_unix_secs() -> i64 {
+pub(crate) fn now_unix_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -299,7 +299,7 @@ impl HttpUpstream {
     }
 }
 
-fn map_auth_error(e: HttpAuthError) -> UpstreamError {
+pub(crate) fn map_auth_error(e: HttpAuthError) -> UpstreamError {
     use HttpAuthError as E;
     match e {
         E::MissingToken => UpstreamError::Unauthorized {

@@ -20,16 +20,36 @@ const STRIPPED_HEADER_NAMES: &[&str] = &[
 ];
 
 /// 协议规划输出 —— 保证**不含**任何 passthrough bearer。
+///
+/// **真封印(ADR 0021 MF#1)**:字段**私有** + `#[non_exhaustive]`,唯一构造器是 crate 内的
+/// [`plan_authorized_request`](header 剥离 + same-origin 校验在内)。外部 crate **无法**用结构体
+/// 字面量自拼 `headers`(否则可绕过 passthrough-deny,注入任意 `Authorization`)。读取一律走访问器。
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AuthorizedHttpRequest {
-    /// 目标 upstream URL
-    pub url: Url,
-    /// HTTP 方法
-    pub method: HttpMethod,
-    /// headers,含 `Authorization: Bearer <gateway_token>`
-    pub headers: Vec<(String, String)>,
-    /// body(可选)
-    pub body: Option<Vec<u8>>,
+    url: Url,
+    method: HttpMethod,
+    headers: Vec<(String, String)>,
+    body: Option<Vec<u8>>,
+}
+
+impl AuthorizedHttpRequest {
+    /// 目标 upstream URL。
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+    /// HTTP 方法。
+    pub fn method(&self) -> HttpMethod {
+        self.method
+    }
+    /// headers —— 含 planner 注入的 `Authorization: Bearer <gateway_token>`,保证无 passthrough。
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+    /// body(可选)。
+    pub fn body(&self) -> Option<&[u8]> {
+        self.body.as_deref()
+    }
 }
 
 /// passthrough 情况报告:审计 payload 用(不含 value,只含 header 名集合)。
@@ -100,6 +120,40 @@ pub fn plan_authorized_request(
             stripped_header_names: stripped_names,
         },
     ))
+}
+
+/// 无鉴权上游(public MCP)的 sealed 请求构造(ADR 0021 Slice 1 no-auth)。
+///
+/// 同样剥离 incoming bearer-like header(`STRIPPED_HEADER_NAMES`),但**不**追加任何 `Authorization`。
+/// 仍返 sealed [`AuthorizedHttpRequest`](私有字段,no passthrough)—— 用于无凭证的 public HTTP MCP。
+pub fn plan_unauthorized_request(
+    incoming_headers: &[(String, String)],
+    upstream_url: Url,
+    method: HttpMethod,
+    body: Option<Vec<u8>>,
+) -> (AuthorizedHttpRequest, PassthroughReport) {
+    let mut kept_headers: Vec<(String, String)> = Vec::with_capacity(incoming_headers.len());
+    let mut stripped_names: Vec<String> = Vec::new();
+    for (name, value) in incoming_headers {
+        if is_stripped(name) {
+            stripped_names.push(name.clone());
+            let _ = value; // **不**记 value(§I-10.3)
+            continue;
+        }
+        kept_headers.push((name.clone(), value.clone()));
+    }
+    // 无鉴权:不追加任何 Authorization。
+    (
+        AuthorizedHttpRequest {
+            url: upstream_url,
+            method,
+            headers: kept_headers,
+            body,
+        },
+        PassthroughReport {
+            stripped_header_names: stripped_names,
+        },
+    )
 }
 
 fn is_stripped(name: &str) -> bool {
