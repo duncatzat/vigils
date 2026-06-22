@@ -1629,6 +1629,79 @@ pub fn anchor_checkpoint_on_shutdown(ledger_path: Option<&std::path::Path>, ledg
     }
 }
 
+/// 把 `verify_anchored` 结果格式化为启动期 stderr 告警串(`None` = 静默)。`has_events` 区分
+/// "链空首跑"(静默)与"链非空却无锚点"(低调提示)。抽成纯函数便于单测各状态措辞;
+/// ADR 0020 §3 诚实口径(不冒充 tamper-proof)。
+fn format_anchor_startup_message(
+    result: Result<vigil_audit::Anchored, vigil_audit::AuditError>,
+    has_events: bool,
+) -> Option<String> {
+    use vigil_audit::{Anchored, AuditError};
+    match result {
+        Ok(Anchored::Verified {
+            checkpoints,
+            through_event_id,
+        }) => Some(format!(
+            "✓ audit chain verified against {checkpoints} checkpoint(s) (through event #{through_event_id})"
+        )),
+        // 链**非空却无锚点**(首跑未关过 / `.checkpoints` sidecar 被删或丢)→ 低调提示(非 tamper
+        // 告警),与 CLI `verify` 一致,且堵"删 sidecar 把 CheckpointMismatch 降级成静默"的逃逸
+        // (hostile review #5:删相邻文件比重写链更易,silent 分支会掩盖本特性要抓的整链重写)。
+        Ok(Anchored::Unanchored) if has_events => Some(
+            "audit chain not yet anchored (no checkpoints found). It anchors automatically on clean \
+             shutdown; if you expected anchors, the `.checkpoints` sidecar may be missing — run \
+             `vigil-hub verify`."
+                .to_string(),
+        ),
+        // 链空首跑(无事件且无锚点)→ 静默,不刷屏。
+        Ok(Anchored::Unanchored) => None,
+        Err(AuditError::CheckpointMismatch { event_id }) => Some(format!(
+            "⚠ AUDIT TAMPER — full-chain rewrite detected at event #{event_id} vs checkpoint anchor; \
+             historical audit is compromised. Run `vigil-hub verify` for detail. \
+             (the firewall still protects this session)"
+        )),
+        Err(AuditError::ChainBroken { event_id }) => Some(format!(
+            "⚠ AUDIT CHAIN BROKEN at event #{event_id} — audit log integrity failure. Run `vigil-hub verify`."
+        )),
+        Err(AuditError::CheckpointStoreCorrupt { reason }) => Some(format!(
+            "⚠ audit checkpoint sidecar damaged ({reason}); anchor protection reduced \
+             (the audit chain itself passed its internal check)."
+        )),
+        Err(e) => Some(format!("audit anchor verify skipped (non-fatal): {e}")),
+    }
+}
+
+/// 网关启动时 **best-effort 异步** 校验审计链锚定 —— ADR 0020 verify 半边的 turnkey 自动化。
+///
+/// emit 已在每次会话结束自动锚定([`anchor_checkpoint_on_shutdown`]),但 verify 此前**仅手动 CLI**
+/// (`vigil-hub verify`);turnkey 用户从不手动跑 → 整链重写写了锚点却**无人核对**。此处独立线程
+/// **异步**核对(不阻塞 serve 启动、绝不写 stdout 污染 MCP 通道、绝不 brick 会话),发现 tamper 即
+/// stderr 大声告警。**不 refuse serve**:firewall 仍保护当前会话,审计被篡改是历史可信问题,告警
+/// 可见即闭合"自动检测"缺口,且避免误报(legit 账本搬迁/恢复)brick agent。
+///
+/// 返回一个完成信号 `Receiver`:调用方应在 serve 退出前对其**有界等待**(hostile review #3:
+/// 慢 verify(大账本 O(n))+ 快 EOF 会话若不等待,detached 线程的 tamper 告警可能在进程退出前
+/// 来不及打印而**丢失**)。`None` = 内存账本(无 sidecar,无需核对)。
+#[must_use]
+pub fn verify_anchored_on_startup(
+    ledger_path: Option<&std::path::Path>,
+    ledger: &Arc<Ledger>,
+) -> Option<std::sync::mpsc::Receiver<()>> {
+    let path = ledger_path?.to_path_buf(); // 内存账本(None)→ 无 sidecar,跳过
+    let ledger = ledger.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let log = vigil_audit::CheckpointLog::sidecar_for(&path);
+        // event_count 失败 → 保守当"有事件"(倾向提示而非静默掩盖);区分链空首跑 vs sidecar 丢失。
+        let has_events = ledger.event_count().map(|n| n > 0).unwrap_or(true);
+        if let Some(msg) = format_anchor_startup_message(log.verify_anchored(&ledger), has_events) {
+            eprintln!("vigil-hub serve: {msg}");
+        }
+        let _ = tx.send(()); // 完成信号;send 失败(主线程已超时离开)忽略
+    });
+    Some(rx)
+}
+
 pub fn run(args: ServeArgs) -> Result<(), ServeError> {
     let (hub, ledger) = build_hub(&args)?;
     // DEF-001 诊断:启动即在 stderr 打印解析后的账本路径 —— 桌面 GUI 看不到 CLI 写入事件的最
@@ -1654,6 +1727,9 @@ pub fn run(args: ServeArgs) -> Result<(), ServeError> {
             args.project_roots.join(", ")
         );
     }
+    // ADR 0020:启动异步核对审计链锚定(turnkey 自动 verify 半边;emit 在 shutdown)。整链重写
+    // 写了锚点却无人核对的缺口由此闭合 —— 发现 tamper 即 stderr 大声告警,不阻塞、不 brick。
+    let anchor_verify_done = verify_anchored_on_startup(args.ledger_path.as_deref(), &ledger);
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut reader = std::io::BufReader::new(stdin.lock());
@@ -1661,6 +1737,11 @@ pub fn run(args: ServeArgs) -> Result<(), ServeError> {
     let loop_result = run_stdio_loop(&hub, &mut reader, &mut writer);
     // 无论优雅 EOF 还是协议错误退出,都 best-effort 锚定本会话已写入的审计链头。
     anchor_checkpoint_on_shutdown(args.ledger_path.as_deref(), &ledger);
+    // 给启动异步核对一个**有界**机会落地告警(防慢 verify(大账本)+ 快 EOF 把 tamper 告警丢在
+    // 进程退出之前;hostile review #3)。超时即放弃(detached 线程随进程退出结束)。
+    if let Some(rx) = anchor_verify_done {
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+    }
     loop_result
 }
 
@@ -1870,6 +1951,76 @@ mod tests {
             }
             other => panic!("预期 InvalidUpstream(jwks_uri SSRF),实际 {other:?}"),
         }
+    }
+
+    // ── ADR 0020:启动异步锚定核对的措辞(format_anchor_startup_message 纯函数) ──
+    #[test]
+    fn anchor_startup_message_verified() {
+        use vigil_audit::Anchored;
+        let v = format_anchor_startup_message(
+            Ok(Anchored::Verified {
+                checkpoints: 3,
+                through_event_id: 42,
+            }),
+            true,
+        )
+        .unwrap();
+        assert!(v.contains("verified against 3 checkpoint"), "{v}");
+        assert!(v.contains("#42"), "{v}");
+    }
+
+    /// hostile review #5:Unanchored 必须区分链空首跑(静默)与链非空无锚点(提示)——
+    /// 后者堵"删 `.checkpoints` sidecar 把 CheckpointMismatch 降级成静默"的逃逸。
+    #[test]
+    fn anchor_startup_message_unanchored_distinguishes_empty_vs_missing_sidecar() {
+        use vigil_audit::Anchored;
+        // 链空首跑(无事件)→ 静默。
+        assert!(format_anchor_startup_message(Ok(Anchored::Unanchored), false).is_none());
+        // 链非空却无锚点(sidecar 被删/丢)→ 低调提示(非静默掩盖)。
+        let m = format_anchor_startup_message(Ok(Anchored::Unanchored), true).unwrap();
+        assert!(
+            m.contains("not yet anchored") && m.contains("sidecar may be missing"),
+            "{m}"
+        );
+        assert!(
+            !m.contains("⚠"),
+            "Unanchored 提示不该是 tamper 级 ⚠ 告警: {m}"
+        );
+    }
+
+    #[test]
+    fn anchor_startup_message_tamper_and_chain_broken_warn_loud() {
+        use vigil_audit::AuditError;
+        let m = format_anchor_startup_message(
+            Err(AuditError::CheckpointMismatch { event_id: 7 }),
+            true,
+        )
+        .unwrap();
+        assert!(
+            m.contains("AUDIT TAMPER") && m.contains("#7") && m.contains("firewall still protects"),
+            "{m}"
+        );
+        let b = format_anchor_startup_message(Err(AuditError::ChainBroken { event_id: 9 }), true)
+            .unwrap();
+        assert!(b.contains("AUDIT CHAIN BROKEN") && b.contains("#9"), "{b}");
+    }
+
+    #[test]
+    fn anchor_startup_message_corrupt_sidecar_warns_but_notes_chain_ok() {
+        use vigil_audit::AuditError;
+        let m = format_anchor_startup_message(
+            Err(AuditError::CheckpointStoreCorrupt {
+                reason: "torn line".into(),
+            }),
+            true,
+        )
+        .unwrap();
+        assert!(
+            m.contains("sidecar damaged")
+                && m.contains("torn line")
+                && m.contains("chain itself passed"),
+            "{m}"
+        );
     }
 
     /// MF#3:`{name,argv,url}` 歧义 —— 两变体 deny_unknown_fields 都拒 → 整体报错(非静默 Stdio 丢 url)。
