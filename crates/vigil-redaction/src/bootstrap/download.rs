@@ -28,9 +28,28 @@ use sha2::{Digest, Sha256};
 
 use super::error::BootstrapError;
 
-/// 单 chunk 下载超时(ADR 0012 §3.4)。900 MB onnx ÷ 16 chunks ≈ 56 MB / chunk;
-/// 30s 在 5 MB/s 慢线下也够;过长会拖慢全失败 fallback 决策。
+/// 控制类小请求超时(ETag 短路 GET `Range: 0-0` 等轻请求)。
+/// 注:**chunk 体下载**不再用此固定值 —— 见 [`chunk_timeout`](按 chunk 大小动态定)。
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+
+// chunk 体下载的动态超时参数。
+//
+// 根因复盘(v0.4.0 Linux 真机):16 chunk **并发共享带宽**,~48 MB/chunk 在 ~11.5 MB/s 链路上
+// 单 chunk 实测 ~65s;旧固定 30s **总请求**超时会中途砍断 body 读取(reqwest
+// "error decoding response body")→ 整下载失败,而 curl(无超时)同链路 70s 跑完。
+// 旧注释"30s 在 5 MB/s 慢线够"忽略了 16 路并发每路只剩 ~0.7 MB/s。
+// 改:按 chunk 字节数 / 最低可接受吞吐换算超时,使"慢但持续推进"的链路也能成功;
+// truly-dead 连接由 `connect_timeout`(10s)兜底,极端中途 stall 由 ceil 上限收敛。
+const MIN_CHUNK_BYTES_PER_SEC: u64 = 128 * 1024; // 128 KiB/s/chunk(≈ 2 MiB/s 聚合 @16）
+const CHUNK_TIMEOUT_FLOOR_SECS: u64 = 60;
+const CHUNK_TIMEOUT_CEIL_SECS: u64 = 900; // 与单流路径 900s 上限一致
+
+/// 按本 chunk 大小推导**下载体**总超时,夹逼到 `[floor, ceil]`。
+fn chunk_timeout(chunk_bytes: u64) -> Duration {
+    let secs =
+        (chunk_bytes / MIN_CHUNK_BYTES_PER_SEC).clamp(CHUNK_TIMEOUT_FLOOR_SECS, CHUNK_TIMEOUT_CEIL_SECS);
+    Duration::from_secs(secs)
+}
 
 /// HEAD 探测同样 30s 上限(轻请求,正常 < 1s)。
 const HEAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -406,10 +425,14 @@ fn fetch_chunk_once(
     start: u64,
     end_incl: u64,
 ) -> Result<(), BootstrapError> {
-    let client = build_client(CHUNK_TIMEOUT).map_err(|e| BootstrapError::DownloadFailed {
-        url: url.to_string(),
-        status: 0,
-        source: e,
+    // 按本 chunk 大小定**下载体**超时(见 chunk_timeout):16 路并发共享带宽时,大 chunk
+    // 合法地需要 >30s;固定 30s 总超时会砍断进行中的 body 读取(v0.4.0 Linux 真机失败根因)。
+    let client = build_client(chunk_timeout(end_incl - start + 1)).map_err(|e| {
+        BootstrapError::DownloadFailed {
+            url: url.to_string(),
+            status: 0,
+            source: e,
+        }
     })?;
     let range_val = format!("bytes={start}-{end_incl}");
     // Accept-Encoding: identity 必须与 url_supports_ranges 探测一致 —— 否则探测(identity)
@@ -543,5 +566,18 @@ mod chunk_math_tests {
         let chunk = total.div_ceil(n).max(1); // = 1
         assert_eq!(chunk, 1);
         // idx 0:start=0, end_incl=0 → 单字节;idx 1+:start>=1 → 空 partial
+    }
+
+    #[test]
+    fn chunk_timeout_scales_with_size_and_clamps() {
+        use super::{chunk_timeout, CHUNK_TIMEOUT_CEIL_SECS, CHUNK_TIMEOUT_FLOOR_SECS};
+        // 小请求 → floor(不让 3 KB config 等 900s)
+        assert_eq!(chunk_timeout(1024).as_secs(), CHUNK_TIMEOUT_FLOOR_SECS);
+        // ~48 MiB chunk(真机失败规模):远超旧 30s,且 < ceil → 慢链路也能跑完
+        let secs = chunk_timeout(50_566_375).as_secs();
+        assert!(secs > 300, "48MB chunk timeout should comfortably exceed 65s real time, got {secs}");
+        assert!(secs <= CHUNK_TIMEOUT_CEIL_SECS);
+        // 超大 → ceil 收敛
+        assert_eq!(chunk_timeout(u64::MAX).as_secs(), CHUNK_TIMEOUT_CEIL_SECS);
     }
 }
