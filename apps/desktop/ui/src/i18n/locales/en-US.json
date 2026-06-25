@@ -277,7 +277,28 @@
     "anchor_error": "Anchor failed: {msg}",
     "onnx_not_implemented": "ONNX PII model download is managed via the vigil-hub CLI in this version.",
     "version_label": "Version",
-    "identifier_label": "App Identifier"
+    "identifier_label": "App Identifier",
+    "daemon": {
+      "title": "Daemon (resident engine)",
+      "subtitle": "A resident daemon holds the warm AI model so the hook main path runs ML with zero cold-start. Start it to enable ML protection for your agent.",
+      "status_stopped": "STOPPED",
+      "status_running": "RUNNING",
+      "status_ml": "RUNNING · ML WARM",
+      "start": "Start daemon",
+      "stop": "Stop daemon",
+      "error": "Daemon action failed: {msg}"
+    },
+    "model": {
+      "title": "AI Model",
+      "subtitle": "Local privacy models (DeBERTa injection + PII, ~738MB each). Secure first-run download (HTTPS + SHA-verified).",
+      "status_unknown": "STATUS UNKNOWN",
+      "phase2": "PHASE 2",
+      "installed": "INSTALLED",
+      "not_installed": "NOT INSTALLED",
+      "unsupported": "ML VARIANT REQUIRED",
+      "install": "Install AI model",
+      "error": "Model install failed: {msg}"
+    }
   },
   "detail": {
     "drawer_title": "Approval Detail",

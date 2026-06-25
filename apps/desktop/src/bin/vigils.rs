@@ -634,6 +634,52 @@ async fn verify_chain(state: State<'_, AppState>) -> Result<ChainVerifyReport, S
     }
 }
 
+// ─────────────────── ML 控制平面(ADR 0024):daemon 生命周期 + 模型安装 ───────────────────
+//
+// shell-out 纪律(不把 ort 拉进 GUI):重活在 `vigil-hub` CLI,GUI 只调度 + 解析(逻辑在
+// `vigil_desktop::ml_control`)。这些 handler 取 `AppHandle`(Tauri 自动注入)以经 resource_dir /
+// 稳定启动器 / PATH 解析引擎二进制;不触 Ledger / Hub。引擎缺失时只读 handler 优雅回默认值不报错。
+
+/// `invoke('daemon_status')` → 只读 daemon 运行态(running / pii_loaded / engine_present)。
+#[tauri::command]
+async fn daemon_status(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::ml_control::DaemonStatus, String> {
+    vigil_desktop::ml_control::daemon_status(&app)
+}
+
+/// `invoke('daemon_start')` → **Write**:detached 启动常驻 daemon(暖载 ML 供 hook 主路径)。
+#[tauri::command]
+async fn daemon_start(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::ml_control::DaemonStatus, String> {
+    vigil_desktop::ml_control::daemon_start(&app)
+}
+
+/// `invoke('daemon_stop')` → **Write**:停止常驻 daemon(R1+token 验存活后杀 pid)。
+#[tauri::command]
+async fn daemon_stop(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::ml_control::DaemonStatus, String> {
+    vigil_desktop::ml_control::daemon_stop(&app)
+}
+
+/// `invoke('model_status')` → 只读 ML 模型缓存态(privacy/injection installed + ml_supported)。
+#[tauri::command]
+async fn model_status(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::ml_control::ModelStatus, String> {
+    vigil_desktop::ml_control::model_status(&app)
+}
+
+/// `invoke('model_install')` → **Write**:下载 ML 模型(阻塞,数十秒;fail-closed)。
+#[tauri::command]
+async fn model_install(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::ml_control::ModelStatus, String> {
+    vigil_desktop::ml_control::model_install(&app)
+}
+
 // ─────────────────────────── Tauri setup ──────────────────────────────────
 //
 // β5 Ledger 磁盘持久化:
@@ -734,6 +780,12 @@ fn main() {
             protection_summary,
             // Settings: 手动锚定审计检查点
             anchor_checkpoint,
+            // ML 控制平面(ADR 0024):daemon 生命周期(3)+ 模型安装(2)
+            daemon_status,
+            daemon_start,
+            daemon_stop,
+            model_status,
+            model_install,
         ])
         .setup(move |app| {
             let _main_window = app.get_webview_window("main");

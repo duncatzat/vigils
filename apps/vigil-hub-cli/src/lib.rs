@@ -9,9 +9,12 @@
 #![allow(missing_docs)]
 
 pub mod add_remote;
+pub mod daemon;
 pub mod demo;
+pub mod engine_config;
 pub mod hook;
 pub mod inspect;
+pub mod model;
 pub mod posture;
 pub mod quickstart;
 pub mod serve;

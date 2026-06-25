@@ -616,3 +616,56 @@ export interface ProtectionSummary {
 export async function protectionSummary(): Promise<ProtectionSummary> {
   return await invoke<ProtectionSummary>("protection_summary");
 }
+
+// ─────────────────────────── ML 控制平面（ADR 0024：daemon + 模型）───────────────────────────
+//
+// GUI 经 `vigil-hub` CLI shell-out 调度常驻 daemon 生命周期与 ML 模型安装（Rust 侧
+// `vigil_desktop::ml_control`）。这些命令仅取 `AppHandle`（Tauri 自动注入），前端不传 payload。
+// 字段名为 Rust serde 默认 snake_case（结构体未 override）。
+
+/** 对应 Rust `vigil_desktop::ml_control::DaemonStatus`。 */
+export interface DaemonStatus {
+  /** daemon 是否在运行 */
+  running: boolean;
+  /** 隐私 PII 模型是否已暖载（running 且 status 行报 pii_loaded=true 时为 true） */
+  pii_loaded: boolean;
+  /** vigil-hub 引擎二进制是否就位（false → 守护卡只读，提示先部署引擎） */
+  engine_present: boolean;
+}
+
+/** 对应 Rust `vigil_desktop::ml_control::ModelStatus`。 */
+export interface ModelStatus {
+  /** 隐私 PII 模型已安装（本地缓存 sha256 校验通过） */
+  privacy_installed: boolean;
+  /** 注入分类器模型已安装 */
+  injection_installed: boolean;
+  /** 当前引擎二进制是否支持 ML（ort 变体）。false = 非 ML 变体，无法安装 */
+  ml_supported: boolean;
+  /** 引擎二进制是否就位 */
+  engine_present: boolean;
+}
+
+/** 只读：daemon 运行态（引擎缺失时回 running=false + engine_present=false，不报错）。 */
+export async function daemonStatus(): Promise<DaemonStatus> {
+  return await invoke<DaemonStatus>("daemon_status");
+}
+
+/** 写：detached 启动常驻 daemon（暖载 ML 供 hook 主路径）。回最新状态。 */
+export async function daemonStart(): Promise<DaemonStatus> {
+  return await invoke<DaemonStatus>("daemon_start");
+}
+
+/** 写：停止常驻 daemon。回最新状态。 */
+export async function daemonStop(): Promise<DaemonStatus> {
+  return await invoke<DaemonStatus>("daemon_stop");
+}
+
+/** 只读：ML 模型缓存态（privacy/injection installed + ml_supported）。 */
+export async function modelStatus(): Promise<ModelStatus> {
+  return await invoke<ModelStatus>("model_status");
+}
+
+/** 写：安装 ML 模型（阻塞，数十秒；fail-closed，失败抛错）。回安装后状态。 */
+export async function modelInstall(): Promise<ModelStatus> {
+  return await invoke<ModelStatus>("model_install");
+}

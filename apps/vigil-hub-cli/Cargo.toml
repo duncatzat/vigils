@@ -64,6 +64,10 @@ toml_edit = "0.25"
 vigil-desktop = { path = "../desktop", default-features = false }
 vigil-runner = { path = "../../crates/vigil-runner" }
 vigil-ui-protocol = { path = "../../crates/vigil-ui-protocol" }
+# P2.3 daemon IPC(ADR 0024):跨平台本地 socket(UDS / Windows named pipe)的瘦客户端 +
+# 服务端 transport。用成熟 crate 而非手写 named-pipe FFI(安全边界,减少 unsafe 出错面);
+# R1 peer-credential + R2 读截止 在其 raw fd/handle 上另加(见 daemon/transport.rs)。
+interprocess = "2"
 
 [dev-dependencies]
 # CLI 级集成测试用(β R1 MUST-FIX 4):InMemorySecretStore 注入 + mock AS

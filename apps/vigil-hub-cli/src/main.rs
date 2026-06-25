@@ -8,9 +8,12 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use vigil_hub_cli::daemon;
 use vigil_hub_cli::demo::{self, DemoArgs};
+use vigil_hub_cli::engine_config;
 use vigil_hub_cli::hook::{self, HookArgs};
 use vigil_hub_cli::inspect::{self, InspectArgs};
+use vigil_hub_cli::model;
 use vigil_hub_cli::posture;
 use vigil_hub_cli::quickstart;
 use vigil_hub_cli::serve::{self, ServeArgs};
@@ -89,6 +92,19 @@ enum Command {
     ///
     /// 用法:`vigil-hub inspect protection` / `vigil-hub inspect activity`。
     Inspect(InspectArgs),
+    /// 查看 / 切换 AI 引擎模式(ADR 0022 三态:hardfp / ml / auto)的**落盘配置**。
+    /// GUI(控制平面)经本命令读写;serve/wrap 未显式 `--engine` 时回落本配置(消费侧增量接线)。
+    /// `ml`/`auto` 实际跑 ML 仍需 ML 引擎变体(`--features ort`)。
+    /// 用法:`vigil-hub engine show` / `vigil-hub engine set ml`。
+    Engine(CliEngineArgs),
+    /// 启 / 查常驻 daemon(ADR 0024):暖载 ML 模型供 hook 主路径低延迟查询(瘦客户端经本地 IPC)。
+    /// `start` 前台运行(单实例:已运行则退出);`status` 查运行态。ort 构建 + 模型已缓存则暖载真
+    /// PII scanner,否则 model-less(hook 落硬指纹)。
+    Daemon(CliDaemonArgs),
+    /// 安装 / 查 ML 模型(隐私 PII + 注入分类器,各 ~700MB)。turnkey:`model install` →
+    /// `daemon start`(暖载)→ `engine set ml` → hook 走 ML。ort-gated(非 ML 变体报错指向变体)。
+    /// 用法:`vigil-hub model install` / `vigil-hub model status`。
+    Model(CliModelArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -110,6 +126,61 @@ enum PostureCommand {
         #[arg(long)]
         ledger: Option<PathBuf>,
     },
+}
+
+#[derive(clap::Args, Debug)]
+struct CliEngineArgs {
+    #[command(subcommand)]
+    command: EngineCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum EngineCommand {
+    /// 显示当前引擎模式(读 engine 配置;文件缺失 = 未配置,显示默认 hardfp)。
+    Show,
+    /// 切换到指定引擎模式(原子写配置)。`ml`/`auto` 实际生效仍需 ML 引擎变体(`--features ort`)。
+    Set {
+        /// 目标模式:hardfp / ml / auto。
+        #[arg(value_enum)]
+        mode: serve::EngineMode,
+    },
+}
+
+#[derive(clap::Args, Debug)]
+struct CliDaemonArgs {
+    #[command(subcommand)]
+    command: DaemonCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    /// 前台启动 daemon(bind 本地 socket + 写 daemon.json + serve)。单实例:已运行则失败退出。
+    Start,
+    /// 查 daemon 状态(读 daemon.json + 连接 query live Status,经 R1 peer-cred)。
+    Status,
+    /// 停止 daemon(R1+token 验存活后杀 daemon.json.pid;不响应则只清陈旧 json,防 pid 重用误杀)。
+    Stop,
+}
+
+#[derive(clap::Args, Debug)]
+struct CliModelArgs {
+    #[command(subcommand)]
+    command: ModelCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ModelCommand {
+    /// 下载 ML 模型。`--privacy` / `--injection` 选装;都不给 = 都装。已缓存则幂等秒回(ETag 304)。
+    Install {
+        /// 只装隐私 PII 模型。
+        #[arg(long)]
+        privacy: bool,
+        /// 只装注入分类器模型。
+        #[arg(long)]
+        injection: bool,
+    },
+    /// 查两个模型本地是否已缓存(daemon 暖载 / `--engine auto` best-effort 的前提)。
+    Status,
 }
 
 #[derive(clap::Args, Debug)]
@@ -343,9 +414,18 @@ struct CliServeArgs {
 
 impl From<CliServeArgs> for ServeArgs {
     fn from(c: CliServeArgs) -> Self {
-        // ADR 0022:把 --engine + 裸 --enable-* 解析成最终两开关(`auto` 含只读 fs 探测,不下载)。
+        // P2.2:显式 `--engine` 缺省时回落持久化 engine.json(GUI 控制平面写的全局偏好);
+        // 持久化 = standing 偏好 → best-effort(缺 ort/模型响亮降级硬指纹而非拒启;ADR 0024 D8)。
+        let persisted =
+            engine_config::default_engine_path().map(|p| engine_config::load_engine(&p));
+        if let Some(w) = persisted.as_ref().and_then(|l| l.warning.as_deref()) {
+            eprintln!("vigil-hub serve: {w}");
+        }
+        let (effective, ml_best_effort) =
+            engine_config::effective_engine(c.engine, persisted.and_then(|l| l.mode));
+        // ADR 0022:把生效 engine + 裸 --enable-* 解析成最终两开关(`auto` 含只读 fs 探测,不下载)。
         let sel = serve::resolve_engine_args(
-            c.engine,
+            effective,
             c.enable_privacy_filter,
             c.enable_injection_classifier,
         );
@@ -356,8 +436,7 @@ impl From<CliServeArgs> for ServeArgs {
             dev_permissive_firewall: c.dev_permissive_firewall,
             enable_privacy_filter: sel.enable_privacy_filter,
             enable_injection_classifier: sel.enable_injection_classifier,
-            // ADR 0022:auto = best-effort(只用本地缓存模型,缺失/init 失败降级硬指纹,绝不下载)。
-            ml_best_effort: matches!(c.engine, Some(serve::EngineMode::Auto)),
+            ml_best_effort,
             redact_tool_results: c.redact_tool_results,
             // `serve` 子命令保持既有 enforce(default-deny + 阻塞审批);monitor 是 wrap turnkey 专用。
             monitor: false,
@@ -436,6 +515,15 @@ fn main() -> std::process::ExitCode {
             // posture_path / co_approval_wait_secs 走默认(canonical 路径 + 按 CLI 预算);
             // 显式覆盖仅测试注入用。
             // α2 注入配置:仅 `--inject` 时构造(否则 None = 占位符落三档姿态,无行为回归)。
+            // engine.json(GUI 控制平面写的全局偏好)决定 hook 是否经常驻 daemon 走 ML PII 增强
+            // (ADR 0024)。持久化 = standing 偏好 → best-effort(daemon 缺则降级硬指纹;D8)。hook 由
+            // agent 以固定注册参数调起,无 `--engine` flag → 仅读 engine.json(显式覆盖留 serve/wrap)。
+            let loaded_engine =
+                engine_config::default_engine_path().map(|p| engine_config::load_engine(&p));
+            if let Some(w) = loaded_engine.as_ref().and_then(|l| l.warning.as_deref()) {
+                eprintln!("vigil-hook: {w}");
+            }
+            let engine = loaded_engine.and_then(|l| l.mode);
             let injection =
                 build_injection_config(args.inject, args.secrets.as_deref(), args.inject_ttl_secs);
             let hook_args = HookArgs {
@@ -443,6 +531,7 @@ fn main() -> std::process::ExitCode {
                 cli: args.cli,
                 injection,
                 redact_results: args.redact_results,
+                engine,
                 ..HookArgs::default()
             };
             let stdin = std::io::stdin();
@@ -551,6 +640,76 @@ fn main() -> std::process::ExitCode {
             }
         }
         Some(Command::Posture(args)) => run_posture(args),
+        Some(Command::Engine(args)) => run_engine(args),
+        Some(Command::Daemon(args)) => run_daemon(args),
+        Some(Command::Model(args)) => run_model(args),
+    }
+}
+
+/// `vigil-hub engine show|set`:查看 / 切换 AI 引擎模式的落盘配置(ADR 0022)。镜像 [`run_posture`]
+/// 纪律(原子写;配置目录定位失败 = fail-soft 错误退出)。消费侧(serve/wrap 回落本配置)是后续
+/// 增量;本命令只读写配置,不改任何决策路径。
+fn run_engine(args: CliEngineArgs) -> std::process::ExitCode {
+    let Some(path) = engine_config::default_engine_path() else {
+        eprintln!("vigil-hub engine: cannot locate the engine config directory");
+        return std::process::ExitCode::FAILURE;
+    };
+    match args.command {
+        EngineCommand::Show => {
+            let loaded = engine_config::load_engine(&path);
+            if let Some(w) = &loaded.warning {
+                eprintln!("vigil-hub engine: {w}");
+            }
+            // 未配置(None)= 默认 hardfp(与发行二进制实际行为一致)。
+            println!("{}", loaded.mode.unwrap_or_default().as_str());
+            std::process::ExitCode::SUCCESS
+        }
+        EngineCommand::Set { mode } => {
+            let old = engine_config::load_engine(&path).mode.unwrap_or_default();
+            match engine_config::store_engine(&path, mode) {
+                Ok(()) => {
+                    println!("engine: {} -> {}", old.as_str(), mode.as_str());
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("vigil-hub engine: failed to store engine config ({e})");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+/// `vigil-hub daemon start|status`(ADR 0024):前台启动 / 查询常驻 daemon。逻辑在
+/// [`daemon::lifecycle`];本处只做分发 + ExitCode 映射。
+fn run_daemon(args: CliDaemonArgs) -> std::process::ExitCode {
+    let result = match args.command {
+        DaemonCommand::Start => daemon::lifecycle::run_start(),
+        DaemonCommand::Status => daemon::lifecycle::run_status(),
+        DaemonCommand::Stop => daemon::lifecycle::run_stop(),
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("vigil-hub daemon: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `vigil-hub model install|status`(「安装模型支持」turnkey 入口):下载 / 查 ML 模型。逻辑在
+/// [`model`];本处只做分发 + ExitCode 映射。ort-gated(非 ML 变体 `install` 返错指向 ML 变体)。
+fn run_model(args: CliModelArgs) -> std::process::ExitCode {
+    let result = match args.command {
+        ModelCommand::Install { privacy, injection } => model::run_install(privacy, injection),
+        ModelCommand::Status => model::run_status(),
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("vigil-hub model: {e}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
