@@ -69,6 +69,11 @@ vigil-ui-protocol = { path = "../../crates/vigil-ui-protocol" }
 # R1 peer-credential + R2 读截止 在其 raw fd/handle 上另加(见 daemon/transport.rs)。
 interprocess = "2"
 
+# macOS daemon R1:`peer_creds().pid()` 在 macOS UDS 恒 None(无 SO_PEERCRED),euid 可用。
+# 用 rustix(安全封装,本 crate 仍 forbid unsafe)取自身 euid 与对端比对。版本对齐 lock 既有 1.x。
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [dev-dependencies]
 # CLI 级集成测试用(β R1 MUST-FIX 4):InMemorySecretStore 注入 + mock AS
 vigil-audit = { path = "../../crates/vigil-audit", features = ["test-util"] }
