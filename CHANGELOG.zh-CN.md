@@ -8,6 +8,36 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.4.0] — 2026-06-26 — 常驻 daemon 把 ML 隐私过滤带上 hook 主防护路径(ADR 0024)+ 模型安装 turnkey + GUI 控制
+
+AI 隐私模型(DeBERTa 注入 + PII NER)现在跑在 **hook 主防护路径**上,而不只是 `serve`/`wrap`。常驻
+**daemon** 持有暖载模型,每次 `vigil-hub hook` 经本地 IPC socket 查询、近零额外延迟 —— 若 daemon /
+模型 / IPC 缺失或变慢,hook **回落硬指纹地板**(fail-closed,绝不 fail-open)。自内部 R3 移植,脱敏
+路径经对抗式审查。
+
+### 新增
+
+- **ML-on-hook 常驻 daemon(ADR 0024)。** `vigil-hub daemon start|status|stop` 跑单实例本地 socket
+  服务,一次性暖载 PII scanner + 注入分类器,hook 作瘦 IPC 客户端查询。peer-credential 认证(客户端
+  核验 server PID == 记录的 daemon)、流式读截止、daemon 自持审计账本、fire-and-forget 注入分类,
+  使其有界且抗篡改。ort-gated;非 ML 构建或模型未缓存 → model-less daemon,hook 留在硬指纹 —— 绝不
+  fail-open。
+- **`vigil-hub model install|status` turnkey。** 一条命令下载隐私 + 注入模型(HTTPS、16-chunk 并发、
+  SHA-256 钉死、不符即 fail-closed)。`model status` 报每个模型缓存态;非 ML 构建报 `unsupported`。
+- **`vigil-hub engine show|set`** 落盘引擎模式(`hardfp` / `ml` / `auto`),`serve`/`wrap`/hook 在无
+  显式 `--engine` 时回落本配置(由 GUI 控制平面写入)。
+- **桌面 GUI 控制卡。** 设置页新增 **守护进程** 卡(运行 / ML 暖载态 + 启停)与 **AI 模型** 卡(已装 /
+  不支持态 + 一键安装),经独立进程 shell-out CLI,GUI 自身绝不加载 ort。
+- **ML 引擎发行变体。** 逐平台 `vigils-cli-ml-*` 归档(含捆绑 ONNX Runtime 动态库)与默认纯硬指纹
+  二进制一并发布。
+
+### 安全
+
+- 硬指纹脱敏地板在任何 daemon 缺失 / 模型缺失 / IPC 超时 / 非 ort 路径上**无条件**生效;ML 严格加性
+  叠加其上。经移植 hook 路径的对抗式审查 + 端到端回归测试(ML-only 模式、daemon 缺席 → 地板仍 scrub)验证。
+
+---
+
 ## [v0.3.0] — 2026-06-22 — 远端 HTTP/SSE MCP 上游(OAuth/Bearer)+ 防篡改 OAuth 信任链 + 锚定自动核对
 
 首个把**远端 HTTP MCP 服务器**纳入 Vigil 防火墙的版本,外加对新 OAuth 路径的两项审计完整性加固。

@@ -1210,6 +1210,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "doctest-file"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
+
+[[package]]
 name = "dom_query"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2274,6 +2280,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a588916bfdfd92e71cacef98a63d9b1f0d74d6599980d11894290e7ddefffcf7"
 dependencies = [
  "cfb",
+]
+
+[[package]]
+name = "interprocess"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b"
+dependencies = [
+ "doctest-file",
+ "libc",
+ "recvmsg",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3804,6 +3823,12 @@ dependencies = [
  "time",
  "yasna",
 ]
+
+[[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
 name = "redox_syscall"
@@ -5633,7 +5658,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vigil-audit"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "hex",
@@ -5653,7 +5678,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-browser"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "once_cell",
  "regex",
@@ -5666,7 +5691,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "dirs 6.0.0",
@@ -5693,7 +5718,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-firewall"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dunce",
  "hex",
@@ -5717,7 +5742,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-http-auth"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -5734,7 +5759,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-http-transport"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -5768,12 +5793,13 @@ dependencies = [
 
 [[package]]
 name = "vigil-hub-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "dirs 6.0.0",
  "getrandom 0.2.17",
  "hex",
+ "interprocess",
  "oauth2",
  "rusqlite",
  "serde",
@@ -5801,7 +5827,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-lease"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hex",
  "keyring",
@@ -5819,7 +5845,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hex",
  "once_cell",
@@ -5844,7 +5870,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-native-host"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "dirs 6.0.0",
@@ -5858,7 +5884,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-policy"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5868,7 +5894,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-redaction"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "dirs 5.0.1",
@@ -5890,7 +5916,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-runner"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cap-std",
  "dunce",
@@ -5911,7 +5937,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-runner-types"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dunce",
  "serde",
@@ -5920,7 +5946,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-sandbox-linux"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "landlock",
  "libc",
@@ -5930,7 +5956,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-sdk"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_json",
  "uuid",
@@ -5944,7 +5970,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-types"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5952,7 +5978,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-ui-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -6567,6 +6593,12 @@ dependencies = [
  "windows",
  "windows-core 0.61.2",
 ]
+
+[[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
 name = "wiggle"

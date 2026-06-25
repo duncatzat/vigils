@@ -32,4 +32,11 @@ pub mod render;
 #[cfg(feature = "gui")]
 pub mod embed;
 
+/// ADR 0024 — 「ML 控制平面」GUI 驱动 vigil-hub CLI 的常驻 daemon 生命周期 + ML 模型安装
+/// (gui-feature-gated;shell-out 调度,不把 ort 拉进 GUI)。
+///
+/// 详见 `ml_control.rs` 顶部注释。
+#[cfg(feature = "gui")]
+pub mod ml_control;
+
 pub use dispatcher::dispatch;

@@ -157,10 +157,22 @@ pub fn resolve_project_roots(cli_roots: &[PathBuf]) -> Vec<String> {
 /// 用户面引擎选择三态(`--engine <hardfp|ml|auto>`)。
 ///
 /// 不改 merge 语义(ADR 0013);只决定 **ML 层是否运行**。硬指纹脱敏在三态下**始终常开**。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum EngineMode {
     /// 仅硬指纹(默认):正则脱敏常开,完全不加载 ML 模型 / onnxruntime。
     /// = 当前发行二进制的实际行为(离线、确定性、零模型依赖)。
+    #[default]
     Hardfp,
     /// 严格 ML:启用 OpenAI PII + DeBERTa 注入分类器。缺 feature/模型/dylib → **拒绝启动**
     /// (保留既有 fail-closed:明确要 ML 就必须知道它是否可用,绝不静默裸奔)。
@@ -168,6 +180,17 @@ pub enum EngineMode {
     /// 自动:**仅当**模型已本地缓存且 onnxruntime dylib 就位时启用 ML;否则降级硬指纹 + warn。
     /// 永不触发大文件下载,永不进入 loader-lock 卡死路径(ADR 0022 D4)。
     Auto,
+}
+
+impl EngineMode {
+    /// 稳定小写名(与 serde / clap 名一致),用于配置回显 / GUI 展示。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hardfp => "hardfp",
+            Self::Ml => "ml",
+            Self::Auto => "auto",
+        }
+    }
 }
 
 /// [`resolve_engine_selection`] 的纯输出:两引擎开关。
@@ -721,6 +744,97 @@ fn run_ort_init_with_timeout<T: Send + 'static>(
                  set ORT_DYLIB_PATH, then retry. Aborting."
             );
             std::process::abort();
+        }
+    }
+}
+
+/// 暖载 PII scanner —— **best-effort + 仅本地已缓存**(绝不下载),供 daemon(ADR 0024)复用 serve
+/// 的 ort init 纪律(dylib 稳源 + loader-lock 安全超时 `abort()`),避免逻辑漂移。
+///
+/// 返回 `Some(scanner)` 仅当:隐私模型**已缓存** 且 ort init 成功。模型未缓存 / init 失败或 panic →
+/// `None`(daemon model-less PII → hook 落硬指纹底座,**非 fail-open**);真 init *hang* 仍由内部
+/// [`run_ort_init_with_timeout`] `abort()` 兜底(loader-lock 安全)。
+///
+/// **下载策略**:刻意只读已缓存([`vigil_redaction::model_cached`]),绝不触发 738MB 下载 —— 下载由
+/// GUI「AI 模型」安装卡显式驱动(P2.2b),不在 `daemon start` 静默发生。
+///
+/// **并发不变量(必守)**:内部 `set_var`(`ORT_DYLIB_PATH` + `VIGIL_PRIVACY_FILTER_MODEL_DIR`)在有
+/// 其他线程并发读 env 时是 data-race UB。调用方必须保证调用时进程**仍单线程** —— daemon `run_start`
+/// 在 `serve` spawn 任何线程**之前**调用(见 `daemon::lifecycle::run_start`)。
+#[cfg(feature = "ort")]
+pub(crate) fn warm_load_pii_scanner_best_effort() -> Option<Arc<dyn vigil_firewall::PiiScanner>> {
+    prepare_ort_dylib_path();
+    let dir = vigil_redaction::model_cached(None).map(|p| p.dir().to_path_buf());
+    let dir = match dir {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "vigil-hub daemon: privacy-filter model not cached; PII via hard-fingerprint only \
+                 (install the model from the GUI to enable ML)"
+            );
+            return None;
+        }
+    };
+    std::env::set_var("VIGIL_PRIVACY_FILTER_MODEL_DIR", &dir);
+    eprintln!(
+        "vigil-hub daemon: privacy model ready (dir={}); warming ort…",
+        dir.display()
+    );
+    match run_ort_init_with_timeout("privacy filter", vigil_firewall::ort_scanner_arc_from_env) {
+        Ok(scanner) => Some(scanner),
+        Err(OrtInitOutcome::Failed(e)) => {
+            eprintln!("vigil-hub daemon: privacy filter init failed: {e}; hard-fingerprint only");
+            None
+        }
+        Err(OrtInitOutcome::Panicked) => {
+            eprintln!(
+                "vigil-hub daemon: privacy filter init worker panicked; hard-fingerprint only"
+            );
+            None
+        }
+    }
+}
+
+/// 暖载注入分类器(DeBERTa)—— **best-effort + 仅本地已缓存**(绝不下载),供 daemon(ADR 0024)
+/// 复用 serve 的 ort init 纪律。与 PII 对称:模型未缓存 / init 失败 → `None`(注入 ML 检测 off,
+/// 软信号缺位不破 fail-safe —— hook 仍有正则元指令检测兜底)。`set_var` 并发不变量同 PII(调用方
+/// 须在 `serve` spawn 任何线程前调用)。
+#[cfg(feature = "ort")]
+pub(crate) fn warm_load_injection_classifier_best_effort(
+) -> Option<Arc<vigil_redaction::InjectionClassifier>> {
+    prepare_ort_dylib_path(); // 与 PII 共用 dylib;重复调用幂等(已设则跳过)
+    let dir = match vigil_redaction::injection_model_cached(None).map(|p| p.dir().to_path_buf()) {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "vigil-hub daemon: injection-classifier model not cached; injection ML off \
+                 (install it from the GUI to enable)"
+            );
+            return None;
+        }
+    };
+    let banner = dir.clone();
+    match run_ort_init_with_timeout("injection classifier", move || {
+        vigil_redaction::InjectionClassifier::from_model_dir(&dir).inspect(|c| {
+            let _ = c.warmup(); // graph optimize / JIT cold-path 前移到启动期
+        })
+    }) {
+        Ok(c) => {
+            eprintln!(
+                "vigil-hub daemon: injection classifier warm (dir={})",
+                banner.display()
+            );
+            Some(Arc::new(c))
+        }
+        Err(OrtInitOutcome::Failed(e)) => {
+            eprintln!("vigil-hub daemon: injection classifier init failed: {e}; injection ML off");
+            None
+        }
+        Err(OrtInitOutcome::Panicked) => {
+            eprintln!(
+                "vigil-hub daemon: injection classifier init worker panicked; injection ML off"
+            );
+            None
         }
     }
 }

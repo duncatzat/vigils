@@ -8,6 +8,41 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.4.0] — 2026-06-26 — resident daemon brings ML privacy filtering to the hook main path (ADR 0024) + model-install turnkey + GUI controls
+
+The AI privacy models (DeBERTa injection + PII NER) now run on the **hook main protection path**, not
+just `serve`/`wrap`. A resident **daemon** holds the warm models so each `vigil-hub hook` invocation
+queries them over a local IPC socket with near-zero added latency — and if the daemon, model, or IPC is
+missing/slow, the hook **falls back to the hard-fingerprint floor** (fail-closed; never fail-open).
+Ported from internal R3 with adversarial review of the redaction path.
+
+### Added
+
+- **Resident daemon for ML-on-hook (ADR 0024).** `vigil-hub daemon start|status|stop` runs a
+  single-instance local-socket server that warm-loads the PII scanner + injection classifier once and
+  serves the hook as a thin IPC client. Peer-credential auth (the client verifies the server PID == the
+  recorded daemon), a streaming read deadline, a daemon-owned audit ledger, and fire-and-forget
+  injection classification keep it bounded and tamper-resistant. ort-gated; a non-ML build or uncached
+  model yields a *model-less* daemon and the hook stays on hard-fingerprint — never fail-open.
+- **`vigil-hub model install|status` turnkey.** One command downloads the privacy + injection models
+  (HTTPS, 16-chunk parallel, SHA-256 pinned, fail-closed on mismatch). `model status` reports per-model
+  cache state; non-ML builds report `unsupported`.
+- **`vigil-hub engine show|set`** persists the engine mode (`hardfp` / `ml` / `auto`) that `serve`,
+  `wrap`, and the hook fall back to when no explicit `--engine` is given (written by the GUI control plane).
+- **Desktop GUI control cards.** Settings gains a **Daemon** card (running / ML-warm status + start/stop)
+  and an **AI Model** card (installed / unsupported state + one-click install), shelling out to the CLI in
+  a separate process so the GUI never loads ort itself.
+- **ML-engine release variant.** Per-platform `vigils-cli-ml-*` archives (with the bundled ONNX Runtime
+  dylib) are published alongside the default hard-fingerprint-only binaries.
+
+### Security
+
+- The hard-fingerprint redaction floor is **unconditional** on every daemon-missing / model-missing /
+  IPC-timeout / non-ort path; ML is strictly additive on top of it. Verified by adversarial review of the
+  ported hook path plus an end-to-end regression test (ML-only mode, daemon absent → floor still scrubs).
+
+---
+
 ## [v0.3.0] — 2026-06-22 — remote HTTP/SSE MCP upstreams (OAuth/Bearer) + tamper-evident OAuth trust chain + automatic anchor verification
 
 The first release to put **remote HTTP MCP servers** behind Vigil's firewall, plus two audit-integrity

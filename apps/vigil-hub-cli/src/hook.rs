@@ -86,7 +86,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -96,11 +96,36 @@ use vigil_audit::{ApprovalTargetContext, Ledger};
 use vigil_lease::{LeaseBroker, MintRequest, ResolveContext, SecretStore, SecretValue};
 use vigil_types::{ApprovalStatus, DecisionKind, DecisionRecord, EffectVector, InjectionMethod};
 
+use crate::daemon::protocol::{Request, Response, ScanKind, WireFinding};
+use crate::daemon::transport;
 use crate::posture::{self, PostureAction, RiskClass};
+use crate::serve::EngineMode;
 
 /// hook stdin 上限(Codex R1 HIGH):16 MiB 覆盖任何现实工具入参,封顶防无界输入把
 /// OOM/超时变成 fail-open(Claude Code 的 hook 超时/崩溃是 non-blocking = 放行)。
 const MAX_HOOK_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// PostToolUse ML 增强(ADR 0024 hook 瘦客户端):单次 daemon `RedactScan` 查询的有界总截止。
+/// 超时 → 该段降级硬指纹(daemon 慢/挤牙膏绝不楔死工具调用;R2 在 transport 侧已强制)。
+const ML_QUERY_DEADLINE: Duration = Duration::from_millis(800);
+
+/// 单个 `tool_response` 内所有 ML 查询的**累计 wall-clock 预算**(hostile review HIGH)。首次查询
+/// 起算;超此预算 → 余下叶子直接跳过(纯硬指纹)。封死"慢 daemon × 多叶子"累积楔死每次工具调用
+/// —— per-query [`ML_QUERY_DEADLINE`] 之外再设聚合上限;另配**首次失败即 give-up**(见
+/// [`MlScrub::augment`]):一次连不上/超时即认定 daemon 本次不可用,余下叶子不再查。
+const ML_TOTAL_BUDGET: Duration = Duration::from_millis(2500);
+
+/// 单个字符串叶子送 daemon 扫描的最小字节长度。小于此值跳过 ML(短串极少含 PII NER 目标 —— 姓名/
+/// 地址/邮箱通常 ≥8 字节;且硬指纹仍无条件兜底),省每叶子一次 IPC + 模型推理开销。
+const ML_MIN_SEG_LEN: usize = 8;
+
+/// 单个字符串叶子送 daemon 的文本上限(字节,char-boundary 向下取整)。对齐 [`ScanKind::Result`]
+/// 的 hook 侧裁切契约(CPU 防护 + 防超 [`crate::daemon::protocol::MAX_FRAME_BYTES`])。
+const ML_SCAN_TEXT_CAP: usize = 16 * 1024;
+
+/// 单个 `tool_response` 的 ML 查询次数上限。超过 → 余下叶子仅硬指纹(防巨型多叶 response 触发
+/// N× IPC/推理;非静默 —— 触顶 stderr 记一次,见 [`MlScrub::augment`])。硬指纹底座不受此限。
+const ML_MAX_QUERIES_PER_RESPONSE: usize = 64;
 
 /// 共同批准等待预算(Claude/Gemini/Cursor):各自注册的 hook timeout 是 60s
 /// (setup.rs `HOOK_TIMEOUT_SECS` / setup_hooks.rs Gemini 60_000ms、Cursor 60s),
@@ -223,6 +248,24 @@ pub struct HookArgs {
     /// true = 把工具结果里的硬指纹 secret(ghp_/AKIA/…)替换为占位符再返回模型(仅 Claude)。
     /// 默认 false(行为与改前一致);由 `--redact-results` flag 置位,setup 默认为 Claude 写入。
     pub redact_results: bool,
+    /// 解析后的引擎模式(GUI 控制平面写的 `engine.json` 全局偏好;生产 main.rs 注入,测试可覆盖)。
+    /// `Some(Ml | Auto)` → PostToolUse 结果再脱敏经常驻 daemon 查 ML PII 增强(ADR 0024 瘦客户端;
+    /// daemon 缺/超时/畸形 → **fail-closed 降级硬指纹**,绝不 fail-open);`None` / `Some(Hardfp)` →
+    /// 仅硬指纹(零行为回归)。
+    pub engine: Option<EngineMode>,
+}
+
+impl HookArgs {
+    /// ML PII 增强是否启用(engine = `ml` 严格 或 `auto`)。两者在 hook 路径同等对待:daemon 可用
+    /// 则查、不可用则降级硬指纹(D8:`ml` 也响亮降级而非硬拒,否则阻断每次工具调用 = 用户卸载)。
+    fn ml_enabled(&self) -> bool {
+        matches!(self.engine, Some(EngineMode::Ml | EngineMode::Auto))
+    }
+
+    /// 是否**严格 `ml`**(用于 R5 降级审计响度:用户显式要 ml 却降级 → 持久审计 + 响亮)。
+    fn ml_is_strict(&self) -> bool {
+        self.engine == Some(EngineMode::Ml)
+    }
 }
 
 /// 归一化后的 PreToolUse 事件(多 CLI 字段变体收敛后的统一形状)。
@@ -1197,6 +1240,25 @@ fn handle_post_tool_use(args: &HookArgs, raw: &Value) -> HookOutcome {
         );
     }
 
+    // ── 步骤 3.5:ML 注入检测(ADR 0024,engine=ml/auto)。把原始 output 投给常驻 daemon **异步**
+    //    classify(**fire-and-forget / R4**:daemon 立即 ack、后台 bump session risk;hook 不等)。与上面
+    //    正则元指令检测**并行加性**:daemon 缺/不可用 → `query_daemon` 返 None,无害跳过(正则路径仍兜)。
+    //    risk bump 走 daemon 自有 canonical ledger,对下次 PreToolUse 的 `read_session_risk` 可见(同 key)。
+    if args.ml_enabled() {
+        if let Some(sid) = session_id.as_deref() {
+            if !original_text.is_empty() {
+                let capped = cap_to_char_boundary(&original_text, ML_SCAN_TEXT_CAP);
+                let _ = transport::query_daemon(
+                    Request::ClassifyInjection {
+                        session_id: sid.to_string(),
+                        text: capped.to_string(),
+                    },
+                    ML_QUERY_DEADLINE,
+                );
+            }
+        }
+    }
+
     // ── 步骤 4:datamarking(包裹脱敏后 output)。触发=「元指令命中 或 含已有 sentinel 标签」且 Claude。──
     // 仅 Claude 有 updatedToolOutput 能力;非 Claude 不改写(strip 仅作审计,见下)。
     //
@@ -1421,6 +1483,8 @@ struct RedactReport {
     reverse_hits: usize,
     /// 命中的硬指纹规则名(去重,静态串,**非真值**)。
     hard_hits: Vec<&'static str>,
+    /// daemon ML PII 增强命中的 span 数(零真值;`[REDACTED <label>]` 替换计数)。
+    ml_hits: usize,
 }
 
 /// PostToolUse 结果再脱敏(TASK-006)。返回:
@@ -1442,7 +1506,11 @@ fn try_result_redaction(args: &HookArgs, raw: &Value) -> Option<HookOutcome> {
     // injection 启用 → 完整再脱敏(逆替换 + 硬指纹);仅 `--redact-results` 启用 → 硬指纹 scrub only
     // (无状态、无声明 secret 依赖,独立于 `--inject`;#12)。两者皆未开 → pass-through(零行为回归)。
     let inj_opt = args.injection.as_ref().filter(|i| i.enabled);
-    if (inj_opt.is_none() && !args.redact_results) || !cli_supports_updated_input(args.cli) {
+    // ML 增强(engine=ml/auto)是结果再脱敏的**第三个触发器**(独立于 injection / `--redact-results`):
+    // 三者皆未开 → pass-through(零行为回归)。ML 脱敏与硬指纹 scrub 同样需 updatedToolOutput(仅 Claude)。
+    if (inj_opt.is_none() && !args.redact_results && !args.ml_enabled())
+        || !cli_supports_updated_input(args.cli)
+    {
         return None;
     }
     // 工具名(精确路由)。#3 二次传播兜底:再脱敏面从"仅边界工具"扩到所有 **native** 工具。
@@ -1547,6 +1615,26 @@ fn try_result_redaction(args: &HookArgs, raw: &Value) -> Option<HookOutcome> {
         return Some(redact_fail_closed_outcome(&tool_name));
     }
 
+    // ── ML PII 增强(ADR 0024 hook 瘦客户端):engine=ml/auto 时,在已脱敏(逆替换 + 硬指纹底座)
+    //    的结果上**再追加**一遍常驻 daemon 的 ML PII 脱敏。**纯加性 + fail-closed**:daemon 缺/超时/
+    //    畸形 → 跳过(硬指纹底座已无条件兜住,非 fail-open)。自检在此之前跑(ML 只追加 PII 脱敏、
+    //    不引入 secret,故 declared-secret 自检语义不受影响)。
+    let mut ml = MlScrub::new(args);
+    let redacted = if ml.enabled {
+        ml_augment_value(&redacted, &mut ml, &mut report)
+    } else {
+        redacted
+    };
+    // R5:严格 `ml` 下 daemon 降级 → 响亮 stderr(用户显式要 ml 应当知情;持久审计事件为下一 slice)。
+    // `auto` 降级静默(daemon 可选,降级是预期常态,避免每次工具调用刷屏)。
+    if ml.degraded && ml.strict {
+        eprintln!(
+            "vigil-hook: engine=ml but the resident ML daemon was unavailable for result \
+             redaction; fell back to hard-fingerprint only (start the Vigil daemon to enable \
+             ML PII filtering)"
+        );
+    }
+
     // 无变化 = 结果无任何泄漏 → pass-through(零噪声,常态)。
     if !report.changed {
         return None;
@@ -1567,10 +1655,12 @@ fn try_result_redaction(args: &HookArgs, raw: &Value) -> Option<HookOutcome> {
 
     let note = format!(
         "Vigil re-redacted the result of `{}` before returning it to the model: \
-         {} injected secret occurrence(s) and {} hard-fingerprint hit(s) replaced with placeholders.",
+         {} injected secret occurrence(s), {} hard-fingerprint hit(s), and {} ML PII span(s) \
+         replaced with placeholders.",
         safe_tool_name(&tool_name),
         report.reverse_hits,
         report.hard_hits.len(),
+        report.ml_hits,
     );
     Some(HookOutcome::RedactOutput {
         updated_output: redacted,
@@ -1706,6 +1796,178 @@ fn scrub_one(seg: &str, report: &mut RedactReport) -> String {
     }
     report.changed = true;
     vigil_redaction::scrub_text(seg)
+}
+
+/// PostToolUse ML PII 增强(ADR 0024 hook 瘦客户端 + D8 响亮降级)。**纯加性、fail-closed**:在
+/// 已脱敏(逆替换 + 硬指纹)的结果上**再追加**一遍常驻 daemon 的 ML PII 脱敏 —— daemon 可用则把
+/// 模型命中的 PII span 替换为 `[REDACTED <label>]`;daemon 缺/超时/Error/畸形 → 跳过该段(记
+/// `degraded`),**硬指纹底座已由前一步无条件兜住** → ML 失败绝不降低保护(非 fail-open)。
+struct MlScrub {
+    /// engine = ml/auto 才查 daemon(否则全程跳过,零行为回归)。
+    enabled: bool,
+    /// engine = 严格 ml(R5 降级响度:用户显式要 ml 却降级 → 响亮)。
+    strict: bool,
+    /// 本 response 已发起的 daemon 查询数([`ML_MAX_QUERIES_PER_RESPONSE`] 限流)。
+    queries_used: usize,
+    /// 触顶日志只打一次(no-silent-cap 但不刷屏)。
+    cap_logged: bool,
+    /// 是否发生过降级(任一段 daemon 不可用)→ 调用方据此按 R5 处置。
+    degraded: bool,
+    /// **首次失败/超预算即放弃本 response 余下查询**(hostile review HIGH):一次连不上/超时即认定
+    /// daemon 本次不可用,余下叶子直接跳到硬指纹底座,防 `N × ML_QUERY_DEADLINE` 累积楔死工具调用。
+    give_up: bool,
+    /// 首次查询时间戳(累计 [`ML_TOTAL_BUDGET`] 的起点);`None` = 尚未查询。
+    budget_start: Option<Instant>,
+}
+
+impl MlScrub {
+    fn new(args: &HookArgs) -> Self {
+        Self {
+            enabled: args.ml_enabled(),
+            strict: args.ml_is_strict(),
+            queries_used: 0,
+            cap_logged: false,
+            degraded: false,
+            give_up: false,
+            budget_start: None,
+        }
+    }
+
+    /// 对一个字符串叶子做 ML PII 增强。跳过(返回原串)条件:未启用 / 太短 / 触限流 / 含 Vigil
+    /// 占位符(保留逆替换往返,占位符非 PII 跳过无安全损失)。daemon 返 findings → 应用 span。
+    fn augment(&mut self, seg: &str, report: &mut RedactReport) -> String {
+        // give_up(本 response 已认定 daemon 不可用)/ 未启用 / 太短 → 直接跳过(硬指纹底座另兜)。
+        if !self.enabled || self.give_up || seg.len() < ML_MIN_SEG_LEN {
+            return seg.to_string();
+        }
+        if seg.contains("secret://") || seg.contains("vigil://redact/") {
+            return seg.to_string();
+        }
+        if self.queries_used >= ML_MAX_QUERIES_PER_RESPONSE {
+            if !self.cap_logged {
+                eprintln!(
+                    "vigil-hook: ML PII scan cap ({ML_MAX_QUERIES_PER_RESPONSE}) reached for this \
+                     result; remaining segments use hard-fingerprint only"
+                );
+                self.cap_logged = true;
+            }
+            return seg.to_string();
+        }
+        // 累计 wall-clock 预算(首查询起算):超预算 → give_up,余下叶子纯硬指纹(防慢 daemon 累积楔死)。
+        let start = *self.budget_start.get_or_insert_with(Instant::now);
+        if start.elapsed() >= ML_TOTAL_BUDGET {
+            self.give_up = true;
+            self.degraded = true;
+            return seg.to_string();
+        }
+        self.queries_used += 1;
+        let capped = cap_to_char_boundary(seg, ML_SCAN_TEXT_CAP);
+        match transport::query_daemon(
+            Request::RedactScan {
+                kind: ScanKind::Result,
+                text: capped.to_string(),
+            },
+            ML_QUERY_DEADLINE,
+        ) {
+            Some(Response::Findings { findings }) => {
+                if findings.is_empty() {
+                    return seg.to_string();
+                }
+                // span 相对 capped 前缀;仅在该前缀范围内 apply(suffix 无 ML,硬指纹已兜)。
+                apply_wire_spans(seg, capped.len(), &findings, report)
+            }
+            // daemon 不可用 / Error / 超时 / 畸形 → 降级 + **give_up**(首次失败即认定本 response
+            // daemon 不可用,余下叶子不再查;封死 N×deadline 累积楔死。硬指纹底座已兜,非 fail-open)。
+            _ => {
+                self.degraded = true;
+                self.give_up = true;
+                seg.to_string()
+            }
+        }
+    }
+}
+
+/// 字节 `cap` 处向下取整到 UTF-8 char boundary,返回 `&s[..n]`(`n ≤ cap`),避免切碎多字节字符。
+fn cap_to_char_boundary(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut n = cap;
+    while n > 0 && !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    &s[..n]
+}
+
+/// label 来自 daemon [`WireFinding`](应为 `PrivacyLabel` 闭集);防御性 sanitize:仅留 ascii 字母
+/// 数字 + 下划线、截断 ≤32、空则 `pii`。**绝不**把 daemon 响应原样嵌进返模型的输出
+/// (untrusted-input-not-in-errors 同理:即便 R1 已验对端,响应内容仍按不可信处理)。
+fn safe_label(label: &str) -> String {
+    let cleaned: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(32)
+        .collect();
+    if cleaned.is_empty() {
+        "pii".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// 把 daemon 的 [`WireFinding`] span(相对前 `scanned_len` 字节前缀)应用到 `seg`,命中处替换为
+/// `[REDACTED <label>]`。**右→左单遍**(替换不挪未处理前缀的 offset);span 空/逆序、越出扫描前缀、
+/// 非 char-boundary、或与已处理区间重叠 → 跳过(防御 + 防 panic)。命中计入 `report.ml_hits` + 置 changed。
+fn apply_wire_spans(
+    seg: &str,
+    scanned_len: usize,
+    findings: &[WireFinding],
+    report: &mut RedactReport,
+) -> String {
+    let mut spans: Vec<&WireFinding> = findings.iter().collect();
+    spans.sort_by_key(|f| std::cmp::Reverse(f.start)); // 降序 by start → 右→左替换
+    let mut out = seg.to_string();
+    let mut lowest_applied = out.len(); // 已替换区间的最小起点(防重叠)
+    for f in spans {
+        if f.start >= f.end || f.end > scanned_len {
+            continue; // 空/逆序 span,或越出扫描前缀
+        }
+        if f.end > lowest_applied {
+            continue; // 与已替换区间重叠(merge 应已无重叠;防御性)
+        }
+        if !out.is_char_boundary(f.start) || !out.is_char_boundary(f.end) {
+            continue;
+        }
+        let label = safe_label(&f.label);
+        out.replace_range(f.start..f.end, &format!("[REDACTED {label}]"));
+        lowest_applied = f.start;
+        report.ml_hits += 1;
+        report.changed = true;
+    }
+    out
+}
+
+/// 递归对 `tool_response` 的每个字符串叶子做 ML PII 增强(JSON 结构保持;object key 不改 —— 与
+/// [`redact_boundary_value`] 同理,注入真值落在 value 位)。在 `redact_boundary_value`(逆替换 +
+/// 硬指纹底座)**之后**跑,ML 纯加性。
+fn ml_augment_value(v: &Value, ml: &mut MlScrub, report: &mut RedactReport) -> Value {
+    match v {
+        Value::String(s) => Value::String(ml.augment(s, report)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|x| ml_augment_value(x, ml, report))
+                .collect(),
+        ),
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, val) in map {
+                out.insert(k.clone(), ml_augment_value(val, ml, report));
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
 }
 
 /// 递归自检:`v` 的任意字符串叶子或 object key 是否仍含某个真值(逆向替换遗漏)。
@@ -2006,6 +2268,180 @@ fn safe_tool_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::posture::PostureProfile;
+
+    // ── ADR 0024 hook-ML PII 增强:纯 helper 单测(daemon 查询路径走 e2e / P2.5)──
+
+    fn wf(label: &str, start: usize, end: usize) -> WireFinding {
+        WireFinding {
+            label: label.to_string(),
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn apply_wire_spans_single_span_redacts_with_label() {
+        let mut report = RedactReport::default();
+        let out = apply_wire_spans(
+            "alice@example.com here",
+            22,
+            &[wf("email", 0, 17)],
+            &mut report,
+        );
+        assert_eq!(out, "[REDACTED email] here");
+        assert_eq!(report.ml_hits, 1);
+        assert!(report.changed);
+    }
+
+    #[test]
+    fn apply_wire_spans_multiple_spans_right_to_left_keep_offsets() {
+        // 两个 span 降序应用,不挪未处理前缀 offset。
+        let seg = "a alice@x.io b bob@y.io c";
+        let mut report = RedactReport::default();
+        let out = apply_wire_spans(
+            seg,
+            seg.len(),
+            &[wf("email", 2, 12), wf("email", 15, 23)],
+            &mut report,
+        );
+        assert_eq!(out, "a [REDACTED email] b [REDACTED email] c");
+        assert_eq!(report.ml_hits, 2);
+    }
+
+    #[test]
+    fn apply_wire_spans_out_of_bounds_and_beyond_scanned_skipped() {
+        let seg = "hello world";
+        let mut report = RedactReport::default();
+        // end > scanned_len(5) / end > seg.len() / start>=end(逆序)→ 全跳过。
+        let out = apply_wire_spans(
+            seg,
+            5,
+            &[wf("x", 0, 9), wf("y", 100, 200), wf("z", 4, 2)],
+            &mut report,
+        );
+        assert_eq!(out, "hello world");
+        assert_eq!(report.ml_hits, 0);
+        assert!(!report.changed);
+    }
+
+    #[test]
+    fn apply_wire_spans_non_char_boundary_skipped() {
+        // "héllo":é(U+00E9)= 2 字节占 [1,3);byte 2 落 é 中间 → 非 boundary → 跳过(防 panic)。
+        let seg = "héllo";
+        let mut report = RedactReport::default();
+        let out = apply_wire_spans(seg, seg.len(), &[wf("x", 0, 2)], &mut report);
+        assert_eq!(out, seg);
+        assert_eq!(report.ml_hits, 0);
+    }
+
+    #[test]
+    fn apply_wire_spans_overlap_defensive_skip() {
+        // 重叠 span(merge 本应无,防御性):右→左,[3,7) 与已处理 [5,9) 重叠 → 跳过。
+        let seg = "abcdefghij";
+        let mut report = RedactReport::default();
+        let out = apply_wire_spans(seg, seg.len(), &[wf("a", 5, 9), wf("b", 3, 7)], &mut report);
+        assert_eq!(out, "abcde[REDACTED a]j");
+        assert_eq!(report.ml_hits, 1);
+    }
+
+    #[test]
+    fn cap_to_char_boundary_floors_to_boundary() {
+        assert_eq!(cap_to_char_boundary("hello", 100), "hello");
+        assert_eq!(cap_to_char_boundary("hello", 3), "hel");
+        // "aéb":é 占 [1,3);cap=2 落 é 中间 → 退到 1 → "a"。
+        assert_eq!(cap_to_char_boundary("aéb", 2), "a");
+    }
+
+    #[test]
+    fn safe_label_sanitizes_and_caps() {
+        assert_eq!(safe_label("email"), "email");
+        assert_eq!(safe_label("private_phone"), "private_phone");
+        // 非白名单字符(空格/分号/方括号/连字符)全过滤(防把 daemon 响应原样嵌进返模型输出)。
+        assert_eq!(safe_label("e]mail[injection"), "emailinjection");
+        assert_eq!(safe_label("a b;c"), "abc");
+        assert_eq!(safe_label("na-me"), "name");
+        assert_eq!(safe_label(""), "pii");
+        assert_eq!(safe_label("!!!"), "pii");
+        assert_eq!(safe_label(&"x".repeat(100)).len(), 32);
+    }
+
+    #[test]
+    fn ml_augment_disabled_is_identity() {
+        // engine 非 ml/auto → MlScrub 禁用 → ml_augment_value 恒等(零行为回归,绝不查 daemon)。
+        let args = HookArgs::default(); // engine: None
+        let mut ml = MlScrub::new(&args);
+        assert!(!ml.enabled);
+        let mut report = RedactReport::default();
+        let v = json!({"stdout": "alice@example.com", "nested": ["bob@y.io"]});
+        let out = ml_augment_value(&v, &mut ml, &mut report);
+        assert_eq!(out, v);
+        assert_eq!(report.ml_hits, 0);
+        assert!(!report.changed);
+        assert!(!ml.degraded);
+    }
+
+    #[test]
+    fn ml_enabled_reflects_engine_mode() {
+        let mk = |e: Option<EngineMode>| HookArgs {
+            engine: e,
+            ..HookArgs::default()
+        };
+        assert!(!mk(None).ml_enabled());
+        assert!(!mk(Some(EngineMode::Hardfp)).ml_enabled());
+        assert!(mk(Some(EngineMode::Ml)).ml_enabled());
+        assert!(mk(Some(EngineMode::Auto)).ml_enabled());
+        assert!(mk(Some(EngineMode::Ml)).ml_is_strict());
+        assert!(!mk(Some(EngineMode::Auto)).ml_is_strict());
+    }
+
+    #[test]
+    fn ml_augment_skips_placeholder_segments() {
+        // 占位符段跳过(保留逆替换往返;且不触发 daemon 查询 → hermetic)。
+        let args = HookArgs {
+            engine: Some(EngineMode::Auto),
+            ..HookArgs::default()
+        };
+        let mut ml = MlScrub::new(&args);
+        let mut report = RedactReport::default();
+        let kept = ml.augment("secret://deploy-key trailing text here", &mut report);
+        assert_eq!(kept, "secret://deploy-key trailing text here");
+        assert!(!ml.degraded, "占位符段早返回,不查 daemon → 不降级");
+        assert_eq!(report.ml_hits, 0);
+    }
+
+    #[test]
+    fn ml_augment_give_up_skips_query() {
+        // hostile review HIGH 修:give_up=true(已认定本 response daemon 不可用)→ augment 直接返回
+        // 原段,**不发起查询**(封死 N×deadline 累积楔死)。hermetic:不依赖环境是否有 daemon。
+        let args = HookArgs {
+            engine: Some(EngineMode::Ml),
+            ..HookArgs::default()
+        };
+        let mut ml = MlScrub::new(&args);
+        ml.give_up = true;
+        let mut report = RedactReport::default();
+        let out = ml.augment("alice@example.com long enough segment here", &mut report);
+        assert_eq!(out, "alice@example.com long enough segment here");
+        assert_eq!(ml.queries_used, 0, "give_up → 不发起查询");
+    }
+
+    #[test]
+    fn ml_augment_total_budget_exhausted_gives_up() {
+        // hostile review HIGH 修:累计 wall-clock 预算耗尽 → give_up + degraded,余下叶子跳过不查。
+        // hermetic:预置 budget_start 到 ML_TOTAL_BUDGET 之前。
+        let args = HookArgs {
+            engine: Some(EngineMode::Ml),
+            ..HookArgs::default()
+        };
+        let mut ml = MlScrub::new(&args);
+        ml.budget_start = Some(Instant::now() - ML_TOTAL_BUDGET - Duration::from_millis(50));
+        let mut report = RedactReport::default();
+        let out = ml.augment("alice@example.com long enough segment here", &mut report);
+        assert_eq!(out, "alice@example.com long enough segment here");
+        assert!(ml.give_up, "超预算 → give_up");
+        assert!(ml.degraded, "超预算 → degraded");
+        assert_eq!(ml.queries_used, 0, "超预算 → 不发起查询");
+    }
 
     #[test]
     fn meta_risk_delta_caps_per_event_against_dos() {
@@ -3524,6 +3960,41 @@ mod tests {
         assert!(
             s.contains("REDACTED"),
             "expected a [REDACTED ...] placeholder, got: {s}"
+        );
+    }
+
+    #[test]
+    fn ml_only_engine_still_scrubs_hard_fingerprint_with_daemon_absent() {
+        // 移植加固(ADR 0024 hostile review):engine=ml 是结果再脱敏的**第三触发器**,但 daemon 缺席
+        // (测试环境无 daemon.json)时,PostToolUse 结果里的硬指纹 secret 仍被**硬指纹地板**scrub ——
+        // ML 是地板之上的**加性**增强,daemon 缺失 → `ml_augment` 降级(give_up),地板不塌。这正是
+        // fail-closed 不变量:ML 路径任何缺失/超时都回落硬指纹,绝不 fail-open 放行未脱敏内容。
+        let td = tempfile::TempDir::new().unwrap();
+        let tok = "ghp_0123456789abcdefABCDEF0123456789abcd";
+        let event = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": { "file_path": "/x/.env" },
+            "tool_response": { "content": format!("token is {tok} end") },
+        });
+        let mut cur = Cursor::new(event.to_string().into_bytes());
+        let args = HookArgs {
+            cli: CliKind::Claude,
+            ledger_path: Some(td.path().join("ledger.sqlite3")),
+            injection: None,       // 注入关
+            redact_results: false, // 结果再脱敏关 —— **仅**靠 engine=ml 触发再脱敏路径
+            engine: Some(EngineMode::Ml),
+            ..HookArgs::default()
+        };
+        let out = run(&args, &mut cur);
+        let s = redacted_output(&out).to_string();
+        assert!(
+            !s.contains(tok),
+            "ml-only engine with daemon absent must still hard-fingerprint scrub ghp_, got: {s}"
+        );
+        assert!(
+            s.contains("REDACTED"),
+            "expected a [REDACTED ...] placeholder (floor held), got: {s}"
         );
     }
 
