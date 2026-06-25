@@ -104,3 +104,6 @@ __pycache__/
 /ref-*.jpeg
 /ref-*.jpg
 /ref-*.png
+
+# release-acceptance suite local config (SSH targets)
+tests/acceptance/config.env
