@@ -372,41 +372,58 @@ pub(crate) fn risk_of(kind: &str) -> u32 {
     }
 }
 
-/// 按 findings 的 span 从后往前替换,避免 offset 漂移。
-/// 替换文案走 `PrivacyLabel::as_str()`(稳定契约);未识别 kind 降级用原字面量,
-/// 保证不丢信息。
+/// 按 findings 的 span 替换为 `[REDACTED <label>]`;替换文案走 `PrivacyLabel::as_str()`
+/// (稳定契约),未识别 kind 降级用原字面量,保证不丢信息。
 ///
-/// **重叠 span 的 leak 安全性(D16 审计修正)**:`merge_findings` 已去掉与 Hard 重叠的
-/// Model,但 **Hard×Hard 内部确实会重叠** —— 最常见 `env_assignment` 匹配整段 `KEY=secret`、
-/// 同时内层硬规则(`github_token`/`database_url`/…)匹配 `secret` 部分(此前注释误称"不出现
-/// 跨规则同位重叠",已证伪)。本实现对重叠**仍 leak-safe**,依据:① 按 start **降序**处理,
-/// 内层(start 更大)secret **先**被 `replace_range` 覆盖;② 外层 `env_assignment`(start 更小、
-/// 跨度更长)随后因 `end > out.len()`(内层替换缩短了串)被**跳过**,只留下非 secret 的 `KEY=`
-/// 前缀/尾部可见。即"真正的 secret 字节总被内层先覆盖"。与网关路径 `redact_string`(D16 改用
-/// 单遍 + 并集合并)是**两条独立实现**,本路径靠"内层先替换 + 越界跳过"达成同等 leak 安全
-/// (非并集合并);`overlapping_hard_spans_no_leak` 回归测试锁定该不变量,防未来规则改动破坏。
+/// **重叠 span 的 leak 安全性(VIGIL-SEC-OVERLAP 审计修正)**:`merge_findings` 只去掉与
+/// Hard 重叠的 Model,但 **Hard×Hard / Model×Model 内部仍会重叠**(env_assignment 套
+/// github_token;模型对相邻实体吐嵌套 person/address span)。
+///
+/// 旧实现靠"按 start **降序** + 内层先 `replace_range` + 外层 `end > out.len()` 越界跳过"
+/// 达成 leak 安全 —— 但该不变量**仅当外层独有前缀非密时成立**(env_assignment 的 `KEY=` 前缀)。
+/// 若外层独有前缀本身是 PII(模型嵌套 span:外 `[0,40]` person 套内 `[15,40]` person),内层
+/// 替换缩短串令外层 `end > len` 被跳过 → 外层前缀 `[0,15]` 明文 PII **泄漏**(标准复现:
+/// `"Jonathan Whitfield Robert Smith Junior"` → `"Jonathan Whitfi[REDACTED person]"`)。
+///
+/// 故改为与网关 [`crate::redact_string`] 同款 **并集合并**:重叠 span 先合并成互不重叠的
+/// `[min_start, max_end)` 区间,再单次替换。保证每个被任一 finding 命中的字节都落入某个被替换
+/// 区间(leak-safe),且占位符良构(无嵌套破碎)。`overlapping_hard_spans_no_leak` +
+/// `model_overlap_no_leak` 回归测试锁定该不变量。
 fn build_redacted_text(input: &str, findings: &[Finding]) -> String {
-    // sort 副本,不改 caller 给的 findings;span.0 降序(右→左替换避免 index 漂移)。
-    // v0.13:rust 1.95 clippy::unnecessary_sort_by 推荐用 sort_by_key + Reverse 表达。
+    // 拷贝 + 排序:start 升序;同 start 时 end **降序**(长 span 作并集代表名,与网关
+    // redact_string 对齐)。不改 caller 给的 findings。
     let mut sorted: Vec<&Finding> = findings.iter().collect();
-    sorted.sort_by_key(|f| std::cmp::Reverse(f.span.0));
+    sorted.sort_by(|a, b| a.span.0.cmp(&b.span.0).then(b.span.1.cmp(&a.span.1)));
 
-    let mut out = input.to_string();
+    // 重叠区间**并集合并**(leak-safe):代表 kind 取并集内 start 最小→span 最长者(排序已保证)。
+    // 越界 / 非 char boundary 的手工构造 Finding 在并入前剔除,避免 replace_range panic。
+    let mut merged: Vec<(usize, usize, &str)> = Vec::with_capacity(sorted.len());
     for f in sorted {
         let (start, end) = f.span;
-        // 越界防御:理论上 merge 后的 span 来自 regex 命中,不会越界;但 caller
-        // 可能构造 Finding 手动塞进 merge。越界直接跳过,避免 panic。
-        if start > end || end > out.len() {
+        if start > end
+            || end > input.len()
+            || !input.is_char_boundary(start)
+            || !input.is_char_boundary(end)
+        {
             continue;
         }
-        // UTF-8 char boundary 校验:非 char boundary 跳过,保证 out.replace_range
-        // 不会 panic。regex Match 总在 char boundary,但手工构造的 span 可能不是。
-        if !out.is_char_boundary(start) || !out.is_char_boundary(end) {
-            continue;
+        match merged.last_mut() {
+            // 重叠(strict-less,相邻 end==start 不算)→ 扩展并集上界;代表名保持先者
+            Some(last) if start < last.1 => {
+                if end > last.1 {
+                    last.1 = end;
+                }
+            }
+            _ => merged.push((start, end, f.kind)),
         }
-        let placeholder = match PrivacyLabel::from_kind(f.kind) {
+    }
+
+    // 右→左替换:merged 已 start 升序且互不重叠,从后往前替换不影响前面区间 index。
+    let mut out = input.to_string();
+    for &(start, end, kind) in merged.iter().rev() {
+        let placeholder = match PrivacyLabel::from_kind(kind) {
             Some(label) => format!("[REDACTED {}]", label.as_str()),
-            None => format!("[REDACTED {}]", f.kind),
+            None => format!("[REDACTED {}]", kind),
         };
         out.replace_range(start..end, &placeholder);
     }
@@ -807,6 +824,53 @@ mod tests {
         let out = build_redacted_text(text, &[bad]);
         // 跳过则原文不变;不崩就算通过
         assert_eq!(out, text);
+    }
+
+    /// VIGIL-SEC-OVERLAP 回归:**模型嵌套 / 跨类重叠 span** 必须 leak-safe + 占位符良构。
+    /// 旧"右→左 + 越界跳过"实现下,内层(start 更大)替换缩短串令外层 `end > len` 被跳过,
+    /// 外层独有的 PII 前缀明文泄漏。union-merge 修复后并集全覆盖,无泄漏、无破碎占位符。
+    #[test]
+    fn model_overlap_no_leak() {
+        // ① 嵌套同类:外 person [0,40] 套内 person [15,40](内层长→缩串→旧实现跳外层)。
+        //    旧输出 "Jonathan Whitfi[REDACTED person]"(前缀泄漏);修复后并集 [0,40) 全脱敏。
+        let input = "Jonathan Whitfield Robert Smith Junior!!";
+        let findings = vec![
+            Finding::model("private_person", (0, 40), 0.9, 5),
+            Finding::model("private_person", (15, 40), 0.9, 5),
+        ];
+        let out = build_redacted_text(input, &findings);
+        assert!(!out.contains("Jonathan"), "外层 PII 前缀泄漏:{out:?}");
+        assert!(!out.contains("Whitfi"), "外层 PII 前缀泄漏:{out:?}");
+        assert_eq!(out, "[REDACTED person]", "嵌套同类应并集为单一占位符");
+
+        // ② 跨类部分重叠:address [0,47] 与 email [41,54] 交叠(a<c<b<d)。
+        //    旧实现产 "[REDACTED address]TED email]"(破碎);修复后并集 [0,54) 良构。
+        let input2 = "742 Evergreen Terrace Springfield, email jw@clinic.org";
+        let findings2 = vec![
+            Finding::model("private_address", (0, 47), 0.9, 5),
+            Finding::model("private_email", (41, 54), 0.9, 5),
+        ];
+        let out2 = build_redacted_text(input2, &findings2);
+        assert!(!out2.contains("Evergreen"), "address 泄漏:{out2:?}");
+        assert!(!out2.contains("jw@clinic.org"), "email 泄漏:{out2:?}");
+        assert_eq!(
+            out2.matches("[REDACTED").count(),
+            out2.matches(']').count(),
+            "占位符破碎(开闭不配对):{out2:?}"
+        );
+
+        // ③ 非重叠 span 仍各自独立占位符(防 union-merge 过度合并回归)。
+        let input3 = "Bob from Berlin";
+        let findings3 = vec![
+            Finding::model("private_person", (0, 3), 0.9, 5),
+            Finding::model("private_address", (9, 15), 0.9, 5),
+        ];
+        let out3 = build_redacted_text(input3, &findings3);
+        assert_eq!(
+            out3.matches("[REDACTED").count(),
+            2,
+            "非重叠应保两占位符:{out3:?}"
+        );
     }
 
     // ──────────────────────────── risk_of 分级回归 ────────────────────────────
