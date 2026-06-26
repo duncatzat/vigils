@@ -31,6 +31,13 @@ for plat in linux-x64 macos-arm64 windows-x64; do
     hub=$(find "$d" -name 'vigil-hub*' | head -1)
     if file -b "$hub" | grep -q "${WANT[$plat]%\**}"; then ok "${kind}${plat}: vigil-hub is ${WANT[$plat]}"; \
       else bad "${kind}${plat}: wrong arch: $(file -b "$hub")"; fi
+    if [ "$kind" = "" ]; then
+      # CLI(非 ML)归档必含浏览器 native-messaging host(release.yml 与 vigil-hub 同打包);
+      # 缺失 = MV3 扩展无法连本机 → 静默丢浏览器防护。ML 归档故意不含(与 ML 无关)。
+      nh=$(find "$d" -iname 'vigil-native-host*' | head -1)
+      [ -n "$nh" ] && ok "${plat}: vigil-native-host bundled (browser native messaging)" \
+        || bad "${plat}: vigil-native-host MISSING from CLI archive"
+    fi
     if [ "$kind" = "ml-" ]; then
       dy=$(find "$d" -iname '*onnxruntime*' | grep -viE 'providers' | head -1)
       [ -n "$dy" ] && ok "${plat}: ORT dylib bundled exe-adjacent ($(basename "$dy"))" || bad "${plat} ML: dylib missing"

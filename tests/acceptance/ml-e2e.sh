@@ -79,5 +79,16 @@ if [ "$DAEMON_UP" = 1 ]; then
 fi
 echo "  ---- redacted: $(echo "$OUT" | grep -o '"stdout":"[^"]*"' | head -1)"
 
+# --- core functional scenario sweep (reuse this published binary, run.sh wires VIGIL_FN_SWEEP) ---
+if [ -n "${VIGIL_FN_SWEEP:-}" ] && [ -f "$VIGIL_FN_SWEEP" ]; then
+  echo "  ---- functional sweep (HUB=$HUB)…"
+  if HUB="$HUB" VIGIL_FN_MCP_PROBE=/tmp/mcp_probe.py bash "$VIGIL_FN_SWEEP" >"$SBX/fn.log" 2>&1; then
+    ok "functional sweep: all scenarios passed ($(grep -oE '[0-9]+ passed' "$SBX/fn.log" | head -1))"
+  else
+    no "functional sweep: scenario failure(s) — $(grep -oE '[0-9]+ passed, [0-9]+ failed' "$SBX/fn.log" | head -1)"
+    grep -iE 'FAIL ' "$SBX/fn.log" | head -5
+  fi
+fi
+
 printf '\n### result: %d passed, %d failed (%s) ###\n' "$P" "$F" "$PLAT"
 [ "$F" = 0 ]

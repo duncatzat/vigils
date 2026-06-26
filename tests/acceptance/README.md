@@ -16,14 +16,17 @@ cp config.env.example config.env      # fill in REPO + your test-machine SSH tar
 ```
 
 Passwordless SSH to each test machine must be configured. Platforms with a blank SSH
-target in `config.env` are skipped.
+target in `config.env` are skipped. The gate is **fail-closed**: any sub-script that
+detects a defect propagates its exit code, and `run.sh` exits non-zero (earlier `|| true`
++ a trailing `rm` swallowed failures — the gate always "passed" and didn't block release).
 
 ## What it does
 
 | Phase | Script | Needs | Checks |
 |-------|--------|-------|--------|
-| 1 Local audit | `local-audit.sh` | `gh`, `file`, `python3`+`pynacl` | all CLI `sha256` (+CRLF lint), per-platform binary **architecture** (flat-collision regression), ML **dylib bundling** exe-adjacent + arch + ORT version, desktop **minisign** signatures (crypto verify), **OTA** manifest version/url |
-| 2 Runtime e2e (Linux/macOS) | `ml-e2e.sh` | test machine | ML binary runs; dylib loads; turnkey `model install`→`daemon start`→`engine set ml`→hook; **R1** daemon reachability; **ML scrubs semantic PII** (person/address) beyond hard-fingerprints; **fail-closed** (no leak, exit 0) |
+| 1 Local audit | `local-audit.sh` | `gh`, `file`, `python3`+`pynacl` | all CLI `sha256` (+CRLF lint), per-platform binary **architecture** (flat-collision regression), **`vigil-native-host` bundled** in CLI archives (browser native-messaging), ML **dylib bundling** exe-adjacent + arch + ORT version, desktop **minisign** signatures (crypto verify), **OTA** manifest version/url |
+| 2 Runtime e2e (Linux/macOS) | `ml-e2e.sh` | test machine | ML binary runs; dylib loads; turnkey `model install`→`daemon start`→`engine set ml`→hook; **R1** daemon reachability; **ML scrubs semantic PII** (person/address) beyond hard-fingerprints; **fail-closed** (no leak, exit 0); then runs `functional-sweep.sh` against the same published binary |
+| 2 Functional sweep | `functional-sweep.sh` (+ `mcp_probe.py`) | any `vigil-hub` (`HUB=…`) | core protection scenarios: `demo` audit-chain + redaction roundtrip, `demo --tamper` chain-break **falsifiability**, hook PreToolUse **deny** (exit 2, no raw echo), hook PostToolUse **redact** + overlap well-formed (no leak), posture/engine persistence, `inspect`/`verify` chain, `serve --stdio` **MCP handshake** (initialize+tools/list), read-only `quickstart` |
 | 2 Runtime e2e (Linux/macOS) | `daemon-regression.sh` | test machine | **R1** peer-credential reachability + **stale-socket** rebind after `kill -9` (regresses the two macOS daemon bugs; model-less, fast) |
 | 2 Runtime e2e (Windows) | `win-acceptance.ps1` | test machine | ML binary runs; `onnxruntime.dll` LoadLibrary (PE + VC++ deps); turnkey model install; named-pipe **R1** daemon reachability |
 
@@ -38,6 +41,13 @@ target in `config.env` are skipped.
 - **macOS stale-socket** — `daemon-regression.sh` fails if `daemon start` can't rebind after
   `kill -9` (filesystem socket not reclaimed). Fixed in the same change.
 - **Windows `.sha256` CRLF** — `local-audit.sh` flags CRLF line endings in checksum files.
+- **Overlapping-span PII leak (found during macOS daemon hook-ML)** — two independent
+  span-replacement sites (`vigil-redaction` `build_redacted_text`, `vigil-hub-cli`
+  `apply_wire_spans`) used right-to-left replace + skip-on-overlap; nested model spans
+  (outer prefix is PII) leaked the outer's plaintext prefix and produced broken nested
+  placeholders. Both rewritten to **union-merge** (like the gateway `redact_string`).
+  Regression: `model_overlap_no_leak`, `apply_wire_spans_{overlap_union_merged,nested}_no_leak`;
+  `functional-sweep.sh` S3b asserts well-formed placeholders on the shipped binary.
 
 ## Safety
 
