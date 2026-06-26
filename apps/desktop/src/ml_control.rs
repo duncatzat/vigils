@@ -875,12 +875,16 @@ mod tests {
         assert!(stable_has_ml_dylib(&engine));
     }
 
-    /// 对真发布 ML artifact 的端到端验证(不硬编码 URL,靠运行方设 `VIGIL_ML_ENGINE_URL` +
-    /// `VIGIL_ML_ENGINE_SHA256` 喂真包;未设则跳过)。默认 `#[ignore]`(含网络下载)。
+    /// 对真发布 ML artifact 的端到端验证(不硬编码 URL)。两种喂法:
+    /// - `VIGIL_ENGINE_MANIFEST_URL` → 走 **turnkey 清单路径**(fetch + 验签 + resolve + 下载 + 装);
+    /// - `VIGIL_ML_ENGINE_URL`(+可选 `_SHA256`)→ 直喂某 ML 包(跳过清单)。
+    /// 两者均未设则跳过。默认 `#[ignore]`(含网络下载)。
     #[test]
-    #[ignore = "network + needs VIGIL_ML_ENGINE_URL/SHA256 set to a real ML artifact"]
+    #[ignore = "network: set VIGIL_ENGINE_MANIFEST_URL (turnkey) or VIGIL_ML_ENGINE_URL (direct)"]
     fn install_real_ml_artifact_makes_engine_ml_capable() {
-        if std::env::var("VIGIL_ML_ENGINE_URL").is_err() {
+        if std::env::var("VIGIL_ML_ENGINE_URL").is_err()
+            && std::env::var("VIGIL_ENGINE_MANIFEST_URL").is_err()
+        {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
