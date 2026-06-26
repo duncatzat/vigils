@@ -306,14 +306,16 @@ struct EngineManifest {
     artifacts: std::collections::HashMap<String, std::collections::HashMap<String, EngineArtifact>>,
 }
 
-/// 签名引擎清单 URL(`VIGIL_ENGINE_MANIFEST_URL` 覆盖,否则版本拼默认镜像)。`.minisig` 在 `<url>.minisig`。
-/// host 即便错 / 被 MITM,验签失败即 fail-closed → host provisional 不损安全。
+/// 签名引擎清单 URL(`VIGIL_ENGINE_MANIFEST_URL` 覆盖,否则取当前版本的 **GitHub release 资产**)。
+/// `.minisig` 在 `<url>.minisig`。release.yml 的 `engine-manifest` job 把签名清单上传到此 tag 的 release
+/// (可靠;vigils.ai 镜像对 /releases/engine/ 是 SPA catch-all 返 HTML,不可用)。host 即便错 / 被 MITM,
+/// 验签失败即 fail-closed → 不损安全。
 fn engine_manifest_url() -> String {
     if let Ok(url) = std::env::var("VIGIL_ENGINE_MANIFEST_URL") {
         return url;
     }
     let ver = env!("CARGO_PKG_VERSION");
-    format!("https://vigils.ai/releases/engine/v{ver}/engine-manifest.json")
+    format!("https://github.com/duncatzat/vigils/releases/download/v{ver}/engine-manifest.json")
 }
 
 /// GET 文本(小文件:清单 + 签名)。
