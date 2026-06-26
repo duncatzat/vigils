@@ -48,6 +48,13 @@ detects a defect propagates its exit code, and `run.sh` exits non-zero (earlier 
   placeholders. Both rewritten to **union-merge** (like the gateway `redact_string`).
   Regression: `model_overlap_no_leak`, `apply_wire_spans_{overlap_union_merged,nested}_no_leak`;
   `functional-sweep.sh` S3b asserts well-formed placeholders on the shipped binary.
+  - **Known P2 (no leak, `VIGIL-SEC-OVERLAP-PH`)** — on the daemon hook-ML path, a daemon ML
+    span can over-capture into a hard-fingerprint placeholder inserted by the prior scrub,
+    producing a *broken nested placeholder* in the model-facing output (e.g.
+    `[[REDACTED address]DACTED email]`). **No raw PII leaks** (the cut bytes are placeholder,
+    the real value was already scrubbed). The safe fix plumbs the *genuine* placeholder byte
+    ranges from the scrub step into `apply_wire_spans` (regex-detecting `[REDACTED …]` is
+    unsafe — a tool result can forge fake placeholders to evade ML). Tracked for a follow-up.
 
 ## Safety
 

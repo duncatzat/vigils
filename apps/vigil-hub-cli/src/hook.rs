@@ -1924,6 +1924,13 @@ fn safe_label(label: &str) -> String {
 /// 重叠被整条跳过,其独有的 `[3,5)` 明文 PII **残留泄漏**;且嵌套场景产生破碎嵌套占位符。并集合并
 /// (与 vigil-redaction `build_redacted_text` 同款 leak-safe 策略)保证每个被任一 span 命中的字节都
 /// 落入某替换区间。`report.ml_hits` 计并集后实际替换的区间数。
+///
+/// **已知 P2(无泄漏,VIGIL-SEC-OVERLAP-PH)**:daemon 在 `redact_boundary_value` 已脱敏(含
+/// `[REDACTED …]` 占位符)的文本上扫描,其 ML span 可 over-capture 延伸进占位符 → `replace_range`
+/// 切碎成破碎嵌套占位符(macOS 实测 `[[REDACTED address]DACTED email]`)。**无原值泄漏**(被切的
+/// 是占位符,真值早被硬指纹脱敏)。安全修法须从脱敏步骤**透传真实占位符字节区间**给本函数后做减法
+/// —— 不可用正则识别 `[REDACTED …]`(攻击者可在工具输出伪造假占位符把语义 PII 包进去 → ML 跳过 →
+/// 绕过脱敏)。待后续 slice 实现该 plumbing。
 fn apply_wire_spans(
     seg: &str,
     scanned_len: usize,
