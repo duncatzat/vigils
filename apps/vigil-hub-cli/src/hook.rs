@@ -1916,31 +1916,52 @@ fn safe_label(label: &str) -> String {
 }
 
 /// 把 daemon 的 [`WireFinding`] span(相对前 `scanned_len` 字节前缀)应用到 `seg`,命中处替换为
-/// `[REDACTED <label>]`。**右→左单遍**(替换不挪未处理前缀的 offset);span 空/逆序、越出扫描前缀、
-/// 非 char-boundary、或与已处理区间重叠 → 跳过(防御 + 防 panic)。命中计入 `report.ml_hits` + 置 changed。
+/// `[REDACTED <label>]`。空/逆序、越出扫描前缀、非 char-boundary 的 span 先剔除(防 panic + 防御),
+/// 再**并集合并**成互不重叠区间后右→左单遍替换。
+///
+/// **为何并集而非"重叠跳过"(VIGIL-SEC-OVERLAP)**:daemon 可能对相邻实体吐嵌套/重叠 span。旧实现
+/// 右→左 + "与已处理区间重叠则跳过"会漏掉外层 span 独有的 PII 前缀 —— 例如 `[3,7)` 与已处理 `[5,9)`
+/// 重叠被整条跳过,其独有的 `[3,5)` 明文 PII **残留泄漏**;且嵌套场景产生破碎嵌套占位符。并集合并
+/// (与 vigil-redaction `build_redacted_text` 同款 leak-safe 策略)保证每个被任一 span 命中的字节都
+/// 落入某替换区间。`report.ml_hits` 计并集后实际替换的区间数。
 fn apply_wire_spans(
     seg: &str,
     scanned_len: usize,
     findings: &[WireFinding],
     report: &mut RedactReport,
 ) -> String {
-    let mut spans: Vec<&WireFinding> = findings.iter().collect();
-    spans.sort_by_key(|f| std::cmp::Reverse(f.start)); // 降序 by start → 右→左替换
+    // 剔除非法 span(空/逆序、越出扫描前缀、非 char-boundary),保留 (start, end, label)。
+    let mut spans: Vec<(usize, usize, &str)> = findings
+        .iter()
+        .filter(|f| {
+            f.start < f.end
+                && f.end <= scanned_len
+                && seg.is_char_boundary(f.start)
+                && seg.is_char_boundary(f.end)
+        })
+        .map(|f| (f.start, f.end, f.label.as_str()))
+        .collect();
+    if spans.is_empty() {
+        return seg.to_string();
+    }
+    // start 升序、同 start 时 end 降序(长 span 作并集代表名)。
+    spans.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    // 并集合并成互不重叠区间(代表 label 取并集内 start 最小→最长者)。
+    let mut merged: Vec<(usize, usize, &str)> = Vec::with_capacity(spans.len());
+    for (start, end, label) in spans {
+        match merged.last_mut() {
+            Some(last) if start < last.1 => {
+                if end > last.1 {
+                    last.1 = end;
+                }
+            }
+            _ => merged.push((start, end, label)),
+        }
+    }
+    // 右→左替换(merged 已 start 升序且互不重叠,从后往前不影响前面区间 index)。
     let mut out = seg.to_string();
-    let mut lowest_applied = out.len(); // 已替换区间的最小起点(防重叠)
-    for f in spans {
-        if f.start >= f.end || f.end > scanned_len {
-            continue; // 空/逆序 span,或越出扫描前缀
-        }
-        if f.end > lowest_applied {
-            continue; // 与已替换区间重叠(merge 应已无重叠;防御性)
-        }
-        if !out.is_char_boundary(f.start) || !out.is_char_boundary(f.end) {
-            continue;
-        }
-        let label = safe_label(&f.label);
-        out.replace_range(f.start..f.end, &format!("[REDACTED {label}]"));
-        lowest_applied = f.start;
+    for &(start, end, label) in merged.iter().rev() {
+        out.replace_range(start..end, &format!("[REDACTED {}]", safe_label(label)));
         report.ml_hits += 1;
         report.changed = true;
     }
@@ -2335,12 +2356,31 @@ mod tests {
     }
 
     #[test]
-    fn apply_wire_spans_overlap_defensive_skip() {
-        // 重叠 span(merge 本应无,防御性):右→左,[3,7) 与已处理 [5,9) 重叠 → 跳过。
+    fn apply_wire_spans_overlap_union_merged_no_leak() {
+        // 重叠 span 并集合并(VIGIL-SEC-OVERLAP):[3,7) 与 [5,9) → 并集 [3,9),全覆盖。
+        // 旧"重叠跳过"实现会留下 [3,7) 独有的 "de"(残留泄漏 "abcde[REDACTED a]j");并集后无残留。
         let seg = "abcdefghij";
         let mut report = RedactReport::default();
         let out = apply_wire_spans(seg, seg.len(), &[wf("a", 5, 9), wf("b", 3, 7)], &mut report);
-        assert_eq!(out, "abcde[REDACTED a]j");
+        assert_eq!(out, "abc[REDACTED b]j", "重叠应并集为单一占位符,覆盖 [3,9)");
+        assert!(!out.contains("de"), "[3,7) 独有前缀 de 不得残留:{out}");
+        assert_eq!(report.ml_hits, 1);
+    }
+
+    #[test]
+    fn apply_wire_spans_nested_no_leak() {
+        // 嵌套 span:外 [0,40] 套内 [15,40](内层长)。旧右→左 + 重叠跳过会跳过外层 →
+        // 外层前缀 "Jonathan Whitfi" 明文泄漏("Jonathan Whitfi[REDACTED person]")。
+        let seg = "Jonathan Whitfield Robert Smith Junior!!"; // 40 字节(ASCII)
+        let mut report = RedactReport::default();
+        let out = apply_wire_spans(
+            seg,
+            seg.len(),
+            &[wf("person", 0, 40), wf("person", 15, 40)],
+            &mut report,
+        );
+        assert!(!out.contains("Jonathan"), "外层 PII 前缀泄漏:{out}");
+        assert_eq!(out, "[REDACTED person]", "嵌套应并集为单一占位符");
         assert_eq!(report.ml_hits, 1);
     }
 
