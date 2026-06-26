@@ -100,9 +100,9 @@
                 right: "16px",
                 bottom: "16px",
                 zIndex: "2147483647",
-                maxWidth: "min(420px, calc(100vw - 32px))",
+                maxWidth: "min(320px, calc(100vw - 32px))",
                 padding: "10px 14px",
-                borderRadius: "6px",
+                borderRadius: "12px",
                 boxShadow: "0 12px 32px rgba(15, 23, 42, 0.28)",
                 fontFamily: "system-ui, -apple-system, sans-serif",
                 fontSize: "13px",
@@ -110,9 +110,9 @@
                 fontWeight: "600",
                 color: "#fff",
                 pointerEvents: "none",
-                transition: "opacity 0.2s, transform 0.2s",
+                transition: "opacity 0.25s ease, transform 0.25s ease",
                 opacity: "0",
-                transform: "translateY(8px)",
+                transform: "translateX(12px) translateY(8px)",
                 whiteSpace: "normal",
             });
         }
@@ -125,20 +125,23 @@
     function showToast(message, tone /* "info" | "warn" | "error" */) {
         // 懒创建;Vue / naive 那一套不可用(content script 是独立 JS world)
         if (!ensureToastMounted()) return;
-        const color =
-            tone === "error" ? "#b91c1c" : tone === "warn" ? "#b45309" : "#1e40af";
-        toastEl.style.background = color;
+        const colorMap = {
+            error: "var(--vigil-toast-bg-error)",
+            warn: "var(--vigil-toast-bg-warn)",
+            info: "var(--vigil-toast-bg-info)",
+        };
+        toastEl.style.background = colorMap[tone] || colorMap.info;
         // 用 textContent(Vue 默认插值同效),杜绝站点 HTML 注入 contaminate Vigil 提示
         toastEl.textContent = message;
         toastEl.style.opacity = "1";
-        toastEl.style.transform = "translateY(0)";
+        toastEl.style.transform = "translateX(0) translateY(0)";
         clearTimeout(showToast._t);
         showToast._t = setTimeout(() => {
             if (toastEl) {
                 toastEl.style.opacity = "0";
-                toastEl.style.transform = "translateY(8px)";
+                toastEl.style.transform = "translateX(12px) translateY(4px)";
             }
-        }, 4000);
+        }, 3500);
     }
 
     let riskPromptEl = null;
@@ -186,13 +189,13 @@
 
     function positionRiskPrompt() {
         if (!riskPromptEl) return;
-        const margin = 16;
-        const gap = 12;
+        const margin = 14;
+        const gap = 14;
         const promptWidth = Math.min(
-            riskPromptEl.offsetWidth || 320,
+            riskPromptEl.offsetWidth || 300,
             window.innerWidth - margin * 2,
         );
-        const promptHeight = riskPromptEl.offsetHeight || 156;
+        const promptHeight = riskPromptEl.offsetHeight || 150;
 
         riskPromptEl.style.right = "auto";
         riskPromptEl.style.bottom = "auto";
@@ -204,23 +207,24 @@
         if (riskPromptTarget) {
             const rect = riskPromptTarget.getBoundingClientRect();
             if (rect.width > 0 && rect.height > 0) {
-                const fitsRight =
-                    rect.right + gap + promptWidth <= window.innerWidth - margin;
                 const fitsAbove = rect.top - gap - promptHeight >= margin;
-                const fitsBelow =
-                    rect.bottom + gap + promptHeight <= window.innerHeight - margin;
+                const fitsRight = rect.right + gap + promptWidth <= window.innerWidth - margin;
+                const fitsBelow = rect.bottom + gap + promptHeight <= window.innerHeight - margin;
 
-                if (fitsRight) {
+                // 首选：输入框右上角（右对齐，上方）
+                if (fitsAbove) {
+                    placement = "above";
+                    left = rect.right - promptWidth;
+                    top = rect.top - promptHeight - gap;
+                } else if (fitsRight) {
+                    // 上方没空间，放右侧
                     placement = "right";
                     left = rect.right + gap;
-                    top = rect.top + rect.height / 2 - promptHeight / 2;
-                } else if (fitsAbove) {
-                    placement = "above";
-                    left = rect.left + rect.width / 2 - promptWidth / 2;
-                    top = rect.top - promptHeight - gap;
+                    top = rect.top;
                 } else if (fitsBelow) {
+                    // 右侧也没空间，放下方右对齐
                     placement = "below";
-                    left = rect.left + rect.width / 2 - promptWidth / 2;
+                    left = rect.right - promptWidth;
                     top = rect.bottom + gap;
                 }
             }
@@ -246,22 +250,22 @@
                 Object.assign(riskPromptArrowEl.style, {
                     left: "-6px",
                     top: "calc(50% - 6px)",
-                    borderLeft: "1px solid rgba(245, 158, 11, 0.24)",
-                    borderBottom: "1px solid rgba(245, 158, 11, 0.24)",
+                    borderLeft: "1px solid var(--vigil-prompt-border)",
+                    borderBottom: "1px solid var(--vigil-prompt-border)",
                 });
             } else if (placement === "above") {
                 Object.assign(riskPromptArrowEl.style, {
                     bottom: "-6px",
                     left: "calc(50% - 6px)",
-                    borderRight: "1px solid rgba(245, 158, 11, 0.24)",
-                    borderBottom: "1px solid rgba(245, 158, 11, 0.24)",
+                    borderRight: "1px solid var(--vigil-prompt-border)",
+                    borderBottom: "1px solid var(--vigil-prompt-border)",
                 });
             } else if (placement === "below") {
                 Object.assign(riskPromptArrowEl.style, {
                     top: "-6px",
                     left: "calc(50% - 6px)",
-                    borderLeft: "1px solid rgba(245, 158, 11, 0.24)",
-                    borderTop: "1px solid rgba(245, 158, 11, 0.24)",
+                    borderLeft: "1px solid var(--vigil-prompt-border)",
+                    borderTop: "1px solid var(--vigil-prompt-border)",
                 });
             }
         }
@@ -279,20 +283,20 @@
         box.setAttribute("aria-live", "polite");
         Object.assign(box.style, {
             position: "fixed",
-            right: "16px",
-            bottom: "16px",
             zIndex: "2147483647",
-            width: "min(320px, calc(100vw - 32px))",
-            padding: "12px",
-            borderRadius: "10px",
-            background: "#ffffff",
-            color: "#111827",
-            boxShadow: "0 16px 36px rgba(15, 23, 42, 0.18)",
+            width: "min(300px, calc(100vw - 32px))",
+            padding: "14px",
+            borderRadius: "14px",
+            background: "var(--vigil-prompt-bg)",
+            color: "var(--vigil-prompt-fg)",
+            boxShadow: "var(--vigil-prompt-shadow)",
             fontFamily: "system-ui, -apple-system, sans-serif",
             fontSize: "13px",
             lineHeight: "1.45",
-            border: "1px solid rgba(245, 158, 11, 0.24)",
+            border: "1px solid var(--vigil-prompt-border)",
             boxSizing: "border-box",
+            animation: "vigil-prompt-in 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards, vigil-prompt-pulse 1.8s ease-in-out 0.3s 1",
+            transition: "opacity 0.2s ease, transform 0.2s ease",
         });
 
         const arrow = document.createElement("div");
@@ -301,7 +305,7 @@
             position: "absolute",
             width: "12px",
             height: "12px",
-            background: "#ffffff",
+            background: "var(--vigil-prompt-bg)",
             boxSizing: "border-box",
         });
         box.appendChild(arrow);
@@ -314,20 +318,21 @@
         box.appendChild(heading);
 
         const body = document.createElement("div");
-        body.style.color = "#374151";
+        body.style.color = "var(--vigil-prompt-muted)";
         body.textContent = "建议先脱敏再发送。";
         box.appendChild(body);
 
         const privacy = document.createElement("div");
         privacy.style.marginTop = "6px";
-        privacy.style.color = "#6b7280";
+        privacy.style.color = "var(--vigil-prompt-muted)";
+        privacy.style.opacity = "0.7";
         privacy.textContent = "原文未离开你的浏览器。";
         box.appendChild(privacy);
 
         const actions = document.createElement("div");
         actions.style.display = "flex";
         actions.style.gap = "8px";
-        actions.style.marginTop = "12px";
+        actions.style.marginTop = "14px";
         actions.style.justifyContent = "flex-end";
         box.appendChild(actions);
 
@@ -345,15 +350,44 @@
         btn.textContent = label;
         Object.assign(btn.style, {
             border: "1px solid transparent",
-            borderRadius: "7px",
-            padding: "7px 10px",
+            borderRadius: "8px",
+            padding: "7px 12px",
             cursor: "pointer",
             fontWeight: "700",
             fontSize: "12px",
-            color: tone === "primary" ? "#111827" : "#374151",
-            background: tone === "primary" ? "#f59e0b" : "#f3f4f6",
-            borderColor: tone === "primary" ? "#d97706" : "#e5e7eb",
+            transition: "background 0.15s ease, border-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease, filter 0.15s ease",
         });
+        if (tone === "primary") {
+            Object.assign(btn.style, {
+                color: "var(--vigil-btn-primary-fg)",
+                background: "var(--vigil-btn-primary-bg)",
+                borderColor: "var(--vigil-btn-primary-border)",
+            });
+            btn.addEventListener("mouseenter", () => {
+                btn.style.filter = "brightness(1.08)";
+                btn.style.boxShadow = "0 2px 8px rgba(245, 158, 11, 0.30)";
+            });
+            btn.addEventListener("mouseleave", () => {
+                btn.style.filter = "none";
+                btn.style.boxShadow = "none";
+            });
+        } else {
+            Object.assign(btn.style, {
+                color: "var(--vigil-btn-secondary-fg)",
+                background: "var(--vigil-btn-secondary-bg)",
+                borderColor: "var(--vigil-btn-secondary-border)",
+            });
+            btn.addEventListener("mouseenter", () => {
+                btn.style.background = "rgba(255,255,255,0.95)";
+                btn.style.borderColor = "#d97706";
+            });
+            btn.addEventListener("mouseleave", () => {
+                btn.style.background = "var(--vigil-btn-secondary-bg)";
+                btn.style.borderColor = "var(--vigil-btn-secondary-border)";
+            });
+        }
+        btn.addEventListener("mousedown", () => { btn.style.transform = "scale(0.96)"; });
+        btn.addEventListener("mouseup", () => { btn.style.transform = "scale(1)"; });
         return btn;
     }
 
@@ -461,7 +495,12 @@
         if (!parent) return;
         vigilStyleEl = document.createElement("style");
         vigilStyleEl.setAttribute("data-vigil-style", "");
+        const prefersDark =
+            typeof window.matchMedia === "function" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const isDark = prefersDark ? true : false;
         vigilStyleEl.textContent = [
+            /* ring animation (existing) */
             "@property --vigil-ring-glow-alpha {",
             "  syntax: '<number>';",
             "  inherits: false;",
@@ -470,6 +509,43 @@
             "@keyframes vigil-redact-ring-breathe {",
             "  0%, 100% { --vigil-ring-glow-alpha: 0; }",
             "  50% { --vigil-ring-glow-alpha: 0.55; }",
+            "}",
+            /* toast animation */
+            "@keyframes vigil-toast-in {",
+            "  from { opacity: 0; transform: translateX(-12px) translateY(8px); }",
+            "  to   { opacity: 1; transform: translateX(0) translateY(0); }",
+            "}",
+            "@keyframes vigil-toast-out {",
+            "  from { opacity: 1; transform: translateX(0) translateY(0); }",
+            "  to   { opacity: 0; transform: translateX(-12px) translateY(4px); }",
+            "}",
+            /* prompt slide-in */
+            "@keyframes vigil-prompt-in {",
+            "  from { opacity: 0; transform: translateY(10px) scale(0.97); }",
+            "  to   { opacity: 1; transform: translateY(0) scale(1); }",
+            "}",
+            /* prompt arrow pulse for attention */
+            "@keyframes vigil-prompt-pulse {",
+            "  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.35); }",
+            "  50%  { box-shadow: 0 0 0 6px rgba(245, 158, 11, 0); }",
+            "}",
+            /* shared CSS variables */
+            ":root {",
+            "  --vigil-toast-bg-info: " + (isDark ? "#1e3a8a" : "#1e40af") + ";",
+            "  --vigil-toast-bg-warn: " + (isDark ? "#7c2d12" : "#b45309") + ";",
+            "  --vigil-toast-bg-error: " + (isDark ? "#7f1d1d" : "#b91c1c") + ";",
+            "  --vigil-prompt-bg: " + (isDark ? "#0f172a" : "#ffffff") + ";",
+            "  --vigil-prompt-fg: " + (isDark ? "#f8fafc" : "#111827") + ";",
+            "  --vigil-prompt-muted: " + (isDark ? "#94a3b8" : "#374151") + ";",
+            "  --vigil-prompt-border: " + (isDark ? "rgba(245, 158, 11, 0.45)" : "rgba(245, 158, 11, 0.30)") + ";",
+            "  --vigil-prompt-shadow: " + (isDark ? "0 20px 48px rgba(0, 0, 0, 0.50)" : "0 16px 36px rgba(15, 23, 42, 0.18)") + ";",
+            "  --vigil-btn-primary-bg: " + (isDark ? "#f59e0b" : "#f59e0b") + ";",
+            "  --vigil-btn-primary-fg: " + (isDark ? "#0f172a" : "#111827") + ";",
+            "  --vigil-btn-primary-border: " + (isDark ? "#d97706" : "#d97706") + ";",
+            "  --vigil-btn-secondary-bg: " + (isDark ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.72)") + ";",
+            "  --vigil-btn-secondary-fg: " + (isDark ? "#e2e8f0" : "#44403c") + ";",
+            "  --vigil-btn-secondary-border: " + (isDark ? "rgba(255,255,255,0.12)" : "#d6d3d1") + ";",
+            "  --vigil-safe-bg: " + (isDark ? "rgba(245, 158, 11, 0.10)" : "rgba(255, 251, 235, 0.92)") + ";",
             "}",
         ].join("\n");
         parent.appendChild(vigilStyleEl);
@@ -607,21 +683,24 @@
             Object.assign(safePromptEl.style, {
                 position: "fixed",
                 zIndex: "2147483647",
-                maxWidth: "min(420px, calc(100vw - 32px))",
-                padding: "7px 8px",
-                borderRadius: "10px",
-                border: "1px solid rgba(245, 158, 11, 0.5)",
-                boxShadow: "0 12px 28px rgba(15, 23, 42, 0.22)",
+                maxWidth: "min(360px, calc(100vw - 32px))",
+                padding: "8px 12px",
+                borderRadius: "12px",
+                border: "1px solid var(--vigil-prompt-border)",
+                boxShadow: "var(--vigil-prompt-shadow)",
                 fontFamily: "system-ui, -apple-system, sans-serif",
                 fontSize: "12px",
-                lineHeight: "1.35",
+                lineHeight: "1.45",
                 fontWeight: "600",
                 letterSpacing: "0",
-                color: "#111827",
-                background: "rgba(255, 251, 235, 0.86)",
-                backdropFilter: "blur(8px)",
+                color: "var(--vigil-prompt-fg)",
+                background: "var(--vigil-safe-bg)",
+                backdropFilter: "blur(10px) saturate(1.6)",
+                WebkitBackdropFilter: "blur(10px) saturate(1.6)",
                 userSelect: "none",
                 pointerEvents: "auto",
+                animation: "vigil-prompt-in 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards",
+                transition: "opacity 0.2s ease, transform 0.2s ease",
             });
         }
         if (!safePromptEl.isConnected) parent.appendChild(safePromptEl);
@@ -634,18 +713,43 @@
         if (!safePromptEl || !promptTarget) return;
         const rect = promptTarget.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return;
-        const promptWidth = Math.min(safePromptEl.offsetWidth || 420, window.innerWidth - 32);
-        const promptHeight = safePromptEl.offsetHeight || 38;
-        const left = Math.max(
-            16,
-            Math.min(rect.right - promptWidth - 8, window.innerWidth - promptWidth - 16),
-        );
-        const top = Math.max(
-            16,
-            Math.min(rect.bottom - promptHeight - 8, window.innerHeight - promptHeight - 16),
-        );
+        const promptWidth = Math.min(safePromptEl.offsetWidth || 360, window.innerWidth - 32);
+        const promptHeight = safePromptEl.offsetHeight || 40;
+        const gap = 10;
+        const margin = 16;
+
+        let left;
+        let top;
+        let placement = "above";
+
+        // 首选：输入框右上角（右对齐，上方）
+        if (rect.top - gap - promptHeight >= margin) {
+            placement = "above";
+            top = rect.top - gap - promptHeight;
+            left = rect.right - promptWidth;
+        } else if (rect.right + gap + promptWidth <= window.innerWidth - margin) {
+            // 上方没空间，放右侧
+            placement = "right";
+            top = rect.top;
+            left = rect.right + gap;
+        } else if (rect.bottom + gap + promptHeight <= window.innerHeight - margin) {
+            // 右侧也没空间，放下方右对齐
+            placement = "below";
+            top = rect.bottom + gap;
+            left = rect.right - promptWidth;
+        } else {
+            // fallback：紧贴上方
+            placement = "above";
+            top = Math.max(margin, rect.top - promptHeight - 4);
+            left = rect.right - promptWidth;
+        }
+
+        left = clampNumber(left, margin, window.innerWidth - promptWidth - margin);
+        top = clampNumber(top, margin, window.innerHeight - promptHeight - margin);
+
         safePromptEl.style.left = `${left}px`;
         safePromptEl.style.top = `${top}px`;
+        safePromptEl.setAttribute("data-vigil-placement", placement);
     }
 
     function closeSafePrompt() {
@@ -726,26 +830,47 @@
         btn.type = "button";
         btn.textContent = label;
         Object.assign(btn.style, {
-            borderRadius: "7px",
-            padding: "3px 8px",
+            borderRadius: "8px",
+            padding: "4px 10px",
             font: "inherit",
             fontWeight: variant === "primary" ? "750" : "650",
-            lineHeight: "1.25",
+            lineHeight: "1.3",
             cursor: "pointer",
             whiteSpace: "nowrap",
+            transition: "background 0.15s ease, border-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease",
         });
         if (variant === "primary") {
             Object.assign(btn.style, {
-                border: "1px solid #d97706",
-                background: "#f59e0b",
-                color: "#111827",
+                border: "1px solid var(--vigil-btn-primary-border)",
+                background: "var(--vigil-btn-primary-bg)",
+                color: "var(--vigil-btn-primary-fg)",
             });
+            btn.addEventListener("mouseenter", () => {
+                btn.style.filter = "brightness(1.1)";
+                btn.style.boxShadow = "0 2px 8px rgba(245, 158, 11, 0.35)";
+            });
+            btn.addEventListener("mouseleave", () => {
+                btn.style.filter = "none";
+                btn.style.boxShadow = "none";
+            });
+            btn.addEventListener("mousedown", () => { btn.style.transform = "scale(0.96)"; });
+            btn.addEventListener("mouseup", () => { btn.style.transform = "scale(1)"; });
         } else {
             Object.assign(btn.style, {
-                border: "1px solid #d6d3d1",
-                background: "rgba(255, 255, 255, 0.72)",
-                color: "#44403c",
+                border: "1px solid var(--vigil-btn-secondary-border)",
+                background: "var(--vigil-btn-secondary-bg)",
+                color: "var(--vigil-btn-secondary-fg)",
             });
+            btn.addEventListener("mouseenter", () => {
+                btn.style.background = "rgba(255,255,255,0.95)";
+                btn.style.borderColor = "#d97706";
+            });
+            btn.addEventListener("mouseleave", () => {
+                btn.style.background = "var(--vigil-btn-secondary-bg)";
+                btn.style.borderColor = "var(--vigil-btn-secondary-border)";
+            });
+            btn.addEventListener("mousedown", () => { btn.style.transform = "scale(0.96)"; });
+            btn.addEventListener("mouseup", () => { btn.style.transform = "scale(1)"; });
         }
         return btn;
     }

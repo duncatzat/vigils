@@ -21,6 +21,7 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
     const protectCurrentBtn = document.getElementById("protect-current-btn");
 
     let currentPageSite = null;
+    let lastRenderedFindings = "";
 
     function fmtTs(ts) {
         try {
@@ -129,6 +130,10 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
     }
 
     function renderFindings(items) {
+        const hash = JSON.stringify(items);
+        if (hash === lastRenderedFindings) return;
+        lastRenderedFindings = hash;
+
         listEl.replaceChildren();
 
         if (!Array.isArray(items) || items.length === 0) {
@@ -144,6 +149,7 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
 
         for (const it of items) {
             const li = document.createElement("li");
+            li.classList.add("vigil-animate-in");
 
             const tag = document.createElement("span");
             tag.className = `tag tag-${it.action || "block"}`;
@@ -268,6 +274,7 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
 
     clearBtn.addEventListener("click", () => {
         chrome.runtime.sendMessage({ type: "vigil_clear_findings" }, () => {
+            lastRenderedFindings = "";
             refreshEvents();
         });
     });

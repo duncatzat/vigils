@@ -69,6 +69,18 @@ body {
   padding: 12px;
 }
 
+/* 自定义滚动条，避免系统默认滚动条破坏视觉 */
+body::-webkit-scrollbar {
+  width: 6px;
+}
+body::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 3px;
+}
+body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
 header {
   display: flex;
   align-items: center;
@@ -102,6 +114,7 @@ header .subtitle {
   padding: 5px 9px;
   font-size: 12px;
   font-weight: 650;
+  transition: background 0.25s ease, border-color 0.25s ease, color 0.25s ease;
 }
 .status-pill-warn {
   color: var(--warn);
@@ -118,6 +131,7 @@ header .subtitle {
   height: 7px;
   border-radius: 50%;
   background: #22c55e;
+  transition: background 0.3s ease, transform 0.3s ease;
 }
 .status-pill-warn .status-dot {
   background: var(--warn);
@@ -134,9 +148,14 @@ button {
   padding: 6px 10px;
   font-size: 12px;
   cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
 }
 button:hover {
   background: var(--panel-soft);
+  border-color: var(--accent);
+}
+button:active {
+  transform: scale(0.98);
 }
 
 .primary-btn {
@@ -176,6 +195,29 @@ button:hover {
 .onboarding-card li {
   margin: 2px 0;
 }
+
+/* Onboarding 展开 / 收起过渡 */
+#onboarding-card {
+  transition: opacity 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+              max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+              padding 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+              margin 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+              border-bottom-width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+  max-height: 400px;
+  opacity: 1;
+  overflow: hidden;
+}
+#onboarding-card.hidden {
+  display: grid !important;
+  max-height: 0;
+  opacity: 0;
+  padding-top: 0 !important;
+  padding-bottom: 0 !important;
+  margin-top: 0;
+  margin-bottom: 0;
+  border-bottom-width: 0 !important;
+}
+
 .page-card {
   display: grid;
   gap: 8px;
@@ -199,6 +241,24 @@ button:hover {
 .page-card .primary-btn {
   justify-self: start;
 }
+
+/* 保护按钮的显隐过渡 */
+#protect-current-btn {
+  transition: opacity 0.2s ease, max-height 0.2s ease, transform 0.2s ease, padding 0.2s ease, margin 0.2s ease;
+  max-height: 100px;
+  opacity: 1;
+  transform: translateY(0);
+}
+#protect-current-btn.hidden {
+  display: block !important;
+  max-height: 0;
+  opacity: 0;
+  transform: translateY(-4px);
+  padding: 0 !important;
+  margin: 0 !important;
+  border: 0 !important;
+}
+
 .section-head {
   display: flex;
   align-items: center;
@@ -234,6 +294,31 @@ button:hover {
   display: none !important;
 }
 
+/* 空提示与列表的切换过渡 */
+#empty-hint {
+  transition: opacity 0.25s ease, max-height 0.25s ease;
+  max-height: 200px;
+  opacity: 1;
+  overflow: hidden;
+}
+#empty-hint.hidden {
+  display: block !important;
+  max-height: 0;
+  opacity: 0;
+}
+
+#findings-list {
+  transition: opacity 0.25s ease, max-height 0.25s ease;
+  max-height: 1200px;
+  opacity: 1;
+  overflow: hidden;
+}
+#findings-list.hidden {
+  display: block !important;
+  max-height: 0;
+  opacity: 0;
+}
+
 .findings-list {
   list-style: none;
   margin: 0;
@@ -250,6 +335,16 @@ button:hover {
 .findings-list li:last-child {
   border-bottom: none;
 }
+
+/* 安全事件项滑入动画 */
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.vigil-animate-in {
+  animation: slideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
 .tag {
   display: inline-block;
   padding: 2px 7px;
@@ -284,6 +379,6 @@ footer {
 
 @media (prefers-color-scheme: dark) {
   button {
-    color: #e2e8f0;
+    color: var(--fg);
   }
 }
