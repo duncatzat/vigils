@@ -22,9 +22,9 @@
 
 /// Tauri `#[tauri::command]` 真白名单 —— 构建期与运行期 ACL 的 SSOT。
 ///
-/// **顺序不重要**(内部按 slugified 生成 permission);共 **28** 条
+/// **顺序不重要**(内部按 slugified 生成 permission);共 **29** 条
 /// (α1=1 + α2=3 + α3=3 + α4=10 + α5=2 + ISS-017=1 + ISS-018=1 + D19=1 + checkpoint=1
-/// + ML 控制平面=5[daemon_status/start/stop + model_status/install])。
+/// + ML 控制平面=5[daemon_status/start/stop + model_status/install] + ML 引擎变体安装=1[download_ml_engine])。
 pub const INVOKE_COMMANDS: &[&str] = &[
     // α1(Sessions smoke)
     "list_sessions",
@@ -64,6 +64,8 @@ pub const INVOKE_COMMANDS: &[&str] = &[
     "daemon_stop",
     "model_status",
     "model_install",
+    // ML 引擎变体安装(让 GUI 用户的 ML 真正可用)
+    "download_ml_engine",
 ];
 
 #[cfg(test)]
@@ -79,7 +81,7 @@ mod tests {
     fn invoke_commands_count_in_sync() {
         assert_eq!(
             INVOKE_COMMANDS.len(),
-            28,
+            29,
             "INVOKE_COMMANDS 漂移 —— 新增/删除 handler 时必须同步:\n\
              1) 本文件 `apps/desktop/src/commands.rs`\n\
              2) `apps/desktop/src/bin/vigils.rs` 的 `tauri::generate_handler!` 列表\n\

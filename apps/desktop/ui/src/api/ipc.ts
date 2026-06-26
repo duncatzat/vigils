@@ -669,3 +669,12 @@ export async function modelStatus(): Promise<ModelStatus> {
 export async function modelInstall(): Promise<ModelStatus> {
   return await invoke<ModelStatus>("model_install");
 }
+
+/**
+ * 写：下载安装 ML 引擎变体（`--features ort` 的 vigil-hub + 同目录 ONNX Runtime 库；HTTPS + 签名
+ * 引擎清单 SHA-pin + 运行核验，fail-closed）。出厂硬指纹引擎无法装模型 —— 装好 ML 引擎后
+ * `ml_supported` 翻 true,方可继续装模型。回安装后状态。
+ */
+export async function downloadMlEngine(): Promise<ModelStatus> {
+  return await invoke<ModelStatus>("download_ml_engine");
+}

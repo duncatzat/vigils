@@ -36,6 +36,7 @@
     "allow-daemon-start",
     "allow-daemon-stop",
     "allow-model-status",
-    "allow-model-install"
+    "allow-model-install",
+    "allow-download-ml-engine"
   ]
 }

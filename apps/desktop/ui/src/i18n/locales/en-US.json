@@ -297,6 +297,7 @@
       "not_installed": "NOT INSTALLED",
       "unsupported": "ML VARIANT REQUIRED",
       "install": "Install AI model",
+      "install_ml_engine": "Install ML engine",
       "error": "Model install failed: {msg}"
     }
   },

@@ -297,6 +297,7 @@
       "not_installed": "未安装",
       "unsupported": "需 ML 变体",
       "install": "安装 AI 模型",
+      "install_ml_engine": "安装 ML 引擎",
       "error": "模型安装失败: {msg}"
     }
   },
