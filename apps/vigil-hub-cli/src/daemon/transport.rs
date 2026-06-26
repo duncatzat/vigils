@@ -17,11 +17,11 @@ use std::time::Duration;
 use std::{io, thread};
 
 use interprocess::local_socket::prelude::*;
-use interprocess::local_socket::{ListenerOptions, Stream as LocalStream};
 #[cfg(target_os = "macos")]
 use interprocess::local_socket::GenericFilePath;
 #[cfg(not(target_os = "macos"))]
 use interprocess::local_socket::GenericNamespaced;
+use interprocess::local_socket::{ListenerOptions, Stream as LocalStream};
 
 use super::client::{daemon_info_path, exchange, read_daemon_info, DaemonInfo};
 use super::protocol::{Request, Response};

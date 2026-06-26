@@ -46,8 +46,8 @@ const CHUNK_TIMEOUT_CEIL_SECS: u64 = 900; // 与单流路径 900s 上限一致
 
 /// 按本 chunk 大小推导**下载体**总超时,夹逼到 `[floor, ceil]`。
 fn chunk_timeout(chunk_bytes: u64) -> Duration {
-    let secs =
-        (chunk_bytes / MIN_CHUNK_BYTES_PER_SEC).clamp(CHUNK_TIMEOUT_FLOOR_SECS, CHUNK_TIMEOUT_CEIL_SECS);
+    let secs = (chunk_bytes / MIN_CHUNK_BYTES_PER_SEC)
+        .clamp(CHUNK_TIMEOUT_FLOOR_SECS, CHUNK_TIMEOUT_CEIL_SECS);
     Duration::from_secs(secs)
 }
 
@@ -575,7 +575,10 @@ mod chunk_math_tests {
         assert_eq!(chunk_timeout(1024).as_secs(), CHUNK_TIMEOUT_FLOOR_SECS);
         // ~48 MiB chunk(真机失败规模):远超旧 30s,且 < ceil → 慢链路也能跑完
         let secs = chunk_timeout(50_566_375).as_secs();
-        assert!(secs > 300, "48MB chunk timeout should comfortably exceed 65s real time, got {secs}");
+        assert!(
+            secs > 300,
+            "48MB chunk timeout should comfortably exceed 65s real time, got {secs}"
+        );
         assert!(secs <= CHUNK_TIMEOUT_CEIL_SECS);
         // 超大 → ceil 收敛
         assert_eq!(chunk_timeout(u64::MAX).as_secs(), CHUNK_TIMEOUT_CEIL_SECS);
