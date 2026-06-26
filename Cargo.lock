@@ -5802,6 +5802,7 @@ dependencies = [
  "interprocess",
  "oauth2",
  "rusqlite",
+ "rustix 1.1.4",
  "serde",
  "serde_jcs",
  "serde_json",

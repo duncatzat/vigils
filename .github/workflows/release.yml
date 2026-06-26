@@ -238,7 +238,8 @@ jobs:
         run: |
           $f = "vigils-cli-${{ matrix.plat }}.${{ matrix.archive }}"
           $h = (Get-FileHash -Algorithm SHA256 "dist/$f").Hash.ToLower()
-          Set-Content -Path "dist/$f.sha256" -Value "$h  $f" -Encoding ascii
+          # LF (not CRLF) so `sha256sum -c` works in Unix-y environments / git-bash / WSL
+          Set-Content -Path "dist/$f.sha256" -Value "$h  $f`n" -NoNewline -Encoding ascii
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
@@ -371,7 +372,8 @@ jobs:
         run: |
           $f = "vigils-cli-ml-${{ matrix.plat }}.${{ matrix.archive }}"
           $h = (Get-FileHash -Algorithm SHA256 "dist/$f").Hash.ToLower()
-          Set-Content -Path "dist/$f.sha256" -Value "$h  $f" -Encoding ascii
+          # LF (not CRLF) so `sha256sum -c` works in Unix-y environments / git-bash / WSL
+          Set-Content -Path "dist/$f.sha256" -Value "$h  $f`n" -NoNewline -Encoding ascii
 
       - name: Upload ML to release
         uses: softprops/action-gh-release@v2

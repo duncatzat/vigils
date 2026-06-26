@@ -4,10 +4,12 @@
 //! - **单实例** = OS bind 失败守门([`bind`] 已有 listener → Err;一名一 listener)。
 //! - **R2**:整段查询(连接 + 握手 + 请求 + 读响应)跑在工作线程,主线程 `recv_timeout` 总截止;
 //!   超时 → None → 硬指纹(防慢 / 挤牙膏 daemon 楔死每次工具调用)。
-//! - **R1**(peer-credential):连接后核对**对端(server)进程 PID == `daemon.json.pid`**,经
-//!   interprocess **原生** `peer_creds().pid()`(其内部封装平台 unsafe;故本 crate 仍 forbid unsafe,
-//!   无需自有 FFI)。防同用户冒充 daemon(token 自洽不够 —— 冒充者伪造不了真 daemon 的 PID)。
-//!   取不到 / 不符 → fail-closed → 硬指纹。
+//! - **R1**(peer-credential):**Linux/Windows** 连接后核对**对端(server)进程 PID ==
+//!   `daemon.json.pid`**(经 interprocess 原生 `peer_creds().pid()`)。**macOS** 上
+//!   `peer_creds().pid()` 恒 None(无 `SO_PEERCRED`)→ 退化为 **euid 校验**(对端必须以**本用户**
+//!   身份运行)。注意:macOS 为 **euid-only,不作 pid 绑定**,故不主张 pid-reuse 保护——cross-user
+//!   由用户私有目录权限排除,同用户冒充由 token + 单实例 bind 兜底;且**永不 fail-open**(硬指纹
+//!   底座在 hook 内先跑,冒充/缺失至多抑制 ML recall)。取不到 / 不符 → fail-closed → 硬指纹。
 //! - **R6**(socket 权限硬化,后续):Unix 0600 / Windows pipe DACL。
 
 use std::sync::mpsc;
@@ -15,21 +17,97 @@ use std::time::Duration;
 use std::{io, thread};
 
 use interprocess::local_socket::prelude::*;
-use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream as LocalStream};
+#[cfg(target_os = "macos")]
+use interprocess::local_socket::GenericFilePath;
+#[cfg(not(target_os = "macos"))]
+use interprocess::local_socket::GenericNamespaced;
+use interprocess::local_socket::{ListenerOptions, Stream as LocalStream};
 
 use super::client::{daemon_info_path, exchange, read_daemon_info, DaemonInfo};
 use super::protocol::{Request, Response};
 use super::server::{handle_connection, DaemonCaps};
 
-/// 默认 daemon socket 名(namespaced:Unix 抽象 UDS / Windows `\\.\pipe\`)。
+/// 默认 daemon socket 标识。
+///
+/// - **Linux**:`GenericNamespaced` → 抽象 UDS(`\0` 前缀,内核在进程死亡时自动回收,无 stale)。
+/// - **Windows**:`GenericNamespaced` → `\\.\pipe\vigil-daemon.sock`(named pipe,句柄关即清)。
+/// - **macOS**:**无抽象命名空间** —— namespaced 会落到世界可读的 `/tmp` 文件 socket、非干净
+///   退出不回收(EADDRINUSE 永久卡死重启)、且 `peer_creds().pid()` 恒 None(R1 失效)。故改用
+///   **用户私有数据目录下的显式文件 socket**(与 daemon.json 同目录;cross-user 由目录权限排除),
+///   配合 bind 前 stale 清理 + euid 版 R1(见 [`bind`] / [`connect_and_verify`])。
 pub fn default_socket_name() -> String {
-    "vigil-daemon.sock".to_string()
+    #[cfg(target_os = "macos")]
+    {
+        dirs::data_local_dir()
+            .map(|dir| {
+                dir.join("Vigil")
+                    .join("vigil-daemon.sock")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_else(|| {
+                // 回退也用**每用户私有** temp(macOS `$TMPDIR` = /var/folders/.../T,0700),
+                // 绝不用世界可写的 `/tmp`(防跨用户 squat / stale 不清 —— 正是本修复要消灭的类)。
+                std::env::temp_dir()
+                    .join("vigil-daemon.sock")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "vigil-daemon.sock".to_string()
+    }
 }
 
-/// 绑定 socket(server)。**单实例**:已有同名 listener → `Err`(OS 强制一名一 listener)。
+/// 绑定 socket(server)。**单实例**:已有**存活**同名 listener → `Err`(OS 强制一名一 listener)。
+///
+/// macOS:文件 socket 在非干净退出(kill/crash,Drop 不跑)后残留 → 旧版 namespaced 永久
+/// `EADDRINUSE`。此处 bind 前 **probe-then-unlink**:文件在但连不通(stale)→ 删之重绑;
+/// 连得通(真有存活 daemon)→ 保留 → `create_sync` 返 `AddrInUse` → 单实例守门不破。
 pub fn bind(socket_name: &str) -> io::Result<interprocess::local_socket::Listener> {
-    let name = socket_name.to_ns_name::<GenericNamespaced>()?;
-    ListenerOptions::new().name(name).create_sync()
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // bind 早于 write_daemon_info(其会建目录)→ 先确保父目录在并 **0700**(仅 owner;
+        // 不把 `~/Library` 默认权限当唯一屏障 —— 防同主机跨用户连接,且回退 temp 路径下也成立)。
+        if let Some(parent) = std::path::Path::new(socket_name).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        reclaim_stale_socket(socket_name);
+        let name = socket_name.to_fs_name::<GenericFilePath>()?;
+        let listener = ListenerOptions::new().name(name).create_sync()?;
+        // R6:socket 节点 0600(仅 owner 可连),目录权限之外再加一层。
+        let _ = std::fs::set_permissions(socket_name, std::fs::Permissions::from_mode(0o600));
+        Ok(listener)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let name = socket_name.to_ns_name::<GenericNamespaced>()?;
+        ListenerOptions::new().name(name).create_sync()
+    }
+}
+
+/// macOS:bind 前清理 stale 文件 socket。存活 daemon(连得通)→ 不动,让 `create_sync` 以
+/// `AddrInUse` 守单实例;连不通(unclean exit 残留)→ unlink,使重绑成功。
+#[cfg(target_os = "macos")]
+fn reclaim_stale_socket(path: &str) {
+    if !std::path::Path::new(path).exists() {
+        return;
+    }
+    // 存活探测带短重试:活 daemon(即便 accept backlog 瞬时满)会在几 ms 内接受连接,真 stale
+    // socket 永不接受。重试收窄 false-stale 窗口——瞬时不可达 + 并发 daemon start 竞态(给对端
+    // create_sync 完成的时间)——避免误删存活 daemon 的 socket(codex/hostile 双审 item 2)。
+    for _ in 0..5 {
+        if connect_raw(path).is_some() {
+            return; // 活 daemon —— 保留,单实例由 create_sync 的 AddrInUse 守门
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_file(path); // 连续探测均失败 → 确属 stale → 删之以便重绑
 }
 
 /// server accept 循环:每连接 spawn [`handle_connection`](thread-per-conn,简化;bounded 后续)。
@@ -49,6 +127,8 @@ pub fn serve(listener: interprocess::local_socket::Listener, caps: DaemonCaps) {
 /// `forbid(unsafe_code)`,无需自有 FFI)。取不到 → `None`(上游 fail-closed)。
 // interprocess `Pid` 平台相异:Windows = `u32`(`try_from` 是 no-op),Unix = `pid_t`(i32,需转 +
 // 滤负)。allow 让单一跨平台函数在两侧都正确(Windows 上的"多余转换"被刻意接受)。
+// macOS 上 `peer_creds().pid()` 恒 None(无 SO_PEERCRED)→ pid 版 R1 不适用,仅非 macOS 编译。
+#[cfg(not(target_os = "macos"))]
 #[allow(clippy::useless_conversion)]
 fn peer_pid(stream: &LocalStream) -> Option<u32> {
     let pid = stream.peer_creds().ok()?.pid()?;
@@ -57,6 +137,9 @@ fn peer_pid(stream: &LocalStream) -> Option<u32> {
 
 /// 连接 socket(**无 R1**)。供 transport 机制测试 + R1 落地后内部复用。
 fn connect_raw(socket_name: &str) -> Option<LocalStream> {
+    #[cfg(target_os = "macos")]
+    let name = socket_name.to_fs_name::<GenericFilePath>().ok()?;
+    #[cfg(not(target_os = "macos"))]
     let name = socket_name.to_ns_name::<GenericNamespaced>().ok()?;
     LocalStream::connect(name).ok()
 }
@@ -65,11 +148,34 @@ fn connect_raw(socket_name: &str) -> Option<LocalStream> {
 /// 取不到对端 pid(无凭据 / `peer_creds` 失败)→ 整体 fail-closed `None`(绝不连未经身份核验的 daemon)。
 fn connect_and_verify(socket_name: &str, expected_pid: u32) -> Option<LocalStream> {
     let stream = connect_raw(socket_name)?;
-    let pid = peer_pid(&stream)?;
-    if pid != expected_pid {
-        return None;
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux/Windows:对端 server pid 必须 == daemon.json.pid。
+        if peer_pid(&stream)? != expected_pid {
+            return None;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS:peer_creds().pid() 恒 None(无 SO_PEERCRED);euid 可用。socket + daemon.json
+        // 均在用户私有目录(cross-user 由目录权限排除)→ R1 等价检查 = 对端 server 必须以**本
+        // 用户**身份运行(euid 相等);pid 在此无意义。
+        let _ = expected_pid;
+        if !peer_is_current_user(&stream) {
+            return None;
+        }
     }
     Some(stream)
+}
+
+/// macOS R1:对端(server)euid == 本进程 euid(都是当前用户)。取不到 → fail-closed。
+/// `rustix::process::geteuid` 安全封装(本 crate 仍 `forbid(unsafe_code)`)。
+#[cfg(target_os = "macos")]
+fn peer_is_current_user(stream: &LocalStream) -> bool {
+    match stream.peer_creds().ok().and_then(|c| c.euid()) {
+        Some(peer_euid) => peer_euid == rustix::process::geteuid().as_raw(),
+        None => false,
+    }
 }
 
 /// 用一个 [`DaemonInfo`] 跑一次查询(连接其 socket_path + R1 核 pid + exchange)。fail-closed。
@@ -103,7 +209,18 @@ mod tests {
 
     fn unique_sock(tag: &str) -> String {
         // 唯一名(进程 id + tag):防与真 daemon / 并行测试碰撞;**不碰真 daemon.json**。
-        format!("vigil-itest-{}-{}.sock", tag, std::process::id())
+        // macOS 用 GenericFilePath(文件路径)→ 落 temp 绝对路径,避免污染 CWD。
+        #[cfg(target_os = "macos")]
+        {
+            std::env::temp_dir()
+                .join(format!("vigil-itest-{}-{}.sock", tag, std::process::id()))
+                .to_string_lossy()
+                .into_owned()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            format!("vigil-itest-{}-{}.sock", tag, std::process::id())
+        }
     }
 
     fn spawn_daemon(sock: &str, token: &str, up: u64) {
@@ -156,6 +273,8 @@ mod tests {
         );
     }
 
+    // pid 版 R1 仅非 macOS;macOS 走 euid(同进程必同 euid,无法用 pid 构造拒绝用例)。
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn r1_rejects_wrong_expected_pid() {
         // R1:对端真实 pid = 本进程;expected 设不可能值 → fail-closed None(防冒充 daemon)。
