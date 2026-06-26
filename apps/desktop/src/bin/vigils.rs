@@ -680,6 +680,16 @@ async fn model_install(
     vigil_desktop::ml_control::model_install(&app)
 }
 
+/// `invoke('download_ml_engine')` → **Write**:下载安装 ML 引擎变体(`--features ort` 的 vigil-hub +
+/// 同目录 ONNX Runtime 库;HTTPS + 签名清单 SHA-pin + 运行核验,fail-closed)到稳定目录,使 GUI 用户
+/// 的 ML 真正可用。返回安装后模型态(`ml_supported` 应翻 true)。
+#[tauri::command]
+async fn download_ml_engine(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::ml_control::ModelStatus, String> {
+    vigil_desktop::ml_control::download_ml_engine(&app)
+}
+
 // ─────────────────────────── Tauri setup ──────────────────────────────────
 //
 // β5 Ledger 磁盘持久化:
@@ -786,6 +796,8 @@ fn main() {
             daemon_stop,
             model_status,
             model_install,
+            // ML 引擎变体安装(端到端 ML 最后一公里)
+            download_ml_engine,
         ])
         .setup(move |app| {
             let _main_window = app.get_webview_window("main");

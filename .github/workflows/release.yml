@@ -550,13 +550,60 @@ jobs:
         with:
           subject-path: dist/vigils-chrome-extension.zip
 
+  # ── 5. Signed engine manifest (SHA trust anchor for desktop ML-engine auto-install)──────────
+  # Aggregate the cli-ml `.sha256` sidecars → engine-manifest.json (per-platform url+sha256) →
+  # minisign-sign with the release key → upload. The desktop GUI fetches + verifies this manifest
+  # (reusing the Tauri-updater minisign pubkey) to SHA-pin the ML engine download — the download
+  # source itself cannot forge a valid signature. The manifest carries the URLs too, so the GUI
+  # never hardcodes asset names (handles the Windows .zip / Unix .tar.gz divergence).
+  # Draft-safe: if this job fails the release stays a draft (finalize needs it).
+  engine-manifest:
+    needs: [create-release, cli-ml]
+    runs-on: ubuntu-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Download cli-ml checksums from the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p sums
+          gh release download "${{ needs.create-release.outputs.tag }}" \
+            --repo "${{ github.repository }}" --pattern "vigils-cli-ml-*.sha256" --dir sums
+          ls -la sums
+      - name: Build engine-manifest.json
+        run: node scripts/gen-engine-manifest.mjs "${{ needs.create-release.outputs.tag }}" "${{ github.repository }}" sums
+      - name: Sign engine-manifest.json (minisign, release key)
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          cargo install tauri-cli --version "^2"
+          # tauri signer writes engine-manifest.json.sig (base64-wrapped minisign); GUI fetches `.minisig`
+          cargo tauri signer sign engine-manifest.json
+          mv engine-manifest.json.sig engine-manifest.json.minisig
+      - name: Upload signed engine manifest to the draft release
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          draft: true
+          files: |
+            engine-manifest.json
+            engine-manifest.json.minisig
+
   # ── 6. Finalize ───────────────────────────────────────────────────────────
   # ISS-20260621-005: publish the release (draft -> public) ONLY after every build job succeeded.
   # If any build fails this job is skipped (needs: all builds) and the release stays a draft, so a
   # failed build never leaves a public release with missing/partial assets. Mirrors — and now
   # enforces in CI — the manual rc-then-promote discipline in docs/releasing-gotchas.md.
   finalize:
-    needs: [create-release, cli, cli-ml, desktop, extension]
+    needs: [create-release, cli, cli-ml, desktop, extension, engine-manifest]
     runs-on: ubuntu-latest
     steps:
       - name: Publish release after all builds succeeded

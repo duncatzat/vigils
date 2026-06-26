@@ -25,6 +25,7 @@ import {
   daemonStop,
   modelStatus,
   modelInstall,
+  downloadMlEngine,
   type DaemonStatus,
   type ModelStatus,
 } from "@/api/ipc";
@@ -83,6 +84,19 @@ async function installModel(): Promise<void> {
   busy.value = "model:install";
   try {
     model.value = await modelInstall();
+  } catch (e) {
+    message.error(t("settings.model.error", { msg: String(e) }));
+  } finally {
+    busy.value = null;
+  }
+}
+
+// 装 ML 引擎变体（让 ml_supported 翻 true，再可装模型）。出厂硬指纹引擎无 ort，必经此步。
+async function installMlEngine(): Promise<void> {
+  if (busy.value) return;
+  busy.value = "ml-engine:install";
+  try {
+    model.value = await downloadMlEngine();
   } catch (e) {
     message.error(t("settings.model.error", { msg: String(e) }));
   } finally {
@@ -311,6 +325,17 @@ function updatePollingInterval(v: number | null): void {
             <NTag v-else size="small" :bordered="false" data-testid="model-state">
               {{ t("settings.model.status_unknown") }}
             </NTag>
+            <NButton
+              v-if="model && !model.ml_supported"
+              size="small"
+              type="primary"
+              :loading="busy === 'ml-engine:install'"
+              :disabled="busy !== null || !model?.engine_present"
+              data-testid="ml-engine-install"
+              @click="installMlEngine()"
+            >
+              {{ t("settings.model.install_ml_engine") }}
+            </NButton>
             <NButton
               size="small"
               tertiary
