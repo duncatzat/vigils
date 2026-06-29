@@ -13,6 +13,7 @@ pub mod daemon;
 pub mod demo;
 pub mod engine_config;
 pub mod hook;
+pub mod i18n;
 pub mod inspect;
 pub mod model;
 pub mod posture;
