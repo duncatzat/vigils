@@ -78,6 +78,10 @@ echo "$OUT" | grep -q 'AKIAIOSFODNN7EXAMPLE' && no "RAW AWS KEY LEAKED (fail-ope
 echo "$OUT" | grep -q 'REDACTED aws_access_key_id' && ok "hard-fingerprint floor scrubbed AWS key" || no "hard-fp floor did not scrub"
 if [ "$DAEMON_UP" = 1 ]; then
   echo "$OUT" | grep -qiE 'REDACTED (person|name)' && ok "ML scrubbed semantic PII (person) — beyond hard-fp" || no "ML did not scrub person name (daemon up but no ML span)"
+  # VIGIL-SEC-ML-SKIP 回归:含 secret:// 的 leaf 不再整段跳 ML → 同段 soft-PII 仍被 ML scrub(可证伪)。
+  SKEV='{"hook_event_name":"PostToolUse","tool_name":"Bash","session_id":"acc","tool_response":{"stdout":"deploy with secret://prod-key for patient Margaret Chen at 88 Willow Lane Boston"}}'
+  SKOUT="$(printf '%s' "$SKEV" | "$HUB" hook --cli claude --redact-results 2>&1)"
+  echo "$SKOUT" | grep -qiE 'REDACTED (person|name|address)' && ok "ML-SKIP closed: secret:// leaf still ML-scrubs soft-PII" || no "ML-SKIP: secret:// leaf suppressed ML (soft-PII not scrubbed)"
 fi
 echo "  ---- redacted: $(echo "$OUT" | grep -o '"stdout":"[^"]*"' | head -1)"
 

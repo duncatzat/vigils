@@ -72,14 +72,21 @@ detects a defect propagates its exit code, and `run.sh` exits non-zero (earlier 
     span_fully_in_protected_dropped,span_spanning_protected_splits,forged_placeholder_not_protected}`,
     `subtract_ranges_cases`, `scrub_preserving_placeholders_reports_real_placeholder_spans`,
     `vigil-redaction::scrub_with_spans_marks_placeholder_ranges`.
-  - **Known P2 (no leak, `VIGIL-SEC-ML-SKIP`)** — `MlScrub::augment` skips ML for an *entire* string
-    leaf when it contains the literal `secret://` or `vigil://redact/`. Tool output is attacker-influenced,
-    so embedding a literal `secret://x` beside soft-PII (email/person/address — not hard-fingerprints)
-    suppresses ML redaction for that leaf (the hard-fingerprint base still applies; only ML-class
-    semantic PII is affected; requires engine=ml/auto). The `VIGIL-SEC-OVERLAP-PH` `protected`-subtraction
-    now makes it safe to scan the whole leaf and protect only genuine placeholder bytes — but a correct
-    fix must first decide how to treat `vigil://redact/` tokens (unlike `secret://<alias>`, they aren't
-    recorded as pipeline-produced, so they can't be trusted as genuine). Tracked for a follow-up.
+  - **`VIGIL-SEC-ML-SKIP` (`secret://` face FIXED)** — `MlScrub::augment` used to skip ML for an *entire*
+    leaf containing literal `secret://` or `vigil://redact/`, so embedding `secret://x` beside soft-PII
+    (email/person/address) suppressed ML for that leaf (no leak — hard-fingerprint base holds — but an
+    ML-recall gap; engine=ml/auto only). **Fix**: with the `VIGIL-SEC-OVERLAP-PH` `protected`-subtraction
+    it is now safe to scan the whole leaf and protect only *genuine* placeholder bytes, so the `secret://`
+    skip is removed — `secret://<alias>` is pipeline-produced (`redact_leaf` reverse-substitution, byte
+    range already in `protected`) → `apply_wire_spans` keeps ML off it while same-leaf soft-PII is scrubbed;
+    a **forged** `secret://…` in tool output is *not* in `protected`, so PII it wraps is still scrubbed
+    (`apply_wire_spans_forged_placeholder_not_protected`). The `vigil://redact/` skip is **retained**:
+    Tier-B tokens are written upstream into tool output (not pipeline-produced), so their ranges can't be
+    trusted into `protected` without a verified-token channel (a forged `vigil://redact/<wrapped-PII>`
+    would otherwise suppress ML → leak). Regression: `ml_augment_skips_vigil_redact_token_segment`,
+    `ml_augment_no_longer_skips_secret_alias_segment`. *Residual (no leak):* a pre-existing `secret://x`
+    literal whose real value isn't in this leaf isn't in `protected`; an over-capturing ML span could
+    corrupt that literal (round-trip only — ML virtually never flags `secret://<alias>` as PII).
 
 ## Safety
 

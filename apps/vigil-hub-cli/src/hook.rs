@@ -1887,7 +1887,13 @@ impl MlScrub {
         if !self.enabled || self.give_up || seg.len() < ML_MIN_SEG_LEN {
             return seg.to_string();
         }
-        if seg.contains("secret://") || seg.contains("vigil://redact/") {
+        // `vigil://redact/`(Tier-B 动态 token,上游 MCP 网关 detokenize 写入 → 在 tool_output 中而非
+        // 本流程自产)无法可信标记其字节区间(工具输出可伪造假占位符) → 保守整段跳 ML,保 token 完整不被
+        // ML over-capture 切碎(detokenize 依赖完整 token)。`secret://<alias>` **不再**触发跳:它由
+        // redact_leaf 逆替换**自产**、字节区间已随 `protected` 传入,apply_wire_spans 的减法保其不被切,
+        // 同段 soft-PII 得以正常 ML 脱敏(闭合 VIGIL-SEC-ML-SKIP 的 secret:// 面;工具输出**伪造**的
+        // secret:// 不在 protected,其包裹的真 PII 仍被 ML 替换 → 无泄漏)。
+        if seg.contains("vigil://redact/") {
             return seg.to_string();
         }
         if self.queries_used >= ML_MAX_QUERIES_PER_RESPONSE {
@@ -2624,18 +2630,42 @@ mod tests {
     }
 
     #[test]
-    fn ml_augment_skips_placeholder_segments() {
-        // 占位符段跳过(保留逆替换往返;且不触发 daemon 查询 → hermetic)。
+    fn ml_augment_skips_vigil_redact_token_segment() {
+        // `vigil://redact/`(上游 Tier-B token,非本 hook 自产 → 无法可信加 protected)段整体跳 ML,
+        // 保 token 完整不被 ML over-capture 切碎;hermetic(早返回,不触发 daemon 查询)。
         let args = HookArgs {
             engine: Some(EngineMode::Auto),
             ..HookArgs::default()
         };
         let mut ml = MlScrub::new(&args);
         let mut report = RedactReport::default();
-        let kept = ml.augment("secret://deploy-key trailing text here", &[], &mut report);
-        assert_eq!(kept, "secret://deploy-key trailing text here");
-        assert!(!ml.degraded, "占位符段早返回,不查 daemon → 不降级");
+        let kept = ml.augment("vigil://redact/abc123 trailing text here", &[], &mut report);
+        assert_eq!(kept, "vigil://redact/abc123 trailing text here");
+        assert!(!ml.degraded, "vigil://redact/ 段早返回,不查 daemon → 不降级");
         assert_eq!(report.ml_hits, 0);
+    }
+
+    #[test]
+    fn ml_augment_no_longer_skips_secret_alias_segment() {
+        // VIGIL-SEC-ML-SKIP 修:含 `secret://<alias>` 的段**不再**整体跳 ML —— 自产占位符区间由
+        // `protected` + apply_wire_spans 减法保护,同段 soft-PII 得以正常 ML 脱敏。验证"确实发起
+        // 查询"(queries_used 自增)而非 early-return;hermetic:无 daemon 时查询失败降级,但 queries_used
+        // 在查询**尝试**时(query 前)自增,不依赖 daemon 是否在线。
+        let args = HookArgs {
+            engine: Some(EngineMode::Auto),
+            ..HookArgs::default()
+        };
+        let mut ml = MlScrub::new(&args);
+        let mut report = RedactReport::default();
+        let _ = ml.augment(
+            "secret://deploy-key and a long enough trailing segment",
+            &[],
+            &mut report,
+        );
+        assert_eq!(
+            ml.queries_used, 1,
+            "secret:// 段不再 early-return → 发起 daemon 查询(self-produced 占位符由 protected 护)"
+        );
     }
 
     #[test]
