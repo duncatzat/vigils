@@ -15,6 +15,15 @@ use super::client::{daemon_info_path, read_daemon_info, write_daemon_info, Daemo
 use super::protocol::{Request, Response, PROTOCOL_VERSION};
 use super::server::DaemonCaps;
 use super::transport::{bind, default_socket_name, query_daemon, serve};
+use crate::i18n::Lang;
+
+/// 按语言取静态文案(中 / 英并排)。用户直面命令(`daemon start|status|stop`),输出按系统语言本地化。
+fn tr(lang: Lang, en: &'static str, zh: &'static str) -> &'static str {
+    match lang {
+        Lang::En => en,
+        Lang::Zh => zh,
+    }
+}
 
 /// 生成 per-launch token(128-bit CSPRNG → 32 hex)。熵失败 → `None`。
 fn generate_token() -> Option<String> {
@@ -43,10 +52,12 @@ fn open_canonical_ledger() -> Option<std::sync::Arc<vigil_audit::Ledger>> {
 ///
 /// 单实例:`bind` 失败(同名 socket 已被占用 = 已有 daemon)→ `Err` 退出。成功则**阻塞**于
 /// `serve` accept 循环直到进程被杀(GUI 生命周期 P2.4 负责 spawn/kill)。
-pub fn run_start() -> Result<(), String> {
+pub fn run_start(lang: Lang) -> Result<(), String> {
     let socket = default_socket_name();
-    let listener =
-        bind(&socket).map_err(|e| format!("bind failed (a daemon may already be running): {e}"))?;
+    let listener = bind(&socket).map_err(|e| match lang {
+        Lang::En => format!("bind failed (a daemon may already be running): {e}"),
+        Lang::Zh => format!("绑定 socket 失败(可能已有 daemon 在运行):{e}"),
+    })?;
 
     // ort 暖载层(ADR 0024):**在 serve spawn 任何线程之前**(进程仍单线程)暖载 PII scanner —— 复用
     // serve 的 ort init 纪律(dylib 稳源 + loader-lock 安全超时 abort)。best-effort:模型未缓存 /
@@ -69,8 +80,14 @@ pub fn run_start() -> Result<(), String> {
     let inj_loaded = false;
     let ledger = open_canonical_ledger(); // best-effort:开不了 → 注入信号不落(PII 仍工作)
 
-    let token =
-        generate_token().ok_or_else(|| "failed to generate a token (no entropy)".to_string())?;
+    let token = generate_token().ok_or_else(|| {
+        tr(
+            lang,
+            "failed to generate a token (no entropy)",
+            "生成 token 失败(无可用熵源)",
+        )
+        .to_string()
+    })?;
 
     // daemon.json 的 `pii_loaded` / `inj_loaded` 反映**真实**暖载结果(GUI / `status` 据此显示就绪态)。
     let info = DaemonInfo {
@@ -81,17 +98,35 @@ pub fn run_start() -> Result<(), String> {
         pii_loaded,
         inj_loaded,
     };
-    let path =
-        daemon_info_path().ok_or_else(|| "cannot locate the daemon.json directory".to_string())?;
-    write_daemon_info(&path, &info).map_err(|e| format!("failed to write daemon.json: {e}"))?;
+    let path = daemon_info_path().ok_or_else(|| {
+        tr(
+            lang,
+            "cannot locate the daemon.json directory",
+            "无法定位 daemon.json 所在目录",
+        )
+        .to_string()
+    })?;
+    write_daemon_info(&path, &info).map_err(|e| match lang {
+        Lang::En => format!("failed to write daemon.json: {e}"),
+        Lang::Zh => format!("写入 daemon.json 失败:{e}"),
+    })?;
 
-    eprintln!(
-        "vigil-hub daemon: listening on `{}` (pid {}); PII {}, injection {}",
-        info.socket_path,
-        info.pid,
-        if pii_loaded { "warm" } else { "off" },
-        if inj_loaded { "warm" } else { "off" }
-    );
+    match lang {
+        Lang::En => eprintln!(
+            "vigil-hub daemon: listening on `{}` (pid {}); PII {}, injection {}",
+            info.socket_path,
+            info.pid,
+            if pii_loaded { "warm" } else { "off" },
+            if inj_loaded { "warm" } else { "off" }
+        ),
+        Lang::Zh => eprintln!(
+            "vigil-hub daemon:正在监听 `{}`(pid {});PII {},注入 {}",
+            info.socket_path,
+            info.pid,
+            if pii_loaded { "已暖载" } else { "未加载" },
+            if inj_loaded { "已暖载" } else { "未加载" }
+        ),
+    }
     let caps = DaemonCaps {
         token,
         scanner,
@@ -112,9 +147,16 @@ pub fn run_start() -> Result<(), String> {
 /// `vigil-hub daemon status`:读 daemon.json + 试 `query_daemon(Status)` 报告运行态。
 ///
 /// daemon.json 缺 → 未运行;存在但 query 失败(未响应 / R1 不符 / 超时)→ 陈旧或异常。
-pub fn run_status() -> Result<(), String> {
+pub fn run_status(lang: Lang) -> Result<(), String> {
     let Some(info) = daemon_info_path().and_then(|p| read_daemon_info(&p)) else {
-        println!("daemon: not running (no daemon.json)");
+        println!(
+            "{}",
+            tr(
+                lang,
+                "daemon: not running (no daemon.json)",
+                "daemon:未运行(无 daemon.json)",
+            )
+        );
         return Ok(());
     };
     match query_daemon(Request::Status, Duration::from_secs(2)) {
@@ -123,19 +165,32 @@ pub fn run_status() -> Result<(), String> {
             inj_loaded,
             uptime_secs,
             inflight,
-        }) => {
-            println!(
+        }) => match lang {
+            Lang::En => println!(
                 "daemon: running (pid={}, pii_loaded={}, inj_loaded={}, uptime={}s, inflight={})",
                 info.pid, pii_loaded, inj_loaded, uptime_secs, inflight
-            );
-        }
-        _ => {
-            println!(
-                "daemon: daemon.json present (pid={}) but not responding (stale, or R1 peer-cred \
-                 mismatch — not the recorded daemon)",
+            ),
+            Lang::Zh => println!(
+                "daemon:运行中(pid={};PII 模型 {};注入模型 {};已运行 {}s;处理中 {})",
+                info.pid,
+                if pii_loaded { "已暖载" } else { "未加载" },
+                if inj_loaded { "已暖载" } else { "未加载" },
+                uptime_secs,
+                inflight
+            ),
+        },
+        _ => match lang {
+            Lang::En => println!(
+                "daemon: recorded (pid={}) but not responding -- it may have exited, or this pid \
+                 is now reused by another program (not the original Vigil daemon). Re-run vigil-hub daemon start.",
                 info.pid
-            );
-        }
+            ),
+            Lang::Zh => println!(
+                "daemon:有记录(pid={}),但联系不上 —— 可能已退出,或这个 pid 已被别的程序占用 \
+                 (并非原来的 Vigil 守护进程)。可重新运行 vigil-hub daemon start。",
+                info.pid
+            ),
+        },
     }
     Ok(())
 }
@@ -145,9 +200,16 @@ pub fn run_status() -> Result<(), String> {
 /// **防 pid 重用误杀**:先 `query_daemon(Status)` 经 **R1 peer-cred + token** 确认 daemon.json.pid
 /// 真是活着的、本人的 Vigil daemon,**才** kill;不响应(可能已死、pid 已被无辜进程重用)→ 只清理
 /// 陈旧 daemon.json,**绝不**杀那个 pid。
-pub fn run_stop() -> Result<(), String> {
+pub fn run_stop(lang: Lang) -> Result<(), String> {
     let Some(info) = daemon_info_path().and_then(|p| read_daemon_info(&p)) else {
-        println!("daemon: not running (no daemon.json)");
+        println!(
+            "{}",
+            tr(
+                lang,
+                "daemon: not running (no daemon.json)",
+                "daemon:未运行(无 daemon.json)",
+            )
+        );
         return Ok(());
     };
     let path = daemon_info_path();
@@ -156,23 +218,32 @@ pub fn run_stop() -> Result<(), String> {
         if let Some(p) = &path {
             let _ = std::fs::remove_file(p);
         }
-        println!(
-            "daemon: not responding; cleaned stale daemon.json (did NOT kill pid {} — could be \
-             reused by an unrelated process)",
-            info.pid
-        );
+        match lang {
+            Lang::En => println!(
+                "daemon: not reachable -- likely already exited. Removed the leftover record file; \
+                 did NOT kill pid {} (it may now be reused by an unrelated program).",
+                info.pid
+            ),
+            Lang::Zh => println!(
+                "daemon:联系不上,可能早已退出。已清理残留的记录文件;没有强行结束进程号 {}(它可能已被其它无关程序占用,以免误杀)。",
+                info.pid
+            ),
+        }
         return Ok(());
     }
-    kill_pid(info.pid)?;
+    kill_pid(lang, info.pid)?;
     if let Some(p) = &path {
         let _ = std::fs::remove_file(p); // 强杀不会触发 serve 的自清理,这里补上
     }
-    println!("daemon: stopped (pid {})", info.pid);
+    match lang {
+        Lang::En => println!("daemon: stopped (pid {})", info.pid),
+        Lang::Zh => println!("daemon:已停止(pid {})", info.pid),
+    }
     Ok(())
 }
 
 /// 跨平台按 pid 结束进程(无 `unsafe`:走 OS 工具 `taskkill`/`kill`,不引 libc FFI,守 forbid unsafe)。
-fn kill_pid(pid: u32) -> Result<(), String> {
+fn kill_pid(lang: Lang, pid: u32) -> Result<(), String> {
     let mut cmd = if cfg!(windows) {
         let mut c = std::process::Command::new("taskkill");
         c.args(["/F", "/PID", &pid.to_string()]);
@@ -182,14 +253,21 @@ fn kill_pid(pid: u32) -> Result<(), String> {
         c.arg(pid.to_string());
         c
     };
-    let status = cmd
-        .status()
-        .map_err(|e| format!("failed to spawn the kill helper: {e}"))?;
+    let status = cmd.status().map_err(|e| match lang {
+        Lang::En => format!("failed to spawn the kill helper: {e}"),
+        Lang::Zh => format!("启动结束进程助手失败:{e}"),
+    })?;
     if !status.success() {
-        return Err(format!(
-            "failed to stop daemon pid {pid} (kill helper exit {:?})",
-            status.code()
-        ));
+        return Err(match lang {
+            Lang::En => format!(
+                "failed to stop daemon pid {pid} (kill helper exit {:?})",
+                status.code()
+            ),
+            Lang::Zh => format!(
+                "停止 daemon(pid {pid})失败(结束助手退出码 {:?})",
+                status.code()
+            ),
+        });
     }
     Ok(())
 }
