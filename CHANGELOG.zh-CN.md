@@ -8,7 +8,7 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
-## [Unreleased]
+## [v0.4.5] — 2026-06-30 — 闭合 `VIGIL-SEC-ML-SKIP`(`secret://` 面):恢复同段 soft-PII 脱敏
 
 ### 安全
 

@@ -8,7 +8,7 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
-## [Unreleased]
+## [v0.4.5] — 2026-06-30 — close `VIGIL-SEC-ML-SKIP` (`secret://` face): same-leaf soft-PII redaction restored
 
 ### Security
 
