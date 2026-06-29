@@ -48,13 +48,28 @@ detects a defect propagates its exit code, and `run.sh` exits non-zero (earlier 
   placeholders. Both rewritten to **union-merge** (like the gateway `redact_string`).
   Regression: `model_overlap_no_leak`, `apply_wire_spans_{overlap_union_merged,nested}_no_leak`;
   `functional-sweep.sh` S3b asserts well-formed placeholders on the shipped binary.
-  - **Known P2 (no leak, `VIGIL-SEC-OVERLAP-PH`)** — on the daemon hook-ML path, a daemon ML
-    span can over-capture into a hard-fingerprint placeholder inserted by the prior scrub,
-    producing a *broken nested placeholder* in the model-facing output (e.g.
-    `[[REDACTED address]DACTED email]`). **No raw PII leaks** (the cut bytes are placeholder,
-    the real value was already scrubbed). The safe fix plumbs the *genuine* placeholder byte
-    ranges from the scrub step into `apply_wire_spans` (regex-detecting `[REDACTED …]` is
-    unsafe — a tool result can forge fake placeholders to evade ML). Tracked for a follow-up.
+  - **`VIGIL-SEC-OVERLAP-PH` (FIXED)** — on the daemon hook-ML path, a daemon ML span could
+    over-capture into a hard-fingerprint placeholder inserted by the prior scrub, producing a
+    *broken nested placeholder* in the model-facing output (e.g. `[[REDACTED address]DACTED email]`).
+    No raw PII leaked (the cut bytes were placeholder; the real value was already scrubbed). **Fix**:
+    `vigil-redaction::scrub_text_with_spans` returns the byte ranges of the placeholders it inserts;
+    the hook fuses redact+ML into one pass (`redact_and_augment_value`) and plumbs the *genuine*
+    placeholder ranges (hard-fingerprint + `secret://`) into `apply_wire_spans`, which subtracts them
+    from each merged ML span (`subtract_ranges`) and replaces only the bytes outside placeholders.
+    Ranges come solely from the pipeline's own output, never regex-detection of `[REDACTED …]` shape
+    (a tool result can forge fake placeholders; forged ones aren't in `protected`, so the real PII
+    they wrap is still replaced). Regression: `apply_wire_spans_{subtracts_protected_no_split,
+    span_fully_in_protected_dropped,span_spanning_protected_splits,forged_placeholder_not_protected}`,
+    `subtract_ranges_cases`, `scrub_preserving_placeholders_reports_real_placeholder_spans`,
+    `vigil-redaction::scrub_with_spans_marks_placeholder_ranges`.
+  - **Known P2 (no leak, `VIGIL-SEC-ML-SKIP`)** — `MlScrub::augment` skips ML for an *entire* string
+    leaf when it contains the literal `secret://` or `vigil://redact/`. Tool output is attacker-influenced,
+    so embedding a literal `secret://x` beside soft-PII (email/person/address — not hard-fingerprints)
+    suppresses ML redaction for that leaf (the hard-fingerprint base still applies; only ML-class
+    semantic PII is affected; requires engine=ml/auto). The `VIGIL-SEC-OVERLAP-PH` `protected`-subtraction
+    now makes it safe to scan the whole leaf and protect only genuine placeholder bytes — but a correct
+    fix must first decide how to treat `vigil://redact/` tokens (unlike `secret://<alias>`, they aren't
+    recorded as pipeline-produced, so they can't be trusted as genuine). Tracked for a follow-up.
 
 ## Safety
 

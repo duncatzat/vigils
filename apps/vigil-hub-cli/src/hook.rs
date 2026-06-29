@@ -1602,29 +1602,24 @@ fn try_result_redaction(args: &HookArgs, raw: &Value) -> Option<HookOutcome> {
         }
     }
 
-    // 递归再脱敏:逆向替换真值→占位符 + 硬指纹 scrub。
+    // 递归再脱敏 + ML 增强(融合单遍):逆向替换真值→占位符 + 硬指纹 scrub,**同遍**对每个干净叶子
+    // 追加 daemon ML PII 脱敏(engine=ml/auto)。融合的关键:ML 受保护区(真实占位符字节区间)只在
+    // 脱敏产出占位符的那刻精确可知 —— 同遍 plumb 进 apply_wire_spans 做减法,不切碎已脱敏占位符
+    // (VIGIL-SEC-OVERLAP-PH)。ML 纯加性 + fail-closed:daemon 缺/超时/畸形 → 跳过(硬指纹底座无条件
+    // 兜住,非 fail-open);某叶子逆替换遗漏真值 → 跳过该叶子 ML(残留留给下方整树自检 withhold)。
     let mut report = RedactReport::default();
-    let redacted = redact_boundary_value(tool_response, &resolved, &mut report);
+    let mut ml = MlScrub::new(args);
+    let redacted = redact_and_augment_value(tool_response, &resolved, &mut ml, &mut report);
 
     // belt-and-suspenders 自检(语义层,对含特殊字符的真值也精确):若 redacted 任意字符串叶子 /
-    // object key 仍残留某个真值(递归替换因边角遗漏),fail-closed 裁剪 —— 绝不透传残留真值。
+    // object key 仍残留某个真值(逆替换边角遗漏 → 该叶子已跳过 ML、残留原样留存),fail-closed 裁剪
+    // —— 绝不透传残留真值,也绝不让 ML 把残留遮成 [REDACTED] 而逃逸本自检。
     if value_contains_any_secret(&redacted, &resolved) {
         eprintln!(
             "vigil-hook: re-redaction self-check found residual plaintext; withheld fail-closed"
         );
         return Some(redact_fail_closed_outcome(&tool_name));
     }
-
-    // ── ML PII 增强(ADR 0024 hook 瘦客户端):engine=ml/auto 时,在已脱敏(逆替换 + 硬指纹底座)
-    //    的结果上**再追加**一遍常驻 daemon 的 ML PII 脱敏。**纯加性 + fail-closed**:daemon 缺/超时/
-    //    畸形 → 跳过(硬指纹底座已无条件兜住,非 fail-open)。自检在此之前跑(ML 只追加 PII 脱敏、
-    //    不引入 secret,故 declared-secret 自检语义不受影响)。
-    let mut ml = MlScrub::new(args);
-    let redacted = if ml.enabled {
-        ml_augment_value(&redacted, &mut ml, &mut report)
-    } else {
-        redacted
-    };
     // R5:严格 `ml` 下 daemon 降级 → 响亮 stderr(用户显式要 ml 应当知情;持久审计事件为下一 slice)。
     // `auto` 降级静默(daemon 可选,降级是预期常态,避免每次工具调用刷屏)。
     if ml.degraded && ml.strict {
@@ -1684,55 +1679,81 @@ fn redact_fail_closed_outcome(tool_name: &str) -> HookOutcome {
     }
 }
 
-/// 递归再脱敏一个 `tool_response` Value。字符串叶子:先逐 alias 把真值替换为 `secret://<alias>`
-/// (逆向替换,**主**机制),再 `scrub_text` 硬指纹(纵深防御)。非字符串叶子原样递归。
+/// 叶子级再脱敏:把一个字符串叶子先逐 alias 把真值替换为 `secret://<alias>`(逆向替换,**主**
+/// 机制),再硬指纹 scrub(纵深防御)。返回(脱敏串, **真实占位符**字节区间 —— `secret://` + 本次
+/// 硬指纹 `[REDACTED …]`)。占位符区间供 daemon ML 受保护区减法(VIGIL-SEC-OVERLAP-PH)。
 ///
 /// **顺序**:逆向替换在硬指纹 scrub **之前** —— 注入的真值未必匹配硬指纹,逆向替换是唯一捕获
 /// 手段。**且**硬指纹 scrub 必须**排除**逆向替换刚写入的占位符 span(见 [`scrub_preserving_placeholders`]):
 /// 否则 `env_assignment` 等规则会把 `KEY=secret://alias` 整体当赋值吞掉,损坏占位符(over-redact,
 /// 非泄漏但破坏往返 —— hostile review MEDIUM)。
+fn redact_leaf(
+    s: &str,
+    resolved: &HashMap<String, SecretValue>,
+    report: &mut RedactReport,
+) -> (String, Vec<(usize, usize)>) {
+    let mut out = s.to_string();
+    // 1) 逆向替换:每个声明 secret 的真值 → 其占位符。空真值跳过(replace("", …) 无意义)。
+    //    记录写入的占位符,供步骤 2 排除(防硬指纹 scrub 二次吞掉)。
+    let mut written: Vec<String> = Vec::new();
+    for (alias, value) in resolved {
+        let needle = value.expose();
+        if needle.is_empty() || !out.contains(needle) {
+            continue;
+        }
+        let placeholder = format!("{SECRET_ALIAS_PREFIX}{alias}");
+        report.reverse_hits += out.matches(needle).count();
+        out = out.replace(needle, &placeholder);
+        if !written.contains(&placeholder) {
+            written.push(placeholder);
+        }
+        report.changed = true;
+    }
+    // 2) 硬指纹 scrub(纵深防御),排除步骤 1 写入的占位符 span;返回所有真实占位符区间。
+    scrub_preserving_placeholders(&out, &written, report)
+}
+
+/// 递归再脱敏一个 `tool_response` Value,**并在同一遍**对每个字符串叶子追加 daemon ML PII 增强
+/// (ADR 0024)。融合两遍(旧 `redact_boundary_value` + `ml_augment_value`)的关键动因:ML 的受
+/// 保护区(真实占位符字节区间)只在 [`redact_leaf`] 产出占位符的那一刻精确可知 —— 同遍 plumb 进
+/// [`MlScrub::augment`] 才能让 [`apply_wire_spans`] 对 ML span 做减法、不切碎已脱敏占位符
+/// (VIGIL-SEC-OVERLAP-PH);两遍独立遍历无法可靠对齐每叶子的占位符区间(易 drift)。
+///
+/// **fail-closed 自检语义保持**:若某叶子逆向替换后仍残留真值(逆替换遗漏),**跳过该叶子的 ML**
+/// —— 残留真值原样留存,由顶层 [`value_contains_any_secret`] 整树自检检出并 withhold;绝不让 ML
+/// 把残留真值遮成 `[REDACTED]` 而"逃逸"自检(那会把"应 withhold"弱化为"放行被遮结果")。
 ///
 /// **不处理 object key**:tool_response 的 key 来自宿主固定包装 schema(`stdout`/`stderr` 等),
 /// 注入的真值落在命令**输出**(value 位),不会成为结果 key 名;真出现异常残留由调用方的
 /// [`value_contains_any_secret`] 自检兜底 fail-closed(故此处不对 key 改写,避免破坏结构语义)。
-fn redact_boundary_value(
+fn redact_and_augment_value(
     v: &Value,
     resolved: &HashMap<String, SecretValue>,
+    ml: &mut MlScrub,
     report: &mut RedactReport,
 ) -> Value {
     match v {
         Value::String(s) => {
-            let mut out = s.clone();
-            // 1) 逆向替换:每个声明 secret 的真值 → 其占位符。空真值跳过(replace("", …) 无意义)。
-            //    记录写入的占位符,供步骤 2 排除(防硬指纹 scrub 二次吞掉)。
-            let mut written: Vec<String> = Vec::new();
-            for (alias, value) in resolved {
-                let needle = value.expose();
-                if needle.is_empty() || !out.contains(needle) {
-                    continue;
-                }
-                let placeholder = format!("{SECRET_ALIAS_PREFIX}{alias}");
-                report.reverse_hits += out.matches(needle).count();
-                out = out.replace(needle, &placeholder);
-                if !written.contains(&placeholder) {
-                    written.push(placeholder);
-                }
-                report.changed = true;
+            let (out, protected) = redact_leaf(s, resolved, report);
+            // 逆替换遗漏自检(叶子级):残留真值 → 跳过 ML(防遮蔽逃逸),留给顶层整树自检 withhold。
+            if str_contains_any_secret(&out, resolved) {
+                return Value::String(out);
             }
-            // 2) 硬指纹 scrub(纵深防御),排除步骤 1 写入的占位符 span。
-            let out = scrub_preserving_placeholders(&out, &written, report);
-            Value::String(out)
+            Value::String(ml.augment(&out, &protected, report))
         }
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|x| redact_boundary_value(x, resolved, report))
+                .map(|x| redact_and_augment_value(x, resolved, ml, report))
                 .collect(),
         ),
         Value::Object(map) => {
             let mut out = serde_json::Map::with_capacity(map.len());
             for (k, val) in map {
-                out.insert(k.clone(), redact_boundary_value(val, resolved, report));
+                out.insert(
+                    k.clone(),
+                    redact_and_augment_value(val, resolved, ml, report),
+                );
             }
             Value::Object(out)
         }
@@ -1746,16 +1767,21 @@ fn redact_boundary_value(
 /// 做法:按占位符把 `s` 切段,普通段各自 `scrub_one`、占位符段原样拼回。`env_assignment` 等
 /// `KEY=值` 规则的 `KEY=` 落在普通段、占位符(值)是分隔符 —— 普通段尾部 `KEY=` 缺值匹配器
 /// 要求的 ≥1 非空白字符 → 不命中,占位符得以保留;普通段内的**其它**真硬指纹仍被 scrub。
+///
+/// 返回(脱敏串, **真实占位符**在脱敏串中的字节区间);区间含两类:① 普通段内本次硬指纹 scrub
+/// 新插入的 `[REDACTED …]`,② 逆向替换写入并被保留的 `secret://<alias>`。供上层作 daemon ML
+/// 受保护区(VIGIL-SEC-OVERLAP-PH)—— 这些是脱敏流程**自己产出**的真实占位符,可信地标记。
 fn scrub_preserving_placeholders(
     s: &str,
     placeholders: &[String],
     report: &mut RedactReport,
-) -> String {
+) -> (String, Vec<(usize, usize)>) {
     if placeholders.is_empty() {
         // 常态:无逆向替换写入 → 整体 scrub(纯硬指纹兜底)。
         return scrub_one(s, report);
     }
     let mut result = String::with_capacity(s.len());
+    let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut rest = s;
     loop {
         // 找最早出现的任一占位符(多占位符时取位置最靠前者)。
@@ -1769,25 +1795,38 @@ fn scrub_preserving_placeholders(
         }
         match earliest {
             Some((pos, p)) => {
-                result.push_str(&scrub_one(&rest[..pos], report)); // 普通段 scrub
-                result.push_str(p); // 占位符原样保留
+                let (scrubbed, sub) = scrub_one(&rest[..pos], report); // 普通段 scrub
+                let base = result.len();
+                for (a, b) in sub {
+                    spans.push((base + a, base + b)); // 段内新占位符区间偏移到 result 坐标
+                }
+                result.push_str(&scrubbed);
+                let ph_start = result.len();
+                result.push_str(p); // 占位符(secret://alias)原样保留
+                spans.push((ph_start, result.len())); // 保留的占位符也纳入受保护区
                 rest = &rest[pos + p.len()..];
             }
             None => {
-                result.push_str(&scrub_one(rest, report)); // 末段
+                let (scrubbed, sub) = scrub_one(rest, report); // 末段
+                let base = result.len();
+                for (a, b) in sub {
+                    spans.push((base + a, base + b));
+                }
+                result.push_str(&scrubbed);
                 break;
             }
         }
     }
-    result
+    (result, spans)
 }
 
 /// 对一段(不含受保护占位符的)文本做硬指纹 scrub:命中即替换为 `[REDACTED <rule>]`,
-/// 记录规则名(静态串,非真值)+ 置 `changed`。无命中原样返回。
-fn scrub_one(seg: &str, report: &mut RedactReport) -> String {
+/// 记录规则名(静态串,非真值)+ 置 `changed`。返回(脱敏串, **本次插入**的占位符在脱敏串中的
+/// 字节区间);无命中原样返回 + 空区间。占位符区间供上层作 daemon ML 受保护区(VIGIL-SEC-OVERLAP-PH)。
+fn scrub_one(seg: &str, report: &mut RedactReport) -> (String, Vec<(usize, usize)>) {
     let hits = vigil_redaction::scan_hard_findings(seg);
     if hits.is_empty() {
-        return seg.to_string();
+        return (seg.to_string(), Vec::new());
     }
     for h in hits {
         if !report.hard_hits.contains(&h) {
@@ -1795,7 +1834,7 @@ fn scrub_one(seg: &str, report: &mut RedactReport) -> String {
         }
     }
     report.changed = true;
-    vigil_redaction::scrub_text(seg)
+    vigil_redaction::scrub_text_with_spans(seg)
 }
 
 /// PostToolUse ML PII 增强(ADR 0024 hook 瘦客户端 + D8 响亮降级)。**纯加性、fail-closed**:在
@@ -1835,7 +1874,15 @@ impl MlScrub {
 
     /// 对一个字符串叶子做 ML PII 增强。跳过(返回原串)条件:未启用 / 太短 / 触限流 / 含 Vigil
     /// 占位符(保留逆替换往返,占位符非 PII 跳过无安全损失)。daemon 返 findings → 应用 span。
-    fn augment(&mut self, seg: &str, report: &mut RedactReport) -> String {
+    ///
+    /// `protected`:本叶子脱敏流程**自己产出**的真实占位符字节区间(相对 `seg`);ML span 命中其中
+    /// 时做减法(见 [`apply_wire_spans`]),避免把已脱敏占位符切碎(VIGIL-SEC-OVERLAP-PH)。
+    fn augment(
+        &mut self,
+        seg: &str,
+        protected: &[(usize, usize)],
+        report: &mut RedactReport,
+    ) -> String {
         // give_up(本 response 已认定 daemon 不可用)/ 未启用 / 太短 → 直接跳过(硬指纹底座另兜)。
         if !self.enabled || self.give_up || seg.len() < ML_MIN_SEG_LEN {
             return seg.to_string();
@@ -1874,7 +1921,7 @@ impl MlScrub {
                     return seg.to_string();
                 }
                 // span 相对 capped 前缀;仅在该前缀范围内 apply(suffix 无 ML,硬指纹已兜)。
-                apply_wire_spans(seg, capped.len(), &findings, report)
+                apply_wire_spans(seg, capped.len(), &findings, protected, report)
             }
             // daemon 不可用 / Error / 超时 / 畸形 → 降级 + **give_up**(首次失败即认定本 response
             // daemon 不可用,余下叶子不再查;封死 N×deadline 累积楔死。硬指纹底座已兜,非 fail-open)。
@@ -1917,24 +1964,24 @@ fn safe_label(label: &str) -> String {
 
 /// 把 daemon 的 [`WireFinding`] span(相对前 `scanned_len` 字节前缀)应用到 `seg`,命中处替换为
 /// `[REDACTED <label>]`。空/逆序、越出扫描前缀、非 char-boundary 的 span 先剔除(防 panic + 防御),
-/// 再**并集合并**成互不重叠区间后右→左单遍替换。
+/// **并集合并**成互不重叠区间,再减去 `protected`(真实占位符区间)后右→左替换露出的子区间。
 ///
 /// **为何并集而非"重叠跳过"(VIGIL-SEC-OVERLAP)**:daemon 可能对相邻实体吐嵌套/重叠 span。旧实现
 /// 右→左 + "与已处理区间重叠则跳过"会漏掉外层 span 独有的 PII 前缀 —— 例如 `[3,7)` 与已处理 `[5,9)`
 /// 重叠被整条跳过,其独有的 `[3,5)` 明文 PII **残留泄漏**;且嵌套场景产生破碎嵌套占位符。并集合并
-/// (与 vigil-redaction `build_redacted_text` 同款 leak-safe 策略)保证每个被任一 span 命中的字节都
-/// 落入某替换区间。`report.ml_hits` 计并集后实际替换的区间数。
+/// 保证每个被任一 span 命中的字节都落入某替换区间。
 ///
-/// **已知 P2(无泄漏,VIGIL-SEC-OVERLAP-PH)**:daemon 在 `redact_boundary_value` 已脱敏(含
-/// `[REDACTED …]` 占位符)的文本上扫描,其 ML span 可 over-capture 延伸进占位符 → `replace_range`
-/// 切碎成破碎嵌套占位符(macOS 实测 `[[REDACTED address]DACTED email]`)。**无原值泄漏**(被切的
-/// 是占位符,真值早被硬指纹脱敏)。安全修法须从脱敏步骤**透传真实占位符字节区间**给本函数后做减法
-/// —— 不可用正则识别 `[REDACTED …]`(攻击者可在工具输出伪造假占位符把语义 PII 包进去 → ML 跳过 →
-/// 绕过脱敏)。待后续 slice 实现该 plumbing。
+/// **受保护区减法(VIGIL-SEC-OVERLAP-PH,已修)**:daemon 在已脱敏(含 `[REDACTED …]` 占位符)的
+/// 文本上扫描,其 ML span 可 over-capture 延伸进占位符。`protected` 携带脱敏流程**自产**的真实占位符
+/// 字节区间;对每个 ML 并集区间减去 `protected`,只替换露在占位符之外的子区间 → 不再切碎成破碎嵌套
+/// (旧 macOS 实测 `[[REDACTED address]DACTED email]`)。**安全**:`protected` 不靠正则识别 `[REDACTED …]`
+/// 形态(工具输出可伪造假占位符把 PII 包进去),只信脱敏流程自产区间 → 伪造的占位符不在 `protected`、
+/// 其包裹的真 PII 仍被替换。`report.ml_hits` 计减法后实际替换的子区间数。
 fn apply_wire_spans(
     seg: &str,
     scanned_len: usize,
     findings: &[WireFinding],
+    protected: &[(usize, usize)],
     report: &mut RedactReport,
 ) -> String {
     // 剔除非法 span(空/逆序、越出扫描前缀、非 char-boundary),保留 (start, end, label)。
@@ -1965,9 +2012,25 @@ fn apply_wire_spans(
             _ => merged.push((start, end, label)),
         }
     }
-    // 右→左替换(merged 已 start 升序且互不重叠,从后往前不影响前面区间 index)。
+    // 受保护区减法(VIGIL-SEC-OVERLAP-PH):从每个 ML 并集区间减去真实占位符区间,只替换**露在占位符
+    // 之外**的子区间。安全不变量:① 任何不在 protected 内、且被某 ML span 命中的字节,必落入某个被替换
+    // 子区间(真 PII 不漏);② protected 内字节永不被 replace_range 触碰(已脱敏占位符不切碎)。
+    let mut final_spans: Vec<(usize, usize, &str)> = Vec::new();
+    for &(start, end, label) in &merged {
+        for (ss, se) in subtract_ranges(start, end, protected) {
+            final_spans.push((ss, se, label));
+        }
+    }
+    // final_spans 全局升序(merged 升序且互不重叠 + 每个减法子区间升序)→ 右→左替换不漂移 index。
     let mut out = seg.to_string();
-    for &(start, end, label) in merged.iter().rev() {
+    for &(start, end, label) in final_spans.iter().rev() {
+        // 锁定 char-boundary 不变量:子区间端点来自 ML span(已过 is_char_boundary 滤)与 protected
+        // 占位符端点(均为 push_str 处 len() 采样 → 必落 char 边界),故 replace_range 不会切碎多字节
+        // 字符。debug_assert 防未来 protected 改由偏移算术得出(可能落 mid-char)而静默重引 panic 风险。
+        debug_assert!(
+            seg.is_char_boundary(start) && seg.is_char_boundary(end),
+            "apply_wire_spans 子区间非 char-boundary: ({start},{end}) in {seg:?}"
+        );
         out.replace_range(start..end, &format!("[REDACTED {}]", safe_label(label)));
         report.ml_hits += 1;
         report.changed = true;
@@ -1975,44 +2038,56 @@ fn apply_wire_spans(
     out
 }
 
-/// 递归对 `tool_response` 的每个字符串叶子做 ML PII 增强(JSON 结构保持;object key 不改 —— 与
-/// [`redact_boundary_value`] 同理,注入真值落在 value 位)。在 `redact_boundary_value`(逆替换 +
-/// 硬指纹底座)**之后**跑,ML 纯加性。
-fn ml_augment_value(v: &Value, ml: &mut MlScrub, report: &mut RedactReport) -> Value {
-    match v {
-        Value::String(s) => Value::String(ml.augment(s, report)),
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|x| ml_augment_value(x, ml, report))
-                .collect(),
-        ),
-        Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, val) in map {
-                out.insert(k.clone(), ml_augment_value(val, ml, report));
-            }
-            Value::Object(out)
-        }
-        other => other.clone(),
+/// 返回 `[start, end)` 减去 `protected` 中所有区间后剩余的子区间(升序、互不重叠)。
+/// `protected` 为脱敏流程自产的真实占位符区间(可乱序/重叠,内部先 clamp 到 `[start,end)` 再规整)。
+/// 用于 [`apply_wire_spans`] 把 ML 并集区间裁掉与已脱敏占位符重叠的部分(VIGIL-SEC-OVERLAP-PH)。
+fn subtract_ranges(start: usize, end: usize, protected: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    if start >= end {
+        return Vec::new();
     }
+    // 取与 [start,end) 相交的受保护区间(clamp 到窗口内),按 start 升序。
+    let mut blocks: Vec<(usize, usize)> = protected
+        .iter()
+        .map(|&(a, b)| (a.max(start), b.min(end)))
+        .filter(|&(a, b)| a < b)
+        .collect();
+    if blocks.is_empty() {
+        return vec![(start, end)];
+    }
+    blocks.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut out = Vec::new();
+    let mut cursor = start;
+    for (a, b) in blocks {
+        if a > cursor {
+            out.push((cursor, a)); // 占位符之前露出的段
+        }
+        if b > cursor {
+            cursor = b; // 跳过占位符(含重叠部分),游标前移到其右界
+        }
+    }
+    if cursor < end {
+        out.push((cursor, end)); // 末尾露出段
+    }
+    out
+}
+
+/// 单串自检:`s` 是否仍含某个 resolved 真值(逆向替换遗漏)。空真值不计。
+fn str_contains_any_secret(s: &str, resolved: &HashMap<String, SecretValue>) -> bool {
+    resolved.values().any(|sv| {
+        let n = sv.expose();
+        !n.is_empty() && s.contains(n)
+    })
 }
 
 /// 递归自检:`v` 的任意字符串叶子或 object key 是否仍含某个真值(逆向替换遗漏)。
 /// **语义层**比较(非序列化串),对含 JSON 特殊字符的真值同样精确。
 fn value_contains_any_secret(v: &Value, resolved: &HashMap<String, SecretValue>) -> bool {
-    let contains_secret = |s: &str| {
-        resolved.values().any(|sv| {
-            let n = sv.expose();
-            !n.is_empty() && s.contains(n)
-        })
-    };
     match v {
-        Value::String(s) => contains_secret(s),
+        Value::String(s) => str_contains_any_secret(s, resolved),
         Value::Array(items) => items.iter().any(|x| value_contains_any_secret(x, resolved)),
-        Value::Object(map) => map
-            .iter()
-            .any(|(k, val)| contains_secret(k) || value_contains_any_secret(val, resolved)),
+        Value::Object(map) => map.iter().any(|(k, val)| {
+            str_contains_any_secret(k, resolved) || value_contains_any_secret(val, resolved)
+        }),
         _ => false,
     }
 }
@@ -2314,6 +2389,7 @@ mod tests {
             "alice@example.com here",
             22,
             &[wf("email", 0, 17)],
+            &[],
             &mut report,
         );
         assert_eq!(out, "[REDACTED email] here");
@@ -2330,6 +2406,7 @@ mod tests {
             seg,
             seg.len(),
             &[wf("email", 2, 12), wf("email", 15, 23)],
+            &[],
             &mut report,
         );
         assert_eq!(out, "a [REDACTED email] b [REDACTED email] c");
@@ -2345,6 +2422,7 @@ mod tests {
             seg,
             5,
             &[wf("x", 0, 9), wf("y", 100, 200), wf("z", 4, 2)],
+            &[],
             &mut report,
         );
         assert_eq!(out, "hello world");
@@ -2357,7 +2435,7 @@ mod tests {
         // "héllo":é(U+00E9)= 2 字节占 [1,3);byte 2 落 é 中间 → 非 boundary → 跳过(防 panic)。
         let seg = "héllo";
         let mut report = RedactReport::default();
-        let out = apply_wire_spans(seg, seg.len(), &[wf("x", 0, 2)], &mut report);
+        let out = apply_wire_spans(seg, seg.len(), &[wf("x", 0, 2)], &[], &mut report);
         assert_eq!(out, seg);
         assert_eq!(report.ml_hits, 0);
     }
@@ -2368,7 +2446,13 @@ mod tests {
         // 旧"重叠跳过"实现会留下 [3,7) 独有的 "de"(残留泄漏 "abcde[REDACTED a]j");并集后无残留。
         let seg = "abcdefghij";
         let mut report = RedactReport::default();
-        let out = apply_wire_spans(seg, seg.len(), &[wf("a", 5, 9), wf("b", 3, 7)], &mut report);
+        let out = apply_wire_spans(
+            seg,
+            seg.len(),
+            &[wf("a", 5, 9), wf("b", 3, 7)],
+            &[],
+            &mut report,
+        );
         assert_eq!(out, "abc[REDACTED b]j", "重叠应并集为单一占位符,覆盖 [3,9)");
         assert!(!out.contains("de"), "[3,7) 独有前缀 de 不得残留:{out}");
         assert_eq!(report.ml_hits, 1);
@@ -2384,11 +2468,108 @@ mod tests {
             seg,
             seg.len(),
             &[wf("person", 0, 40), wf("person", 15, 40)],
+            &[],
             &mut report,
         );
         assert!(!out.contains("Jonathan"), "外层 PII 前缀泄漏:{out}");
         assert_eq!(out, "[REDACTED person]", "嵌套应并集为单一占位符");
         assert_eq!(report.ml_hits, 1);
+    }
+
+    #[test]
+    fn apply_wire_spans_subtracts_protected_no_split() {
+        // VIGIL-SEC-OVERLAP-PH:ML span over-capture 延伸进真实占位符 → 减法只替换露出部分,占位符不切碎。
+        let seg = "x [REDACTED email] y"; // 占位符 "[REDACTED email]" 在 [2,18)
+        let mut report = RedactReport::default();
+        let out = apply_wire_spans(
+            seg,
+            seg.len(),
+            &[wf("address", 0, 10)],
+            &[(2, 18)],
+            &mut report,
+        );
+        assert_eq!(out, "[REDACTED address][REDACTED email] y");
+        assert!(out.contains("[REDACTED email]"), "真实占位符不得被切碎");
+        assert_eq!(report.ml_hits, 1);
+    }
+
+    #[test]
+    fn apply_wire_spans_span_fully_in_protected_dropped() {
+        // ML span 完全落在真实占位符内 → 减法后空 → 不替换,占位符原样、无 hit、不置 changed。
+        let seg = "x [REDACTED email] y";
+        let mut report = RedactReport::default();
+        let out = apply_wire_spans(seg, seg.len(), &[wf("pii", 4, 12)], &[(2, 18)], &mut report);
+        assert_eq!(out, seg);
+        assert_eq!(report.ml_hits, 0);
+        assert!(!report.changed);
+    }
+
+    #[test]
+    fn apply_wire_spans_span_spanning_protected_splits() {
+        // ML span 跨越整个占位符 → 减法切成左右两段各替换,占位符夹中间完整。
+        let seg = "aa [REDACTED email] bb"; // 占位符 [3,19)
+        let mut report = RedactReport::default();
+        let out = apply_wire_spans(seg, seg.len(), &[wf("p", 0, 22)], &[(3, 19)], &mut report);
+        assert_eq!(out, "[REDACTED p][REDACTED email][REDACTED p]");
+        assert_eq!(report.ml_hits, 2);
+    }
+
+    #[test]
+    fn apply_wire_spans_forged_placeholder_not_protected() {
+        // 工具输出伪造 `[REDACTED x]` 包裹真 PII。伪造占位符**不在** protected(只含脱敏自产区间)→
+        // ML span 命中其中真 PII 仍被替换,伪造无法让 ML 跳过(绕过脱敏)。
+        let seg = "[REDACTED x]alice@evil.com[REDACTED y]"; // 真 PII alice@evil.com 在 [12,26)
+        let mut report = RedactReport::default();
+        let out = apply_wire_spans(seg, seg.len(), &[wf("email", 12, 26)], &[], &mut report);
+        assert!(
+            !out.contains("alice@evil.com"),
+            "伪造占位符不得保护其包裹的真 PII"
+        );
+        assert!(out.contains("[REDACTED email]"));
+        assert_eq!(report.ml_hits, 1);
+    }
+
+    #[test]
+    fn subtract_ranges_cases() {
+        let empty = Vec::<(usize, usize)>::new();
+        assert_eq!(subtract_ranges(0, 10, &[]), vec![(0, 10)]); // 无保护 → 原区间
+        assert_eq!(subtract_ranges(0, 10, &[(2, 5)]), vec![(0, 2), (5, 10)]); // 中间挖洞
+        assert_eq!(subtract_ranges(0, 10, &[(0, 10)]), empty); // 全保护 → 空
+        assert_eq!(subtract_ranges(0, 10, &[(0, 4)]), vec![(4, 10)]); // 头部
+        assert_eq!(subtract_ranges(0, 10, &[(6, 10)]), vec![(0, 6)]); // 尾部
+        assert_eq!(
+            subtract_ranges(0, 10, &[(3, 5), (6, 8)]),
+            vec![(0, 3), (5, 6), (8, 10)]
+        ); // 多洞
+        assert_eq!(
+            subtract_ranges(0, 10, &[(2, 6), (4, 8)]),
+            vec![(0, 2), (8, 10)]
+        ); // 重叠 block
+        assert_eq!(subtract_ranges(0, 10, &[(5, 5), (8, 4)]), vec![(0, 10)]); // 空/逆序 block 过滤
+        assert_eq!(subtract_ranges(5, 5, &[]), empty); // 空窗口
+        assert_eq!(subtract_ranges(2, 8, &[(0, 4), (6, 20)]), vec![(4, 6)]); // protected 越界 → clamp
+    }
+
+    #[test]
+    fn scrub_preserving_placeholders_reports_real_placeholder_spans() {
+        // 返回的 protected 区间精确覆盖两类真实占位符:保留的 secret:// 与本次硬指纹 [REDACTED …]。
+        let mut report = RedactReport::default();
+        let placeholders = vec!["secret://dk".to_string()];
+        let (out, protected) = scrub_preserving_placeholders(
+            "secret://dk x AKIAIOSFODNN7EXAMPLE y",
+            &placeholders,
+            &mut report,
+        );
+        assert!(out.starts_with("secret://dk"));
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"), "硬指纹应被脱敏");
+        assert_eq!(protected.len(), 2, "secret:// + 硬指纹各一个受保护区");
+        for &(s, e) in &protected {
+            let slice = &out[s..e];
+            assert!(
+                slice == "secret://dk" || slice.starts_with("[REDACTED "),
+                "受保护区应正好是某真实占位符: {slice}"
+            );
+        }
     }
 
     #[test]
@@ -2414,13 +2595,14 @@ mod tests {
 
     #[test]
     fn ml_augment_disabled_is_identity() {
-        // engine 非 ml/auto → MlScrub 禁用 → ml_augment_value 恒等(零行为回归,绝不查 daemon)。
+        // engine 非 ml/auto → MlScrub 禁用 → redact_and_augment_value 的 ML 部分恒等(零行为回归,
+        // 绝不查 daemon);空 resolved + 无硬指纹输入 → redact 部分亦恒等 → 整体恒等。
         let args = HookArgs::default(); // engine: None
         let mut ml = MlScrub::new(&args);
         assert!(!ml.enabled);
         let mut report = RedactReport::default();
         let v = json!({"stdout": "alice@example.com", "nested": ["bob@y.io"]});
-        let out = ml_augment_value(&v, &mut ml, &mut report);
+        let out = redact_and_augment_value(&v, &HashMap::new(), &mut ml, &mut report);
         assert_eq!(out, v);
         assert_eq!(report.ml_hits, 0);
         assert!(!report.changed);
@@ -2450,7 +2632,7 @@ mod tests {
         };
         let mut ml = MlScrub::new(&args);
         let mut report = RedactReport::default();
-        let kept = ml.augment("secret://deploy-key trailing text here", &mut report);
+        let kept = ml.augment("secret://deploy-key trailing text here", &[], &mut report);
         assert_eq!(kept, "secret://deploy-key trailing text here");
         assert!(!ml.degraded, "占位符段早返回,不查 daemon → 不降级");
         assert_eq!(report.ml_hits, 0);
@@ -2467,7 +2649,11 @@ mod tests {
         let mut ml = MlScrub::new(&args);
         ml.give_up = true;
         let mut report = RedactReport::default();
-        let out = ml.augment("alice@example.com long enough segment here", &mut report);
+        let out = ml.augment(
+            "alice@example.com long enough segment here",
+            &[],
+            &mut report,
+        );
         assert_eq!(out, "alice@example.com long enough segment here");
         assert_eq!(ml.queries_used, 0, "give_up → 不发起查询");
     }
@@ -2483,11 +2669,50 @@ mod tests {
         let mut ml = MlScrub::new(&args);
         ml.budget_start = Some(Instant::now() - ML_TOTAL_BUDGET - Duration::from_millis(50));
         let mut report = RedactReport::default();
-        let out = ml.augment("alice@example.com long enough segment here", &mut report);
+        let out = ml.augment(
+            "alice@example.com long enough segment here",
+            &[],
+            &mut report,
+        );
         assert_eq!(out, "alice@example.com long enough segment here");
         assert!(ml.give_up, "超预算 → give_up");
         assert!(ml.degraded, "超预算 → degraded");
         assert_eq!(ml.queries_used, 0, "超预算 → 不发起查询");
+    }
+
+    #[test]
+    fn ml_only_engine_still_scrubs_hard_fingerprint_with_daemon_absent() {
+        // 移植加固(ADR 0024 hostile review):engine=ml 是结果再脱敏的**第三触发器**,但 daemon 缺席
+        // (测试环境无 daemon.json)时,PostToolUse 结果里的硬指纹 secret 仍被**硬指纹地板**scrub ——
+        // ML 是地板之上的**加性**增强,daemon 缺失 → `ml_augment` 降级(give_up),地板不塌。这正是
+        // fail-closed 不变量:ML 路径任何缺失/超时都回落硬指纹,绝不 fail-open 放行未脱敏内容。
+        let td = tempfile::TempDir::new().unwrap();
+        let tok = "ghp_0123456789abcdefABCDEF0123456789abcd";
+        let event = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": { "file_path": "/x/.env" },
+            "tool_response": { "content": format!("token is {tok} end") },
+        });
+        let mut cur = Cursor::new(event.to_string().into_bytes());
+        let args = HookArgs {
+            cli: CliKind::Claude,
+            ledger_path: Some(td.path().join("ledger.sqlite3")),
+            injection: None,       // 注入关
+            redact_results: false, // 结果再脱敏关 —— **仅**靠 engine=ml 触发再脱敏路径
+            engine: Some(EngineMode::Ml),
+            ..HookArgs::default()
+        };
+        let out = run(&args, &mut cur);
+        let s = redacted_output(&out).to_string();
+        assert!(
+            !s.contains(tok),
+            "ml-only engine with daemon absent must still hard-fingerprint scrub ghp_, got: {s}"
+        );
+        assert!(
+            s.contains("REDACTED"),
+            "expected a [REDACTED ...] placeholder (floor held), got: {s}"
+        );
     }
 
     #[test]
@@ -4007,41 +4232,6 @@ mod tests {
         assert!(
             s.contains("REDACTED"),
             "expected a [REDACTED ...] placeholder, got: {s}"
-        );
-    }
-
-    #[test]
-    fn ml_only_engine_still_scrubs_hard_fingerprint_with_daemon_absent() {
-        // 移植加固(ADR 0024 hostile review):engine=ml 是结果再脱敏的**第三触发器**,但 daemon 缺席
-        // (测试环境无 daemon.json)时,PostToolUse 结果里的硬指纹 secret 仍被**硬指纹地板**scrub ——
-        // ML 是地板之上的**加性**增强,daemon 缺失 → `ml_augment` 降级(give_up),地板不塌。这正是
-        // fail-closed 不变量:ML 路径任何缺失/超时都回落硬指纹,绝不 fail-open 放行未脱敏内容。
-        let td = tempfile::TempDir::new().unwrap();
-        let tok = "ghp_0123456789abcdefABCDEF0123456789abcd";
-        let event = json!({
-            "hook_event_name": "PostToolUse",
-            "tool_name": "Read",
-            "tool_input": { "file_path": "/x/.env" },
-            "tool_response": { "content": format!("token is {tok} end") },
-        });
-        let mut cur = Cursor::new(event.to_string().into_bytes());
-        let args = HookArgs {
-            cli: CliKind::Claude,
-            ledger_path: Some(td.path().join("ledger.sqlite3")),
-            injection: None,       // 注入关
-            redact_results: false, // 结果再脱敏关 —— **仅**靠 engine=ml 触发再脱敏路径
-            engine: Some(EngineMode::Ml),
-            ..HookArgs::default()
-        };
-        let out = run(&args, &mut cur);
-        let s = redacted_output(&out).to_string();
-        assert!(
-            !s.contains(tok),
-            "ml-only engine with daemon absent must still hard-fingerprint scrub ghp_, got: {s}"
-        );
-        assert!(
-            s.contains("REDACTED"),
-            "expected a [REDACTED ...] placeholder (floor held), got: {s}"
         );
     }
 
