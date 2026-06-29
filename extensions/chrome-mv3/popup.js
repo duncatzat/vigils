@@ -5,20 +5,19 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
 (() => {
     "use strict";
 
-    const ONBOARDING_KEY = "vigilPopupOnboarded";
-
     const listEl = document.getElementById("findings-list");
-    const emptyHintEl = document.getElementById("empty-hint");
-    const countLabel = document.getElementById("count-label");
+    const emptyStateEl = document.getElementById("empty-state");
     const clearBtn = document.getElementById("clear-btn");
     const optionsLink = document.getElementById("options-link");
-    const statusPill = document.getElementById("status-pill");
-    const statusLabel = document.getElementById("status-label");
-    const onboardingCard = document.getElementById("onboarding-card");
-    const onboardingDoneBtn = document.getElementById("onboarding-done-btn");
-    const pageStatusTitle = document.getElementById("page-status-title");
-    const pageStatusDetail = document.getElementById("page-status-detail");
-    const protectCurrentBtn = document.getElementById("protect-current-btn");
+    const headerStatus = document.getElementById("header-status");
+    const statusText = document.getElementById("status-text");
+    const statusDomain = document.getElementById("status-domain");
+    const banner = document.getElementById("banner");
+    const bannerDomain = document.getElementById("banner-domain");
+    const protectBtn = document.getElementById("protect-btn");
+    const foldHeader = document.getElementById("fold-header");
+    const foldBody = document.getElementById("fold-body");
+    const eventCount = document.getElementById("event-count");
 
     let currentPageSite = null;
     let lastRenderedFindings = "";
@@ -79,18 +78,27 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
         });
     }
 
-    function setHeaderStatus(label, tone) {
-        if (!statusPill || !statusLabel) return;
-        statusLabel.textContent = label;
-        statusPill.classList.toggle("status-pill-warn", tone === "warn");
-        statusPill.classList.toggle("status-pill-muted", tone === "muted");
+    function setHeaderStatus(tone) {
+        if (!headerStatus) return;
+        headerStatus.className = "header-status";
+        if (tone === "warn") {
+            headerStatus.classList.add("warn");
+        } else if (tone === "muted") {
+            headerStatus.classList.add("muted");
+        }
     }
 
-    function setPageStatus(title, detail, tone, canProtect) {
-        pageStatusTitle.textContent = title;
-        pageStatusDetail.textContent = detail;
-        protectCurrentBtn.classList.toggle("hidden", !canProtect);
-        setHeaderStatus(title, tone);
+    function setPageStatus(title, domain, tone, canProtect) {
+        if (statusText) statusText.textContent = title;
+        if (statusDomain) statusDomain.textContent = domain ? `· ${domain}` : "";
+        setHeaderStatus(tone);
+
+        if (banner) {
+            banner.classList.toggle("hidden", !canProtect);
+            if (canProtect && bannerDomain) {
+                bannerDomain.textContent = domain || "当前网站";
+            }
+        }
     }
 
     function eventKindLabel(kind) {
@@ -102,13 +110,16 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
         return labels[kind] || "操作时";
     }
 
-    function actionLabel(action) {
-        const labels = {
-            allow: "已放行",
-            confirm_redact: "已建议脱敏",
-            block: "已阻断",
-        };
-        return labels[action] || "已拦截";
+    function actionIconClass(action) {
+        if (action === "block") return "block";
+        if (action === "allow") return "allow";
+        return "warn";
+    }
+
+    function actionIconText(action) {
+        if (action === "block") return "✕";
+        if (action === "allow") return "✓";
+        return "⚠️";
     }
 
     function findingLabel(kind) {
@@ -137,39 +148,41 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
         listEl.replaceChildren();
 
         if (!Array.isArray(items) || items.length === 0) {
-            emptyHintEl.classList.remove("hidden");
+            emptyStateEl.classList.remove("hidden");
             listEl.classList.add("hidden");
-            countLabel.textContent = "最近 0 条";
+            if (eventCount) {
+                eventCount.classList.add("hidden");
+                eventCount.textContent = "0";
+            }
             return;
         }
 
-        emptyHintEl.classList.add("hidden");
+        emptyStateEl.classList.add("hidden");
         listEl.classList.remove("hidden");
-        countLabel.textContent = `最近 ${items.length} 条`;
+        if (eventCount) {
+            eventCount.classList.remove("hidden");
+            eventCount.textContent = String(items.length);
+        }
 
         for (const it of items) {
             const li = document.createElement("li");
-            li.classList.add("vigil-animate-in");
+            li.classList.add("event-row");
 
-            const tag = document.createElement("span");
-            tag.className = `tag tag-${it.action || "block"}`;
-            tag.textContent = actionLabel(it.action);
-
-            const col = document.createElement("div");
-
-            const title = document.createElement("strong");
+            const iconClass = actionIconClass(it.action);
+            const iconText = actionIconText(it.action);
             const findingNames = Array.isArray(it.findings) && it.findings.length > 0
                 ? it.findings.map(findingLabel).join("、")
                 : "风险内容";
-            title.textContent = `${eventKindLabel(it.event_kind)}检测到 ${findingNames}`;
-            col.appendChild(title);
 
-            const metaLine = document.createElement("div");
-            metaLine.className = "meta-line";
-            metaLine.textContent = `${it.origin || "当前网站"} · ${fmtTs(it.ts)}`;
-            col.appendChild(metaLine);
+            li.innerHTML = `
+                <div class="event-row-icon ${iconClass}">${iconText}</div>
+                <div class="event-row-body">
+                    <div class="title">${eventKindLabel(it.event_kind)}检测到 ${findingNames}</div>
+                    <div class="meta">${it.origin || "当前网站"} · ${fmtTs(it.ts)}</div>
+                </div>
+                <div class="event-row-arrow">›</div>
+            `;
 
-            li.append(tag, col);
             listEl.appendChild(li);
         }
     }
@@ -183,7 +196,8 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
         const resp = await sendRuntimeMessage({ type: "vigil_get_mode" });
         const mode = resp && resp.mode === "enterprise" ? "enterprise" : "consumer";
         if (mode === "enterprise") {
-            setHeaderStatus("企业保护", "ok");
+            if (statusText) statusText.textContent = "企业保护";
+            setHeaderStatus("ok");
         }
     }
 
@@ -199,12 +213,7 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
 
         if (!parsed || !["http:", "https:"].includes(parsed.protocol)) {
             currentPageSite = null;
-            setPageStatus(
-                "未保护",
-                "当前页面不是普通网页，Vigils 不会在这里读取输入内容。",
-                "muted",
-                false,
-            );
+            setPageStatus("未保护", "", "muted", false);
             return;
         }
 
@@ -214,18 +223,13 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
             : `${parsed.origin}/*`;
         const allowed = await permissionsContains(pattern);
         if (allowed) {
-            setPageStatus(
-                "已保护",
-                `${parsed.hostname} 的复制、粘贴和发送会被本地检查。`,
-                "ok",
-                false,
-            );
+            setPageStatus("保护中", parsed.hostname, "ok", false);
             return;
         }
 
         setPageStatus(
-            "需要授权",
-            `${parsed.hostname} 尚未加入保护范围。`,
+            "待授权",
+            parsed.hostname,
             "warn",
             Boolean(currentPageSite && currentPageSite.ok),
         );
@@ -233,11 +237,11 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
 
     async function protectCurrentSite() {
         if (!currentPageSite || !currentPageSite.ok) return;
-        protectCurrentBtn.disabled = true;
+        protectBtn.disabled = true;
         try {
             const permission = await requestOriginPermission(currentPageSite.pattern);
             if (!permission.granted) {
-                setPageStatus("需要授权", "你取消了该网站权限请求。", "warn", true);
+                setPageStatus("待授权", currentPageSite.host, "warn", true);
                 return;
             }
             const added = await sendRuntimeMessage({
@@ -245,32 +249,14 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
                 site: currentPageSite,
             });
             if (!added || !added.ok) {
-                setPageStatus("需要授权", "权限已授权，但保存保护网站失败。", "warn", true);
+                setPageStatus("待授权", "保存保护网站失败", "warn", true);
                 return;
             }
-            setPageStatus(
-                "已保护",
-                `${currentPageSite.host} 已加入保护范围。刷新页面后生效。`,
-                "ok",
-                false,
-            );
+            setPageStatus("保护中", currentPageSite.host, "ok", false);
         } finally {
-            protectCurrentBtn.disabled = false;
+            protectBtn.disabled = false;
         }
     }
-
-    function refreshOnboarding() {
-        chrome.storage.local.get([ONBOARDING_KEY], (got) => {
-            if (chrome.runtime.lastError) return;
-            onboardingCard.classList.toggle("hidden", Boolean(got && got[ONBOARDING_KEY]));
-        });
-    }
-
-    onboardingDoneBtn.addEventListener("click", () => {
-        chrome.storage.local.set({ [ONBOARDING_KEY]: true }, () => {
-            onboardingCard.classList.add("hidden");
-        });
-    });
 
     clearBtn.addEventListener("click", () => {
         chrome.runtime.sendMessage({ type: "vigil_clear_findings" }, () => {
@@ -279,7 +265,15 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
         });
     });
 
-    protectCurrentBtn.addEventListener("click", protectCurrentSite);
+    // 折叠事件列表
+    if (foldHeader) {
+        foldHeader.addEventListener("click", () => {
+            foldHeader.classList.toggle("open");
+            foldBody.classList.toggle("open");
+        });
+    }
+
+    protectBtn.addEventListener("click", protectCurrentSite);
 
     optionsLink.addEventListener("click", (ev) => {
         ev.preventDefault();
@@ -289,8 +283,7 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
     });
 
     (() => {
-        setHeaderStatus("检查中", "muted");
-        refreshOnboarding();
+        setHeaderStatus("muted");
         refreshEvents();
         refreshCurrentPage();
         refreshModeLabel();
