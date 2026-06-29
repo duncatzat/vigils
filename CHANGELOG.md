@@ -8,6 +8,107 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [Unreleased]
+
+### Security
+
+- **`VIGIL-SEC-ML-SKIP` closed (`secret://` face).** `MlScrub::augment` no longer skips ML for an entire
+  string leaf merely because it contains a literal `secret://`. A `secret://<alias>` placeholder is
+  pipeline-produced (reverse-substituted by the redaction pass, its byte range recorded in the
+  `protected` set), so `apply_wire_spans` keeps ML off it via interval subtraction while same-leaf
+  soft-PII (person / address / email) is now scrubbed — closing an ML-recall gap where an
+  attacker-embedded `secret://x` beside soft-PII suppressed semantic redaction (no leak; the
+  hard-fingerprint floor always held). The `vigil://redact/` skip is retained (those Tier-B tokens
+  arrive in tool output, not pipeline-produced, so their ranges can't be trusted into `protected`); a
+  forged `secret://…` in tool output is likewise not in `protected`, so PII it wraps is still scrubbed.
+  Verified by adversarial review, a falsifiable real-machine comparison (old binary suppressed soft-PII
+  vs. fixed binary scrubs it while the `secret://` placeholder survives), and an end-to-end acceptance
+  assertion.
+
+---
+
+## [v0.4.4] — 2026-06-29 — macOS daemon socket robustness on a deep `$HOME` (`sun_path` overflow fix)
+
+On macOS the daemon's default socket path (`~/Library/Application Support/Vigil/vigil-daemon.sock`) could
+exceed the `sockaddr_un.sun_path` limit (104 bytes) under a deep `$HOME` — an enterprise network home
+(`/Network/Servers/…`) or a sandboxed `$TMPDIR` — making `daemon start` fail with a cryptic libc error
+and silently degrading ML protection to the hard-fingerprint floor.
+
+### Fixed
+
+- **`VIGIL_DAEMON_SOCKET` env override** lets the daemon socket path be set explicitly — a short,
+  user-private escape hatch for deep-`$HOME` deployments (and deterministic test sandboxes). Resolved
+  once in `default_socket_name()`, it flows through `daemon.json` to the hook client unchanged, so the
+  server bind and client connect always agree.
+- **Actionable bind-time guard.** A socket path at or over the `sun_path` capacity is now rejected with a
+  clear error naming `VIGIL_DAEMON_SOCKET`, instead of the opaque libc message. Touches none of the
+  single-instance / peer-credential (R1) / stale-reclaim invariants — the env only supplies a string they
+  already consume.
+
+---
+
+## [v0.4.3] — 2026-06-29 — `VIGIL-SEC-OVERLAP-PH`: protected-region subtraction stops broken nested placeholders
+
+The daemon ML pass runs over already-redacted text (containing `[REDACTED …]` placeholders). An ML span
+could over-capture into a placeholder and slice it (`[[REDACTED address]DACTED email]`). No raw value
+leaked (the sliced bytes were placeholder; the real value was already scrubbed), but the model-facing
+output was malformed.
+
+### Fixed
+
+- **`apply_wire_spans` subtracts genuine placeholder ranges.** The redaction pass now reports the byte
+  ranges of the placeholders it inserts (`scrub_text_with_spans`); the hook fuses redact + ML into one
+  pass and plumbs those *genuine* ranges into `apply_wire_spans`, which subtracts them from each ML span
+  and only replaces the bytes outside a placeholder. The ranges come from the pipeline's own output,
+  never from regex-matching `[REDACTED …]` shapes — so a forged placeholder in tool output cannot shield
+  the PII it wraps.
+
+---
+
+## [v0.4.2] — 2026-06-26 — GUI auto-installs the ML engine variant + signed engine manifest (ML last-mile)
+
+### Added
+
+- **One-click ML engine install from the desktop GUI.** The Settings AI-Model card downloads and swaps in
+  the per-platform ML engine variant (format-agnostic zip/tar), closing the last mile so a default
+  install can become ML-capable without manual binary juggling.
+- **Signed engine manifest.** The engine manifest is signed in CI (minisign) and verified against a
+  pubkey embedded in the GUI before any engine swap, so a tampered or man-in-the-middled manifest is
+  rejected.
+
+### Fixed
+
+- Engine-manifest default URL points at the GitHub release asset (the prior `vigils.ai` mirror returned
+  SPA HTML for `/releases/engine/`, breaking the turnkey path).
+
+---
+
+## [v0.4.1] — 2026-06-26 — P1 overlapping-span PII leak fix + v0.4.0 distribution fixes
+
+Release-acceptance testing of v0.4.0 against the published artifacts surfaced a redaction-path leak and
+four packaging/distribution bugs; all are fixed here.
+
+### Security
+
+- **P1: overlapping-span PII leak (two sites).** Two independent span-replacement sites
+  (`vigil-redaction::build_redacted_text`, `vigil-hub-cli::apply_wire_spans`) used right-to-left replace
+  with skip-on-overlap; nested model spans (where the outer span's prefix is PII) leaked the outer
+  plaintext prefix. Both rewritten to **union-merge** (like the gateway `redact_string`), so every byte
+  hit by any span lands in a replacement.
+
+### Fixed
+
+- **Linux `model install` timeout** — a fixed 30 s per-chunk timeout was shorter than a 48 MB chunk needs
+  on a bandwidth-shared link, so the turnkey download failed; loosened.
+- **macOS daemon R1 / stale socket** — `peer_creds().pid()` is `None` on macOS (R1 now falls back to an
+  euid check) and a file socket wasn't reclaimed after an unclean exit (permanent `EADDRINUSE`); both
+  fixed via a private-directory filesystem socket + stale-reclaim in `transport.rs`.
+- **ML archives missing `vigil-native-host`** — the browser native-messaging host is now bundled in the
+  ML variant archives.
+- **Windows `.sha256` CRLF** — checksum files are flagged when they carry CRLF line endings.
+
+---
+
 ## [v0.4.0] — 2026-06-26 — resident daemon brings ML privacy filtering to the hook main path (ADR 0024) + model-install turnkey + GUI controls
 
 The AI privacy models (DeBERTa injection + PII NER) now run on the **hook main protection path**, not

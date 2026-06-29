@@ -8,6 +8,92 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [Unreleased]
+
+### 安全
+
+- **`VIGIL-SEC-ML-SKIP` 闭合(`secret://` 面)。** `MlScrub::augment` 不再因字符串 leaf 含字面
+  `secret://` 就整段跳 ML。`secret://<alias>` 占位符由脱敏流程**自产**(逆向替换写入、字节区间已记入
+  `protected` 集),`apply_wire_spans` 经区间减法保其不被 ML 切,同段 soft-PII(person / address / email)
+  得以正常脱敏 —— 闭合一处 ML-recall gap:攻击者在 soft-PII 旁嵌字面 `secret://x` 即抑制该 leaf 的语义
+  脱敏(无泄漏;硬指纹地板始终兜住)。`vigil://redact/` skip 保留(这类 Tier-B token 在 tool_output 中、
+  非自产,区间无法可信加入 `protected`);tool_output 中**伪造**的 `secret://…` 同样不在 `protected`,其
+  包裹的 PII 仍被 scrub。经对抗式审查、可证伪真机对比(旧二进制抑制 soft-PII vs 修复后 scrub 且
+  `secret://` 占位符保留)、端到端验收断言验证。
+
+---
+
+## [v0.4.4] — 2026-06-29 — 深 `$HOME` 下 macOS daemon socket 健壮性(`sun_path` 溢出修复)
+
+macOS 上 daemon 默认 socket 路径(`~/Library/Application Support/Vigil/vigil-daemon.sock`)在深 `$HOME`
+下 —— 企业网络 home(`/Network/Servers/…`)或 sandbox 的 `$TMPDIR` —— 可能超出 `sockaddr_un.sun_path`
+上限(104 字节),令 `daemon start` 以晦涩 libc 错误失败,并把 ML 防护静默降级到硬指纹地板。
+
+### 修复
+
+- **`VIGIL_DAEMON_SOCKET` env 覆盖** 让 daemon socket 路径可显式指定 —— 深 `$HOME` 部署(及确定性测试
+  sandbox)的短、用户私有逃生口。在 `default_socket_name()` 一处解析,经 `daemon.json` 原样流向 hook
+  客户端,故 server bind 与 client connect 始终一致。
+- **可操作的 bind 时守门。** socket 路径达到或超过 `sun_path` 容量时,以明确指向 `VIGIL_DAEMON_SOCKET`
+  的错误拒绝,而非晦涩 libc 消息。不触及单实例 / peer-credential(R1)/ stale-reclaim 任一不变量 ——
+  env 只提供它们已消费的字符串。
+
+---
+
+## [v0.4.3] — 2026-06-29 — `VIGIL-SEC-OVERLAP-PH`:受保护区减法消除破碎嵌套占位符
+
+daemon ML pass 跑在已脱敏(含 `[REDACTED …]` 占位符)的文本上。ML span 可能 over-capture 延伸进占位符
+并切碎它(`[[REDACTED address]DACTED email]`)。无原值泄漏(被切的是占位符字节;真值已脱敏),但面向模型的
+输出畸形。
+
+### 修复
+
+- **`apply_wire_spans` 减去真实占位符区间。** 脱敏流程现在报告它插入的占位符字节区间
+  (`scrub_text_with_spans`);hook 把 redact + ML 融合为单遍,把这些**真实**区间 plumb 进
+  `apply_wire_spans`,后者从每个 ML span 减去它们、只替换占位符之外的字节。区间来自流程**自产**输出,
+  绝不靠正则识别 `[REDACTED …]` 形态 —— 故 tool_output 中伪造的占位符无法遮蔽其包裹的 PII。
+
+---
+
+## [v0.4.2] — 2026-06-26 — GUI 自动安装 ML 引擎变体 + 签名引擎清单(ML 最后一公里)
+
+### 新增
+
+- **桌面 GUI 一键安装 ML 引擎。** 设置页 AI 模型卡下载并换入逐平台 ML 引擎变体(格式无关 zip/tar),
+  闭合最后一公里 —— 默认安装无需手动倒腾二进制即可变为 ML 可用。
+- **签名引擎清单。** 引擎清单在 CI 中签名(minisign),换引擎前经 GUI 内嵌 pubkey 核验,故被篡改或
+  中间人的清单被拒。
+
+### 修复
+
+- 引擎清单默认 URL 指向 GitHub release 资产(此前 `vigils.ai` 镜像对 `/releases/engine/` 返回 SPA
+  HTML,破坏 turnkey 路径)。
+
+---
+
+## [v0.4.1] — 2026-06-26 — P1 重叠 span PII 泄漏修复 + v0.4.0 分发 bug 修复
+
+对 v0.4.0 已发布产物的发布验收测试,暴露出一处脱敏路径泄漏与四个打包/分发 bug;此处全部修复。
+
+### 安全
+
+- **P1:重叠 span PII 泄漏(两处)。** 两处独立 span 替换点(`vigil-redaction::build_redacted_text`、
+  `vigil-hub-cli::apply_wire_spans`)旧用右→左替换 + 重叠跳过;嵌套 model span(外层前缀是 PII)时泄漏
+  外层明文前缀。两处均改写为 **union-merge**(对齐网关 `redact_string`),令任一 span 命中的每个字节都
+  落入某替换区间。
+
+### 修复
+
+- **Linux `model install` 超时** —— 固定 30 秒每-chunk 超时短于 48MB chunk 在带宽共享链路上所需,
+  turnkey 下载失败;已放宽。
+- **macOS daemon R1 / stale socket** —— `peer_creds().pid()` 在 macOS 上为 `None`(R1 改回落 euid
+  核验),且文件 socket 在非干净退出后未回收(永久 `EADDRINUSE`);经私有目录文件 socket + stale-reclaim
+  在 `transport.rs` 修复。
+- **ML 归档缺 `vigil-native-host`** —— 浏览器 native-messaging host 现已捆进 ML 变体归档。
+- **Windows `.sha256` CRLF** —— 校验和文件携带 CRLF 行尾时被标记。
+
+---
+
 ## [v0.4.0] — 2026-06-26 — 常驻 daemon 把 ML 隐私过滤带上 hook 主防护路径(ADR 0024)+ 模型安装 turnkey + GUI 控制
 
 AI 隐私模型(DeBERTa 注入 + PII NER)现在跑在 **hook 主防护路径**上,而不只是 `serve`/`wrap`。常驻
