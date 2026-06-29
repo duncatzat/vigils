@@ -97,10 +97,15 @@ jobs:
               inblk { print }
             ' "$1"
           }
-          # English body (authoritative).
+          # English body (authoritative). A stable tag MUST carry a "## [<tag>]" CHANGELOG section:
+          # v0.4.1–v0.4.4 shipped with fallback notes precisely because this step silently fell back
+          # when the section was missing. Fail stable builds; beta/rc (tag carries '-') may fall back.
           extract CHANGELOG.md > "$notes" || true
           if [ ! -s "$notes" ]; then
-            printf 'Vigils %s — a local-first control plane for AI agents.\n' "$tag" > "$notes"
+            case "$tag" in
+              *-*) printf 'Vigils %s — a local-first control plane for AI agents.\n' "$tag" > "$notes" ;;
+              *) echo "::error::CHANGELOG.md has no '## [$tag]' section — add it (and CHANGELOG.zh-CN.md) before tagging a stable release" >&2; exit 1 ;;
+            esac
           fi
           # Chinese as a clearly-separated section (never interleaved).
           zh="$(extract CHANGELOG.zh-CN.md 2>/dev/null || true)"
