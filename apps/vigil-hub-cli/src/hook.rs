@@ -2641,7 +2641,10 @@ mod tests {
         let mut report = RedactReport::default();
         let kept = ml.augment("vigil://redact/abc123 trailing text here", &[], &mut report);
         assert_eq!(kept, "vigil://redact/abc123 trailing text here");
-        assert!(!ml.degraded, "vigil://redact/ 段早返回,不查 daemon → 不降级");
+        assert!(
+            !ml.degraded,
+            "vigil://redact/ 段早返回,不查 daemon → 不降级"
+        );
         assert_eq!(report.ml_hits, 0);
     }
 
