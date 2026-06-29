@@ -13,12 +13,14 @@ case "$(uname -s)/$(uname -m)" in
   *) echo "unsupported $(uname -s)/$(uname -m)"; exit 2 ;;
 esac
 SBX="${TMPDIR:-/tmp}/vigil-dreg-$$"; rm -rf "$SBX"; mkdir -p "$SBX/home"
+# macOS $TMPDIR 过长 → 默认 socket 超 sun_path(104)。env 指定 sandbox 内短路径(见 transport.rs)。
 export HOME="$SBX/home" XDG_DATA_HOME="$SBX/home/.local/share" \
-       XDG_CONFIG_HOME="$SBX/home/.config" XDG_CACHE_HOME="$SBX/home/.cache"
+       XDG_CONFIG_HOME="$SBX/home/.config" XDG_CACHE_HOME="$SBX/home/.cache" \
+       VIGIL_DAEMON_SOCKET="$SBX/d.sock"
 HUB="$SBX/ml/vigil-hub"; P=0; F=0
 ok(){ printf '  PASS %s\n' "$*"; P=$((P+1)); }; no(){ printf '  FAIL %s\n' "$*"; F=$((F+1)); }
 cleanup(){ pkill -f "$SBX/ml/vigil-hub" 2>/dev/null || true
-           rm -f /tmp/vigil-daemon.sock /private/tmp/vigil-daemon.sock 2>/dev/null || true; rm -rf "$SBX"; }
+           rm -rf "$SBX"; }
 trap cleanup EXIT
 
 curl -fsSL -o "$SBX/ml.tgz" "https://github.com/$REPO/releases/download/$VERSION/vigils-cli-ml-${PLAT}.tar.gz" \

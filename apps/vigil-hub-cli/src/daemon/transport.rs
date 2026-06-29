@@ -36,6 +36,21 @@ use super::server::{handle_connection, DaemonCaps};
 ///   **用户私有数据目录下的显式文件 socket**(与 daemon.json 同目录;cross-user 由目录权限排除),
 ///   配合 bind 前 stale 清理 + euid 版 R1(见 [`bind`] / [`connect_and_verify`])。
 pub fn default_socket_name() -> String {
+    // `VIGIL_DAEMON_SOCKET`(非空)显式覆盖:测试确定性 + 企业网络/深 HOME(默认路径撑爆
+    // macOS `sun_path` 104 时,见 [`bind`] 守门)的逃生口。否则按平台默认。
+    resolve_socket_name(std::env::var("VIGIL_DAEMON_SOCKET").ok().as_deref())
+}
+
+/// socket 名解析:显式覆盖(非空)优先,否则平台默认。抽纯函数以单测覆盖逻辑(免动全局 env)。
+fn resolve_socket_name(explicit: Option<&str>) -> String {
+    match explicit {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => platform_default_socket_name(),
+    }
+}
+
+/// 平台默认 socket 标识(无 env 覆盖时)。见 [`default_socket_name`] 的平台行为说明。
+fn platform_default_socket_name() -> String {
     #[cfg(target_os = "macos")]
     {
         dirs::data_local_dir()
@@ -69,6 +84,10 @@ pub fn bind(socket_name: &str) -> io::Result<interprocess::local_socket::Listene
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::fs::PermissionsExt;
+        // macOS `sockaddr_un.sun_path` = 104(含 NUL):深 HOME(企业网络 home / 自定义 data dir)
+        // 下 socket 路径可能超限,libc 仅给晦涩 "exceeds capacity"。提前用可操作错误拒绝并指向
+        // `VIGIL_DAEMON_SOCKET` 逃生口(否则 daemon 静默启动失败 → ML 防护降级硬指纹)。
+        check_macos_sun_path_len(socket_name)?;
         // bind 早于 write_daemon_info(其会建目录)→ 先确保父目录在并 **0700**(仅 owner;
         // 不把 `~/Library` 默认权限当唯一屏障 —— 防同主机跨用户连接,且回退 temp 路径下也成立)。
         if let Some(parent) = std::path::Path::new(socket_name).parent() {
@@ -108,6 +127,25 @@ fn reclaim_stale_socket(path: &str) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let _ = std::fs::remove_file(path); // 连续探测均失败 → 确属 stale → 删之以便重绑
+}
+
+/// macOS:socket 路径 byte 长度须 < `sockaddr_un.sun_path` 容量(104,含末尾 NUL)。超限 →
+/// 可操作 `InvalidInput`(指向 `VIGIL_DAEMON_SOCKET`),而非 libc 晦涩错误 / 静默 bind 失败。
+#[cfg(target_os = "macos")]
+fn check_macos_sun_path_len(socket_name: &str) -> io::Result<()> {
+    const SUN_PATH_MAX: usize = 104; // sizeof(sockaddr_un.sun_path),含末尾 NUL
+    if socket_name.len() >= SUN_PATH_MAX {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "daemon socket path is {} bytes, exceeds macOS sun_path capacity ({}); \
+                 set VIGIL_DAEMON_SOCKET to a shorter path",
+                socket_name.len(),
+                SUN_PATH_MAX
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// server accept 循环:每连接 spawn [`handle_connection`](thread-per-conn,简化;bounded 后续)。
@@ -205,7 +243,12 @@ mod tests {
     use super::super::client::DaemonInfo;
     use super::super::protocol::{Request, Response, PROTOCOL_VERSION};
     use super::super::server::DaemonCaps;
-    use super::{bind, connect_and_verify, query_with, serve};
+    #[cfg(target_os = "macos")]
+    use super::check_macos_sun_path_len;
+    use super::{
+        bind, connect_and_verify, platform_default_socket_name, query_with, resolve_socket_name,
+        serve,
+    };
 
     fn unique_sock(tag: &str) -> String {
         // 唯一名(进程 id + tag):防与真 daemon / 并行测试碰撞;**不碰真 daemon.json**。
@@ -295,5 +338,33 @@ mod tests {
             query_with(&info_for(&sock, "wrong-token"), &Request::Status).is_none(),
             "错 token → 服务端 Error → None"
         );
+    }
+
+    #[test]
+    fn explicit_socket_override_is_honored() {
+        // 非空 VIGIL_DAEMON_SOCKET 字面值优先(测试确定性 + 企业深 HOME 逃生口)。
+        assert_eq!(resolve_socket_name(Some("/short/d.sock")), "/short/d.sock");
+    }
+
+    #[test]
+    fn empty_or_absent_override_falls_back_to_platform_default() {
+        // 空串 / 未设 → 平台默认(不让空 env 顶掉真实路径)。
+        assert_eq!(
+            resolve_socket_name(Some("")),
+            platform_default_socket_name()
+        );
+        assert_eq!(resolve_socket_name(None), platform_default_socket_name());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_overlong_socket_path_rejected_with_actionable_error() {
+        // 超 sun_path(104)→ 可操作 InvalidInput,文案含逃生口 env 名;典型生产路径放行。
+        let long = format!("/{}", "a".repeat(110));
+        let err = check_macos_sun_path_len(&long).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("VIGIL_DAEMON_SOCKET"));
+        check_macos_sun_path_len("/Users/u/Library/Application Support/Vigil/vigil-daemon.sock")
+            .unwrap();
     }
 }

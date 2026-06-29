@@ -40,6 +40,16 @@ detects a defect propagates its exit code, and `run.sh` exits non-zero (earlier 
   `transport.rs` (euid-based R1 + `GenericFilePath`).
 - **macOS stale-socket** — `daemon-regression.sh` fails if `daemon start` can't rebind after
   `kill -9` (filesystem socket not reclaimed). Fixed in the same change.
+- **macOS socket-path too long (`sun_path`)** — on a deep `$HOME` (the acceptance sandbox under
+  macOS's long `$TMPDIR`, or enterprise network homes like `/Network/Servers/...`), the default
+  `~/Library/Application Support/Vigil/vigil-daemon.sock` (≈123 B) exceeds `sockaddr_un.sun_path`
+  (104) → `daemon start` bind fails → ML protection silently degrades to hard-fingerprints. Fixed
+  in `transport.rs`: a `VIGIL_DAEMON_SOCKET` env override (short, user-private escape hatch; the
+  acceptance scripts set `$SBX/d.sock`) **plus** an actionable bind-time guard that rejects
+  over-length paths and names the env var (instead of a cryptic libc error). Touches none of the
+  R1 / single-instance / stale-reclaim invariants (the env only supplies a string they already
+  consume). Regression: `explicit_socket_override_is_honored`,
+  `macos_overlong_socket_path_rejected_with_actionable_error`.
 - **Windows `.sha256` CRLF** — `local-audit.sh` flags CRLF line endings in checksum files.
 - **Overlapping-span PII leak (found during macOS daemon hook-ML)** — two independent
   span-replacement sites (`vigil-redaction` `build_redacted_text`, `vigil-hub-cli`
