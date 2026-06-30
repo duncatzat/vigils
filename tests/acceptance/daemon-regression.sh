@@ -23,8 +23,9 @@ cleanup(){ pkill -f "$SBX/ml/vigil-hub" 2>/dev/null || true
            rm -rf "$SBX"; }
 trap cleanup EXIT
 
-curl -fsSL -o "$SBX/ml.tgz" "https://github.com/$REPO/releases/download/$VERSION/vigils-cli-ml-${PLAT}.tar.gz" \
-  || { echo "download failed"; exit 1; }
+curl -fsSL --connect-timeout 20 --speed-limit 10000 --speed-time 30 --retry 3 --retry-delay 5 --max-time 600 \
+  -o "$SBX/ml.tgz" "https://github.com/$REPO/releases/download/$VERSION/vigils-cli-ml-${PLAT}.tar.gz" \
+  || { echo "download failed (or too slow: <10KB/s for 30s)"; exit 1; }
 mkdir -p "$SBX/ml"; tar -xzf "$SBX/ml.tgz" -C "$SBX/ml"; chmod +x "$HUB"
 
 wait_running(){ for i in $(seq 1 25); do sleep 1; "$HUB" daemon status 2>&1 | grep -q 'running (pid' && return 0; done; return 1; }
