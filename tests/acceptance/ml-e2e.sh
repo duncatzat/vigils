@@ -35,7 +35,8 @@ cleanup(){ "$HUB" daemon stop >/dev/null 2>&1 || true
 trap cleanup EXIT
 
 echo "### ML hook-ML e2e: $ARCHIVE (RUN_ML_MODEL=$RUN_ML_MODEL) ###"
-curl -fsSL -o "$SBX/ml.$EXT" "$URL" || { echo "download $URL failed"; exit 1; }
+curl -fsSL --connect-timeout 20 --speed-limit 10000 --speed-time 30 --retry 3 --retry-delay 5 --max-time 600 \
+  -o "$SBX/ml.$EXT" "$URL" || { echo "download $URL failed (or too slow: <10KB/s for 30s)"; exit 1; }
 mkdir -p "$SBX/ml"; tar -xzf "$SBX/ml.$EXT" -C "$SBX/ml"; chmod +x "$HUB"
 
 # --- bundled dylib present, exe-adjacent, right arch ---
