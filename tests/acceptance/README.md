@@ -15,6 +15,16 @@ cp config.env.example config.env      # fill in REPO + your test-machine SSH tar
 ./run.sh v0.4.0
 ```
 
+### Unattended (CI) mode — runs itself after every release
+
+`.github/workflows/acceptance.yml` runs automatically when the **Release** workflow
+finishes (and via *Run workflow* with a tag for back-testing): on all three GitHub-hosted
+platforms it downloads the **published** assets exactly like a user, verifies sha256 +
+build-provenance attestation, then runs `user-sim.sh` + `functional-sweep.sh`; a fourth
+job runs `local-audit.sh` over the full asset set. What CI cannot cover stays on the
+internal real machines via `run.sh`: the ~1.5 GB ML model-download e2e (`ml-e2e.sh`,
+`RUN_ML_MODEL=1`) and desktop-GUI pixel verification.
+
 Passwordless SSH to each test machine must be configured. Platforms with a blank SSH
 target in `config.env` are skipped. The gate is **fail-closed**: any sub-script that
 detects a defect propagates its exit code, and `run.sh` exits non-zero (earlier `|| true`
@@ -26,6 +36,7 @@ detects a defect propagates its exit code, and `run.sh` exits non-zero (earlier 
 |-------|--------|-------|--------|
 | 1 Local audit | `local-audit.sh` | `gh`, `file`, `python3`+`pynacl` | all CLI `sha256` (+CRLF lint), per-platform binary **architecture** (flat-collision regression), **`vigil-native-host` bundled** in CLI archives (browser native-messaging), ML **dylib bundling** exe-adjacent + arch + ORT version, desktop **minisign** signatures (crypto verify), **OTA** manifest version/url |
 | 2 Runtime e2e (Linux/macOS) | `ml-e2e.sh` | test machine | ML binary runs; dylib loads; turnkey `model install`→`daemon start`→`engine set ml`→hook; **R1** daemon reachability; **ML scrubs semantic PII** (person/address) beyond hard-fingerprints; **fail-closed** (no leak, exit 0); then runs `functional-sweep.sh` against the same published binary |
+| 2 User-journey sim | `user-sim.sh` | any `vigil-hub` (`HUB=…`) | simulates a fresh user end-to-end: `--version` → `quickstart` (agent detection + honest skip labels) → `demo` (funnels to `setup --all`) → **turnkey `setup --all` install → status ACTIVE → uninstall with canonical-JSON config-restore assert** (uppercase server names wrapped via slugified ids) → daemon lifecycle (**uptime ticks**, clean `stop` output) → `checkpoint` platform-correct tip → `verify` anchored. Sandboxed via `$HOME`/XDG on Linux/macOS; write-path journeys gated to throwaway envs on Windows |
 | 2 Functional sweep | `functional-sweep.sh` (+ `mcp_probe.py`) | any `vigil-hub` (`HUB=…`) | core protection scenarios: `demo` audit-chain + redaction roundtrip, `demo --tamper` chain-break **falsifiability**, hook PreToolUse **deny** (exit 2, no raw echo), hook PostToolUse **redact** + overlap well-formed (no leak), posture/engine persistence, `inspect`/`verify` chain, `serve --stdio` **MCP handshake** (initialize+tools/list), read-only `quickstart` |
 | 2 Runtime e2e (Linux/macOS) | `daemon-regression.sh` | test machine | **R1** peer-credential reachability + **stale-socket** rebind after `kill -9` (regresses the two macOS daemon bugs; model-less, fast) |
 | 2 Runtime e2e (Windows) | `win-acceptance.ps1` | test machine | ML binary runs; `onnxruntime.dll` LoadLibrary (PE + VC++ deps); turnkey model install; named-pipe **R1** daemon reachability |

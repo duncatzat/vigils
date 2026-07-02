@@ -1,0 +1,159 @@
+# 值守式发布验收:Release workflow 全部完成后,自动在三平台 runner 上
+# 「扮演真实用户」—— 从 GitHub 下载**已发布**产物 → sha256 + 构建溯源校验 →
+# 跑用户旅程模拟(user-sim.sh)+ 核心防护语义扫描(functional-sweep.sh),
+# 外加控制端全资产打包审计(local-audit.sh)。
+#
+# 触发:
+#   - Release workflow 成功结束(workflow_run;此时资产已全部上传,无竞态)
+#   - 手动 workflow_dispatch(tag 输入)—— 用于补跑历史版本
+#
+# 分工:本工作流覆盖「无头可测」的用户面(CLI 全旅程)。ML 模型下载 e2e
+# (~1.5 GB)与桌面 GUI 像素级验证仍走内部真机(tests/acceptance/run.sh +
+# scripts/test-local/uv-gui-*),见 tests/acceptance/README.md。
+name: User Acceptance
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test (e.g. v0.4.6-beta.1)"
+        required: true
+
+permissions:
+  contents: read
+  # gh attestation verify 走公开 API,contents:read 足够
+
+jobs:
+  user-sim:
+    # workflow_run 触发时:仅在 Release 成功、且确为 tag 构建时跑
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset: vigils-cli-linux-x64.tar.gz
+            bin: vigil-hub
+          - os: macos-latest
+            asset: vigils-cli-macos-arm64.tar.gz
+            bin: vigil-hub
+          - os: windows-latest
+            asset: vigils-cli-windows-x64.zip
+            bin: vigil-hub.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Testing published release: $TAG"
+
+      - name: Download published asset as a user would
+        shell: bash
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            -R "${{ github.repository }}" \
+            -p "${{ matrix.asset }}" -p "${{ matrix.asset }}.sha256" \
+            -D dl --clobber
+          ls -la dl/
+
+      - name: Verify sha256 (fail-closed)
+        shell: bash
+        run: |
+          cd dl
+          python3 -c "import hashlib,sys;a=sys.argv[1];w=open(a+'.sha256',encoding='utf-8').read().split()[0];g=hashlib.sha256(open(a,'rb').read()).hexdigest();print('want',w);print('got ',g);sys.exit(0 if w==g else 1)" "${{ matrix.asset }}"
+
+      - name: Verify build provenance (SLSA attestation)
+        shell: bash
+        run: |
+          gh attestation verify "dl/${{ matrix.asset }}" -R "${{ github.repository }}"
+
+      - name: Unpack
+        shell: bash
+        run: |
+          mkdir -p bin
+          case "${{ matrix.asset }}" in
+            *.tar.gz) tar -xzf "dl/${{ matrix.asset }}" -C bin ;;
+            *.zip)    unzip -oq "dl/${{ matrix.asset }}" -d bin ;;
+          esac
+          ls -la bin/
+
+      - name: "User-journey simulation (user-sim.sh)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" bash tests/acceptance/user-sim.sh | tee usim.out
+
+      - name: "Core-protection sweep (functional-sweep.sh)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" bash tests/acceptance/functional-sweep.sh | tee sweep.out
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## ${{ matrix.os }} — ${{ steps.tag.outputs.tag }}"
+            echo '```'
+            grep -E "SUMMARY|FAIL " usim.out sweep.out 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  local-audit:
+    # 控制端全资产审计:checksums+CRLF、逐平台二进制架构、ML dylib 捆绑、
+    # 桌面 minisign 签名、OTA manifest —— 复用既有 local-audit.sh
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Install signature-verify deps
+        run: pip install pynacl
+      - name: Run local artifact audit
+        shell: bash
+        run: |
+          VERSION="${{ steps.tag.outputs.tag }}" REPO="${{ github.repository }}" \
+            bash tests/acceptance/local-audit.sh | tee audit.out
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## local-audit — ${{ steps.tag.outputs.tag }}"
+            echo '```'
+            grep -E "SUMMARY|FAIL " audit.out 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
