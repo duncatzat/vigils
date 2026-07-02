@@ -810,6 +810,13 @@ fn localize_daemon(c: Command, lang: Lang) -> Command {
             "Check whether the daemon is running",
             "查看 daemon 是否在运行",
         ))
+        .mut_arg("json", |a| {
+            a.help(s(
+                lang,
+                "Machine-readable JSON (stable schema, locale-independent; for scripts/CI)",
+                "机器可读 JSON(schema 稳定、与界面语言无关;供脚本/CI 断言)",
+            ))
+        })
     });
     c.mut_subcommand("stop", |sc| {
         sc.about(s(lang, "Stop the running daemon", "停止正在运行的 daemon"))
@@ -1045,7 +1052,10 @@ mod tests {
     #[derive(Subcommand, Debug)]
     enum MirrorDaemon {
         Start,
-        Status,
+        Status {
+            #[arg(long)]
+            json: bool,
+        },
         Stop,
     }
     #[derive(Subcommand, Debug)]

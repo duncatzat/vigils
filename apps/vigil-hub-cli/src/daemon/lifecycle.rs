@@ -144,19 +144,68 @@ pub fn run_start(lang: Lang) -> Result<(), String> {
     Ok(())
 }
 
+/// `daemon status --json` 的三态(与人类可读输出同一判定,只换 render)。
+enum StatusState {
+    NotRunning,
+    Running {
+        pid: u32,
+        pii_loaded: bool,
+        inj_loaded: bool,
+        uptime_secs: u64,
+        inflight: u32,
+    },
+    /// daemon.json 有记录但 query 联系不上(已退出 / pid 被重用 / 超时)。
+    Stale { recorded_pid: u32 },
+}
+
+/// `--json` 的稳定输出 schema:机器可读、与界面语言无关(locale 事故根治面)。
+/// 兼容性纪律:字段只增不删不改名;`running` 恒在;非 running 态带 `reason`。
+fn status_json(state: &StatusState) -> serde_json::Value {
+    match state {
+        StatusState::NotRunning => serde_json::json!({
+            "running": false,
+            "reason": "not-running",
+        }),
+        StatusState::Running {
+            pid,
+            pii_loaded,
+            inj_loaded,
+            uptime_secs,
+            inflight,
+        } => serde_json::json!({
+            "running": true,
+            "pid": pid,
+            "pii_loaded": pii_loaded,
+            "inj_loaded": inj_loaded,
+            "uptime_secs": uptime_secs,
+            "inflight": inflight,
+        }),
+        StatusState::Stale { recorded_pid } => serde_json::json!({
+            "running": false,
+            "reason": "stale-or-unresponsive",
+            "recorded_pid": recorded_pid,
+        }),
+    }
+}
+
 /// `vigil-hub daemon status`:读 daemon.json + 试 `query_daemon(Status)` 报告运行态。
 ///
 /// daemon.json 缺 → 未运行;存在但 query 失败(未响应 / R1 不符 / 超时)→ 陈旧或异常。
-pub fn run_status(lang: Lang) -> Result<(), String> {
+/// `json=true` 输出 [`status_json`] 的稳定 schema(供脚本/CI;人类文案走 i18n 会随语言变)。
+pub fn run_status(lang: Lang, json: bool) -> Result<(), String> {
     let Some(info) = daemon_info_path().and_then(|p| read_daemon_info(&p)) else {
-        println!(
-            "{}",
-            tr(
-                lang,
-                "daemon: not running (no daemon.json)",
-                "daemon:未运行(无 daemon.json)",
-            )
-        );
+        if json {
+            println!("{}", status_json(&StatusState::NotRunning));
+        } else {
+            println!(
+                "{}",
+                tr(
+                    lang,
+                    "daemon: not running (no daemon.json)",
+                    "daemon:未运行(无 daemon.json)",
+                )
+            );
+        }
         return Ok(());
     };
     match query_daemon(Request::Status, Duration::from_secs(2)) {
@@ -165,32 +214,58 @@ pub fn run_status(lang: Lang) -> Result<(), String> {
             inj_loaded,
             uptime_secs,
             inflight,
-        }) => match lang {
-            Lang::En => println!(
-                "daemon: running (pid={}, pii_loaded={}, inj_loaded={}, uptime={}s, inflight={})",
-                info.pid, pii_loaded, inj_loaded, uptime_secs, inflight
-            ),
-            Lang::Zh => println!(
-                "daemon:运行中(pid={};PII 模型 {};注入模型 {};已运行 {}s;处理中 {})",
-                info.pid,
-                if pii_loaded { "已暖载" } else { "未加载" },
-                if inj_loaded { "已暖载" } else { "未加载" },
-                uptime_secs,
-                inflight
-            ),
-        },
-        _ => match lang {
-            Lang::En => println!(
-                "daemon: recorded (pid={}) but not responding -- it may have exited, or this pid \
-                 is now reused by another program (not the original Vigil daemon). Re-run vigil-hub daemon start.",
-                info.pid
-            ),
-            Lang::Zh => println!(
-                "daemon:有记录(pid={}),但联系不上 —— 可能已退出,或这个 pid 已被别的程序占用 \
-                 (并非原来的 Vigil 守护进程)。可重新运行 vigil-hub daemon start。",
-                info.pid
-            ),
-        },
+        }) => {
+            if json {
+                println!(
+                    "{}",
+                    status_json(&StatusState::Running {
+                        pid: info.pid,
+                        pii_loaded,
+                        inj_loaded,
+                        uptime_secs,
+                        inflight,
+                    })
+                );
+                return Ok(());
+            }
+            match lang {
+                Lang::En => println!(
+                    "daemon: running (pid={}, pii_loaded={}, inj_loaded={}, uptime={}s, inflight={})",
+                    info.pid, pii_loaded, inj_loaded, uptime_secs, inflight
+                ),
+                Lang::Zh => println!(
+                    "daemon:运行中(pid={};PII 模型 {};注入模型 {};已运行 {}s;处理中 {})",
+                    info.pid,
+                    if pii_loaded { "已暖载" } else { "未加载" },
+                    if inj_loaded { "已暖载" } else { "未加载" },
+                    uptime_secs,
+                    inflight
+                ),
+            }
+        }
+        _ => {
+            if json {
+                println!(
+                    "{}",
+                    status_json(&StatusState::Stale {
+                        recorded_pid: info.pid
+                    })
+                );
+                return Ok(());
+            }
+            match lang {
+                Lang::En => println!(
+                    "daemon: recorded (pid={}) but not responding -- it may have exited, or this pid \
+                     is now reused by another program (not the original Vigil daemon). Re-run vigil-hub daemon start.",
+                    info.pid
+                ),
+                Lang::Zh => println!(
+                    "daemon:有记录(pid={}),但联系不上 —— 可能已退出,或这个 pid 已被别的程序占用 \
+                     (并非原来的 Vigil 守护进程)。可重新运行 vigil-hub daemon start。",
+                    info.pid
+                ),
+            }
+        }
     }
     Ok(())
 }
@@ -276,7 +351,7 @@ fn kill_pid(lang: Lang, pid: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::generate_token;
+    use super::{generate_token, status_json, StatusState};
 
     #[test]
     fn generate_token_is_32_hex_chars_and_varies() {
@@ -285,5 +360,33 @@ mod tests {
         assert_eq!(a.len(), 32, "128-bit → 32 hex 字符");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "必须全 hex: {a}");
         assert_ne!(a, b, "per-launch token 应随机不同");
+    }
+
+    /// `--json` 稳定 schema 三态守门:脚本/CI 断言 `"running":true|false` + 各字段名。
+    /// 字段只增不删不改名 —— 本测试即该纪律的回归锚。
+    #[test]
+    fn status_json_stable_schema_three_states() {
+        let running = status_json(&StatusState::Running {
+            pid: 42,
+            pii_loaded: true,
+            inj_loaded: false,
+            uptime_secs: 7,
+            inflight: 3,
+        });
+        assert_eq!(running["running"], true);
+        assert_eq!(running["pid"], 42);
+        assert_eq!(running["pii_loaded"], true);
+        assert_eq!(running["inj_loaded"], false);
+        assert_eq!(running["uptime_secs"], 7);
+        assert_eq!(running["inflight"], 3);
+
+        let not_running = status_json(&StatusState::NotRunning);
+        assert_eq!(not_running["running"], false);
+        assert_eq!(not_running["reason"], "not-running");
+
+        let stale = status_json(&StatusState::Stale { recorded_pid: 42 });
+        assert_eq!(stale["running"], false);
+        assert_eq!(stale["reason"], "stale-or-unresponsive");
+        assert_eq!(stale["recorded_pid"], 42);
     }
 }

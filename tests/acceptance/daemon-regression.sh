@@ -29,7 +29,14 @@ curl -fsSL --connect-timeout 20 --speed-limit 10000 --speed-time 30 --retry 3 --
   || { echo "download failed (or too slow: <10KB/s for 30s)"; exit 1; }
 mkdir -p "$SBX/ml"; tar -xzf "$SBX/ml.tgz" -C "$SBX/ml"; chmod +x "$HUB"
 
-wait_running(){ for i in $(seq 1 25); do sleep 1; "$HUB" daemon status 2>&1 | grep -q 'running (pid' && return 0; done; return 1; }
+# 状态断言:`--json` 稳定契约(schema 与 locale 无关)优先;老版本(无该 flag)fallback
+# 到钉 VIGIL_LANG=en 的文案 grep。探测一次,后续断言走同一函数。
+if "$HUB" daemon status --help 2>/dev/null | grep -q -- '--json'; then
+  d_running(){ "$HUB" daemon status --json 2>/dev/null | grep -q '"running":true'; }
+else
+  d_running(){ "$HUB" daemon status 2>&1 | grep -q 'running (pid'; }
+fi
+wait_running(){ for i in $(seq 1 25); do sleep 1; d_running && return 0; done; return 1; }
 
 echo "### daemon regression ($PLAT, model-less) ###"
 nohup "$HUB" daemon start >"$SBX/d1.log" 2>&1 & D1=$!
