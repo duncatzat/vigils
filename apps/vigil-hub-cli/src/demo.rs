@@ -638,9 +638,7 @@ fn ending_screen(lang: Lang) {
             println!("    provider was simulated.");
             println!();
             println!("    Protect your real agent:");
-            println!(
-                "      vigil-hub serve --stdio      # point Claude Code / Codex / Cursor at it"
-            );
+            println!("      vigil-hub setup --all        # one command, reversible");
             println!();
         }
         Lang::Zh => {
@@ -662,7 +660,7 @@ fn ending_screen(lang: Lang) {
             println!("    都是 Vigil 真实的运行时代码 —— 只有模型 / 工具一侧是模拟的。");
             println!();
             println!("    保护你真实的 agent:");
-            println!("      vigil-hub serve --stdio      # 把 Claude Code / Codex / Cursor 指向它");
+            println!("      vigil-hub setup --all        # 一条命令接入,全程可逆");
             println!();
         }
     }

@@ -75,8 +75,8 @@ enum Command {
     /// 锚定审计链头(ADR 0020):把当前链头快照写入与账本分离的 append-only sidecar
     /// (`<ledger>.checkpoints`)。周期运行(或 cron)即可检出**整链重写**——哈希链单独检不出的篡改。
     ///
-    /// 安全建议:把 `.checkpoints` 设为 OS append-only(`chattr +a`)或异地同步,锚点才能完全闭合
-    /// "持完整本地写权限者整链重写"。
+    /// 安全建议:把 `.checkpoints` 设为 OS append-only(Linux:`chattr +a`;macOS:`chflags uappnd`)
+    /// 或异地同步(含 Windows 均适用),锚点才能完全闭合"持完整本地写权限者整链重写"。
     Checkpoint(CliCheckpointArgs),
     /// 校验审计链:先链内一致性(防篡断裂),再比对 checkpoint 锚点(防整链重写)。三态如实输出。
     Verify(CliVerifyArgs),
@@ -110,8 +110,9 @@ enum Command {
 
 #[derive(clap::Args, Debug)]
 struct CliPostureArgs {
+    /// 省略子命令 = `show`(裸 `vigil-hub posture` 直接给当前值,不甩 help;F-11)。
     #[command(subcommand)]
-    command: PostureCommand,
+    command: Option<PostureCommand>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -131,8 +132,9 @@ enum PostureCommand {
 
 #[derive(clap::Args, Debug)]
 struct CliEngineArgs {
+    /// 省略子命令 = `show`(同 posture;F-11)。
     #[command(subcommand)]
-    command: EngineCommand,
+    command: Option<EngineCommand>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -149,8 +151,9 @@ enum EngineCommand {
 
 #[derive(clap::Args, Debug)]
 struct CliDaemonArgs {
+    /// 省略子命令 = `status`(裸 `vigil-hub daemon` 报运行态;`start`/`stop` 仍需显式;F-11)。
     #[command(subcommand)]
-    command: DaemonCommand,
+    command: Option<DaemonCommand>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -305,8 +308,8 @@ struct CliSetupArgs {
     /// Vigil 的 effect 提取词表内 → 提取不出 effect → enforce 下一律 default-deny = 真实 server **全部
     /// 不可用**(turnkey 一键接入直接打挂用户现有工作流 = 采用毒药)。monitor 姿态保留全部硬地板
     /// (裸 secret 拦截 + 结果脱敏可逆往返 + 显式 Deny + descriptor drift),只把 default-deny **地板**
-    /// 降级为观察放行 —— 实际交付的价值(脱敏 + 审计 + 输入拦截)全在,且 server 可用。Codex 评估
-    /// 与三方研究一致(93% 审批被未读即批 → 审批门是剧场;确定性脱敏 >> 阻塞审批)。
+    /// 降级为观察放行 —— 实际交付的价值(脱敏 + 审计 + 输入拦截)全在,且 server 可用。业界研究也一致:
+    /// 绝大多数审批弹窗被未读即批,拦截式审批容易沦为形式,而确定性脱敏保护始终生效。
     /// 想要硬拦语义(已知工具集 / 自建 server / 高保障场景)再显式 `--enforce`。
     #[arg(long)]
     enforce: bool,
@@ -328,10 +331,10 @@ struct CliSetupArgs {
     /// --apply` 两步合一(两者写不同文件、互不冲突)。`--all --uninstall` 撤销两者;`--all --dry-run`
     /// 预览两者;MCP 侧默认 monitor 姿态(加 `--enforce` 升级硬拦)。
     ///
-    /// 与只读操作 `--status` / `--doctor` **互斥**(Codex D13 HIGH:否则 `--all --status` 会因
-    /// `--all` 优先而**变成写操作**,破坏只读契约)—— clap 在 parse 期即拒绝该组合,fail-fast 防惊吓写入。
-    /// 也与 `--mcp` 互斥(Codex D13 R2 nit:`--all` 已含 MCP wrap,`--mcp` 此处会被静默忽略 = 歧义;
-    /// 拒绝逼用户明确用 `--all` **或** `--mcp` 之一)。
+    /// 与只读操作 `--status` / `--doctor` **互斥**(否则 `--all --status` 会因 `--all` 优先而
+    /// **变成写操作**,破坏只读预期)—— 该组合在解析期即被拒绝,避免意外写入。
+    /// 也与 `--mcp` 互斥(`--all` 已包含 MCP wrap,叠加 `--mcp` 会被静默忽略造成歧义;
+    /// 请二选一:`--all` 或 `--mcp`)。
     #[arg(long, conflicts_with_all = ["status", "doctor", "mcp"])]
     all: bool,
 }
@@ -682,7 +685,7 @@ fn run_engine(lang: Lang, args: CliEngineArgs) -> std::process::ExitCode {
         );
         return std::process::ExitCode::FAILURE;
     };
-    match args.command {
+    match args.command.unwrap_or(EngineCommand::Show) {
         EngineCommand::Show => {
             let loaded = engine_config::load_engine(&path);
             if let Some(w) = &loaded.warning {
@@ -729,7 +732,7 @@ fn run_engine(lang: Lang, args: CliEngineArgs) -> std::process::ExitCode {
 /// `vigil-hub daemon start|status`(ADR 0024):前台启动 / 查询常驻 daemon。逻辑在
 /// [`daemon::lifecycle`];本处只做分发 + ExitCode 映射。
 fn run_daemon(lang: Lang, args: CliDaemonArgs) -> std::process::ExitCode {
-    let result = match args.command {
+    let result = match args.command.unwrap_or(DaemonCommand::Status) {
         DaemonCommand::Start => daemon::lifecycle::run_start(lang),
         DaemonCommand::Status => daemon::lifecycle::run_status(lang),
         DaemonCommand::Stop => daemon::lifecycle::run_stop(lang),
@@ -772,7 +775,7 @@ fn run_posture(lang: Lang, args: CliPostureArgs) -> std::process::ExitCode {
         );
         return std::process::ExitCode::FAILURE;
     };
-    match args.command {
+    match args.command.unwrap_or(PostureCommand::Show) {
         PostureCommand::Show => {
             let loaded = posture::load_posture(&path);
             if let Some(w) = &loaded.warning {
@@ -1470,8 +1473,10 @@ fn run_agent_hook_legs(
                             "已安装但已失效(重跑 `vigil-hub setup` 刷新)",
                         )
                         .to_string(),
+                        // 「hook 未注册」而非「未安装」—— 本段说的是 Vigil hook 的注册态;
+                        // 「未安装」会被读成"该 agent CLI 没装"(F-5:机器上明明装着 Codex)。
                         ProtectionState::NotInstalled => {
-                            tr(lang, "not installed", "未安装").to_string()
+                            tr(lang, "hook not registered", "hook 未注册").to_string()
                         }
                     },
                     setup_hooks::AgentHookOp::Install { dry_run } => {
@@ -1566,7 +1571,9 @@ fn print_setup_all(
         println!("  [1/2] {hook_label}: {did}");
     }
 
-    // [2/2] MCP 网关 wrap(脱敏 + 审计 + 审批 + descriptor pin)
+    // [2/2] MCP 网关 wrap(脱敏 + 审计 + 审批 + descriptor pin)。
+    // 标注 scope(Claude Code):本计数只含 Claude 的 user+local server;Codex/Cursor/Windsurf
+    // 各有独立段落 —— 不标注会让用户误以为这就是全局总数(F-6:真机 22 个被读成 1 个)。
     let total = mcp.total_changed();
     match lang {
         Lang::En => {
@@ -1575,7 +1582,7 @@ fn print_setup_all(
             } else {
                 "wrapped"
             };
-            println!("  [2/2] MCP gateway: {verb} {total} server(s)");
+            println!("  [2/2] MCP gateway (Claude Code): {verb} {total} server(s); other agents follow below");
         }
         Lang::Zh => {
             let verb = if op == "uninstall" {
@@ -1583,7 +1590,7 @@ fn print_setup_all(
             } else {
                 "已防护"
             };
-            println!("  [2/2] MCP 网关:{verb} {total} 个服务器");
+            println!("  [2/2] MCP 网关(Claude Code):{verb} {total} 个服务器;其它 agent 见下方各段");
         }
     }
     if mcp.local_skipped > 0 {
@@ -1852,14 +1859,24 @@ fn print_mcp_apply(lang: Lang, r: &setup_mcp::McpApplyReport, op: &str) -> std::
         (Lang::Zh, false) => "防护",
     };
     let total = r.total_changed();
+    // 「改动写入配置文件」只在真写盘时声称(0 改动 / dry-run 未写文件,措辞失实 = F-6c)。
+    let wrote = total > 0 && !r.dry_run;
     match lang {
         Lang::En => println!(
-            "Vigil setup --mcp --{op}{dry}: {verb} {what} {total} MCP server(s) in {}",
-            r.claude_json.display()
+            "Vigil setup --mcp --{op}{dry}: {verb} {what} {total} MCP server(s){}",
+            if wrote {
+                format!(" in {}", r.claude_json.display())
+            } else {
+                format!(" ({} untouched)", r.claude_json.display())
+            }
         ),
         Lang::Zh => println!(
-            "Vigil setup --mcp --{op}{dry}:{verb}{what} {total} 个 MCP 服务器,改动写入配置文件 {}",
-            r.claude_json.display()
+            "Vigil setup --mcp --{op}{dry}:{verb}{what} {total} 个 MCP 服务器{}",
+            if wrote {
+                format!(",改动写入配置文件 {}", r.claude_json.display())
+            } else {
+                format!("(配置文件 {} 未改动)", r.claude_json.display())
+            }
         ),
     }
     // 分 scope 报告:local scope(projects.*)用**项目限定 server-id**(跨项目同名不串账本)。
@@ -1964,10 +1981,63 @@ fn print_mcp_server_preview(
             );
         }
         McpServerClass::Skipped { name, reason } => {
-            // reason 是 setup_mcp 产出的英文分类码(如 non-stdio),保持原样。
-            println!("  [SKIP] {name} -- {reason}");
+            // reason 是 setup_mcp 产出的英文分类码;zh 输出按已知前缀映射中文,未知则原样
+            // (F-4:英文整句混进中文预览)。
+            match lang {
+                Lang::En => println!("  [SKIP] {name} -- {reason}"),
+                Lang::Zh => println!("  [SKIP] {name} —— {}", skip_reason_zh(reason)),
+            }
         }
     }
+}
+
+/// 把 `setup_mcp` 的英文 Skip 分类码按**稳定前缀**映射为中文(未知原样返回,fail-open 到英文)。
+/// 分类码是 `&'static str` 且仅在 setup_mcp 内定义 —— 前缀匹配足够稳,免为文案引入枚举 ripple。
+fn skip_reason_zh(reason: &str) -> String {
+    const MAP: &[(&str, &str)] = &[
+        (
+            "appears already wrapped under a wrapper prefix",
+            "疑似已被 wrapper 前缀(stdbuf/sh/env…)包裹 —— 跳过,避免嵌套",
+        ),
+        (
+            "Vigil's own server/gateway entry",
+            "Vigil 自身的 server/网关条目 —— 绝不包裹(会自我嵌套)",
+        ),
+        (
+            "remote (http/sse) server",
+            "远程(http/sse)server —— HTTP MCP 的包裹在后续版本支持",
+        ),
+        (
+            "non-stdio or malformed `type`",
+            "非 stdio 或 `type` 字段异常 —— 当前版本不包裹",
+        ),
+        (
+            "`args` is present but not an array",
+            "`args` 存在但不是数组(形状异常)—— 原样未动",
+        ),
+        (
+            "entry has no `command`",
+            "条目缺 `command`(形状异常)—— 原样未动",
+        ),
+        (
+            "`args` has a non-string element",
+            "`args` 含非字符串元素(形状异常)—— 原样未动",
+        ),
+        (
+            "`command` is a single shell string with quotes",
+            "`command` 是含引号的单条 shell 字符串;请在 MCP 配置里拆成 `command` + `args` 数组后再保护",
+        ),
+        (
+            "single-string `command` is itself a vigil-hub invocation",
+            "单串 `command` 本身就是一次 vigil-hub 调用 —— 跳过,避免二次包裹",
+        ),
+    ];
+    for (prefix, zh) in MAP {
+        if reason.starts_with(prefix) {
+            return (*zh).to_string();
+        }
+    }
+    reason.to_string()
 }
 
 fn print_mcp_preview(lang: Lang, r: &setup_mcp::McpPreviewReport) -> std::process::ExitCode {
@@ -2174,16 +2244,25 @@ fn print_codex_apply(lang: Lang, r: &setup_mcp::CodexApplyReport, op: &str) {
         (Lang::Zh, true) => "还原",
         (Lang::Zh, false) => "防护",
     };
+    let wrote = r.changed > 0 && !r.dry_run;
     match lang {
         Lang::En => println!(
-            "Vigil setup --mcp --{op}{dry} (Codex): {verb} {what} {} MCP server(s) in {}",
+            "Vigil setup --mcp --{op}{dry} (Codex): {verb} {what} {} MCP server(s){}",
             r.changed,
-            r.codex_config.display()
+            if wrote {
+                format!(" in {}", r.codex_config.display())
+            } else {
+                format!(" ({} untouched)", r.codex_config.display())
+            }
         ),
         Lang::Zh => println!(
-            "Vigil setup --mcp --{op}{dry}(Codex):{verb}{what} {} 个 MCP 服务器,改动写入配置文件 {}",
+            "Vigil setup --mcp --{op}{dry}(Codex):{verb}{what} {} 个 MCP 服务器{}",
             r.changed,
-            r.codex_config.display()
+            if wrote {
+                format!(",改动写入配置文件 {}", r.codex_config.display())
+            } else {
+                format!("(配置文件 {} 未改动)", r.codex_config.display())
+            }
         ),
     }
     if let Some(b) = &r.backup {
@@ -2274,18 +2353,27 @@ fn print_json_agent_apply(lang: Lang, r: &setup_mcp::JsonAgentApplyReport, op: &
         (Lang::Zh, true) => "还原",
         (Lang::Zh, false) => "防护",
     };
+    let wrote = r.changed > 0 && !r.dry_run;
     match lang {
         Lang::En => println!(
-            "Vigil setup --mcp --{op}{dry} ({}): {verb} {what} {} MCP server(s) in {}",
+            "Vigil setup --mcp --{op}{dry} ({}): {verb} {what} {} MCP server(s){}",
             r.display_name,
             r.changed,
-            r.config_path.display()
+            if wrote {
+                format!(" in {}", r.config_path.display())
+            } else {
+                format!(" ({} untouched)", r.config_path.display())
+            }
         ),
         Lang::Zh => println!(
-            "Vigil setup --mcp --{op}{dry}({}):{verb}{what} {} 个 MCP 服务器,改动写入配置文件 {}",
+            "Vigil setup --mcp --{op}{dry}({}):{verb}{what} {} 个 MCP 服务器{}",
             r.display_name,
             r.changed,
-            r.config_path.display()
+            if wrote {
+                format!(",改动写入配置文件 {}", r.config_path.display())
+            } else {
+                format!("(配置文件 {} 未改动)", r.config_path.display())
+            }
         ),
     }
     if let Some(b) = &r.backup {

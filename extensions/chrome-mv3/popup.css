@@ -164,6 +164,14 @@ button {
 button:hover {
   background: var(--panel-soft);
 }
+/* 禁用态可视化:JS 已在非 http(s) / 已豁免时 disabled 按钮,但无样式时看起来仍可点。 */
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+button:disabled:hover {
+  background: transparent;
+}
 .actions a {
   color: var(--accent);
   text-decoration: none;

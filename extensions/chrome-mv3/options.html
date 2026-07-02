@@ -47,7 +47,7 @@
   </section>
 
   <section class="section">
-    <h2>守门档位(ISS-007)</h2>
+    <h2>守门档位</h2>
     <p class="desc">
       决定命中硬指纹后 Vigils 的行为。默认 <strong>balanced</strong>;
       in-memory 会话级设置(浏览器重启恢复默认)。
@@ -83,7 +83,7 @@
       <li>host_permissions:ChatGPT / Claude / Gemini / Perplexity 及已列入 manifest 的国内 AI 站点</li>
       <li>实时提示在网页输入框内显示;Options 仅用于安装、档位和权限说明</li>
       <li>CSP <code>script-src 'self'</code>,禁 <code>unsafe-eval</code> / 内联 script</li>
-      <li>原文永不入 chrome.storage / console.log(ADR 0009 §I-9.1)</li>
+      <li>原文永不写入 chrome.storage,也不打印到 console.log</li>
     </ul>
   </section>
 

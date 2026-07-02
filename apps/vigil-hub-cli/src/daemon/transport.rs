@@ -275,7 +275,7 @@ mod tests {
             injection: None,
             pii_loaded: false,
             inj_loaded: false,
-            uptime_secs: up,
+            started: std::time::Instant::now() - std::time::Duration::from_secs(up),
         };
         let listener = bind(sock).unwrap();
         std::thread::spawn(move || serve(listener, caps));

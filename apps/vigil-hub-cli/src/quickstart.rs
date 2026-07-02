@@ -79,9 +79,17 @@ fn agent_line(lang: Lang, label: &str, configured: bool, c: Counts) -> String {
         });
     }
     if c.skipped > 0 {
+        // `Skipped` 含多种原因(http/sse 远程、配置形状异常等)—— 不再统称 http/sse
+        // (F-4b:曾把「名字不合法」的 stdio server 错标成 http/sse,与 setup --mcp 预览矛盾)。
         parts.push(match lang {
-            Lang::En => format!("{} unsupported (http/sse)", c.skipped),
-            Lang::Zh => format!("{} 个暂不支持(http/sse)", c.skipped),
+            Lang::En => format!(
+                "{} not wrappable (http/sse or unusual shape; see `vigil-hub setup --mcp`)",
+                c.skipped
+            ),
+            Lang::Zh => format!(
+                "{} 个暂不可保护(http/sse 或形状异常;详见 vigil-hub setup --mcp)",
+                c.skipped
+            ),
         });
     }
     format!("    {label:<13} {}", parts.join(" · "))

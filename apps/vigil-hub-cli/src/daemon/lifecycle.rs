@@ -135,7 +135,7 @@ pub fn run_start(lang: Lang) -> Result<(), String> {
         injection,
         pii_loaded,
         inj_loaded,
-        uptime_secs: 0,
+        started: std::time::Instant::now(),
     };
     serve(listener, caps); // 阻塞;正常不返回(accept 循环)。
 
@@ -253,7 +253,9 @@ fn kill_pid(lang: Lang, pid: u32) -> Result<(), String> {
         c.arg(pid.to_string());
         c
     };
-    let status = cmd.status().map_err(|e| match lang {
+    // `output()` 捕获(吞掉)helper 自身的 stdout/stderr:taskkill 的本地化系统消息
+    // (非 UTF-8 代码页下还会乱码)不该混进 Vigil 的用户输出;结果仍由退出码判定。
+    let status = cmd.output().map(|o| o.status).map_err(|e| match lang {
         Lang::En => format!("failed to spawn the kill helper: {e}"),
         Lang::Zh => format!("启动结束进程助手失败:{e}"),
     })?;
