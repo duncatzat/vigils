@@ -33,6 +33,9 @@ Linux)
   Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 &
   XVFB=$!
   export DISPLAY=:99
+  # WebKitGTK 在无 GPU/GL 的 Xvfb 下,合成/DMABUF 渲染路径会「窗口在、内容全黑」——
+  # 关掉走软件绘制(两个变量覆盖新旧 WebKitGTK 版本)。
+  export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1
   "$BIN" >/dev/null 2>&1 &
   APP=$!
   sleep 10
@@ -45,9 +48,13 @@ Linux)
     [ -n "$WIN" ] && break; sleep 1
   done
   [ -n "$WIN" ] && ok "window found (id=$WIN)" || no "no window matching 'Vigils'"
+  sleep 4   # 首屏 WebView 内容绘制(软件渲染较慢)
+  # 拍窗口本体(root 上未聚焦/未提升的窗口可能不入根可视区);窗口拍不到再退回 root。
+  import -display :99 -window "${WIN:-root}" "$OUT/linux-window.png" 2>/dev/null \
+    || import -display :99 -window root "$OUT/linux-window.png" 2>/dev/null
   import -display :99 -window root "$OUT/linux-root.png" 2>/dev/null
-  SZ="$(size_of "$OUT/linux-root.png")"
-  [ -n "$SZ" ] && [ "$SZ" -gt 15000 ] && ok "screenshot non-blank (${SZ}B)" || no "screenshot blank/tiny (${SZ:-0}B)"
+  SZ="$(size_of "$OUT/linux-window.png")"
+  [ -n "$SZ" ] && [ "$SZ" -gt 15000 ] && ok "window screenshot non-blank (${SZ}B)" || no "window screenshot blank/tiny (${SZ:-0}B)"
   kill "$APP" 2>/dev/null; wait "$APP" 2>/dev/null
   kill "$XVFB" 2>/dev/null
   fin
