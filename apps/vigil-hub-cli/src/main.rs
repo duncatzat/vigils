@@ -404,6 +404,12 @@ struct CliServeArgs {
     /// 省略 = 当前工作目录(CWD)。DEF-004 之前生产入口边界为空,这两条规则形同虚设。
     #[arg(long = "project-root")]
     project_root: Vec<PathBuf>,
+    /// **Monitor 姿态**(与 `wrap --monitor` 对称):无 GUI 审批 resolver 时,把本应人审批的
+    /// 风险调用**自动放行 + 完整审计**(不阻塞 approval_wait ~300s),而非看似卡死。硬地板不变
+    /// (裸 secret 拦截 + 结果脱敏 + 显式 Deny + descriptor drift 仍在),只把 default-deny **地板**
+    /// 降级为观察放行。默认 off = enforce(default-deny + 阻塞审批)。turnkey / headless / e2e 场景用。
+    #[arg(long)]
+    monitor: bool,
     /// P0 注入防护 Slice D:启用 DeBERTa prompt-injection 软信号检测(serve warm session)。
     /// 需编译期 `--features ort`。flag on + feature off → 启动失败 InjectionClassifierUnavailable;
     /// flag off → 不加载。命中只 bump risk + 审计,绝不 deny。
@@ -442,8 +448,8 @@ impl From<CliServeArgs> for ServeArgs {
             enable_injection_classifier: sel.enable_injection_classifier,
             ml_best_effort,
             redact_tool_results: c.redact_tool_results,
-            // `serve` 子命令保持既有 enforce(default-deny + 阻塞审批);monitor 是 wrap turnkey 专用。
-            monitor: false,
+            // 默认 enforce(default-deny + 阻塞审批);`--monitor` 显式转观察放行(headless/turnkey/e2e)。
+            monitor: c.monitor,
             project_roots: serve::resolve_project_roots(&c.project_root),
         }
     }

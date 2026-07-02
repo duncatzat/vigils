@@ -107,6 +107,20 @@ jobs:
         run: |
           HUB="$PWD/bin/${{ matrix.bin }}" bash tests/acceptance/functional-sweep.sh | tee sweep.out
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: "Core-function e2e (privacy filter + secret lease, real MCP gateway)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" node tests/acceptance/core-e2e.mjs | tee core.out
+
+      - name: "Agent-integration protocol compat (Claude/Codex/Gemini/Cursor hooks)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" bash tests/acceptance/agent-compat.sh | tee compat.out
+
       - name: Job summary
         if: always()
         shell: bash
@@ -114,7 +128,7 @@ jobs:
           {
             echo "## ${{ matrix.os }} — ${{ steps.tag.outputs.tag }}"
             echo '```'
-            grep -E "SUMMARY|FAIL " usim.out sweep.out 2>/dev/null || true
+            grep -E "SUMMARY|FAIL " usim.out sweep.out core.out compat.out 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
