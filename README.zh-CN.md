@@ -131,7 +131,7 @@ vigil-hub serve --engine ml       # 严格 ML:首跑下载模型,不可用则 fa
 vigil-hub serve --engine auto     # 仅当模型已缓存且 dylib 就位才启用 ML;否则降级硬指纹,绝不下载
 ```
 
-模型从 Hugging Face(主源)拉取,带 [vigils.ai](https://vigils.ai) 镜像 fallback,逐文件 SHA-256 校验(fail-closed)。ML 构建把 [ONNX Runtime](https://onnxruntime.ai) 1.24 捆在 `vigil-hub` 同目录。**ML** 构建的平台地板:**Linux glibc ≥ 2.28**、**macOS ≥ 14** —— 默认硬指纹构建则没有。_(ML 构建从下一个 release 起提供;更早的 release 可能尚未包含。)_
+模型从 Hugging Face(主源)拉取,带 [vigils.ai](https://vigils.ai) 镜像 fallback,逐文件 SHA-256 校验(fail-closed)。ML 构建把 [ONNX Runtime](https://onnxruntime.ai) 1.24 捆在 `vigil-hub` 同目录。**ML** 构建的平台地板:**Linux glibc ≥ 2.28**、**macOS ≥ 14** —— 默认硬指纹构建则没有。_(ML 构建自 v0.4.0 起随每个 release 发布 —— 认准 `vigils-cli-ml-*` 资产。)_
 
 > 早期版本未签名;首次运行时系统可能弹出 Gatekeeper / SmartScreen 提示。
 
@@ -176,7 +176,7 @@ vigil-hub setup --all       # 一步全保护
 ```bash
 vigil-hub setup --mcp --doctor    # 接入前预检:每个被包裹的 MCP server 真能启动吗?(PATH 检查,只读)
 vigil-hub inspect protection      # 用过 agent 后:一眼看清 Vigils 拦了什么(裸 secret 拦截、泄漏脱敏、链完整)
-vigil-hub setup --all --uninstall # 干净移除全部(你的配置逐字节还原)
+vigil-hub setup --all --uninstall # 干净移除全部(只删 Vigils 自己的条目;你的配置如实还原)
 ```
 
 重启 Claude Code(或开新会话)即受保护。这是从 GitHub 下载到真实防护的最快路径。
