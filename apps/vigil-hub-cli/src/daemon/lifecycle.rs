@@ -155,7 +155,9 @@ enum StatusState {
         inflight: u32,
     },
     /// daemon.json 有记录但 query 联系不上(已退出 / pid 被重用 / 超时)。
-    Stale { recorded_pid: u32 },
+    Stale {
+        recorded_pid: u32,
+    },
 }
 
 /// `--json` 的稳定输出 schema:机器可读、与界面语言无关(locale 事故根治面)。
