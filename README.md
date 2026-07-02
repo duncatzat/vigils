@@ -83,7 +83,7 @@ testable and composed by the **Hub** (the MCP gateway).
 | **Remote auth** | `vigil-http-auth` / `vigil-http-transport` | OAuth (JWT + opaque), token refresh (singleflight), real TLS |
 | **UI protocol** | `vigil-ui-protocol` | Typed command/response contract for the desktop UI |
 | **Browser** | `vigil-browser` | Redaction classifier + audit for the extension bridge |
-| **SDK** | `vigil-sdk` | Thin, SemVer-stable facade over the engine |
+| **SDK** | `vigil-sdk` | Thin, SemVer-stable facade over the engine. The crates.io release is an early preview on its own cadence — it lags this repo; build from source for the current API |
 
 **Apps & binaries:**
 

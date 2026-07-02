@@ -56,15 +56,23 @@ VER_OUT="$("$HUB" --version)"
 
 # --- turnkey real-model path ---
 DAEMON_UP=0
+# 状态断言:`--json` 稳定契约(schema 与 locale 无关)优先;老版本 fallback 钉-en 文案 grep。
+if "$HUB" daemon status --help 2>/dev/null | grep -q -- '--json'; then
+  d_running(){ "$HUB" daemon status --json 2>/dev/null | grep -q '"running":true'; }
+  d_pii(){ "$HUB" daemon status --json 2>/dev/null | grep -q '"pii_loaded":true'; }
+else
+  d_running(){ "$HUB" daemon status 2>&1 | grep -q 'running (pid'; }
+  d_pii(){ "$HUB" daemon status 2>&1 | grep -q 'pii_loaded=true'; }
+fi
 if [ "$RUN_ML_MODEL" = "1" ]; then
   echo "  ---- model install --privacy (real ~738MB turnkey)…"
   if "$HUB" model install --privacy >"$SBX/install.log" 2>&1; then
     ok "model install --privacy (turnkey download)"
     nohup "$HUB" daemon start >"$SBX/daemon.log" 2>&1 &
-    for i in $(seq 1 40); do sleep 1; "$HUB" daemon status 2>&1 | grep -q 'running (pid' && { DAEMON_UP=1; break; }; done
+    for i in $(seq 1 40); do sleep 1; d_running && { DAEMON_UP=1; break; }; done
     if [ "$DAEMON_UP" = 1 ]; then
       ok "daemon reachable via R1 (status: running)"
-      "$HUB" daemon status 2>&1 | grep -q 'pii_loaded=true' && ok "daemon warm-loaded real PII model" || no "daemon pii_loaded != true"
+      d_pii && ok "daemon warm-loaded real PII model" || no "daemon pii_loaded != true"
     else
       no "daemon NOT reachable (R1 broken? — was the macOS pre-fix failure)"
       info=$(cat "$SBX/daemon.log" 2>/dev/null); echo "  ---- daemon.log: $info"

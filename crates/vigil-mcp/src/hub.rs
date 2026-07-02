@@ -344,6 +344,12 @@ pub struct Hub {
     oracle: Arc<dyn DescriptorOracle>,
     router: Mutex<ToolRouter>,
     upstreams: Mutex<HashMap<String, Arc<dyn McpUpstream>>>,
+    /// OAuth HTTP upstream 的 token scope 集(`server_id` → attach 期 scope 快照)。
+    /// 只有经 [`Hub::attach_upstream_with_oauth_scopes`] 挂上的 upstream 有条目;查无 →
+    /// 该 upstream 的出站评估走 [`OAuthScopeContext::NonOauth`](`ScopeNotInAllowList` 不适用)。
+    /// 快照语义:token auto-refresh 后 scope 若缩窄,按旧(更宽)集合评估只会更严不会更宽
+    /// (fail-safe 方向);扩权需重新 onboard + attach,快照随之更新。
+    upstream_oauth_scopes: Mutex<HashMap<String, Vec<String>>>,
     /// V1.1(Codex code R2):**序列化所有 stdio attach**。`spawn_attach_stdio_upstream` 全程持有,
     /// 让"早 dup 检查 → spawn → insert"对同一/不同 server_id 的并发 attach 串行 —— 杜绝两并发同名
     /// 调用都过早检查后各 spawn 一个进程再 drop 的副作用泄漏。**不**阻塞请求热路径(请求只锁
@@ -426,6 +432,7 @@ impl Hub {
             oracle,
             router: Mutex::new(ToolRouter::default()),
             upstreams: Mutex::new(HashMap::new()),
+            upstream_oauth_scopes: Mutex::new(HashMap::new()),
             attach_lock: Mutex::new(()),
             config,
             session_id: Mutex::new(None),
@@ -692,6 +699,25 @@ impl Hub {
             ));
         }
         g.insert(server_id.to_string(), upstream);
+        Ok(())
+    }
+
+    /// 同 [`Hub::attach_upstream`],并记录该 upstream 的 OAuth token scope 集(attach 期快照),
+    /// 让 `Condition::ScopeNotInAllowList` 在本 upstream 的出站 tools/call 评估上生效——
+    /// 空集也如实记录(评估走 `Scopes(vec![])`,fail-closed 触发)。非 OAuth upstream
+    /// (stdio / Bearer / 无鉴权)用 [`Hub::attach_upstream`],评估走 `NonOauth`(条件不适用)。
+    pub fn attach_upstream_with_oauth_scopes(
+        &self,
+        server_id: &str,
+        argv: &[String],
+        upstream: Arc<dyn McpUpstream>,
+        oauth_scopes: Vec<String>,
+    ) -> Result<(), HubError> {
+        self.attach_upstream(server_id, argv, upstream)?;
+        self.upstream_oauth_scopes
+            .lock()
+            .map_err(|_| HubError::LockPoisoned)?
+            .insert(server_id.to_string(), oauth_scopes);
         Ok(())
     }
 
@@ -1192,14 +1218,23 @@ impl Hub {
         }
 
         // Firewall 评估
-        // I10c-β2:当前 MCP Hub 路径是 stdio MCP(无 OAuth);未来 HTTP MCP 集成点
-        // 会在此处根据 route.kind 区分,并从 `ResolvedAccessToken.scope_set` 构造
-        // `OAuthScopeContext::Scopes`,让 `Condition::ScopeNotInAllowList` 生效。
-        let outcome = self.firewall.evaluate(
-            &invocation,
-            self.oracle.as_ref(),
-            OAuthScopeContext::NonOauth,
-        )?;
+        // OAuth HTTP upstream(经 `attach_upstream_with_oauth_scopes` 挂上)从 attach 期
+        // scope 快照构造 `OAuthScopeContext::Scopes`,让 `Condition::ScopeNotInAllowList`
+        // 生效(空 scope 集也显式 `Scopes(vec![])` → fail-closed);stdio / Bearer / 无鉴权
+        // upstream 查无条目 → `NonOauth`(条件不适用)。
+        let scope_ctx = {
+            let g = self
+                .upstream_oauth_scopes
+                .lock()
+                .map_err(|_| HubError::LockPoisoned)?;
+            match g.get(&route.server_id) {
+                Some(scopes) => OAuthScopeContext::Scopes(scopes.clone()),
+                None => OAuthScopeContext::NonOauth,
+            }
+        };
+        let outcome = self
+            .firewall
+            .evaluate(&invocation, self.oracle.as_ref(), scope_ctx)?;
         match outcome {
             FirewallOutcome::Allowed { decision, .. } => {
                 self.invoke_upstream(req, &invocation, &route, None, decision)

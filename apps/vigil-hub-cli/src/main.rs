@@ -161,7 +161,11 @@ enum DaemonCommand {
     /// 前台启动 daemon(bind 本地 socket + 写 daemon.json + serve)。单实例:已运行则失败退出。
     Start,
     /// 查 daemon 状态(读 daemon.json + 连接 query live Status,经 R1 peer-cred)。
-    Status,
+    Status {
+        /// 机器可读 JSON 输出(schema 稳定、与界面语言无关;供脚本/CI 断言)
+        #[arg(long)]
+        json: bool,
+    },
     /// 停止 daemon(R1+token 验存活后杀 daemon.json.pid;不响应则只清陈旧 json,防 pid 重用误杀)。
     Stop,
 }
@@ -738,9 +742,12 @@ fn run_engine(lang: Lang, args: CliEngineArgs) -> std::process::ExitCode {
 /// `vigil-hub daemon start|status`(ADR 0024):前台启动 / 查询常驻 daemon。逻辑在
 /// [`daemon::lifecycle`];本处只做分发 + ExitCode 映射。
 fn run_daemon(lang: Lang, args: CliDaemonArgs) -> std::process::ExitCode {
-    let result = match args.command.unwrap_or(DaemonCommand::Status) {
+    let result = match args
+        .command
+        .unwrap_or(DaemonCommand::Status { json: false })
+    {
         DaemonCommand::Start => daemon::lifecycle::run_start(lang),
-        DaemonCommand::Status => daemon::lifecycle::run_status(lang),
+        DaemonCommand::Status { json } => daemon::lifecycle::run_status(lang, json),
         DaemonCommand::Stop => daemon::lifecycle::run_stop(lang),
     };
     match result {
