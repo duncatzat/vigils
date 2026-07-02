@@ -157,3 +157,161 @@ jobs:
             grep -E "SUMMARY|FAIL " audit.out 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  desktop-smoke-windows:
+    # 已发布 NSIS 安装包:静默安装 → WebView2 CDP 深冒烟(路由遍历/双语翻转/零 console error/逐页截图)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Download published NSIS installer
+        shell: bash
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" -R "${{ github.repository }}"             -p "Vigils_${{ steps.tag.outputs.ver }}_x64-setup.exe" -D dl --clobber
+          ls -la dl/
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dl/*-setup.exe | Select-Object -First 1
+          Start-Process -Wait -FilePath $setup.FullName -ArgumentList '/S'
+          $exe = Join-Path $env:LOCALAPPDATA 'Vigils/vigils.exe'
+          if (-not (Test-Path $exe)) { $exe = Join-Path $env:LOCALAPPDATA 'Programs/Vigils/vigils.exe' }
+          if (-not (Test-Path $exe)) { Get-ChildItem -Recurse $env:LOCALAPPDATA -Filter vigils.exe -ErrorAction SilentlyContinue | Select-Object -First 3; throw 'installed vigils.exe not found' }
+          "VIGILS_EXE=$exe" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "installed at $exe"
+      - name: GUI smoke over CDP
+        shell: bash
+        run: |
+          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9222 --remote-allow-origins=*" "$VIGILS_EXE" >gui.log 2>&1 &
+          node tests/acceptance/gui-smoke.mjs 9222 gui-shots | tee gsmoke.out
+          RC=${PIPESTATUS[0]}
+          taskkill //F //IM vigils.exe >/dev/null 2>&1 || true
+          exit "$RC"
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## desktop-smoke windows — ${{ steps.tag.outputs.tag }}"
+            echo '```'
+            grep -E "SUMMARY|FAIL " gsmoke.out 2>/dev/null || echo "(no output — launch failed?)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-shots-windows-${{ steps.tag.outputs.tag }}
+          path: gui-shots/
+          if-no-files-found: ignore
+
+  desktop-smoke-linux:
+    # 已发布 .deb:安装(自动拉 WebKitGTK 依赖)→ Xvfb 启动 → 存活/窗口/截图非空
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Download published .deb
+        shell: bash
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" -R "${{ github.repository }}"             -p "Vigils_${{ steps.tag.outputs.ver }}_amd64.deb" -D dl --clobber
+      - name: Install smoke deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xdotool imagemagick
+      - name: Headless GUI smoke
+        shell: bash
+        run: |
+          DEB="$(ls dl/*.deb)" OUT=gui-shots bash tests/acceptance/gui-smoke-headless.sh | tee gsmoke.out
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## desktop-smoke linux — ${{ steps.tag.outputs.tag }}"
+            echo '```'
+            grep -E "SUMMARY|FAIL " gsmoke.out 2>/dev/null || echo "(no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-shots-linux-${{ steps.tag.outputs.tag }}
+          path: gui-shots/
+          if-no-files-found: ignore
+
+  desktop-smoke-macos:
+    # 已发布 .dmg:挂载 → 去 quarantine → 启动 → 存活/截图非空(WKWebView 无 CDP)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Download published .dmg
+        shell: bash
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" -R "${{ github.repository }}"             -p "Vigils_${{ steps.tag.outputs.ver }}_aarch64.dmg" -D dl --clobber
+      - name: Headless GUI smoke
+        shell: bash
+        run: |
+          DMG="$(ls dl/*.dmg)" OUT=gui-shots bash tests/acceptance/gui-smoke-headless.sh | tee gsmoke.out
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## desktop-smoke macos — ${{ steps.tag.outputs.tag }}"
+            echo '```'
+            grep -E "SUMMARY|FAIL " gsmoke.out 2>/dev/null || echo "(no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-shots-macos-${{ steps.tag.outputs.tag }}
+          path: gui-shots/
+          if-no-files-found: ignore
