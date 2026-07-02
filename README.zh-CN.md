@@ -80,7 +80,7 @@ Vigils 是一个由聚焦单一职责的 crate 组成的 Rust workspace,外加�
 | **远程鉴权** | `vigil-http-auth` / `vigil-http-transport` | OAuth(JWT + opaque)、token 刷新(singleflight)、真 TLS |
 | **UI 协议** | `vigil-ui-protocol` | 桌面 UI 的强类型命令/响应契约 |
 | **浏览器** | `vigil-browser` | 扩展桥接的脱敏分类器 + 审计 |
-| **SDK** | `vigil-sdk` | 引擎之上的瘦封装、SemVer 稳定 |
+| **SDK** | `vigil-sdk` | 引擎之上的瘦封装、SemVer 稳定。crates.io 上的发布是独立节奏的早期预览版,落后于本仓库;要用最新 API 请从源码构建 |
 
 **App 与二进制:**
 
