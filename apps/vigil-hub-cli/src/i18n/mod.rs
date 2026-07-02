@@ -279,14 +279,30 @@ pub fn t(lang: Lang, msg: Msg<'_>) -> String {
             }
             Lang::Zh => format!("✓ 已在事件 #{event_id} 处锚定链头(head {head}…)→ {path}"),
         },
-        Msg::CheckpointTip => match lang {
-            Lang::En => "  tip: keep that file append-only (chattr +a) or synced offsite, so a \
-                 full-history rewrite can't also forge the anchor."
-                .into(),
-            Lang::Zh => "  提示:把锚点文件设为 append-only(chattr +a)或异地同步,\
-                 这样即便有人整体重写历史,也伪造不了锚点。"
-                .into(),
-        },
+        Msg::CheckpointTip => {
+            // 平台相关命令示例:Windows 无 append-only 文件属性 → 只建议异地同步。
+            let (en_how, zh_how) = if cfg!(windows) {
+                ("sync it offsite", "把锚点文件异地同步(如网络盘 / 备份)")
+            } else if cfg!(target_os = "macos") {
+                (
+                    "make it append-only (chflags uappnd) or sync it offsite",
+                    "把锚点文件设为 append-only(chflags uappnd)或异地同步",
+                )
+            } else {
+                (
+                    "make it append-only (chattr +a) or sync it offsite",
+                    "把锚点文件设为 append-only(chattr +a)或异地同步",
+                )
+            };
+            match lang {
+                Lang::En => format!(
+                    "  tip: {en_how}, so a full-history rewrite can't also forge the anchor."
+                ),
+                Lang::Zh => {
+                    format!("  提示:{zh_how},这样即便有人整体重写历史,也伪造不了锚点。")
+                }
+            }
+        }
         Msg::CheckpointNothing => match lang {
             Lang::En => {
                 "Nothing to anchor (the ledger is empty, or there are no new events since the last \

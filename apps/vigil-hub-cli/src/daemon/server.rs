@@ -48,8 +48,8 @@ pub struct DaemonCaps {
     pub pii_loaded: bool,
     /// 注入分类器是否暖载。
     pub inj_loaded: bool,
-    /// daemon 启动至今秒数(Status 上报)。
-    pub uptime_secs: u64,
+    /// daemon 启动时刻;`Status` 的 `uptime_secs` 由此**实时计算**(存静态秒数会恒报启动值)。
+    pub started: std::time::Instant,
 }
 
 // 手写 Debug:`dyn PiiScanner` / `InjectionClassifier` 无 Debug bound;且**绝不**经 Debug 泄漏 token。
@@ -60,7 +60,7 @@ impl std::fmt::Debug for DaemonCaps {
             .field("ledger", &self.ledger.as_ref().map(|_| "<bound>"))
             .field("pii_loaded", &self.pii_loaded)
             .field("inj_loaded", &self.inj_loaded)
-            .field("uptime_secs", &self.uptime_secs)
+            .field("uptime_secs", &self.started.elapsed().as_secs())
             .finish_non_exhaustive() // token + injection 刻意省略(不入 Debug)
     }
 }
@@ -149,7 +149,7 @@ fn dispatch(req: &Request, caps: &DaemonCaps) -> Response {
         Request::Status => Response::Status {
             pii_loaded: caps.pii_loaded,
             inj_loaded: caps.inj_loaded,
-            uptime_secs: caps.uptime_secs,
+            uptime_secs: caps.started.elapsed().as_secs(),
             inflight: 0,
         },
         Request::RedactScan { text, .. } => match &caps.scanner {
@@ -265,7 +265,7 @@ mod tests {
             injection: None,
             pii_loaded: true,
             inj_loaded: false,
-            uptime_secs: 7,
+            started: std::time::Instant::now() - std::time::Duration::from_secs(7),
         }
     }
 
@@ -305,7 +305,7 @@ mod tests {
             injection: None,
             pii_loaded: false,
             inj_loaded: false,
-            uptime_secs: 7,
+            started: std::time::Instant::now() - std::time::Duration::from_secs(7),
         }
     }
 

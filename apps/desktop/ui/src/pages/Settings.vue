@@ -370,8 +370,13 @@ function updatePollingInterval(v: number | null): void {
             <div class="text-sm font-medium text-vigils-text-primary">
               {{ t("settings.daemon.title") }}
             </div>
+            <!-- 模型未装时如实降级承诺:此时启动的 daemon 两个模型都不加载,hook 走硬指纹底座。 -->
             <div class="text-xs text-vigils-text-muted mt-0.5">
-              {{ t("settings.daemon.subtitle") }}
+              {{
+                model && !(model.privacy_installed || model.injection_installed)
+                  ? t("settings.daemon.subtitle_no_model")
+                  : t("settings.daemon.subtitle")
+              }}
             </div>
           </div>
           <div class="flex items-center gap-3 shrink-0">

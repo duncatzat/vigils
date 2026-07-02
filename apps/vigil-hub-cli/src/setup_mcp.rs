@@ -260,18 +260,9 @@ fn classify_one(name: &str, entry: &Value) -> McpServerClass {
                 .collect()
         }
     };
-    // F3(Codex holistic MEDIUM):server-id 由 name 派生(`user-<name>` / `local-<hash>-<name>`),
-    // 但网关 attach 时只接受 `^[a-z0-9_-]+$`(namespace::validate_server_id)。若 name 含大写/空格/点/
-    // 斜杠等(Claude server 名可任意),改写会"apply 成功但 wrap 启动失败"(配置坏了却看不出)。
-    // 用**真验证器**校验 name —— 名合法则 `user-`/`local-<hash>-` 前缀拼接后必合法;不合法则 Skip
-    // (不改写),让用户改名后再保护,而非产出一个起不来的网关条目。
-    if vigil_mcp::namespace::validate_server_id(name).is_err() {
-        return McpServerClass::Skipped {
-            name: name.into(),
-            reason: "server name has characters not allowed in a gateway id (use a-z 0-9 _ -); \
-                     rename it in your MCP config to protect it",
-        };
-    }
+    // server 名可含大写/空格/点等任意字符(如 `Playwright`)—— 网关 id 由各派生函数经
+    // [`server_id_component`] 规约(小写 slug + 哈希去歧义),**不再因命名 Skip**(修 F-4:
+    // 专有名词大写命名极常见,让用户手动改名=成规模漏保护)。
 
     // env **键名**(只键不值;绝不读 secret 值)。
     let env_keys: Vec<String> = entry
@@ -369,15 +360,45 @@ pub fn wrapped_argv(
 /// 碰撞概率 ~ n²/2¹²⁸,对任何现实项目数天文级不可能(Codex D8 review:8 hex/32-bit 太短,要求 ≥128-bit)。
 const LOCAL_ID_HASH_HEX: usize = 32;
 
-/// 为 **user scope**(顶层 `mcpServers`)的 server 派生 server-id:`user-<name>`。
+/// 把 agent 配置里的 server 名规约成网关 id 合法组件(`^[a-z0-9_-]+$`)。
+///
+/// 名本就合法 → **原样返回**(既有用户的 server-id 逐字不变 = 向后兼容)。含大写/空格/点等
+/// 非法字符(如 `Playwright`)→ 小写化 + 非法字符折叠为 `-`,再追加 `-<sha256(原名)[:8]>`
+/// 去歧义:两个仅大小写不同的名 slug 相同,哈希后缀保证身份不塌缩;同名恒同 id(稳定)。
+/// 全部字符都不可用(如纯中文名)→ 退化为 `srv-<hash>`。修 F-4:此前直接 Skip 让用户手动
+/// 改名 —— 专有名词大写命名极常见,会成规模漏保护。
+fn server_id_component(name: &str) -> String {
+    let is_valid = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-';
+    if !name.is_empty() && name.chars().all(is_valid) {
+        return name.to_string();
+    }
+    let mut slug = String::with_capacity(name.len());
+    for c in name.to_lowercase().chars() {
+        if is_valid(c) {
+            slug.push(c);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let digest = Sha256::digest(name.as_bytes());
+    let hash = &hex::encode(digest)[..8];
+    if slug.is_empty() {
+        format!("srv-{hash}")
+    } else {
+        format!("{slug}-{hash}")
+    }
+}
+
+/// 为 **user scope**(顶层 `mcpServers`)的 server 派生 server-id:`user-<组件>`。
 ///
 /// 加 `user-` 前缀(而非裸 `<name>`)是为与 [`local_scope_server_id`] 的 `local-` 命名空间**可证不相交**
 /// —— Codex D8 R1 指出:裸名会与 local id 撞(用户若把 user-scope server 命名成形似 local id 的串,
 /// 两者在共享账本里塌缩)。两侧都由 Vigil 加 disjoint 前缀后,任意用户取名都不可能跨 scope 撞 id。
 /// 分隔符用 `-`(**非** `:`)—— `:` 不在网关 `SERVER_ID_RE = ^[a-z0-9_-]+$` 字符集内会 attach 失败
-/// (Codex D8 R2 抓的回归);`-` 合法。
+/// (Codex D8 R2 抓的回归);`-` 合法。名含非法字符时经 [`server_id_component`] 规约。
 pub fn user_scope_server_id(name: &str) -> String {
-    format!("user-{name}")
+    format!("user-{}", server_id_component(name))
 }
 
 /// 为 **local scope**(`projects.<path>.mcpServers`)的 server 派生**项目限定** server-id。
@@ -394,7 +415,7 @@ pub fn user_scope_server_id(name: &str) -> String {
 pub fn local_scope_server_id(project_path: &str, name: &str) -> String {
     let digest = Sha256::digest(project_path.as_bytes());
     let hash = &hex::encode(digest)[..LOCAL_ID_HASH_HEX];
-    format!("local-{hash}-{name}")
+    format!("local-{hash}-{}", server_id_component(name))
 }
 
 /// 枚举 **local scope**(`projects.<path>.mcpServers`)所有 server → `(project_path, 分类)`。纯函数。
@@ -846,13 +867,13 @@ pub fn codex_config_path(home: &Path) -> PathBuf {
     home.join(".codex").join("config.toml")
 }
 
-/// 为 Codex `[mcp_servers.<name>]` 条目派生 server-id:`codex-<name>`。
+/// 为 Codex `[mcp_servers.<name>]` 条目派生 server-id:`codex-<组件>`。
 ///
 /// 加 `codex-` 前缀与 [`user_scope_server_id`](`user-`)/ [`local_scope_server_id`](`local-`)
-/// 命名空间不相交。`name` 已由 [`classify_one`] 用真验证器 `validate_server_id` 过滤(`^[a-z0-9_-]+$`),
-/// 故 `codex-<name>` 拼接后必合法(`codex-` 全在字符集内)。
+/// 命名空间不相交。名经 [`server_id_component`] 规约(合法名原样;非法字符 slug + 哈希),
+/// 拼接后必合法(`codex-` 全在字符集内)。
 pub fn codex_scope_server_id(name: &str) -> String {
-    format!("codex-{name}")
+    format!("codex-{}", server_id_component(name))
 }
 
 /// 读 + 解析 `~/.codex/config.toml`(格式保留)。不存在 → `Ok(None)`;损坏 / 超大 → abort
@@ -1228,9 +1249,10 @@ impl JsonMcpAgent {
         }
     }
     /// 派生 server-id:`<prefix>-<name>`(与 `user-`/`local-`/`codex-` 命名空间不相交)。
-    /// `name` 已由 [`classify_one`] 用真验证器过滤,前缀全在 `^[a-z0-9_-]+$` 字符集内,拼接后必合法。
+    /// 名经 [`server_id_component`] 规约(合法名原样;非法字符 slug + 哈希),前缀全在
+    /// `^[a-z0-9_-]+$` 字符集内,拼接后必合法。
     fn server_id(&self, name: &str) -> String {
-        format!("{}-{}", self.id_prefix, name)
+        format!("{}-{}", self.id_prefix, server_id_component(name))
     }
 }
 
@@ -2176,9 +2198,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_server_name_skipped_not_wrapped() {
-        // F3(Codex holistic MEDIUM):名含网关 server-id 不允许的字符(大写/空格/点/斜杠)→ Skip,
-        // 否则 apply 成功但 wrap attach 在 validate_server_id 失败 = 坏配置。逐名核对真验证器口径。
+    fn invalid_server_name_wrappable_with_valid_derived_id() {
+        // F-4 修订:名含网关 server-id 不允许的字符(大写/空格/点/斜杠)不再 Skip ——
+        // 派生 id 经 [`server_id_component`] slug 化后必过真验证器,配置键名原样保留。
+        // (旧契约「非法名必 Skip」让 Playwright 这类大写命名成规模漏保护。)
         let cfg = json!({"mcpServers": {
             "Filesystem": {"command": "npx", "args": ["a"]},          // 大写
             "my server": {"command": "npx", "args": ["a"]},          // 空格
@@ -2187,21 +2210,23 @@ mod tests {
             "good-name_1": {"command": "npx", "args": ["a"]}         // 合法
         }});
         let c = classify_user_scope_servers(&cfg);
-        let skipped = |n: &str| {
-            c.iter()
-                .any(|x| matches!(x, McpServerClass::Skipped { name, .. } if name == n))
-        };
-        for bad in ["Filesystem", "my server", "weather.api", "a/b"] {
+        for n in [
+            "Filesystem",
+            "my server",
+            "weather.api",
+            "a/b",
+            "good-name_1",
+        ] {
             assert!(
-                skipped(bad),
-                "非法名 `{bad}` 须 Skipped(否则 wrap 启动失败)"
+                c.iter()
+                    .any(|x| matches!(x, McpServerClass::Wrappable { name, .. } if name == n)),
+                "名 `{n}` 应 Wrappable(id 由派生函数 slug 化)"
             );
+            // 派生 id 必过网关真验证器(原始名不合法时靠 slug + 哈希兜住)
+            vigil_mcp::namespace::validate_server_id(&user_scope_server_id(n))
+                .unwrap_or_else(|e| panic!("`{n}` 的派生 id 必合法:{e:?}"));
         }
-        // 合法名仍 Wrappable
-        assert!(c
-            .iter()
-            .any(|x| matches!(x, McpServerClass::Wrappable { name, .. } if name == "good-name_1")));
-        // 真验证器一致性:被 Skip 的名确实过不了 validate_server_id
+        // 真验证器口径不变:原始非法名裸用仍过不了(slug 收口的必要性)
         assert!(vigil_mcp::namespace::validate_server_id("Filesystem").is_err());
         assert!(vigil_mcp::namespace::validate_server_id("good-name_1").is_ok());
     }
@@ -2511,6 +2536,50 @@ mod tests {
             vigil_mcp::namespace::validate_server_id(id)
                 .unwrap_or_else(|e| panic!("生成的 server-id `{id}` 必须过网关校验:{e:?}"));
         }
+    }
+
+    #[test]
+    fn server_id_component_slugs_invalid_names_stably() {
+        // 合法名**原样**(既有用户的 server-id 逐字不变 = 向后兼容)。
+        assert_eq!(server_id_component("filesystem"), "filesystem");
+        assert_eq!(server_id_component("my_srv-2"), "my_srv-2");
+        // 大写名(F-4 实测场景 `Playwright`)→ 小写 slug + 8hex 哈希;同名恒同、大小写变体不塌缩。
+        let p = server_id_component("Playwright");
+        assert!(
+            p.starts_with("playwright-") && p.len() == "playwright-".len() + 8,
+            "slug+8hex:{p}"
+        );
+        assert_eq!(p, server_id_component("Playwright"), "同名恒同 id(稳定)");
+        assert_ne!(
+            p,
+            server_id_component("playwright"),
+            "大小写变体不得塌缩为同一身份"
+        );
+        // 全非法字符退化 `srv-<hash>`;空格/点折叠为单个 `-`。
+        assert!(server_id_component("数据库").starts_with("srv-"));
+        assert!(server_id_component("My Server.v2").starts_with("my-server-v2-"));
+        // 一切产物(含前缀拼接后)必过网关真验证器。
+        for n in ["Playwright", "My Server.v2", "数据库", "a--B", " x "] {
+            let c = server_id_component(n);
+            vigil_mcp::namespace::validate_server_id(&c)
+                .unwrap_or_else(|e| panic!("slug `{c}` 必合法:{e:?}"));
+        }
+        vigil_mcp::namespace::validate_server_id(&user_scope_server_id("My Server")).unwrap();
+        vigil_mcp::namespace::validate_server_id(&codex_scope_server_id("Chrome DevTools"))
+            .unwrap();
+    }
+
+    #[test]
+    fn classify_accepts_uppercase_server_names_as_wrappable() {
+        // F-4:大写名不再 Skip —— 进入可保护集合(id 由派生函数 slug 化,原配置键名不动)。
+        let cfg = json!({"mcpServers": {"Playwright":
+            {"command": "npx", "args": ["-y", "x"], "type": "stdio"}}});
+        let cls = classify_user_scope_servers(&cfg);
+        assert_eq!(cls.len(), 1);
+        assert!(
+            matches!(&cls[0], McpServerClass::Wrappable { name, .. } if name == "Playwright"),
+            "大写名应 Wrappable,got {cls:?}"
+        );
     }
 
     #[test]
@@ -3070,15 +3139,19 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
         assert!(!run_codex_preview(home, "vigil-hub", true).unwrap().exists);
     }
 
-    /// 非法 server 名(含大写 / 点)→ Skipped(不产出一个起不来的网关条目)。
+    /// 非法 server 名(含大写 / 点)→ Wrappable(F-4 修订:id 经 slug 化派生,不再要求用户改名)。
     #[test]
-    fn codex_invalid_server_name_skipped() {
+    fn codex_invalid_server_name_wrappable_with_valid_id() {
         let doc = "[mcp_servers.\"Bad.Name\"]\ncommand = \"npx\"\nargs = [\"x\"]\n"
             .parse::<DocumentMut>()
             .unwrap();
         let classes = classify_codex_servers(&doc);
         assert_eq!(classes.len(), 1);
-        assert!(matches!(&classes[0], McpServerClass::Skipped { name, .. } if name == "Bad.Name"));
+        assert!(
+            matches!(&classes[0], McpServerClass::Wrappable { name, .. } if name == "Bad.Name"),
+            "非法名应 Wrappable,got {classes:?}"
+        );
+        vigil_mcp::namespace::validate_server_id(&codex_scope_server_id("Bad.Name")).unwrap();
     }
 
     /// 内联表条目形态(`[mcp_servers]` 表内 `foo = { command=.., args=.. }`)也能 wrap/unwrap 往返,

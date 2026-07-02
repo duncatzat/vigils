@@ -595,13 +595,15 @@ fn localize_checkpoint(c: Command, lang: Lang) -> Command {
                 "(<ledger>.checkpoints). Run it periodically (or from cron): the hash chain alone\n",
                 "can't detect a rewrite of the whole history, but these anchors can.\n",
                 "\n",
-                "Tip: keep the .checkpoints file append-only (chattr +a) or synced offsite.",
+                "Tip: keep the .checkpoints file append-only (Linux: chattr +a; macOS: chflags \
+                 uappnd) or sync it offsite (works on every OS, incl. Windows).",
             ),
             concat!(
                 "把当前审计链链头的快照写入一个独立的 append-only 文件(<ledger>.checkpoints)。\n",
                 "周期运行(或用 cron):仅靠哈希链检不出「整条历史被重写」,但这些锚点可以。\n",
                 "\n",
-                "提示:把 .checkpoints 文件设为 append-only(chattr +a)或异地同步。",
+                "提示:把 .checkpoints 文件设为 append-only(Linux:chattr +a;macOS:chflags uappnd)\n",
+                "或异地同步(任何系统含 Windows 都适用)。",
             ),
         ));
     arg_help(
@@ -815,31 +817,39 @@ fn localize_daemon(c: Command, lang: Lang) -> Command {
 }
 
 fn localize_model(c: Command, lang: Lang) -> Command {
-    let c = c
-        .about(s(
-            lang,
+    // 非 ML 构建在**顶层命令列表**就标注版本要求(F-14:用户照 help 跑到 `model install`
+    // 才被告知要换 ML 变体 = 撞墙式发现)。ML 构建不加噪音。
+    let (about_en, about_zh) = if cfg!(feature = "ort") {
+        (
             "Download or check the ML models (private-data + injection detectors, ~700MB each)",
             "下载或查看 ML 模型(隐私数据 + 注入检测器,各约 700MB)",
-        ))
-        .long_about(s(
-            lang,
-            concat!(
-                "Manages the optional ML models. The turnkey path is:\n",
-                "  vigil-hub model install  ->  vigil-hub daemon start  ->  vigil-hub engine set ml\n",
-                "\n",
-                "  install  download the models (--privacy / --injection to pick one; default both)\n",
-                "  status   show whether each model is cached locally\n",
-                "Needs an ML build (--features ort); a non-ML binary points you to the ML variant.",
-            ),
-            concat!(
-                "管理可选的 ML 模型。开箱即用的完整流程为:\n",
-                "  vigil-hub model install  →  vigil-hub daemon start  →  vigil-hub engine set ml\n",
-                "\n",
-                "  install  下载模型(--privacy / --injection 只装其一;默认两个都装)\n",
-                "  status   查看每个模型是否已在本地缓存\n",
-                "需 ML 构建变体(--features ort);非 ML 二进制会提示你改用 ML 变体。",
-            ),
-        ));
+        )
+    } else {
+        (
+            "Download or check the ML models (~700MB each; needs the ML build variant -- \
+             this standard binary will point you to it)",
+            "下载或查看 ML 模型(各约 700MB;需 ML 版二进制 —— 本标准版会提示你获取)",
+        )
+    };
+    let c = c.about(s(lang, about_en, about_zh)).long_about(s(
+        lang,
+        concat!(
+            "Manages the optional ML models. The turnkey path is:\n",
+            "  vigil-hub model install  ->  vigil-hub daemon start  ->  vigil-hub engine set ml\n",
+            "\n",
+            "  install  download the models (--privacy / --injection to pick one; default both)\n",
+            "  status   show whether each model is cached locally\n",
+            "Needs an ML build (--features ort); a non-ML binary points you to the ML variant.",
+        ),
+        concat!(
+            "管理可选的 ML 模型。开箱即用的完整流程为:\n",
+            "  vigil-hub model install  →  vigil-hub daemon start  →  vigil-hub engine set ml\n",
+            "\n",
+            "  install  下载模型(--privacy / --injection 只装其一;默认两个都装)\n",
+            "  status   查看每个模型是否已在本地缓存\n",
+            "需 ML 构建变体(--features ort);非 ML 二进制会提示你改用 ML 变体。",
+        ),
+    ));
     let c = c.mut_subcommand("install", |sc| {
         let sc = sc.about(s(
             lang,
