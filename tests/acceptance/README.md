@@ -21,7 +21,12 @@ cp config.env.example config.env      # fill in REPO + your test-machine SSH tar
 finishes (and via *Run workflow* with a tag for back-testing): on all three GitHub-hosted
 platforms it downloads the **published** assets exactly like a user, verifies sha256 +
 build-provenance attestation, then runs `user-sim.sh` + `functional-sweep.sh`; a fourth
-job runs `local-audit.sh` over the full asset set. What CI cannot cover stays on the
+job runs `local-audit.sh` over the full asset set, and three `desktop-smoke-*` jobs test the
+**published desktop packages**: Windows silent-installs the NSIS setup and drives the real
+WebView2 over CDP (`gui-smoke.mjs`: dynamic route walk, locale flip, zero-console-error,
+per-page screenshots as artifacts); Linux installs the `.deb` and macOS mounts the `.dmg`,
+then both assert install → launch → stays-alive → non-blank screenshot
+(`gui-smoke-headless.sh` — WebKitGTK/WKWebView have no CDP). What CI cannot cover stays on the
 internal real machines via `run.sh`: the ~1.5 GB ML model-download e2e (`ml-e2e.sh`,
 `RUN_ML_MODEL=1`) and desktop-GUI pixel verification.
 
