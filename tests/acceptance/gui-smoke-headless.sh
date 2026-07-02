@@ -36,23 +36,32 @@ Linux)
   # WebKitGTK 在无 GPU/GL 的 Xvfb 下,合成/DMABUF 渲染路径会「窗口在、内容全黑」——
   # 关掉走软件绘制(两个变量覆盖新旧 WebKitGTK 版本)。
   export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1
-  "$BIN" >/dev/null 2>&1 &
+  "$BIN" >"$OUT/app.log" 2>&1 &
   APP=$!
   sleep 10
   kill -0 "$APP" 2>/dev/null && ok "process alive after 10s" || { no "app exited early"; kill "$XVFB" 2>/dev/null; fin; }
 
   echo "== window + screenshot =="
-  # GTK/tauri 会挂多个同名窗(实测:10x10 辅助窗 + 1280x800 主窗)—— 按几何面积取最大,
-  # 否则拍到小窗 = 279B「空白」假阴性(首跑实证)。
+  # GTK/tauri 会挂多个同名窗(实测:10x10 辅助窗先出现,1280x800 主窗**后到**——慢机上
+  # 可迟于 10s)。按几何面积取最大,且必须等到 >=100x100 的真主窗(上界 40s),否则
+  # 拍到小窗 = 279B「空白」假阴性(CI 首跑实证)。
   WIN=""
-  for _ in $(seq 1 20); do
-    WIN="$(xdotool search --name -- Vigils 2>/dev/null | while read -r id; do
+  for _ in $(seq 1 40); do
+    CAND="$(xdotool search --name -- Vigils 2>/dev/null | while read -r id; do
              g="$(xdotool getwindowgeometry "$id" 2>/dev/null | sed -n 's/.*Geometry: \([0-9]*\)x\([0-9]*\).*/\1 \2/p')"
              [ -n "$g" ] && echo "$((${g% *} * ${g#* })) $id"
-           done | sort -rn | head -1 | awk '{print $2}')"
-    [ -n "$WIN" ] && break; sleep 1
+           done | sort -rn | head -1)"
+    AREA="${CAND% *}"; ID="${CAND#* }"
+    if [ -n "$CAND" ] && [ "$AREA" -ge 10000 ]; then WIN="$ID"; break; fi
+    sleep 1
   done
-  [ -n "$WIN" ] && ok "main window found (id=$WIN, largest geometry)" || no "no window matching 'Vigils'"
+  if [ -n "$WIN" ]; then ok "main window found (id=$WIN, area=$AREA)"; else
+    no "no >=100x100 window matching 'Vigils' within 40s"
+    echo "  ---- diagnostics: window tree ----"
+    xwininfo -display :99 -root -tree 2>/dev/null | head -12
+    echo "  ---- diagnostics: app log tail ----"
+    tail -8 "$OUT/app.log" 2>/dev/null || true
+  fi
   sleep 4   # 首屏 WebView 内容绘制(软件渲染较慢)
   # 拍窗口本体(root 上未聚焦/未提升的窗口可能不入根可视区);窗口拍不到再退回 root。
   import -display :99 -window "${WIN:-root}" "$OUT/linux-window.png" 2>/dev/null \
