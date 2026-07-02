@@ -42,12 +42,17 @@ Linux)
   kill -0 "$APP" 2>/dev/null && ok "process alive after 10s" || { no "app exited early"; kill "$XVFB" 2>/dev/null; fin; }
 
   echo "== window + screenshot =="
+  # GTK/tauri 会挂多个同名窗(实测:10x10 辅助窗 + 1280x800 主窗)—— 按几何面积取最大,
+  # 否则拍到小窗 = 279B「空白」假阴性(首跑实证)。
   WIN=""
   for _ in $(seq 1 20); do
-    WIN="$(xdotool search --name -- Vigils 2>/dev/null | head -1)"
+    WIN="$(xdotool search --name -- Vigils 2>/dev/null | while read -r id; do
+             g="$(xdotool getwindowgeometry "$id" 2>/dev/null | sed -n 's/.*Geometry: \([0-9]*\)x\([0-9]*\).*/\1 \2/p')"
+             [ -n "$g" ] && echo "$((${g% *} * ${g#* })) $id"
+           done | sort -rn | head -1 | awk '{print $2}')"
     [ -n "$WIN" ] && break; sleep 1
   done
-  [ -n "$WIN" ] && ok "window found (id=$WIN)" || no "no window matching 'Vigils'"
+  [ -n "$WIN" ] && ok "main window found (id=$WIN, largest geometry)" || no "no window matching 'Vigils'"
   sleep 4   # 首屏 WebView 内容绘制(软件渲染较慢)
   # 拍窗口本体(root 上未聚焦/未提升的窗口可能不入根可视区);窗口拍不到再退回 root。
   import -display :99 -window "${WIN:-root}" "$OUT/linux-window.png" 2>/dev/null \
