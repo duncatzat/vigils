@@ -8,6 +8,45 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.4.6-beta.1] — 2026-07-02 — 用户级打磨:server 名 slugify、状态陈述如实化
+
+本测试版聚焦「逐功能用户级验证」(三平台真二进制走查)发现的问题。不涉及任何安全不变量变更,硬底线不动。
+
+### 新增
+
+- **含大写 / 空格 / 点的 server 名现在可被保护**(`setup --mcp` / `--all`):网关 server-id 经
+  slugifier 派生(`Playwright` → `user-playwright-<hash8>`),不再跳过并要求你去改 MCP 配置里的名字。
+  本就合法的名字 id 逐字不变(向后兼容);大小写变体不会塌缩成同一身份(哈希后缀)。
+- 裸 `vigil-hub posture` / `engine` / `daemon` 现在默认执行 `show` / `status`,不再甩出 help。
+
+### 修复
+
+- `daemon status` 的运行时长恒为 `0s`;现在如实报告已运行时间。`daemon stop` 不再把系统结束进程
+  助手的本地化输出漏进用户界面(非 UTF-8 代码页下曾乱码)。
+- `setup --all` 输出如实化:`[2/2]` MCP 网关行标注 scope(Claude Code),不再被误读成全局总数;
+  「改动写入配置文件」只在真实写盘时出现;agent CLI 状态由易误读的「未安装」改为「hook 未注册」。
+- `demo` 结尾改推 `vigil-hub setup --all`(一键路径),不再指向手动 `serve --stdio` 流程。
+- `checkpoint` 提示按平台给建议 —— Windows 不再出现 Linux 专属的 `chattr +a`;macOS 建议
+  `chflags uappnd`。
+- `setup --mcp` 预览的跳过原因在中文输出下本地化;`quickstart` 不再把所有被跳过的 server 统称
+  「http/sse」。
+- 标准(非 ML)构建的 `model` help 直接标注需 ML 版二进制,不再等到 `model install` 才发现。
+- `setup --help` 文本清理内部评审速记。
+- 桌面:模型未安装时,守护进程卡不再承诺「启动即开启 ML 防护」(现在说明此时 daemon 以无模型方式
+  运行,hook 保持硬指纹底座);Naive UI 内建文案(空表、分页)随应用语言。
+- 扩展:用户可见文本清除内部规范编号;禁用按钮有了禁用外观;守护站点文案与 manifest 实际清单一致。
+
+### 文档
+
+- `docs/user-guide/`:移除不存在的命令(`ledger verify` / `ledger query` → `vigil-hub verify` +
+  Activity Feed / 直查 SQLite),修正默认账本路径(`%LOCALAPPDATA%\Vigil\ledger.sqlite3` 及各
+  平台等价路径,用 `VIGIL_LEDGER_PATH` 对齐),把过时的「Stage 1:`tools/list` 返空」说明替换为
+  真实的上游转发行为,并把安装指引指向 GitHub Releases。
+- README(中英):ML 变体可用性说明已过时(v0.4.0 起随每个 release 发布);「逐字节还原」措辞
+  收敛为经验证的承诺(只删 Vigils 自己的条目,你的配置如实还原)。
+
+---
+
 ## [v0.4.5] — 2026-06-30 — 闭合 `VIGIL-SEC-ML-SKIP`(`secret://` 面):恢复同段 soft-PII 脱敏
 
 ### 安全

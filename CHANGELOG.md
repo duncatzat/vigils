@@ -8,6 +8,57 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.4.6-beta.1] — 2026-07-02 — user-level polish: server-name slugify, honest status surfaces
+
+A beta focused on findings from a feature-by-feature user-level verification pass (real binaries on
+all three platforms). No security-invariant changes; hard floors are untouched.
+
+### Added
+
+- **Server names with uppercase / spaces / dots are now protectable** (`setup --mcp` / `--all`):
+  gateway server-ids are derived through a slugifier (`Playwright` → `user-playwright-<hash8>`)
+  instead of skipping the server and asking you to rename it in your MCP config. Already-valid
+  names keep their exact ids (backward compatible); case-variants can't collapse into one identity
+  (hash suffix).
+- Bare `vigil-hub posture` / `engine` / `daemon` now default to `show` / `status` instead of
+  printing help.
+
+### Fixed
+
+- `daemon status` uptime was frozen at `0s`; it now reports real elapsed time. `daemon stop` no
+  longer leaks the OS kill helper's localized output (mojibake on non-UTF-8 codepages).
+- `setup --all` output honesty: the `[2/2]` MCP gateway line is scoped ("Claude Code") so per-agent
+  sections aren't misread against a global total; "changes written to <config>" only appears when
+  the file was actually written; agent-CLI status now says "hook not registered" instead of the
+  misleading "not installed".
+- `demo` now points at `vigil-hub setup --all` (the turnkey path) instead of the manual
+  `serve --stdio` flow.
+- `checkpoint` tip is platform-aware — no more Linux-only `chattr +a` advice on Windows; macOS
+  suggests `chflags uappnd`.
+- `setup --mcp` preview skip-reasons are localized in Chinese output; `quickstart` no longer
+  mislabels every skipped server as "http/sse".
+- `--help` for `model` on the standard (non-ML) build says up front that the ML build variant is
+  required, instead of letting you discover it at `model install`.
+- Internal review shorthand removed from `setup --help` text.
+- Desktop: the daemon card no longer promises "start it to enable ML protection" when no model is
+  installed (it now says the daemon would run model-less on the hard-fingerprint floor); Naive UI
+  built-in texts (empty tables, pagination) follow the app language.
+- Extension: internal spec references removed from user-facing text; disabled buttons now look
+  disabled; guarded-site copy matches the actual manifest list.
+
+### Docs
+
+- `docs/user-guide/`: removed commands that don't exist (`ledger verify` / `ledger query` →
+  `vigil-hub verify` + Activity Feed / direct SQLite), corrected the default ledger path
+  (`%LOCALAPPDATA%\Vigil\ledger.sqlite3` and per-OS equivalents, aligned via
+  `VIGIL_LEDGER_PATH`), replaced the stale "Stage 1: `tools/list` returns empty" note with the
+  real upstream-forwarding behavior, and pointed installation at GitHub Releases.
+- README (en/zh): the ML-variant availability note was stale (ML builds ship since v0.4.0);
+  softened "restored byte-for-byte" to the verified claim (only Vigils' own entries are removed,
+  settings restored faithfully).
+
+---
+
 ## [v0.4.5] — 2026-06-30 — close `VIGIL-SEC-ML-SKIP` (`secret://` face): same-leaf soft-PII redaction restored
 
 ### Security

@@ -2,7 +2,7 @@
 
 ## 安装阶段
 
-### Q1: `.\vigil-native-host.exe install --extension-id XXX` 报 `extension id must be 32 a-p chars`
+### Q1: `.\vigil-native-host.exe install --extension-id XXX` 报 `invalid extension id: <id> (must be 32 chars in a-p)`
 
 Chrome 扩展 ID 只含 `a-p` 小写字母,**32 字符**。如果你输入的 ID 含数字或其他字母,说明复制错了。
 
@@ -46,17 +46,17 @@ Linux 用户级 manifest 路径是 `~/.config/google-chrome/NativeMessagingHosts
 ### Q5: Desktop UI 启动但 Activity Feed 始终空
 
 **原因**:
-- Ledger 文件位置错:默认 `%APPDATA%\Vigil\vigil.sqlite`(Windows),`~/.config/Vigil/` (Linux / macOS)
+- Ledger 文件位置错:默认 `%LOCALAPPDATA%\Vigil\ledger.sqlite3`(Windows,**不是** `%APPDATA%`/Roaming,文件名带 `3`),`~/.local/share/Vigil/ledger.sqlite3` (Linux),`~/Library/Application Support/Vigil/ledger.sqlite3` (macOS)
 - Chrome 扩展的事件没写进同一个 ledger(可能 Native Host 和 Desktop 看向不同文件)
 
 **修**:
 ```powershell
 # 打开 Desktop 时指定 ledger 路径
-.\vigil-desktop.exe --ledger C:\Vigil\data\vigil.sqlite
-# Native Host 也要同路径(environment 或配置文件;v0.2 以默认路径为准)
+.\vigil-desktop.exe --ledger %LOCALAPPDATA%\Vigil\ledger.sqlite3
+# CLI / hook / serve / Native Host 也用同路径(环境变量 VIGIL_LEDGER_PATH,或不设时都落上面的默认 canonical 路径)
 ```
 
-v0.3 会做 UI-level ledger 选择器。v0.2 约定两者都用**默认路径**。
+设 `VIGIL_LEDGER_PATH` 让所有组件(CLI、hook、serve、Desktop、Native Host)指向同一账本;不设时它们都用上面的默认 canonical 路径。
 
 ### Q6: Desktop 启动报 `failed to enable WAL journal mode`
 
@@ -93,23 +93,25 @@ v0.3 会做 UI-level ledger 选择器。v0.2 约定两者都用**默认路径**�
 ### Q10: 如何证明"ledger 没被篡改"?
 
 ```powershell
-.\vigil-hub.exe ledger verify
-# 输出:
-# chain length: 12345
-# verified: OK(每条 event 的 content_hash + prev_hash 闭合)
+.\vigil-hub.exe verify
+# 输出(示例):
+# ✓ the audit chain is internally consistent AND anchored: N checkpoint(s), through event #M
+# (每条 event 的 content_hash + prev_hash 闭合;链完整则退出码 0)
 ```
 
-如果报 `chain break at event_id=NNNN`:
+如果报 `✗ the audit chain is BROKEN at event #NNNN — tampering detected`(退出码非 0):
 - 该 event 之后的链都失真
 - **不要自己改数据库修**,上报 incident
 
 ### Q11: 想审计某段时间的 findings
 
-```powershell
-.\vigil-hub.exe ledger query --since 2026-04-01 --event-type "browser.paste.*"
-```
+Vigil CLI **没有** `ledger query` 子命令。查历史 findings 用以下任一方式:
 
-Activity Feed UI 有 FTS5 搜索框,更直观。
+- **桌面 Activity Feed**:内置 FTS5 搜索框,按 event_type / 时间 / 关键词过滤,最直观。
+- **直接查 SQLite**(高级):
+  ```powershell
+  sqlite3 %LOCALAPPDATA%\Vigil\ledger.sqlite3 "SELECT * FROM events WHERE event_type LIKE 'browser.paste.%' ORDER BY id DESC LIMIT 10;"
+  ```
 
 ## 仍然不行?
 

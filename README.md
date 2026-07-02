@@ -134,7 +134,7 @@ vigil-hub serve --engine ml       # strict ML: fetches models on first run, fail
 vigil-hub serve --engine auto     # ML only if models are already cached and the dylib is present; otherwise degrades to hardfp and never downloads
 ```
 
-Models are fetched from Hugging Face (primary) with a [vigils.ai](https://vigils.ai) mirror fallback, each verified by SHA-256 (fail-closed). The ML build bundles [ONNX Runtime](https://onnxruntime.ai) 1.24 next to `vigil-hub`. Platform floors for the **ML** build: **Linux glibc ≥ 2.28**, **macOS ≥ 14** — the default hard-fingerprint build has neither. _(ML builds ship from the next release onward; an earlier release may not include them yet.)_
+Models are fetched from Hugging Face (primary) with a [vigils.ai](https://vigils.ai) mirror fallback, each verified by SHA-256 (fail-closed). The ML build bundles [ONNX Runtime](https://onnxruntime.ai) 1.24 next to `vigil-hub`. Platform floors for the **ML** build: **Linux glibc ≥ 2.28**, **macOS ≥ 14** — the default hard-fingerprint build has neither. _(ML builds ship with every release since v0.4.0 — look for the `vigils-cli-ml-*` assets.)_
 
 > Early releases aren't OS-code-signed yet; your OS may show a Gatekeeper / SmartScreen prompt
 > on first run — they're still independently verifiable (see below, or the full
@@ -234,7 +234,7 @@ vigil-hub setup --all       # protect everything, in one step
 ```bash
 vigil-hub setup --mcp --doctor    # pre-flight: will each wrapped MCP server actually start? (PATH check, read-only)
 vigil-hub inspect protection      # after using your agent: see what Vigils caught (secrets blocked, leaks redacted, chain intact)
-vigil-hub setup --all --uninstall # cleanly remove everything (your config restored byte-for-byte)
+vigil-hub setup --all --uninstall # cleanly remove everything (only Vigils' own entries; your settings restored faithfully)
 ```
 
 Restart Claude Code (or start a new session) and you're protected. This is the fastest path from a
