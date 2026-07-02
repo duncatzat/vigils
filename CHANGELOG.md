@@ -8,7 +8,7 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
-## [v0.4.6-beta.1] — 2026-07-02 — user-level polish: server-name slugify, honest status surfaces
+## [v0.4.6-beta.2] — 2026-07-02 — unattended user-acceptance CI (functional + agent-integration + GUI) atop beta.1 polish
 
 A beta focused on findings from a feature-by-feature user-level verification pass (real binaries on
 all three platforms). No security-invariant changes; hard floors are untouched.
@@ -56,6 +56,11 @@ all three platforms). No security-invariant changes; hard floors are untouched.
 - README (en/zh): the ML-variant availability note was stale (ML builds ship since v0.4.0);
   softened "restored byte-for-byte" to the verified claim (only Vigils' own entries are removed,
   settings restored faithfully).
+
+### Added (test infrastructure)
+
+- **Unattended user-acceptance CI** (`.github/workflows/acceptance.yml`): after every release, three GitHub-hosted platforms download the published assets like a user, verify sha256 + SLSA provenance, and run `user-sim.sh`, `functional-sweep.sh`, `core-e2e.mjs` (privacy-filter + secret-lease four-leg on the real MCP gateway), `agent-compat.sh` (Claude/Codex/Gemini/Cursor native-hook protocol), plus desktop GUI smoke (Windows WebView2 CDP; Linux/macOS install→launch→screenshot). ML model-download e2e stays on internal machines.
+- **`serve --monitor`** (symmetric with `wrap --monitor`): observe-and-audit posture for headless/e2e when there is no GUI approval resolver; hard floors unchanged.
 
 ---
 

@@ -8,7 +8,7 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
-## [v0.4.6-beta.1] — 2026-07-02 — 用户级打磨:server 名 slugify、状态陈述如实化
+## [v0.4.6-beta.2] — 2026-07-02 — 值守式用户验收 CI(功能 + agent 接入 + GUI),含 beta.1 打磨
 
 本测试版聚焦「逐功能用户级验证」(三平台真二进制走查)发现的问题。不涉及任何安全不变量变更,硬底线不动。
 
@@ -44,6 +44,11 @@ Vigils 的所有重要变更记录于此。格式遵循
   真实的上游转发行为,并把安装指引指向 GitHub Releases。
 - README(中英):ML 变体可用性说明已过时(v0.4.0 起随每个 release 发布);「逐字节还原」措辞
   收敛为经验证的承诺(只删 Vigils 自己的条目,你的配置如实还原)。
+
+### 新增(测试基建)
+
+- **值守式用户验收 CI**(`.github/workflows/acceptance.yml`):每次发布后三平台像用户一样下载已发布产物、校验 sha256 + SLSA 溯源,跑 `user-sim.sh`、`functional-sweep.sh`、`core-e2e.mjs`(真 MCP 网关的隐私过滤 + 密钥租约四段)、`agent-compat.sh`(Claude/Codex/Gemini/Cursor 原生 hook 协议),外加桌面 GUI 冒烟(Windows WebView2 CDP;Linux/macOS 装→启→截图)。ML 模型下载 e2e 留内部真机。
+- **`serve --monitor`**(与 `wrap --monitor` 对称):headless/e2e 无 GUI 审批 resolver 时观察放行 + 审计;硬地板不变。
 
 ---
 
