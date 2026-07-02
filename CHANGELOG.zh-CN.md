@@ -8,6 +8,37 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.4.6-beta.3] — 2026-07-03 — 稳健性打磨:OAuth scope 接线修复、`status --json`、双引擎 parity、远程 MCP e2e
+
+加固向 beta:一个真实网关修复,其余全部是验证覆盖面的加强。
+
+### 修复
+
+- **`ScopeNotInAllowList` 策略规则对 OAuth HTTP upstream 现在真正生效。** 此前网关对所有出站
+  tools/call 硬编码非 OAuth scope 上下文,配置了 scope 白名单 Deny 规则的用户以为有保护、
+  实际规则静默永不触发(虚假安全感)。token 的 scope 集(attach 期快照)现已进入策略评估:
+  越界 scope 拒绝、空 scope 集 fail-closed、非 OAuth 上游(stdio / bearer / 无鉴权)不受影响。
+  三个新集成测试锁定三分支。
+
+### 新增
+
+- **`daemon status --json`** —— 稳定、与界面语言无关的机器可读 schema
+  (`running`/`pid`/`pii_loaded`/`inj_loaded`/`uptime_secs`/`inflight`;字段只增不删)。
+  人类输出不变(仍本地化)。验收脚本优先用它,老版本自动回退钉英文文案。
+- **远程 MCP e2e 进入值守验收矩阵**(`http-e2e.mjs`):对已发布二进制实证 Streamable HTTP
+  upstream 路径的防护不变量 —— Bearer token 到达上游 `Authorization` 头但绝不出现在客户端
+  与审计里、密钥租约四段往返在 HTTP 上成立、SSE(`text/event-stream`)上游响应被折叠并
+  再脱敏、裸 secret 不被转发、审计账本无明文。
+- **双引擎 parity 守门**(`dual_engine_parity`):hook 路径与 MCP 网关路径喂同一份不可信输入,
+  判定必须一致(裸 secret 双拦、干净输入双放、deny 不回显真值)—— 决策核心统一前的漂移警报线。
+- **周度定时验收**(每周一 03:23 UTC,对 Latest release):上游 agent hook 协议漂移、
+  分发服务变化不必等我们发版即可被发现。
+
+### 文档
+
+- README(双语):crates.io 上的 `vigil-sdk` 是独立节奏的早期预览、落后于本仓库;
+  要用最新 API 请从源码构建。
+
 ## [v0.4.6-beta.2] — 2026-07-02 — 值守式用户验收 CI(功能 + agent 接入 + GUI),含 beta.1 打磨
 
 本测试版聚焦「逐功能用户级验证」(三平台真二进制走查)发现的问题。不涉及任何安全不变量变更,硬底线不动。

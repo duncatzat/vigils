@@ -8,6 +8,43 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.4.6-beta.3] — 2026-07-03 — robustness round: OAuth scope wiring fix, `status --json`, dual-engine parity, remote-MCP e2e
+
+A hardening beta. One real gateway fix; everything else strengthens verification coverage.
+
+### Fixed
+
+- **`ScopeNotInAllowList` policy rules now actually fire for OAuth HTTP upstreams.** The gateway
+  previously evaluated every outbound tools/call with a hard-coded non-OAuth scope context, so a
+  configured scope-allowlist Deny rule silently never triggered (false sense of protection). The
+  token's scope set (snapshotted at attach) now reaches policy evaluation: out-of-allowlist scopes
+  deny, an empty scope set fails closed, and non-OAuth upstreams (stdio / bearer / none) are
+  unaffected. Covered by three new integration tests.
+
+### Added
+
+- **`daemon status --json`** — a stable, locale-independent, machine-readable schema
+  (`running`/`pid`/`pii_loaded`/`inj_loaded`/`uptime_secs`/`inflight`; fields are only ever added).
+  Human output is unchanged (still localized). Acceptance scripts prefer it and probe-fallback to
+  pinned-English text on older builds.
+- **Remote-MCP e2e in the unattended acceptance matrix** (`http-e2e.mjs`): proves the protection
+  invariants on the Streamable HTTP upstream path against the published binaries — bearer token
+  reaches the upstream `Authorization` header but never the client or the ledger, the secret-lease
+  four-leg round-trip works over HTTP, an SSE (`text/event-stream`) upstream response is collapsed
+  and re-redacted, raw secrets are not forwarded, and the audit ledger holds no plaintext.
+- **Dual-engine parity guard** (`dual_engine_parity`): the hook path and the MCP-gateway path are
+  fed the same untrusted inputs and must agree (bare secrets deny on both, clean input allows on
+  both, deny reasons never echo the secret) — a regression tripwire for engine drift until the
+  decision cores are unified.
+- **Weekly scheduled acceptance run** (Mondays 03:23 UTC, against the Latest release): upstream
+  agent hook-protocol drift and distribution-service changes get caught without waiting for our
+  next release.
+
+### Docs
+
+- README (both languages): the crates.io `vigil-sdk` release is an early preview on its own
+  cadence and lags this repository; build from source for the current API.
+
 ## [v0.4.6-beta.2] — 2026-07-02 — unattended user-acceptance CI (functional + agent-integration + GUI) atop beta.1 polish
 
 A beta focused on findings from a feature-by-feature user-level verification pass (real binaries on
