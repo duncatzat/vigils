@@ -63,7 +63,7 @@ const hub = spawn(HUB, [
   "--redact-tool-results",   // 结果携密 → in-band 脱敏后再回客户端(C3/C2-leg4)
   "--monitor",               // 无 GUI resolver 时观察放行(硬地板不变),否则 mock 工具审批阻塞 ~300s
   "--auto-approve-first-seen",
-], { env: { ...process.env, VIGIL_E2E_SECRET: REAL_SECRET, VIGIL_LEDGER_PATH: LEDGER }, stdio: ["pipe", "pipe", "pipe"] });
+], { env: { ...process.env, VIGIL_E2E_SECRET: REAL_SECRET, VIGIL_LEDGER_PATH: LEDGER, VIGIL_LANG: "en" }, stdio: ["pipe", "pipe", "pipe"] });
 
 let stderrBuf = "";
 hub.stderr.on("data", (d) => { stderrBuf += d.toString(); });

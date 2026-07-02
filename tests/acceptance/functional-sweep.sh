@@ -32,6 +32,7 @@ export HOME="$SBX/home" \
        XDG_CONFIG_HOME="$SBX/home/.config" \
        XDG_CACHE_HOME="$SBX/home/.cache"
 export VIGIL_LEDGER_PATH="$SBX/ledger.sqlite3"
+export VIGIL_LANG=en          # 断言锚定英文输出(与 locale 无关地稳定)
 trap 'rm -rf "$SBX"' EXIT
 
 P=0; F=0

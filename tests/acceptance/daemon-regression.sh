@@ -17,6 +17,7 @@ SBX="${TMPDIR:-/tmp}/vigil-dreg-$$"; rm -rf "$SBX"; mkdir -p "$SBX/home"
 export HOME="$SBX/home" XDG_DATA_HOME="$SBX/home/.local/share" \
        XDG_CONFIG_HOME="$SBX/home/.config" XDG_CACHE_HOME="$SBX/home/.cache" \
        VIGIL_DAEMON_SOCKET="$SBX/d.sock"
+export VIGIL_LANG=en   # 断言锚定英文文案(zh locale 下 status 输出中文,'running (pid' 失配)
 HUB="$SBX/ml/vigil-hub"; P=0; F=0
 ok(){ printf '  PASS %s\n' "$*"; P=$((P+1)); }; no(){ printf '  FAIL %s\n' "$*"; F=$((F+1)); }
 cleanup(){ pkill -f "$SBX/ml/vigil-hub" 2>/dev/null || true

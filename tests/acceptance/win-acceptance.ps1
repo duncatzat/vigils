@@ -12,6 +12,7 @@ $djBak    = if (Test-Path $dj) { Get-Content $dj -Raw } else { $null }
 $preVigil = Test-Path $vigilDir
 $preModel = Test-Path "$vigilDir\models\privacy-filter-0.5.1"
 Get-Process vigil-hub -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+$env:VIGIL_LANG="en"   # pin assertions to English output regardless of system locale
 $sbx="$env:TEMP\vigil-acc-win"; Remove-Item -Recurse -Force $sbx -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $sbx | Out-Null; Set-Location $sbx
 

@@ -17,6 +17,7 @@ set -u
 : "${HUB:?set HUB=path to vigil-hub}"
 SBX="${TMPDIR:-/tmp}/vigil-compat-$$"; rm -rf "$SBX"; mkdir -p "$SBX"
 export VIGIL_LEDGER_PATH="$SBX/ledger.sqlite3"
+export VIGIL_LANG=en          # 断言锚定英文输出(与 locale 无关地稳定)
 case "$(uname -s)" in Linux|Darwin) export HOME="$SBX" XDG_DATA_HOME="$SBX/.local/share" XDG_CONFIG_HOME="$SBX/.config";; esac
 trap 'rm -rf "$SBX"' EXIT
 
