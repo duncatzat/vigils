@@ -16,6 +16,10 @@ on:
   workflow_run:
     workflows: ["Release"]
     types: [completed]
+  # 每周一 03:23 UTC 对 Latest release 复跑全套 —— 上游 agent(Claude/Codex/Gemini/Cursor)
+  # 改 hook 协议、GitHub 资产/溯源服务漂移等外因,不等我们发版就能被发现。
+  schedule:
+    - cron: "23 3 * * 1"
   workflow_dispatch:
     inputs:
       tag:
@@ -31,6 +35,7 @@ jobs:
     # workflow_run 触发时:仅在 Release 成功、且确为 tag 构建时跑
     if: >
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
       (github.event.workflow_run.conclusion == 'success' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
     strategy:
@@ -61,6 +66,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
           else
             TAG="${{ github.event.workflow_run.head_branch }}"
           fi
@@ -116,6 +123,11 @@ jobs:
         run: |
           HUB="$PWD/bin/${{ matrix.bin }}" node tests/acceptance/core-e2e.mjs | tee core.out
 
+      - name: "Remote-MCP e2e (Streamable HTTP upstream: bearer + lease + SSE re-redaction)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" node tests/acceptance/http-e2e.mjs | tee http.out
+
       - name: "Agent-integration protocol compat (Claude/Codex/Gemini/Cursor hooks)"
         shell: bash
         run: |
@@ -137,6 +149,7 @@ jobs:
     # 桌面 minisign 签名、OTA manifest —— 复用既有 local-audit.sh
     if: >
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
       (github.event.workflow_run.conclusion == 'success' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-latest
@@ -150,6 +163,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
           else
             TAG="${{ github.event.workflow_run.head_branch }}"
           fi
@@ -176,6 +191,7 @@ jobs:
     # 已发布 NSIS 安装包:静默安装 → WebView2 CDP 深冒烟(路由遍历/双语翻转/零 console error/逐页截图)
     if: >
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
       (github.event.workflow_run.conclusion == 'success' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: windows-latest
@@ -189,6 +205,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
           else
             TAG="${{ github.event.workflow_run.head_branch }}"
           fi
@@ -238,6 +256,7 @@ jobs:
     # 已发布 .deb:安装(自动拉 WebKitGTK 依赖)→ Xvfb 启动 → 存活/窗口/截图非空
     if: >
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
       (github.event.workflow_run.conclusion == 'success' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: ubuntu-22.04
@@ -251,6 +270,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
           else
             TAG="${{ github.event.workflow_run.head_branch }}"
           fi
@@ -287,6 +308,7 @@ jobs:
     # 已发布 .dmg:挂载 → 去 quarantine → 启动 → 存活/截图非空(WKWebView 无 CDP)
     if: >
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
       (github.event.workflow_run.conclusion == 'success' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: macos-latest
@@ -300,6 +322,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
           else
             TAG="${{ github.event.workflow_run.head_branch }}"
           fi
