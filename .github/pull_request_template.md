@@ -13,6 +13,7 @@ Closes #
 
 - [ ] I read [CONTRIBUTING.md](../CONTRIBUTING.md) and agree to the [Code of Conduct](../CODE_OF_CONDUCT.md).
 - [ ] This is a focused, single-purpose change (not an unrelated bundle).
+- [ ] The description above covers **all** changes in this PR — not just a subset.
 - [ ] An issue was opened/agreed first for anything non-trivial.
 - [ ] CI passes locally: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (+ desktop UI typecheck/build if touched).
 - [ ] No real secrets/tokens/credentials are committed (including tests/fixtures).

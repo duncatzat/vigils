@@ -31,7 +31,7 @@ test("options uses mode runtime messages", () => {
 test("popup displays consumer and enterprise mode labels", () => {
     const html = read("extensions/chrome-mv3/popup.html");
     const js = read("extensions/chrome-mv3/popup.js");
-    assert.match(html + js, /普通保护/);
+    assert.match(html + js, /保护中/);
     assert.match(html + js, /企业保护/);
 });
 
@@ -87,8 +87,8 @@ test("popup is centered on ordinary user page protection status", () => {
     const js = read("extensions/chrome-mv3/popup.js");
     const source = [html, js].join("\n");
     assert.match(html, /当前页面/);
-    assert.match(html, /保护当前网站/);
-    assert.match(html, /开始使用/);
+    assert.match(html, /未受保护/);
+    assert.match(html, /授权后自动检测/);
     assert.match(js, /chrome\.tabs\.query/);
     assert.match(js, /normalizeCustomSiteInput/);
     assert.match(js, /vigil_add_custom_site/);
@@ -98,9 +98,9 @@ test("popup is centered on ordinary user page protection status", () => {
 test("popup renders safety events in plain language", () => {
     const js = read("extensions/chrome-mv3/popup.js");
     assert.match(js, /eventKindLabel/);
-    assert.match(js, /actionLabel/);
+    assert.match(js, /actionIconText/);
     assert.match(js, /findingLabel/);
-    assert.match(js, /已建议脱敏/);
+    assert.match(js, /粘贴时/);
     assert.doesNotMatch(js, /toUpperCase\(\)/);
 });
 
