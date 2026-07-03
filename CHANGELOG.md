@@ -8,6 +8,49 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.4.6-beta.4] — 2026-07-03 — Command Guard on the hook path + daemon warm-up observability + GUI locale fix
+
+A beta adding one new protection line, plus observability/locale gaps closed by a fourth
+feature-by-feature user-level verification pass (real binaries on all three platforms).
+Hard floors are untouched.
+
+### Added
+
+- **Command Guard — a dangerous-command line of defense on the hook path** (#53, #54). The MCP
+  gateway already classified destructive shell commands, but the hook path (Claude Code / Cursor /
+  Codex `Bash` tools) previously only scanned for secrets/placeholders — with "allow all commands"
+  enabled, an agent gone sideways (intent drift, prompt injection, parameter accidents) could run
+  `rm -rf ~`, `curl … | sh`, or write a crontab entry without tripping anything. The guard
+  classifies **effects, not intent** (denylist, no ML): catastrophic actions (filesystem wipe,
+  raw device writes, fork bombs) are always denied at any posture — a hard floor like raw
+  secrets — while dangerous ones (persistence/autostart, remote-exec installs, deletions outside
+  the project root, `rm -rf $VAR/` empty-expansion accidents) get posture-graded Ask (High=Deny).
+  Project-root awareness keeps false positives down: `rm -rf ./node_modules` inside the project
+  passes; the same command aimed at `~` is caught. Honest boundary: a guardrail against accidents
+  and low-effort injection, not a sandbox — deep obfuscation can evade it.
+- **Daemon warm-up is now observable** (#55): model warm-up can take up to ~45s, during which
+  `daemon status` used to claim "not running" right after `daemon start`. A warming marker makes
+  the window visible: status reports "starting (warming the ML models)", `--json` gains
+  `reason:"warming"` (fields are only ever added), and stale markers self-heal.
+- **`setup --status` shows gateway coverage across all agents** (#55): previously only Claude
+  Code's count was shown — after `setup --all` wrapped 20+ servers for Codex/Cursor, status gave
+  no way to confirm the global footprint. Now:
+  `23 server(s) wrapped (Claude Code 2 / Codex 11 / Cursor 10)`.
+
+### Fixed
+
+- **The desktop app could permanently show the daemon as "not running" on non-English systems**
+  (#55): it parsed the English human-readable `daemon status` line, which localizes with the
+  system language. It now consumes `daemon status --json` and pins `VIGIL_LANG=en` for
+  machine-parsed subprocess output (the "installed" line parsing in model status had the same
+  latent issue). The daemon card also gained a third state — "STARTING · WARMING MODELS" —
+  instead of a misleading "STOPPED" during warm-up, with the start button hidden to avoid a
+  bind conflict.
+- Hook fail-closed messages no longer hardcode "PreToolUse" (the same entry also serves
+  PostToolUse events); daemon cold-state/stop wording dropped the internal "no daemon.json"
+  jargon; Chinese posture level names are now consistent between CLI help and the GUI
+  (宽松 / 适中 / 严格).
+
 ## [v0.4.6-beta.3] — 2026-07-03 — robustness round: OAuth scope wiring fix, `status --json`, dual-engine parity, remote-MCP e2e
 
 A hardening beta. One real gateway fix; everything else strengthens verification coverage.
