@@ -627,6 +627,8 @@ export async function protectionSummary(): Promise<ProtectionSummary> {
 export interface DaemonStatus {
   /** daemon 是否在运行 */
   running: boolean;
+  /** start 已发出、模型暖载中（最长约 45s）—— 显示「启动中」而非「未运行」 */
+  warming: boolean;
   /** 隐私 PII 模型是否已暖载（running 且 status 行报 pii_loaded=true 时为 true） */
   pii_loaded: boolean;
   /** vigil-hub 引擎二进制是否就位（false → 守护卡只读，提示先部署引擎） */
