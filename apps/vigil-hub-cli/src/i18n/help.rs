@@ -670,7 +670,7 @@ fn localize_posture(c: Command, lang: Lang) -> Command {
         .about(s(
             lang,
             "View or switch the security posture (low / medium / high)",
-            "查看或切换安全姿态(低 / 中 / 高)—— 即对 `secret://` 占位符的拦截力度",
+            "查看或切换安全姿态(宽松 / 适中 / 严格)—— 即对 `secret://` 占位符的拦截力度",
         ))
         .long_about(s(
             lang,
@@ -686,9 +686,9 @@ fn localize_posture(c: Command, lang: Lang) -> Command {
             ),
             concat!(
                 "控制 Vigil 对原生工具里 `secret://` 占位符的处置力度:\n",
-                "  low     放行(默认 —— 零摩擦)\n",
-                "  medium  交你确认\n",
-                "  high    拦截\n",
+                "  low     宽松:放行(默认 —— 零摩擦)\n",
+                "  medium  适中:交你确认\n",
+                "  high    严格:拦截\n",
                 "明文密钥在**任何**档位都恒被拦 —— 这条硬底线不可降级。\n",
                 "\n",
                 "  vigil-hub posture show\n",
@@ -702,7 +702,7 @@ fn localize_posture(c: Command, lang: Lang) -> Command {
         let sc = sc.about(s(
             lang,
             "Switch to a posture (low / medium / high)",
-            "切换到指定姿态档位(低 / 中 / 高)",
+            "切换到指定姿态档位(low=宽松 / medium=适中 / high=严格)",
         ));
         let sc = arg_help_enum(
             sc,

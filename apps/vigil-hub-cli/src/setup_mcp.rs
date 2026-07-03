@@ -455,6 +455,42 @@ pub fn wrapped_server_count(home: &Path) -> usize {
     user + local
 }
 
+/// `setup --status` 的逐 agent MCP 网关覆盖统计:`(agent 显示名, 已 wrap 数)`,恒含四个 agent
+/// (0 也返回,渲染层自行取舍)。此前 status 只报 Claude Code 的计数 —— `setup --all` 保护了
+/// Codex/Cursor 的二十余个 server 后,用户无从确认全局覆盖面。best-effort 只读:配置缺失 /
+/// 解析失败按 0 计,状态报告不因单个 agent 配置损坏而失败(与 [`wrapped_server_count`] 同口径)。
+pub fn wrapped_server_counts_all_agents(home: &Path) -> Vec<(&'static str, usize)> {
+    let wrapped_in = |cfg: &Value| {
+        classify_user_scope_servers(cfg)
+            .iter()
+            .filter(|c| matches!(c, McpServerClass::AlreadyWrapped { .. }))
+            .count()
+    };
+    let json_agent = |a: &JsonMcpAgent| {
+        read_claude_json(&a.config_path)
+            .ok()
+            .flatten()
+            .map(|cfg| wrapped_in(&cfg))
+            .unwrap_or(0)
+    };
+    let codex = read_codex_config(&codex_config_path(home))
+        .ok()
+        .flatten()
+        .map(|doc| {
+            classify_codex_servers(&doc)
+                .iter()
+                .filter(|c| matches!(c, McpServerClass::AlreadyWrapped { .. }))
+                .count()
+        })
+        .unwrap_or(0);
+    vec![
+        ("Claude Code", wrapped_server_count(home)),
+        ("Codex", codex),
+        ("Cursor", json_agent(&JsonMcpAgent::cursor(home))),
+        ("Windsurf", json_agent(&JsonMcpAgent::windsurf(home))),
+    ]
+}
+
 /// `setup --mcp`(只读)的预览报告 —— 供 CLI 层渲染。
 #[derive(Debug, Clone)]
 pub struct McpPreviewReport {

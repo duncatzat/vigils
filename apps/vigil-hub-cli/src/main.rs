@@ -589,11 +589,12 @@ fn main() -> std::process::ExitCode {
                 match setup::run(&setup_args) {
                     Ok(report) => {
                         // ISS-20260621-002:status 还需报告 MCP-wrap 保护层(只看 hook 会误报
-                        // `--mcp` turnkey 用户未保护)。best-effort 取 home 统计已 wrap 的 server 数。
-                        let mcp_wrapped = dirs::home_dir()
-                            .map(|h| setup_mcp::wrapped_server_count(&h))
-                            .unwrap_or(0);
-                        let code = print_setup_report(lang, &setup_args, &report, mcp_wrapped);
+                        // `--mcp` turnkey 用户未保护)。逐 agent 统计(F-6:只报 Claude 会让
+                        // setup --all 保护的 Codex/Cursor 覆盖面在 status 里不可见)。
+                        let mcp_counts = dirs::home_dir()
+                            .map(|h| setup_mcp::wrapped_server_counts_all_agents(&h))
+                            .unwrap_or_default();
+                        let code = print_setup_report(lang, &setup_args, &report, &mcp_counts);
                         // 其余 agent 的 hook 注册面(Codex/Gemini/Cursor):检测到才注册,逐面诚实
                         // 报告。ledger 用 Claude 面已解析出的同一路径(审计链单账本)。
                         let op = if setup_args.status {
@@ -2424,9 +2425,10 @@ fn print_setup_report(
     lang: Lang,
     args: &SetupArgs,
     r: &setup::SetupReport,
-    mcp_wrapped: usize,
+    mcp_counts: &[(&'static str, usize)],
 ) -> std::process::ExitCode {
     use setup::ProtectionState;
+    let mcp_wrapped: usize = mcp_counts.iter().map(|(_, n)| n).sum();
     if args.status {
         let self_test = setup::doctor_self_test();
         println!("{}", tr(lang, "Vigil status", "Vigil 状态"));
@@ -2485,9 +2487,16 @@ fn print_setup_report(
             "  {}{}",
             tr(lang, "MCP gateway:   ", "MCP 网关:     "),
             if mcp_wrapped > 0 {
+                // 逐 agent 明细(只列非零项):用户能一眼确认 setup --all 的全局覆盖面。
+                let detail = mcp_counts
+                    .iter()
+                    .filter(|(_, n)| *n > 0)
+                    .map(|(name, n)| format!("{name} {n}"))
+                    .collect::<Vec<_>>()
+                    .join(" / ");
                 match lang {
-                    Lang::En => format!("{mcp_wrapped} server(s) wrapped"),
-                    Lang::Zh => format!("已防护 {mcp_wrapped} 个服务器"),
+                    Lang::En => format!("{mcp_wrapped} server(s) wrapped ({detail})"),
+                    Lang::Zh => format!("已防护 {mcp_wrapped} 个服务器({detail})"),
                 }
             } else {
                 tr(lang, "no servers wrapped", "尚未防护任何服务器").to_string()
@@ -2578,12 +2587,14 @@ fn print_setup_report(
             Lang::En => {
                 println!("  Claude Code:   not detected (claude not on PATH; neither ~/.claude nor ~/.claude.json found)");
                 println!("  Nothing to do. Install Claude Code, then re-run `vigil-hub setup`.");
-                println!("  (For other agents, use the MCP gateway: `vigil-hub serve --stdio`.)");
+                println!(
+                    "  (For other agents (Codex/Gemini/Cursor), run `vigil-hub setup --all`.)"
+                );
             }
             Lang::Zh => {
                 println!("  Claude Code:   未检测到(claude 不在 PATH;~/.claude 与 ~/.claude.json 都不存在)");
                 println!("  无事可做。请先安装 Claude Code,再重跑 `vigil-hub setup`。");
-                println!("  (其它 agent 请用 MCP 网关:`vigil-hub serve --stdio`。)");
+                println!("  (其它 agent(Codex/Gemini/Cursor)请用:`vigil-hub setup --all`。)");
             }
         }
         return std::process::ExitCode::SUCCESS;
