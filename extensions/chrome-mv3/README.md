@@ -101,6 +101,10 @@ Expected behavior:
 - You can choose to continue with redaction or block the action
 - The redacted text no longer contains the original token
 
+## Chrome Web Store
+
+The extension is now live on the Chrome Web Store. Install directly from the store — one click, no manual loading required.
+
 ## Popup
 
 The popup is designed for everyday users and focuses on:
@@ -186,7 +190,7 @@ The goal is to let organizations move scanning and policy decisions into a contr
 - Add fuller E2E test coverage
 - Improve safety event explanations and risk education
 - Add enterprise provider examples
-- Package and publish to the Chrome Web Store
+- ~~Package and publish to the Chrome Web Store~~ ✅ Done
 
 ## License
 

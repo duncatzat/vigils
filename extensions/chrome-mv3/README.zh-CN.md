@@ -101,6 +101,10 @@ token=ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ
 - 可选择“脱敏后继续”或“阻断”
 - 脱敏后写入的文本不会包含原始 token
 
+## Chrome 应用商店
+
+扩展已正式上线 Chrome 应用商店，一键安装，即装即用。
+
 ## Popup
 
 Popup 面向普通用户，重点展示：
@@ -186,7 +190,7 @@ node --test extensions/chrome-mv3/tests/*.test.mjs
 - 增加更完整的 E2E 测试
 - 改进安全事件说明和风险解释
 - 接入企业 provider 示例
-- 打包发布到 Chrome Web Store
+- ~~打包发布到 Chrome Web Store~~ ✅ 已完成
 
 ## 许可
 
