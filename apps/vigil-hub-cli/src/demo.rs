@@ -6,6 +6,8 @@
 //! **诚实第一**:本 demo 走 Vigil **真实运行时代码路径**(firewall DecisionRecord / SecretAliasMap
 //! detokenize seam / 审计 hash-chain),**只模拟**外部 model/tool provider —— 不联系任何 LLM。seeded
 //! secret 在进程内**本地生成**、明确标注,且证明它**从不**越过受保护边界(模型/账本)。
+//!
+//! 屏面文案按系统语言本地化(i18n):静态行用 [`tr`] 中 / 英并排,YES/NO 用 [`yn`]。
 
 #![allow(clippy::uninlined_format_args)]
 
@@ -27,6 +29,8 @@ use vigil_types::{
     ApprovalScope, DecisionKind, DecisionRecord, EffectVector, ServerProfile, TransportKind,
     TrustLevel,
 };
+
+use crate::i18n::Lang;
 
 /// `vigil-hub demo` 参数。
 #[derive(Debug, Clone, Default)]
@@ -124,8 +128,8 @@ fn req(id: i64, args: Value) -> JsonRpcRequest {
 }
 
 /// demo 主入口。
-pub fn run(args: &DemoArgs) -> Result<(), DemoError> {
-    banner();
+pub fn run(args: &DemoArgs, lang: Lang) -> Result<(), DemoError> {
+    banner(lang);
 
     // ── 装配真 Hub(in-memory 账本 + 真 firewall + 真 SecretAliasMap + 真审计)──
     let ledger = Arc::new(Ledger::open_in_memory()?);
@@ -187,27 +191,42 @@ pub fn run(args: &DemoArgs) -> Result<(), DemoError> {
     hub.set_session_id_for_test(&session_id)?;
     hub.inject_route_for_test(SERVER_ID, TOOL_NAME, "demo_descriptor_hash")?;
 
-    teaching_moment(&demo_secret);
+    teaching_moment(lang, &demo_secret);
 
     // ── [1] 默认拒绝:agent 把**裸 secret**塞进工具调用 → 真 firewall 拒,绝不透传 ──
-    section("[1] default-deny: agent puts the RAW secret in the tool call");
+    section(tr(
+        lang,
+        "[1] default-deny: agent puts the RAW secret in the tool call",
+        "[1] 默认拒绝:agent(你接入的 AI 助手)把明文密钥直接塞进工具调用",
+    ));
     let raw_args = json!({ "token": demo_secret });
     let resp_a = hub
         .handle_request(req(1, raw_args))?
         .ok_or_else(|| DemoError::SelfCheck("raw-secret call produced no response".into()))?;
-    print_decision(&resp_a, "github.create_issue", &demo_secret)?;
+    print_decision(lang, &resp_a, "github.create_issue")?;
     if resp_a.error.is_none() {
         return Err(DemoError::SelfCheck(
             "expected raw secret to be DENIED, but it was allowed".into(),
         ));
     }
-    println!("    -> Vigil refuses to forward a raw secret to a tool/upstream.\n");
+    println!(
+        "    -> {}\n",
+        tr(
+            lang,
+            "Vigil refuses to forward a raw secret to a tool/upstream.",
+            "Vigil 拒绝把明文密钥转发给工具 / 上游。",
+        )
+    );
 
     // ── [2] Vigil 之道:agent 改传**占位符** secret://github_pat ──
-    section("[2] the Vigil way: the agent passes a PLACEHOLDER instead");
+    section(tr(
+        lang,
+        "[2] the Vigil way: the agent passes a PLACEHOLDER instead",
+        "[2] Vigil 之道:agent 改传一个占位符",
+    ));
     let alias_args = json!({ "token": "secret://github_pat" });
     // 预批准一次(模拟"你点了 Approve once");走真 scope-allow 路径 → 真 Allow 决策
-    seed_one_time_approval(&ledger, &session_id, &alias_args)?;
+    seed_one_time_approval(lang, &ledger, &session_id, &alias_args)?;
     let resp_b = hub
         .handle_request(req(2, alias_args.clone()))?
         .ok_or_else(|| DemoError::SelfCheck("alias call produced no response".into()))?;
@@ -231,28 +250,59 @@ pub fn run(args: &DemoArgs) -> Result<(), DemoError> {
         .clone()
         .ok_or_else(|| DemoError::SelfCheck("alias call had no result".into()))?;
 
-    println!("    What the REMOTE MODEL saw (args, as sent to the model boundary):");
+    println!(
+        "    {}",
+        tr(
+            lang,
+            "What the REMOTE MODEL saw (the call arguments sent to the model):",
+            "远端模型看到的(也就是发给模型的调用参数):",
+        )
+    );
     println!("      {}", compact(remote_model_payload));
     print_scan(
-        "      plaintext secret?",
+        lang,
+        tr(lang, "      real secret here?", "      含真密钥?"),
         remote_model_payload,
         &demo_secret,
     );
-    println!("      [no LLM is contacted in this demo - this is the exact payload Vigil would forward]\n");
+    println!(
+        "      {}\n",
+        tr(
+            lang,
+            "[no LLM is contacted in this demo - this is the exact payload Vigil would forward]",
+            "[本 demo 不联系任何 LLM —— 这就是 Vigil 会转发的确切载荷]",
+        )
+    );
 
-    println!("    What the LOCAL TOOL received (detokenized, in-memory only):");
+    println!(
+        "    {}",
+        tr(
+            lang,
+            "What the LOCAL TOOL received (placeholder restored to the real value, in memory only):",
+            "本地工具收到的(占位符已还原成真值,只存在于内存里):",
+        )
+    );
     println!("      {}", compact(&local_tool_invocation));
     print_scan(
-        "      contains real value?",
+        lang,
+        tr(lang, "      real secret here?", "      含真密钥?"),
         &local_tool_invocation,
         &demo_secret,
     );
     println!();
 
-    println!("    The tool's result LEAKED a credential; Vigil re-redacted it (Slice 1):");
+    println!(
+        "    {}",
+        tr(
+            lang,
+            "The tool's result LEAKED a credential; Vigil caught it before it reached the model:",
+            "工具的返回结果里夹带了一个凭据;Vigil 在回传给模型前把它挡了下来:",
+        )
+    );
     println!("      {}", compact(&model_visible_result));
     print_scan(
-        "      plaintext secret back to model?",
+        lang,
+        tr(lang, "      real secret here?", "      含真密钥?"),
         &model_visible_result,
         &leaked_secret,
     );
@@ -268,7 +318,11 @@ pub fn run(args: &DemoArgs) -> Result<(), DemoError> {
     )?;
 
     // ── [3] 防篡改审计账本(零明文)──
-    section("[3] tamper-evident audit ledger (no plaintext secrets stored)");
+    section(tr(
+        lang,
+        "[3] tamper-evident audit ledger (no plaintext secrets stored)",
+        "[3] 防篡改审计账本(不存任何明文密钥)",
+    ));
     let events = ledger.replay_session_verified(&session_id)?;
     print_ledger(&events);
     ledger.verify_chain()?;
@@ -276,8 +330,11 @@ pub fn run(args: &DemoArgs) -> Result<(), DemoError> {
         .iter()
         .any(|e| event_contains(e, &demo_secret) || event_contains(e, &leaked_secret));
     println!(
-        "    hash chain valid: YES        plaintext secret in audit: {}",
-        yes_no(!plaintext_in_ledger, /*good_is*/ false)
+        "    {}: {}        {}: {}",
+        tr(lang, "hash chain valid", "哈希链有效"),
+        yn(lang, true),
+        tr(lang, "plaintext secret in audit", "审计中含明文密钥"),
+        yn(lang, plaintext_in_ledger),
     );
     if plaintext_in_ledger {
         return Err(DemoError::SelfCheck(
@@ -288,19 +345,31 @@ pub fn run(args: &DemoArgs) -> Result<(), DemoError> {
 
     // ── [4] 可证伪:篡改账本 → 真 verify 失败 ──
     if args.tamper {
-        section("[4] prove it's real - tamper with the ledger and re-verify");
-        run_tamper_proof()?;
+        section(tr(
+            lang,
+            "[4] prove it's real - tamper with the ledger and re-verify",
+            "[4] 证明它是真的 —— 篡改账本再重新校验",
+        ));
+        run_tamper_proof(lang)?;
         println!();
     } else {
-        println!("    (run `vigil-hub demo --tamper` to alter a ledger row and watch verification FAIL)\n");
+        println!(
+            "    {}\n",
+            tr(
+                lang,
+                "(run `vigil-hub demo --tamper` to alter a ledger row and watch verification FAIL)",
+                "(运行 `vigil-hub demo --tamper` 篡改一条账本行,看校验失败)",
+            )
+        );
     }
 
-    ending_screen();
+    ending_screen(lang);
     Ok(())
 }
 
 /// scope 预批准一次(真 `create_approval` + `approve`,让下一次同 args 调用走真 Allow 路径)。
 fn seed_one_time_approval(
+    lang: Lang,
     ledger: &Ledger,
     session_id: &str,
     call_args: &Value,
@@ -330,12 +399,19 @@ fn seed_one_time_approval(
         ctx,
     )?;
     ledger.approve(&prev.approval_id, ApprovalScope::ThisSession, Some("you"))?;
-    println!("    firewall: needs approval -> [you approve once] -> ALLOW");
+    println!(
+        "    {}",
+        tr(
+            lang,
+            "firewall: needs approval -> [you approve once] -> ALLOW",
+            "防火墙:需要审批 -> [你批准一次] -> ALLOW",
+        )
+    );
     Ok(())
 }
 
 /// tamper 证明:临时文件账本 → 写 2 条事件(verify 通过)→ 直接 SQL 改一行 → verify 失败。
-fn run_tamper_proof() -> Result<(), DemoError> {
+fn run_tamper_proof(lang: Lang) -> Result<(), DemoError> {
     let dir = std::env::temp_dir().join(format!("vigil-demo-tamper-{}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| DemoError::Tamper(e.to_string()))?;
     let path = dir.join("ledger.sqlite");
@@ -357,7 +433,12 @@ fn run_tamper_proof() -> Result<(), DemoError> {
             Some("another row"),
         )?;
         ledger.verify_chain()?;
-        println!("    wrote 2 audit rows -> hash chain valid: YES");
+        println!(
+            "    {} -> {}: {}",
+            tr(lang, "wrote 2 audit rows", "写入 2 条审计行"),
+            tr(lang, "hash chain valid", "哈希链有效"),
+            yn(lang, true),
+        );
 
         // 直接改一行的 redacted_text(不更新其 event_hash)→ 链断裂
         let conn =
@@ -369,10 +450,13 @@ fn run_tamper_proof() -> Result<(), DemoError> {
             )
             .map_err(|e| DemoError::Tamper(e.to_string()))?;
         drop(conn);
-        println!(
-            "    altered {} ledger row in place (changed its content, not its hash)",
-            n
-        );
+        match lang {
+            Lang::En => println!(
+                "    altered {} ledger row in place (changed its content, not its hash)",
+                n
+            ),
+            Lang::Zh => println!("    就地篡改了 {} 条账本行(改了内容,没改哈希)", n),
+        }
 
         let ledger2 = Ledger::open(&path)?;
         match ledger2.verify_chain() {
@@ -381,7 +465,11 @@ fn run_tamper_proof() -> Result<(), DemoError> {
             )),
             Err(_) => {
                 println!(
-                    "    re-verify after tamper -> hash chain valid: NO  [x]  tamper DETECTED"
+                    "    {} -> {}: {}  [x]  {}",
+                    tr(lang, "re-verify after tamper", "篡改后重新校验"),
+                    tr(lang, "hash chain valid", "哈希链有效"),
+                    yn(lang, false),
+                    tr(lang, "tamper DETECTED", "检测到篡改"),
                 );
                 Ok(())
             }
@@ -417,29 +505,69 @@ fn self_check(
     Ok(())
 }
 
-// ── 打印 helpers ──
-fn banner() {
-    println!();
-    println!("  ============================================================");
-    println!("  VIGIL DEMO - in-memory, planted scenario, NOT guarding real yet");
-    println!("  ============================================================");
-    println!("  Real Vigil runtime code paths (firewall / redaction / audit).");
-    println!("  Only the external model/tool provider is simulated - no LLM is contacted.\n");
+// ── 按语言取文案 / YES-NO ──
+/// 静态文案中 / 英并排(无插值的行用它)。
+fn tr<'a>(lang: Lang, en: &'a str, zh: &'a str) -> &'a str {
+    match lang {
+        Lang::En => en,
+        Lang::Zh => zh,
+    }
 }
 
-fn teaching_moment(secret: &str) {
-    println!(
-        "  A demo secret - freshly generated locally for this run (never leaves this process):"
-    );
-    println!("    github_pat = {}", secret);
-    println!("  Watch: it reaches the tool, but the model & audit never see it.\n");
+/// 是/否展示词(YES/NO ↔ 是/否)。
+fn yn(lang: Lang, yes: bool) -> &'static str {
+    match (lang, yes) {
+        (Lang::En, true) => "YES",
+        (Lang::En, false) => "NO",
+        (Lang::Zh, true) => "是",
+        (Lang::Zh, false) => "否",
+    }
+}
+
+// ── 打印 helpers ──
+fn banner(lang: Lang) {
+    println!();
+    println!("  ============================================================");
+    match lang {
+        Lang::En => {
+            println!("  VIGIL DEMO - in-memory, planted scenario, NOT guarding real yet");
+            println!("  ============================================================");
+            println!("  Real Vigil runtime code paths (firewall / redaction / audit).");
+            println!(
+                "  Only the external model/tool provider is simulated - no LLM is contacted.\n"
+            );
+        }
+        Lang::Zh => {
+            println!("  VIGIL 演示 —— 内存中、预置场景,尚未守护真实流量");
+            println!("  ============================================================");
+            println!("  跑的是 Vigil 真实运行时代码路径(防火墙 / 脱敏 / 审计)。");
+            println!("  只有外部的模型 / 工具被模拟 —— 全程不联系任何 LLM。\n");
+        }
+    }
+}
+
+fn teaching_moment(lang: Lang, secret: &str) {
+    match lang {
+        Lang::En => {
+            println!(
+                "  A demo secret - freshly generated locally for this run (never leaves this process):"
+            );
+            println!("    github_pat = {}", secret);
+            println!("  Watch: it reaches the tool, but the model & audit never see it.\n");
+        }
+        Lang::Zh => {
+            println!("  一个 demo 密钥 —— 本次运行在本地新生成(绝不离开本进程):");
+            println!("    github_pat = {}", secret);
+            println!("  注意:它会抵达工具,但模型与审计始终看不到它。\n");
+        }
+    }
 }
 
 fn section(title: &str) {
     println!("  {}", title);
 }
 
-fn print_decision(resp: &JsonRpcResponse, label: &str, _secret: &str) -> Result<(), DemoError> {
+fn print_decision(lang: Lang, resp: &JsonRpcResponse, label: &str) -> Result<(), DemoError> {
     match &resp.error {
         Some(e) => {
             let decision_id = e
@@ -455,8 +583,9 @@ fn print_decision(resp: &JsonRpcResponse, label: &str, _secret: &str) -> Result<
                 .and_then(Value::as_str)
                 .unwrap_or("-");
             println!(
-                "    tool={}  -> Vigil firewall: DENY  (rule={})  decision_id={}",
+                "    tool={}  -> {}: DENY  (rule={})  decision_id={}",
                 label,
+                tr(lang, "Vigil firewall", "Vigil 防火墙"),
                 rule,
                 short(decision_id)
             );
@@ -466,9 +595,9 @@ fn print_decision(resp: &JsonRpcResponse, label: &str, _secret: &str) -> Result<
     Ok(())
 }
 
-fn print_scan(label: &str, v: &Value, needle: &str) {
+fn print_scan(lang: Lang, label: &str, v: &Value, needle: &str) {
     let present = value_contains(v, needle);
-    println!("    {} {}", label, if present { "YES" } else { "NO" });
+    println!("    {} {}", label, yn(lang, present));
 }
 
 fn print_ledger(events: &[ReplayEvent]) {
@@ -482,29 +611,59 @@ fn print_ledger(events: &[ReplayEvent]) {
     }
 }
 
-fn ending_screen() {
+fn ending_screen(lang: Lang) {
     println!("  ============================================================");
-    println!("  What just happened");
-    println!("  ============================================================");
-    println!("    Remote model saw:     secret://github_pat");
-    println!("    Local tool received:  the real secret, only at the execution boundary");
-    println!("    Tool result returned: re-redacted (no secret back to the model)");
-    println!("    Firewall:             default-deny + explicit approval");
-    println!("    Audit ledger:         hash-chain valid, no plaintext secrets");
-    println!();
-    println!("    The agent did useful work with a real secret - while the model,");
-    println!("    logs, and audit never received the real value.");
-    println!();
-    println!("    Philosophy:  local control plane / no token passthrough / fail-closed");
-    println!("                 / audit everything / you stay in control");
-    println!();
-    println!("    This was a planted scenario with a locally-generated fixture. The redaction,");
-    println!("    firewall, and audit above are Vigil's real runtime code - only the model/tool");
-    println!("    provider was simulated.");
-    println!();
-    println!("    Protect your real agent:");
-    println!("      vigil-hub serve --stdio      # point Claude Code / Codex / Cursor at it");
-    println!();
+    match lang {
+        Lang::En => {
+            println!("  What just happened");
+            println!("  ============================================================");
+            println!("    Remote model saw:     secret://github_pat");
+            println!("    Local tool received:  the real secret, only when the tool actually runs");
+            println!("    Tool result returned: caught before reaching the model (none sent back)");
+            println!("    Firewall:             default-deny + explicit approval");
+            println!("    Audit ledger:         hash-chain valid, no plaintext secrets");
+            println!();
+            println!("    The agent did useful work with a real secret - while the model,");
+            println!("    logs, and audit never received the real value.");
+            println!();
+            println!("    Philosophy:  local control plane / no token passthrough / fail-closed");
+            println!("                 / audit everything / you stay in control");
+            println!();
+            println!(
+                "    This was a planted scenario with a locally-generated fixture. The redaction,"
+            );
+            println!(
+                "    firewall, and audit above are Vigil's real runtime code - only the model/tool"
+            );
+            println!("    provider was simulated.");
+            println!();
+            println!("    Protect your real agent:");
+            println!("      vigil-hub setup --all        # one command, reversible");
+            println!();
+        }
+        Lang::Zh => {
+            println!("  刚刚发生了什么");
+            println!("  ============================================================");
+            println!("    远端模型看到的:     secret://github_pat");
+            println!("    本地工具收到的:     真实密钥,只在工具实际执行时出现");
+            println!("    工具结果返回:       回传前已拦下(没有密钥回流到模型)");
+            println!("    防火墙:             默认拒绝 + 显式审批");
+            println!("    审计账本:           哈希链有效,无任何明文密钥");
+            println!();
+            println!("    agent 用真实密钥完成了有用的工作 —— 而模型、日志、审计");
+            println!("    始终没拿到那个真值。");
+            println!();
+            println!("    理念:  本地控制平面 / 不透传 token / fail-closed");
+            println!("           / 一切皆审计 / 你始终掌控");
+            println!();
+            println!("    这是一个用本地生成的样本演的预置场景。上面的脱敏、防火墙与审计");
+            println!("    都是 Vigil 真实的运行时代码 —— 只有模型 / 工具一侧是模拟的。");
+            println!();
+            println!("    保护你真实的 agent:");
+            println!("      vigil-hub setup --all        # 一条命令接入,全程可逆");
+            println!();
+        }
+    }
 }
 
 // ── 小工具 ──
@@ -526,14 +685,6 @@ fn event_contains(e: &ReplayEvent, needle: &str) -> bool {
             .map(|t| t.contains(needle))
             .unwrap_or(false)
 }
-/// good_is=false 时,`ok=true`(无明文)显示绿色语义 "NO"。这里只返回展示串。
-fn yes_no(ok: bool, _good_is: bool) -> &'static str {
-    if ok {
-        "NO"
-    } else {
-        "YES"
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -543,15 +694,17 @@ mod tests {
     // demo 内置 self_check 在任一不变量被破坏时 fail-closed(SelfCheck error):
     // remote payload 泄漏真值 / local 没拿到真值 / 结果未脱敏 / 账本含明文 → run() 返 Err。
     // 故 run() 返 Ok 即**证明**整条可逆脱敏往返 + no-plaintext 不变量在真代码路径上成立。
+    // 语言无关(两语言走同一逻辑);用 En 跑。
     #[test]
     fn demo_round_trip_and_invariants_hold() {
-        run(&DemoArgs { tamper: false })
+        run(&DemoArgs { tamper: false }, Lang::En)
             .expect("demo round-trip + no-plaintext invariants must hold");
     }
 
     // run(tamper) 仅当账本篡改被 verify_chain **检测到**才返 Ok(否则 SelfCheck error)。
     #[test]
     fn demo_tamper_is_detected() {
-        run(&DemoArgs { tamper: true }).expect("ledger tamper must be detected by verify_chain");
+        run(&DemoArgs { tamper: true }, Lang::Zh)
+            .expect("ledger tamper must be detected by verify_chain");
     }
 }

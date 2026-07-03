@@ -8,6 +8,328 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.4.6-beta.3] — 2026-07-03 — 稳健性打磨:OAuth scope 接线修复、`status --json`、双引擎 parity、远程 MCP e2e
+
+加固向 beta:一个真实网关修复,其余全部是验证覆盖面的加强。
+
+### 修复
+
+- **`ScopeNotInAllowList` 策略规则对 OAuth HTTP upstream 现在真正生效。** 此前网关对所有出站
+  tools/call 硬编码非 OAuth scope 上下文,配置了 scope 白名单 Deny 规则的用户以为有保护、
+  实际规则静默永不触发(虚假安全感)。token 的 scope 集(attach 期快照)现已进入策略评估:
+  越界 scope 拒绝、空 scope 集 fail-closed、非 OAuth 上游(stdio / bearer / 无鉴权)不受影响。
+  三个新集成测试锁定三分支。
+
+### 新增
+
+- **`daemon status --json`** —— 稳定、与界面语言无关的机器可读 schema
+  (`running`/`pid`/`pii_loaded`/`inj_loaded`/`uptime_secs`/`inflight`;字段只增不删)。
+  人类输出不变(仍本地化)。验收脚本优先用它,老版本自动回退钉英文文案。
+- **远程 MCP e2e 进入值守验收矩阵**(`http-e2e.mjs`):对已发布二进制实证 Streamable HTTP
+  upstream 路径的防护不变量 —— Bearer token 到达上游 `Authorization` 头但绝不出现在客户端
+  与审计里、密钥租约四段往返在 HTTP 上成立、SSE(`text/event-stream`)上游响应被折叠并
+  再脱敏、裸 secret 不被转发、审计账本无明文。
+- **双引擎 parity 守门**(`dual_engine_parity`):hook 路径与 MCP 网关路径喂同一份不可信输入,
+  判定必须一致(裸 secret 双拦、干净输入双放、deny 不回显真值)—— 决策核心统一前的漂移警报线。
+- **周度定时验收**(每周一 03:23 UTC,对 Latest release):上游 agent hook 协议漂移、
+  分发服务变化不必等我们发版即可被发现。
+
+### 文档
+
+- README(双语):crates.io 上的 `vigil-sdk` 是独立节奏的早期预览、落后于本仓库;
+  要用最新 API 请从源码构建。
+
+## [v0.4.6-beta.2] — 2026-07-02 — 值守式用户验收 CI(功能 + agent 接入 + GUI),含 beta.1 打磨
+
+本测试版聚焦「逐功能用户级验证」(三平台真二进制走查)发现的问题。不涉及任何安全不变量变更,硬底线不动。
+
+### 新增
+
+- **含大写 / 空格 / 点的 server 名现在可被保护**(`setup --mcp` / `--all`):网关 server-id 经
+  slugifier 派生(`Playwright` → `user-playwright-<hash8>`),不再跳过并要求你去改 MCP 配置里的名字。
+  本就合法的名字 id 逐字不变(向后兼容);大小写变体不会塌缩成同一身份(哈希后缀)。
+- 裸 `vigil-hub posture` / `engine` / `daemon` 现在默认执行 `show` / `status`,不再甩出 help。
+
+### 修复
+
+- `daemon status` 的运行时长恒为 `0s`;现在如实报告已运行时间。`daemon stop` 不再把系统结束进程
+  助手的本地化输出漏进用户界面(非 UTF-8 代码页下曾乱码)。
+- `setup --all` 输出如实化:`[2/2]` MCP 网关行标注 scope(Claude Code),不再被误读成全局总数;
+  「改动写入配置文件」只在真实写盘时出现;agent CLI 状态由易误读的「未安装」改为「hook 未注册」。
+- `demo` 结尾改推 `vigil-hub setup --all`(一键路径),不再指向手动 `serve --stdio` 流程。
+- `checkpoint` 提示按平台给建议 —— Windows 不再出现 Linux 专属的 `chattr +a`;macOS 建议
+  `chflags uappnd`。
+- `setup --mcp` 预览的跳过原因在中文输出下本地化;`quickstart` 不再把所有被跳过的 server 统称
+  「http/sse」。
+- 标准(非 ML)构建的 `model` help 直接标注需 ML 版二进制,不再等到 `model install` 才发现。
+- `setup --help` 文本清理内部评审速记。
+- 桌面:模型未安装时,守护进程卡不再承诺「启动即开启 ML 防护」(现在说明此时 daemon 以无模型方式
+  运行,hook 保持硬指纹底座);Naive UI 内建文案(空表、分页)随应用语言。
+- 扩展:用户可见文本清除内部规范编号;禁用按钮有了禁用外观;守护站点文案与 manifest 实际清单一致。
+
+### 文档
+
+- `docs/user-guide/`:移除不存在的命令(`ledger verify` / `ledger query` → `vigil-hub verify` +
+  Activity Feed / 直查 SQLite),修正默认账本路径(`%LOCALAPPDATA%\Vigil\ledger.sqlite3` 及各
+  平台等价路径,用 `VIGIL_LEDGER_PATH` 对齐),把过时的「Stage 1:`tools/list` 返空」说明替换为
+  真实的上游转发行为,并把安装指引指向 GitHub Releases。
+- README(中英):ML 变体可用性说明已过时(v0.4.0 起随每个 release 发布);「逐字节还原」措辞
+  收敛为经验证的承诺(只删 Vigils 自己的条目,你的配置如实还原)。
+
+### 新增(测试基建)
+
+- **值守式用户验收 CI**(`.github/workflows/acceptance.yml`):每次发布后三平台像用户一样下载已发布产物、校验 sha256 + SLSA 溯源,跑 `user-sim.sh`、`functional-sweep.sh`、`core-e2e.mjs`(真 MCP 网关的隐私过滤 + 密钥租约四段)、`agent-compat.sh`(Claude/Codex/Gemini/Cursor 原生 hook 协议),外加桌面 GUI 冒烟(Windows WebView2 CDP;Linux/macOS 装→启→截图)。ML 模型下载 e2e 留内部真机。
+- **`serve --monitor`**(与 `wrap --monitor` 对称):headless/e2e 无 GUI 审批 resolver 时观察放行 + 审计;硬地板不变。
+
+---
+
+## [v0.4.5] — 2026-06-30 — 闭合 `VIGIL-SEC-ML-SKIP`(`secret://` 面):恢复同段 soft-PII 脱敏
+
+### 安全
+
+- **`VIGIL-SEC-ML-SKIP` 闭合(`secret://` 面)。** `MlScrub::augment` 不再因字符串 leaf 含字面
+  `secret://` 就整段跳 ML。`secret://<alias>` 占位符由脱敏流程**自产**(逆向替换写入、字节区间已记入
+  `protected` 集),`apply_wire_spans` 经区间减法保其不被 ML 切,同段 soft-PII(person / address / email)
+  得以正常脱敏 —— 闭合一处 ML-recall gap:攻击者在 soft-PII 旁嵌字面 `secret://x` 即抑制该 leaf 的语义
+  脱敏(无泄漏;硬指纹地板始终兜住)。`vigil://redact/` skip 保留(这类 Tier-B token 在 tool_output 中、
+  非自产,区间无法可信加入 `protected`);tool_output 中**伪造**的 `secret://…` 同样不在 `protected`,其
+  包裹的 PII 仍被 scrub。经对抗式审查、可证伪真机对比(旧二进制抑制 soft-PII vs 修复后 scrub 且
+  `secret://` 占位符保留)、端到端验收断言验证。
+
+---
+
+## [v0.4.4] — 2026-06-29 — 深 `$HOME` 下 macOS daemon socket 健壮性(`sun_path` 溢出修复)
+
+macOS 上 daemon 默认 socket 路径(`~/Library/Application Support/Vigil/vigil-daemon.sock`)在深 `$HOME`
+下 —— 企业网络 home(`/Network/Servers/…`)或 sandbox 的 `$TMPDIR` —— 可能超出 `sockaddr_un.sun_path`
+上限(104 字节),令 `daemon start` 以晦涩 libc 错误失败,并把 ML 防护静默降级到硬指纹地板。
+
+### 修复
+
+- **`VIGIL_DAEMON_SOCKET` env 覆盖** 让 daemon socket 路径可显式指定 —— 深 `$HOME` 部署(及确定性测试
+  sandbox)的短、用户私有逃生口。在 `default_socket_name()` 一处解析,经 `daemon.json` 原样流向 hook
+  客户端,故 server bind 与 client connect 始终一致。
+- **可操作的 bind 时守门。** socket 路径达到或超过 `sun_path` 容量时,以明确指向 `VIGIL_DAEMON_SOCKET`
+  的错误拒绝,而非晦涩 libc 消息。不触及单实例 / peer-credential(R1)/ stale-reclaim 任一不变量 ——
+  env 只提供它们已消费的字符串。
+
+---
+
+## [v0.4.3] — 2026-06-29 — `VIGIL-SEC-OVERLAP-PH`:受保护区减法消除破碎嵌套占位符
+
+daemon ML pass 跑在已脱敏(含 `[REDACTED …]` 占位符)的文本上。ML span 可能 over-capture 延伸进占位符
+并切碎它(`[[REDACTED address]DACTED email]`)。无原值泄漏(被切的是占位符字节;真值已脱敏),但面向模型的
+输出畸形。
+
+### 修复
+
+- **`apply_wire_spans` 减去真实占位符区间。** 脱敏流程现在报告它插入的占位符字节区间
+  (`scrub_text_with_spans`);hook 把 redact + ML 融合为单遍,把这些**真实**区间 plumb 进
+  `apply_wire_spans`,后者从每个 ML span 减去它们、只替换占位符之外的字节。区间来自流程**自产**输出,
+  绝不靠正则识别 `[REDACTED …]` 形态 —— 故 tool_output 中伪造的占位符无法遮蔽其包裹的 PII。
+
+---
+
+## [v0.4.2] — 2026-06-26 — GUI 自动安装 ML 引擎变体 + 签名引擎清单(ML 最后一公里)
+
+### 新增
+
+- **桌面 GUI 一键安装 ML 引擎。** 设置页 AI 模型卡下载并换入逐平台 ML 引擎变体(格式无关 zip/tar),
+  闭合最后一公里 —— 默认安装无需手动倒腾二进制即可变为 ML 可用。
+- **签名引擎清单。** 引擎清单在 CI 中签名(minisign),换引擎前经 GUI 内嵌 pubkey 核验,故被篡改或
+  中间人的清单被拒。
+
+### 修复
+
+- 引擎清单默认 URL 指向 GitHub release 资产(此前 `vigils.ai` 镜像对 `/releases/engine/` 返回 SPA
+  HTML,破坏 turnkey 路径)。
+
+---
+
+## [v0.4.1] — 2026-06-26 — P1 重叠 span PII 泄漏修复 + v0.4.0 分发 bug 修复
+
+对 v0.4.0 已发布产物的发布验收测试,暴露出一处脱敏路径泄漏与四个打包/分发 bug;此处全部修复。
+
+### 安全
+
+- **P1:重叠 span PII 泄漏(两处)。** 两处独立 span 替换点(`vigil-redaction::build_redacted_text`、
+  `vigil-hub-cli::apply_wire_spans`)旧用右→左替换 + 重叠跳过;嵌套 model span(外层前缀是 PII)时泄漏
+  外层明文前缀。两处均改写为 **union-merge**(对齐网关 `redact_string`),令任一 span 命中的每个字节都
+  落入某替换区间。
+
+### 修复
+
+- **Linux `model install` 超时** —— 固定 30 秒每-chunk 超时短于 48MB chunk 在带宽共享链路上所需,
+  turnkey 下载失败;已放宽。
+- **macOS daemon R1 / stale socket** —— `peer_creds().pid()` 在 macOS 上为 `None`(R1 改回落 euid
+  核验),且文件 socket 在非干净退出后未回收(永久 `EADDRINUSE`);经私有目录文件 socket + stale-reclaim
+  在 `transport.rs` 修复。
+- **ML 归档缺 `vigil-native-host`** —— 浏览器 native-messaging host 现已捆进 ML 变体归档。
+- **Windows `.sha256` CRLF** —— 校验和文件携带 CRLF 行尾时被标记。
+
+---
+
+## [v0.4.0] — 2026-06-26 — 常驻 daemon 把 ML 隐私过滤带上 hook 主防护路径(ADR 0024)+ 模型安装 turnkey + GUI 控制
+
+AI 隐私模型(DeBERTa 注入 + PII NER)现在跑在 **hook 主防护路径**上,而不只是 `serve`/`wrap`。常驻
+**daemon** 持有暖载模型,每次 `vigil-hub hook` 经本地 IPC socket 查询、近零额外延迟 —— 若 daemon /
+模型 / IPC 缺失或变慢,hook **回落硬指纹地板**(fail-closed,绝不 fail-open)。自内部 R3 移植,脱敏
+路径经对抗式审查。
+
+### 新增
+
+- **ML-on-hook 常驻 daemon(ADR 0024)。** `vigil-hub daemon start|status|stop` 跑单实例本地 socket
+  服务,一次性暖载 PII scanner + 注入分类器,hook 作瘦 IPC 客户端查询。peer-credential 认证(客户端
+  核验 server PID == 记录的 daemon)、流式读截止、daemon 自持审计账本、fire-and-forget 注入分类,
+  使其有界且抗篡改。ort-gated;非 ML 构建或模型未缓存 → model-less daemon,hook 留在硬指纹 —— 绝不
+  fail-open。
+- **`vigil-hub model install|status` turnkey。** 一条命令下载隐私 + 注入模型(HTTPS、16-chunk 并发、
+  SHA-256 钉死、不符即 fail-closed)。`model status` 报每个模型缓存态;非 ML 构建报 `unsupported`。
+- **`vigil-hub engine show|set`** 落盘引擎模式(`hardfp` / `ml` / `auto`),`serve`/`wrap`/hook 在无
+  显式 `--engine` 时回落本配置(由 GUI 控制平面写入)。
+- **桌面 GUI 控制卡。** 设置页新增 **守护进程** 卡(运行 / ML 暖载态 + 启停)与 **AI 模型** 卡(已装 /
+  不支持态 + 一键安装),经独立进程 shell-out CLI,GUI 自身绝不加载 ort。
+- **ML 引擎发行变体。** 逐平台 `vigils-cli-ml-*` 归档(含捆绑 ONNX Runtime 动态库)与默认纯硬指纹
+  二进制一并发布。
+
+### 安全
+
+- 硬指纹脱敏地板在任何 daemon 缺失 / 模型缺失 / IPC 超时 / 非 ort 路径上**无条件**生效;ML 严格加性
+  叠加其上。经移植 hook 路径的对抗式审查 + 端到端回归测试(ML-only 模式、daemon 缺席 → 地板仍 scrub)验证。
+
+---
+
+## [v0.3.0] — 2026-06-22 — 远端 HTTP/SSE MCP 上游(OAuth/Bearer)+ 防篡改 OAuth 信任链 + 锚定自动核对
+
+首个把**远端 HTTP MCP 服务器**纳入 Vigil 防火墙的版本,外加对新 OAuth 路径的两项审计完整性加固。
+每个安全关键改动都经过对抗式审查。
+
+### Added
+
+- **HTTP / SSE MCP 上游(ADR 0021)。** 经 Streamable HTTP(`application/json` 或 `text/event-stream`)
+  可达的远端 MCP 服务器,现在流经 Vigil 的传输无关 chokepoint,因而继承与本地 stdio 服务器同等的保障:
+  防火墙 default-deny、`secret://` detokenize、结果脱敏、审计。三种鉴权来源,均经一个 sealed planner
+  (无法把传入的 `Authorization` 头 passthrough 给上游):`none`(public)、plain **Bearer**
+  (`env:`/`keyring:` 静态 token)、**OAuth**(`serve` 启动时从 `add-remote-mcp` 已落库的 token 经授权
+  服务器 re-discovery 重建 —— 无需浏览器)。mcp URL **与** OAuth discovery 端点均过 SSRF denylist +
+  no-redirect;OAuth 对未 onboard / 异源 / SSRF / issuer 漂移一律 fail-closed。
+- **启动时自动核对审计锚定(ADR 0020)。** 防篡改锚点此前已在网关关闭时自动 emit(v0.1.32),但只由手动
+  `vigil-hub verify` 命令核对。`serve` 现在启动时也自动核对 checkpoint 锚定(异步、不阻塞、stderr-only、
+  warn-only)—— turnkey 用户无需手动运行任何命令,即可在发生整链重写时被告警(补齐了 emit 自动、verify
+  却只手动的非对称缺口)。
+
+### Changed(安全)
+
+- **OAuth token metadata 现绑入审计哈希链。** `oauth_token_metadata` 行(issuer / authorization-server /
+  resource)是 OAuth token 验证的信任根,此前却在审计链外 —— 本地 DB 攻击者可篡改而不被发现。现在按
+  存储的 `event_id` 绑定到一条审计事件,读时校验(`verify_chain` + payload 比对),故 naive 篡改、绑定
+  事件删除、伪造 append 均被检出。(诚实定界:达到与账本其余状态同级的篡改**可检测性**;防住完整一致
+  重写的篡改**证明**需外部锚定 —— 见 ADR 0020 / `vigil-hub verify`。)
+
+---
+
+## [v0.2.2] — 2026-06-21 — status 报告 MCP-wrap 防护 + ML 引擎错误文案更清晰 + 发布流程加固
+
+v0.2.1 的小幅跟进,来自一次全局代码审计 + 真机 QA:两个面向用户的 CLI 修复、一个 flaky 测试修复,
+以及 CI/发布流程加固。防护逻辑本身未变;两个 CLI 修复已在真实 Linux 硬件上从用户视角验证。
+
+### Fixed
+
+- **`vigil-hub setup --status` 现报告 MCP 网关防护。** 此前只检查原生工具 hook,故用 `setup --mcp`
+  (只 wrap MCP server、不装 hook)配置防护的用户被误报 `Protection: not installed`。status 现显示
+  两层 —— `Native hook:` 与 `MCP gateway: N server(s) wrapped` —— `Protection: ACTIVE` 反映任一层启用。
+- **在非 ML 件上请求 ML 引擎时错误更清晰。** 默认件(`vigils-cli-<plat>`)上 `vigil-hub serve --engine ml`
+  现引用用户实际所传的 `--engine ml`,并指引下载 ML 变体(`vigils-cli-ml-<plat>`)或 `--features ort`
+  重建,不再引用内部 flag。
+
+### Changed(维护者 / CI)
+
+- **发布流程加固。** 发布版本门现还会对陈旧的 inter-crate 版本 pin 与 Tauri Rust/npm minor 不一致
+  早失败(二者都在 v0.2.1 发布过程踩过)。GitHub release 现先建为草稿,所有构建 job 成功后才发布,
+  故构建失败不再可能留下资产残缺的公开 release。
+- de-flake 一个进程内审批唤醒测试(改测唤醒延迟而非总 wall-clock,消除受 CI 负载影响的 flaky)。
+
+---
+
+## [v0.2.1] — 2026-06-21 — ML 脱敏 CLI 变体 + 真机验证修复
+
+发布可选的 ML 脱敏引擎作为预构建 release 产物(`vigils-cli-ml-<plat>`),与默认硬指纹 CLI 并存,
+并修复两个只有三平台真机验证才能暴露的 bug。ML CLI 变体及其模型下载路径已在真实 Linux / macOS /
+Windows 硬件上端到端验证(onnxruntime 1.24 dylib `dlopen` + 真 PII/DeBERTa 推理);已发布的
+`vigils-cli-ml-windows-x64` 与 `vigils-cli-ml-linux-x64` 产物在发布后又做了复测。
+
+### 新增
+
+- **ML CLI 变体 —— `vigils-cli-ml-<plat>`(Linux x64 / macOS arm64 / Windows x64)。** 与默认硬指纹
+  `vigils-cli-<plat>` 并存的第二个 CLI 构建,以 `--features ort` 构建,并把 ONNX Runtime 1.24 动态库
+  捆在 `vigil-hub` 同目录。运行 `vigil-hub serve --engine ml`(或 `auto`)即在硬指纹规则之上叠加
+  OpenAI PII NER 模型 + DeBERTa 提示注入分类器;模型首跑按需下载(~0.8–1.5 GB,Hugging Face 主源 +
+  vigils.ai 镜像 fallback,SHA-256 校验)。两引擎并存(按启动选择)。已在真实 Linux / macOS / Windows
+  硬件验证(dylib dlopen + 真 PII/DeBERTa 推理)。每个资产同默认 CLI 一样带 `.sha256` + Sigstore
+  构建溯源。ML 构建平台地板:Linux glibc ≥ 2.28、macOS ≥ 14。
+
+### 修复
+
+- **模型下载不再在"不支持 HTTP Range 的镜像"上损坏文件。** 16-chunk 并发下载器假设服务端返
+  `206 Partial Content`;经 Cloudflare 的镜像对 JSON 做 gzip,对 Range 请求返 `200`(全量),于是每个
+  worker 把整文件写进自己的分块槽 → 组装成 16× 损坏 → SHA-256 不匹配。仅 HF 被屏蔽、走 vigils.ai
+  镜像 fallback 的用户中招(Hugging Face 永远返 206)。下载器现会探测 Range 支持,镜像不支持时改为
+  单流下载。
+- **ML smoke 覆盖不再硬断言一个已知且搁置的多语种 gap。** per-label 覆盖测试与精度/召回基准共用
+  fixture(已膨胀到 90+ zh/ja/ko/de/it/fr 样本),硬断言了英文中心模型本不应具备的多语种 PII 覆盖;
+  现改为只对受支持范围门控,并将多语种召回转为报告。
+
+### 文档
+
+- README(en + zh)与 mdBook 新增"两种脱敏引擎"说明(默认 vs ML、`--engine` 用法、首跑模型下载、
+  平台地板);并修正安装表中的 CLI 资产命名。
+
+## [v0.2.0] — 2026-06-20 — 首个正式版:turnkey 健壮性 + 诚实边界
+
+退出 beta 线。本版加固一键接入(`vigil-hub setup`)对真实配置形态的处理,修复一轮真机端到端
+测试(Claude Code + Codex 由真实模型驱动、k8s 隔离)发现的状态报告与审计 bug,并诚实陈述防护
+边界,让你能正确地依赖 Vigils。每个修复都有单测 + 33 断言端到端套件(对真二进制)验证;风险最高
+的修复经 Codex 交叉评审。
+
+本版还包含已合并的社区贡献:桌面 UI 重设计(#5)与 Chrome 扩展更新(#2)。感谢贡献者。
+
+### 修复
+
+- **`setup --status` 不再对自定义 `--ledger` 误报 STALE**。用自定义共享 ledger 安装(文档建议的
+  与桌面应用共享审计的方式)后,`setup --status` 会误报 "INSTALLED but STALE / 保护关闭" —— 即便
+  保护有效、自检 PASS —— 且其重跑 `setup` 的提示会把账本悄悄改回默认、切断 GUI 共享。staleness 现
+  与 ledger 路径无关(用户选的路径不算漂移);binary 路径漂移、缺 PostToolUse 注册、缺 flag 仍报
+  STALE。Claude(`settings.json`)与 Codex/Gemini/Cursor(`hooks.json`)两面均修。(#19)
+- **`vigil-hub --version` / `-V` 现能打印版本**,不再报 "unexpected argument"。安全 CLI 连版本都
+  报不出是真实粗糙点(提 bug、核对升级都需要)。(#20)
+- **`vigil-hub verify` 恢复只读**。校验不存在的账本路径会凭空建 221KB 空库(只读审计产生写副作用)
+  再误报 "✓ chain internally valid";现诚实报告账本不存在且不创建。
+- **`setup --mcp` 处理真实 MCP 配置形态**:单串 `command`(`"npx -y pkg /path"`,即 `claude mcp add`
+  写法)拆为 program+args 而非不可运行的单 argv;被 `stdbuf`/`sh`/`env` 前缀包裹的 `vigil-hub wrap`
+  保持原样不二次包装;底层程序不在 `PATH` 的被包装 server 给非阻塞 WARNING 而非虚假 "Protected"。
+  (#14、#15、#16)
+- **Claude Code turnkey 结果脱敏默认开启**,agent 检测不再漏判"已装未首跑"(经 `PATH` 上的
+  `claude` 二进制检测,不仅凭 `~/.claude/`)。(#10、#11)
+- **还原 `vigil-hub inspect` 命令**(`protection` / `activity` / `search` / `approvals` /
+  `verify-chain`)。其 CLI 接线在 v0.1.31 被误删(一次无关的 checkpoint-anchor port 连带删除),而实现
+  与 README / 文档引用都还在 —— 照做会撞 "unrecognized subcommand"。现已恢复。(`inspect protection` 的
+  头条计数目前反映 MCP 网关路径;`activity` 事件流则展示包括 hook 路径拦截在内的全部事件。把 `protection`
+  汇总扩展到 hook 路径的归类留作后续跟进。)
+
+### 文档
+
+- **诚实防护边界**。引言与用户指南现明确陈述 Vigils 能可靠防住什么(13 类指纹的明文凭据泄漏、可逆
+  脱敏、防篡改审计、审批、沙箱)与**防不住**什么(蓄意模型可对 secret 编码/分段、或走 Vigils 未
+  中介的通道绕过输入侧检测)—— 以及出站代理是路线图上的完整堵法。不制造虚假安全感。
+- 修正 agent 接入与 Codex 指引(hook-first 模型;Codex 需 `wire_api=responses`)。
+
+### 验证
+
+- 对新构建的 Linux 二进制跑真机端到端套件(15 组场景、33 断言):内置 `Bash`/`Write`/`Edit` 携裸
+  secret 的 hook 拦截(reason 点名凭据类型且不回显);PostToolUse 结果脱敏;MCP wrap 网关真转发上游
+  tool call + 完整审计;descriptor pinning 漂移 fail-closed;ledger-agnostic 状态;只读 verify;
+  逐字节 uninstall 还原。Workspace 门禁全绿:clippy `-D warnings`、`cargo fmt`、lib 测试。
+
 ## [v0.2.0-beta.9] — 2026-06-16 — 二次传播泄漏加固(非边界工具结果 scrub)
 
 来自同一次结构化项目 review、经 Codex 代码审查确认的安全修复。

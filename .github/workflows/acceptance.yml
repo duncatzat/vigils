@@ -1,0 +1,355 @@
+# 值守式发布验收:Release workflow 全部完成后,自动在三平台 runner 上
+# 「扮演真实用户」—— 从 GitHub 下载**已发布**产物 → sha256 + 构建溯源校验 →
+# 跑用户旅程模拟(user-sim.sh)+ 核心防护语义扫描(functional-sweep.sh),
+# 外加控制端全资产打包审计(local-audit.sh)。
+#
+# 触发:
+#   - Release workflow 成功结束(workflow_run;此时资产已全部上传,无竞态)
+#   - 手动 workflow_dispatch(tag 输入)—— 用于补跑历史版本
+#
+# 分工:本工作流覆盖「无头可测」的用户面(CLI 全旅程)。ML 模型下载 e2e
+# (~1.5 GB)与桌面 GUI 像素级验证仍走内部真机(tests/acceptance/run.sh +
+# scripts/test-local/uv-gui-*),见 tests/acceptance/README.md。
+name: User Acceptance
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  # 每周一 03:23 UTC 对 Latest release 复跑全套 —— 上游 agent(Claude/Codex/Gemini/Cursor)
+  # 改 hook 协议、GitHub 资产/溯源服务漂移等外因,不等我们发版就能被发现。
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test (e.g. v0.4.6-beta.1)"
+        required: true
+
+permissions:
+  contents: read
+  # gh attestation verify 走公开 API,contents:read 足够
+
+jobs:
+  user-sim:
+    # workflow_run 触发时:仅在 Release 成功、且确为 tag 构建时跑
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset: vigils-cli-linux-x64.tar.gz
+            bin: vigil-hub
+          - os: macos-latest
+            asset: vigils-cli-macos-arm64.tar.gz
+            bin: vigil-hub
+          - os: windows-latest
+            asset: vigils-cli-windows-x64.zip
+            bin: vigil-hub.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Testing published release: $TAG"
+
+      - name: Download published asset as a user would
+        shell: bash
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" \
+            -R "${{ github.repository }}" \
+            -p "${{ matrix.asset }}" -p "${{ matrix.asset }}.sha256" \
+            -D dl --clobber
+          ls -la dl/
+
+      - name: Verify sha256 (fail-closed)
+        shell: bash
+        run: |
+          cd dl
+          python3 -c "import hashlib,sys;a=sys.argv[1];w=open(a+'.sha256',encoding='utf-8').read().split()[0];g=hashlib.sha256(open(a,'rb').read()).hexdigest();print('want',w);print('got ',g);sys.exit(0 if w==g else 1)" "${{ matrix.asset }}"
+
+      - name: Verify build provenance (SLSA attestation)
+        shell: bash
+        run: |
+          gh attestation verify "dl/${{ matrix.asset }}" -R "${{ github.repository }}"
+
+      - name: Unpack
+        shell: bash
+        run: |
+          mkdir -p bin
+          case "${{ matrix.asset }}" in
+            *.tar.gz) tar -xzf "dl/${{ matrix.asset }}" -C bin ;;
+            *.zip)    unzip -oq "dl/${{ matrix.asset }}" -d bin ;;
+          esac
+          ls -la bin/
+
+      - name: "User-journey simulation (user-sim.sh)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" bash tests/acceptance/user-sim.sh | tee usim.out
+
+      - name: "Core-protection sweep (functional-sweep.sh)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" bash tests/acceptance/functional-sweep.sh | tee sweep.out
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: "Core-function e2e (privacy filter + secret lease, real MCP gateway)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" node tests/acceptance/core-e2e.mjs | tee core.out
+
+      - name: "Remote-MCP e2e (Streamable HTTP upstream: bearer + lease + SSE re-redaction)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" node tests/acceptance/http-e2e.mjs | tee http.out
+
+      - name: "Agent-integration protocol compat (Claude/Codex/Gemini/Cursor hooks)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" bash tests/acceptance/agent-compat.sh | tee compat.out
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## ${{ matrix.os }} — ${{ steps.tag.outputs.tag }}"
+            echo '```'
+            grep -E "SUMMARY|FAIL " usim.out sweep.out core.out compat.out 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  local-audit:
+    # 控制端全资产审计:checksums+CRLF、逐平台二进制架构、ML dylib 捆绑、
+    # 桌面 minisign 签名、OTA manifest —— 复用既有 local-audit.sh
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - name: Install signature-verify deps
+        run: pip install pynacl
+      - name: Run local artifact audit
+        shell: bash
+        run: |
+          VERSION="${{ steps.tag.outputs.tag }}" REPO="${{ github.repository }}" \
+            bash tests/acceptance/local-audit.sh | tee audit.out
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## local-audit — ${{ steps.tag.outputs.tag }}"
+            echo '```'
+            grep -E "SUMMARY|FAIL " audit.out 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  desktop-smoke-windows:
+    # 已发布 NSIS 安装包:静默安装 → WebView2 CDP 深冒烟(路由遍历/双语翻转/零 console error/逐页截图)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Download published NSIS installer
+        shell: bash
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" -R "${{ github.repository }}"             -p "Vigils_${{ steps.tag.outputs.ver }}_x64-setup.exe" -D dl --clobber
+          ls -la dl/
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dl/*-setup.exe | Select-Object -First 1
+          Start-Process -Wait -FilePath $setup.FullName -ArgumentList '/S'
+          $exe = Join-Path $env:LOCALAPPDATA 'Vigils/vigils.exe'
+          if (-not (Test-Path $exe)) { $exe = Join-Path $env:LOCALAPPDATA 'Programs/Vigils/vigils.exe' }
+          if (-not (Test-Path $exe)) { Get-ChildItem -Recurse $env:LOCALAPPDATA -Filter vigils.exe -ErrorAction SilentlyContinue | Select-Object -First 3; throw 'installed vigils.exe not found' }
+          "VIGILS_EXE=$exe" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "installed at $exe"
+      - name: GUI smoke over CDP
+        shell: bash
+        run: |
+          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9222 --remote-allow-origins=*" "$VIGILS_EXE" >gui.log 2>&1 &
+          node tests/acceptance/gui-smoke.mjs 9222 gui-shots | tee gsmoke.out
+          RC=${PIPESTATUS[0]}
+          taskkill //F //IM vigils.exe >/dev/null 2>&1 || true
+          exit "$RC"
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## desktop-smoke windows — ${{ steps.tag.outputs.tag }}"
+            echo '```'
+            grep -E "SUMMARY|FAIL " gsmoke.out 2>/dev/null || echo "(no output — launch failed?)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-shots-windows-${{ steps.tag.outputs.tag }}
+          path: gui-shots/
+          if-no-files-found: ignore
+
+  desktop-smoke-linux:
+    # 已发布 .deb:安装(自动拉 WebKitGTK 依赖)→ Xvfb 启动 → 存活/窗口/截图非空
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Download published .deb
+        shell: bash
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" -R "${{ github.repository }}"             -p "Vigils_${{ steps.tag.outputs.ver }}_amd64.deb" -D dl --clobber
+      - name: Install smoke deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb xdotool imagemagick
+      - name: Headless GUI smoke
+        shell: bash
+        run: |
+          DEB="$(ls dl/*.deb)" OUT=gui-shots bash tests/acceptance/gui-smoke-headless.sh | tee gsmoke.out
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## desktop-smoke linux — ${{ steps.tag.outputs.tag }}"
+            echo '```'
+            grep -E "SUMMARY|FAIL " gsmoke.out 2>/dev/null || echo "(no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-shots-linux-${{ steps.tag.outputs.tag }}
+          path: gui-shots/
+          if-no-files-found: ignore
+
+  desktop-smoke-macos:
+    # 已发布 .dmg:挂载 → 去 quarantine → 启动 → 存活/截图非空(WKWebView 无 CDP)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - name: Download published .dmg
+        shell: bash
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" -R "${{ github.repository }}"             -p "Vigils_${{ steps.tag.outputs.ver }}_aarch64.dmg" -D dl --clobber
+      - name: Headless GUI smoke
+        shell: bash
+        run: |
+          DMG="$(ls dl/*.dmg)" OUT=gui-shots bash tests/acceptance/gui-smoke-headless.sh | tee gsmoke.out
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## desktop-smoke macos — ${{ steps.tag.outputs.tag }}"
+            echo '```'
+            grep -E "SUMMARY|FAIL " gsmoke.out 2>/dev/null || echo "(no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gui-shots-macos-${{ steps.tag.outputs.tag }}
+          path: gui-shots/
+          if-no-files-found: ignore

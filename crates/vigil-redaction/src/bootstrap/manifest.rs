@@ -180,13 +180,20 @@ pub fn placeholder_manifest() -> Manifest {
         model_id: "openai-privacy-filter-v1".to_string(),
         label_space_version: "8class-v1".to_string(),
         default: true,
+        // v0.3 A1 现代化(2026-06-21):加 vigils.ai 自有镜像作 fallback(L2 单源 HF 风险 ——
+        // 此前 fallback_urls 全空)。primary 仍为 HF 官方权威源;HF 失败/被屏蔽区域按序回落
+        // vigils.ai。整文件 sha256 校验在两源都生效,镜像服务错文件即 fail-closed,不会污染。
+        // 镜像路径约定 = `https://vigils.ai/models/<model_name>-<version>/<filename>`(与本地
+        // cache dir `resolve_target_dir` 同款命名);owner 须把下列 4 文件按此路径上传 vigils.ai。
         files: vec![
             ManifestFile {
                 name: "model_q4f16.onnx".to_string(),
                 size_bytes: 165744,
                 sha256: "eaae4e83cf1345a60abe333ed882b55fe5775d1dfbf34b9b269e5e5416f45e5b".to_string(),
                 primary_url: "https://huggingface.co/openai/privacy-filter/resolve/main/onnx/model_q4f16.onnx".to_string(),
-                fallback_urls: vec![],
+                fallback_urls: vec![
+                    "https://vigils.ai/models/privacy-filter-0.5.1/model_q4f16.onnx".to_string(),
+                ],
             },
             // ONNX external-data weights(~ 772 MB);ORT 加载 model.onnx 时
             // 同目录自动找此文件;manifest 需独立列出确保 bootstrap 下载完整
@@ -195,21 +202,27 @@ pub fn placeholder_manifest() -> Manifest {
                 size_bytes: 809061992,
                 sha256: "6d4dde787e03ace283c45d4e32a94eec32b6cfcc242e7219bea96f5b4c13569d".to_string(),
                 primary_url: "https://huggingface.co/openai/privacy-filter/resolve/main/onnx/model_q4f16.onnx_data".to_string(),
-                fallback_urls: vec![],
+                fallback_urls: vec![
+                    "https://vigils.ai/models/privacy-filter-0.5.1/model_q4f16.onnx_data".to_string(),
+                ],
             },
             ManifestFile {
                 name: "tokenizer.json".to_string(),
                 size_bytes: 27868174,
                 sha256: "0614fe83cadab421296e664e1f48f4261fa8fef6e03e63bb75c20f38e37d07d3".to_string(),
                 primary_url: "https://huggingface.co/openai/privacy-filter/resolve/main/tokenizer.json".to_string(),
-                fallback_urls: vec![],
+                fallback_urls: vec![
+                    "https://vigils.ai/models/privacy-filter-0.5.1/tokenizer.json".to_string(),
+                ],
             },
             ManifestFile {
                 name: "config.json".to_string(),
                 size_bytes: 3039,
                 sha256: "b2b26a4a4a000639ad30b0c264adbefe365bdb567fbd7bb27303b8c438375bd1".to_string(),
                 primary_url: "https://huggingface.co/openai/privacy-filter/resolve/main/config.json".to_string(),
-                fallback_urls: vec![],
+                fallback_urls: vec![
+                    "https://vigils.ai/models/privacy-filter-0.5.1/config.json".to_string(),
+                ],
             },
         ],
     }
@@ -238,27 +251,35 @@ pub fn injection_classifier_manifest() -> Manifest {
         // 二分类 SAFE/INJECTION 自成 label space,与 8class PII label space 解耦
         label_space_version: "injection-binary-v1".to_string(),
         default: false,
+        // v0.3 A1(2026-06-21):vigils.ai 镜像 fallback,同 placeholder_manifest 约定。
+        // 镜像路径 = `https://vigils.ai/models/deberta-injection-v2/<filename>`;owner 须上传下列 3 文件。
         files: vec![
             ManifestFile {
                 name: "model.onnx".to_string(),
                 size_bytes: 738563188,
                 sha256: "f0ea7f239f765aedbde7c9e163a7cb38a79c5b8853d3f76db5152172047b228c".to_string(),
                 primary_url: "https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2/resolve/main/onnx/model.onnx".to_string(),
-                fallback_urls: vec![],
+                fallback_urls: vec![
+                    "https://vigils.ai/models/deberta-injection-v2/model.onnx".to_string(),
+                ],
             },
             ManifestFile {
                 name: "tokenizer.json".to_string(),
                 size_bytes: 8648886,
                 sha256: "752fe5f0d5678ad563e1bd2ecc1ddf7a3ba7e2024d0ac1dba1a72975e26dff2f".to_string(),
                 primary_url: "https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2/resolve/main/onnx/tokenizer.json".to_string(),
-                fallback_urls: vec![],
+                fallback_urls: vec![
+                    "https://vigils.ai/models/deberta-injection-v2/tokenizer.json".to_string(),
+                ],
             },
             ManifestFile {
                 name: "config.json".to_string(),
                 size_bytes: 1014,
                 sha256: "3093743035223c46b1497a72e939e56fa0a50afbd7bafbf7eb8aad060b8d23f8".to_string(),
                 primary_url: "https://huggingface.co/protectai/deberta-v3-base-prompt-injection-v2/resolve/main/onnx/config.json".to_string(),
-                fallback_urls: vec![],
+                fallback_urls: vec![
+                    "https://vigils.ai/models/deberta-injection-v2/config.json".to_string(),
+                ],
             },
         ],
     }

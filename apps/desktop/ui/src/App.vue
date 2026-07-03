@@ -12,6 +12,8 @@ import {
   NMessageProvider,
   darkTheme,
   lightTheme,
+  zhCN,
+  dateZhCN,
   NSelect,
 } from "naive-ui";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
@@ -35,6 +37,10 @@ import IconSettings from "@/components/icons/IconSettings.vue";
 const route = useRoute();
 const { t } = useI18n();
 const settings = useSettingsStore();
+
+// Naive UI 内建文案随 app locale(空表 "No Data"、分页等;null = 默认英文)。
+const naiveLocale = computed(() => (settings.locale === "zh-CN" ? zhCN : null));
+const naiveDateLocale = computed(() => (settings.locale === "zh-CN" ? dateZhCN : null));
 const helpOpen = ref(false);
 useGlobalShortcuts({ router, helpOpen });
 
@@ -138,7 +144,12 @@ function navClass(name: string): string {
 </script>
 
 <template>
-  <NConfigProvider :theme="activeTheme" :theme-overrides="themeOverrides">
+  <NConfigProvider
+    :theme="activeTheme"
+    :theme-overrides="themeOverrides"
+    :locale="naiveLocale"
+    :date-locale="naiveDateLocale"
+  >
     <NMessageProvider>
       <NDialogProvider>
         <div class="flex h-screen bg-vigils-bg-page text-vigils-text-primary overflow-hidden">

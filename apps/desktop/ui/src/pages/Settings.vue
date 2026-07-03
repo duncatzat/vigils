@@ -5,24 +5,108 @@
  * 配置全部来自 `useSettingsStore`,只做 UI 绑定与持久化(localStorage),
  * 不新增后端命令。ONNX / Checkpoint 管理按钮当前为占位操作。
  */
-import { computed } from "vue";
+import { computed, onMounted, ref } from "vue";
 import {
   NButton,
   NInputNumber,
   NSelect,
   NSlider,
   NSwitch,
+  NTag,
   useMessage,
 } from "naive-ui";
 import type { SelectOption } from "naive-ui";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore } from "@/stores/settings";
+import {
+  daemonStatus,
+  daemonStart,
+  daemonStop,
+  modelStatus,
+  modelInstall,
+  downloadMlEngine,
+  type DaemonStatus,
+  type ModelStatus,
+} from "@/api/ipc";
 import PanelCard from "@/components/PanelCard.vue";
 
 const { t } = useI18n();
 const settings = useSettingsStore();
 const message = useMessage();
+
+// ─── ML 控制平面（ADR 0024）：常驻 daemon 生命周期 + ML 模型安装（经 vigil-hub CLI shell-out）───
+const daemon = ref<DaemonStatus | null>(null);
+const model = ref<ModelStatus | null>(null);
+// busy 标记当前进行中的写操作（'daemon:start' | 'daemon:stop' | 'model:install'），驱动按钮 loading 态。
+const busy = ref<string | null>(null);
+
+const modelInstalled = computed<boolean>(
+  () => !!model.value?.privacy_installed && !!model.value?.injection_installed,
+);
+
+async function refreshMlControl(): Promise<void> {
+  try {
+    const [d, m] = await Promise.all([daemonStatus(), modelStatus()]);
+    daemon.value = d;
+    model.value = m;
+  } catch (e) {
+    message.error(t("common.ipc_error") + ": " + String(e));
+  }
+}
+
+async function startDaemon(): Promise<void> {
+  if (busy.value) return;
+  busy.value = "daemon:start";
+  try {
+    daemon.value = await daemonStart();
+  } catch (e) {
+    message.error(t("settings.daemon.error", { msg: String(e) }));
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function stopDaemon(): Promise<void> {
+  if (busy.value) return;
+  busy.value = "daemon:stop";
+  try {
+    daemon.value = await daemonStop();
+  } catch (e) {
+    message.error(t("settings.daemon.error", { msg: String(e) }));
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function installModel(): Promise<void> {
+  if (busy.value) return;
+  busy.value = "model:install";
+  try {
+    model.value = await modelInstall();
+  } catch (e) {
+    message.error(t("settings.model.error", { msg: String(e) }));
+  } finally {
+    busy.value = null;
+  }
+}
+
+// 装 ML 引擎变体（让 ml_supported 翻 true，再可装模型）。出厂硬指纹引擎无 ort，必经此步。
+async function installMlEngine(): Promise<void> {
+  if (busy.value) return;
+  busy.value = "ml-engine:install";
+  try {
+    model.value = await downloadMlEngine();
+  } catch (e) {
+    message.error(t("settings.model.error", { msg: String(e) }));
+  } finally {
+    busy.value = null;
+  }
+}
+
+onMounted(() => {
+  void refreshMlControl();
+});
 
 async function handleAnchorCheckpoint(): Promise<void> {
   try {
@@ -185,6 +269,171 @@ function updatePollingInterval(v: number | null): void {
             :value="settings.redactToolResults"
             @update:value="settings.setRedactToolResults"
           />
+        </div>
+      </div>
+    </PanelCard>
+
+    <!-- AI Model (ADR 0024 — ML 模型安装) -->
+    <PanelCard>
+      <template #header>
+        <h2 class="text-base font-semibold text-vigils-text-primary">
+          {{ t("settings.model.title") }}
+        </h2>
+        <NTag size="small" :bordered="false" type="info">
+          {{ t("settings.model.phase2") }}
+        </NTag>
+      </template>
+
+      <div class="space-y-5">
+        <div class="flex items-start justify-between gap-4">
+          <div class="flex-1">
+            <div class="text-sm font-medium text-vigils-text-primary">
+              {{ t("settings.model.title") }}
+            </div>
+            <div class="text-xs text-vigils-text-muted mt-0.5">
+              {{ t("settings.model.subtitle") }}
+            </div>
+          </div>
+          <div class="flex items-center gap-3 shrink-0">
+            <NTag
+              v-if="model && !model.ml_supported"
+              size="small"
+              :bordered="false"
+              type="warning"
+              data-testid="model-state"
+            >
+              {{ t("settings.model.unsupported") }}
+            </NTag>
+            <NTag
+              v-else-if="modelInstalled"
+              size="small"
+              :bordered="false"
+              type="success"
+              data-testid="model-state"
+            >
+              {{ t("settings.model.installed") }}
+            </NTag>
+            <NTag
+              v-else-if="model"
+              size="small"
+              :bordered="false"
+              type="info"
+              data-testid="model-state"
+            >
+              {{ t("settings.model.not_installed") }}
+            </NTag>
+            <NTag v-else size="small" :bordered="false" data-testid="model-state">
+              {{ t("settings.model.status_unknown") }}
+            </NTag>
+            <NButton
+              v-if="model && !model.ml_supported"
+              size="small"
+              type="primary"
+              :loading="busy === 'ml-engine:install'"
+              :disabled="busy !== null || !model?.engine_present"
+              data-testid="ml-engine-install"
+              @click="installMlEngine()"
+            >
+              {{ t("settings.model.install_ml_engine") }}
+            </NButton>
+            <NButton
+              size="small"
+              tertiary
+              :loading="busy === 'model:install'"
+              :disabled="
+                busy !== null ||
+                !model?.engine_present ||
+                !model?.ml_supported ||
+                modelInstalled
+              "
+              data-testid="model-install"
+              @click="installModel()"
+            >
+              {{ t("settings.model.install") }}
+            </NButton>
+          </div>
+        </div>
+      </div>
+    </PanelCard>
+
+    <!-- Daemon (ADR 0024 — 常驻引擎生命周期) -->
+    <PanelCard>
+      <template #header>
+        <h2 class="text-base font-semibold text-vigils-text-primary">
+          {{ t("settings.daemon.title") }}
+        </h2>
+      </template>
+
+      <div class="space-y-5">
+        <div class="flex items-start justify-between gap-4">
+          <div class="flex-1">
+            <div class="text-sm font-medium text-vigils-text-primary">
+              {{ t("settings.daemon.title") }}
+            </div>
+            <!-- 模型未装时如实降级承诺:此时启动的 daemon 两个模型都不加载,hook 走硬指纹底座。 -->
+            <div class="text-xs text-vigils-text-muted mt-0.5">
+              {{
+                model && !(model.privacy_installed || model.injection_installed)
+                  ? t("settings.daemon.subtitle_no_model")
+                  : t("settings.daemon.subtitle")
+              }}
+            </div>
+          </div>
+          <div class="flex items-center gap-3 shrink-0">
+            <NTag
+              v-if="daemon?.running"
+              size="small"
+              :bordered="false"
+              type="success"
+              data-testid="daemon-state"
+            >
+              {{
+                daemon.pii_loaded
+                  ? t("settings.daemon.status_ml")
+                  : t("settings.daemon.status_running")
+              }}
+            </NTag>
+            <NTag
+              v-else-if="daemon?.warming"
+              size="small"
+              :bordered="false"
+              type="warning"
+              data-testid="daemon-state"
+            >
+              {{ t("settings.daemon.status_warming") }}
+            </NTag>
+            <NTag
+              v-else
+              size="small"
+              :bordered="false"
+              type="warning"
+              data-testid="daemon-state"
+            >
+              {{ t("settings.daemon.status_stopped") }}
+            </NTag>
+            <NButton
+              v-if="!daemon?.running && !daemon?.warming"
+              size="small"
+              tertiary
+              :loading="busy === 'daemon:start'"
+              :disabled="busy !== null || !daemon?.engine_present"
+              data-testid="daemon-start"
+              @click="startDaemon()"
+            >
+              {{ t("settings.daemon.start") }}
+            </NButton>
+            <NButton
+              v-else
+              size="small"
+              tertiary
+              :loading="busy === 'daemon:stop'"
+              :disabled="busy !== null || !daemon?.engine_present"
+              data-testid="daemon-stop"
+              @click="stopDaemon()"
+            >
+              {{ t("settings.daemon.stop") }}
+            </NButton>
+          </div>
         </div>
       </div>
     </PanelCard>

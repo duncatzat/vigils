@@ -60,7 +60,7 @@ vigil-hub setup --all
 
 ```bash
 vigil-hub setup --mcp --doctor    # 接入前预检:每个被包裹的 MCP server 真能启动吗?(只读 PATH 检查)
-vigil-hub inspect protection      # 用过 agent 后:Vigils 拦了什么(裸 secret 拦截、泄漏脱敏、链完整)
+vigil-hub verify                  # 用过 agent 后:确认防篡改审计链完整(桌面应用可看拦了什么)
 vigil-hub setup --all --uninstall # 移除全部(配置逐字节还原)
 ```
 

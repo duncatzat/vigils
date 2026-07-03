@@ -2,6 +2,8 @@
 
 假设你已按 [installation.md](installation.md) 装好:**Vigils** 桌面应用(可执行文件 `vigils.exe`)可双击启动,Chrome 扩展已加载并注册 Native Host。
 
+> **先认清边界**:Vigil 防的是**意外**泄密(原文凭据)+ 审计 + 可逆脱敏,**不是**对抗蓄意外泄 agent 的密封屏障(混淆编码可绕过输入侧检测)。开始前请读 [README §防护边界](README.md#防护边界请先读--不制造虚假安全感)。
+
 ## 场景 1:粘贴 token 被拦截(最直观)
 
 ### 步骤
@@ -27,14 +29,15 @@
 
 1. 启动 **Vigils** 桌面应用(Windows 上可执行文件为 `vigils.exe`)
 2. 左侧 4 Tab:
-   - **Activity Feed**:刚才场景 1 的粘贴事件应在列表里(event_type = `browser.paste.redacted`,findings = `[github_token]`)
+   - **Activity Feed**:刚才场景 1 的粘贴事件应在列表里(event_type = `browser.paste.redacted`,findings = `[github_token]`)。
+     > 注:浏览器事件要出现在这里,需 native-host 与桌面指向**同一持久 ledger**;不设 `VIGIL_LEDGER_PATH` 时,二者默认都落 canonical 路径(`%LOCALAPPDATA%\Vigil\ledger.sqlite3`)。
    - **Approval Queue**:v0.2 仅 Desktop 内 UI;若 agent 调未批工具会进这里(需要场景 3)
    - **Server Registry**:还没配 MCP server 时是空
    - **Session Replay**:展开 session 看完整时间线
 3. 点 Activity Feed 里任一事件 → 打开 Event Detail Modal
 4. **验证**:Modal 的 payload JSON 不应含 `ghp_1234567890abcdef1234567890abcdef12345678` 原文(应只显示 `[REDACTED github_token]`)
 
-## 场景 3:CLI Agent 通过 vigil-hub 连接(v0.3 Stage 1)
+## 场景 3:CLI Agent 通过 vigil-hub 连接
 
 Vigil 的核心能力之一是**作为 MCP 代理**插在 Agent(Claude Code / Codex / OpenCode / Cursor / Zed)和上游 MCP server 之间。
 
@@ -49,7 +52,7 @@ Vigil 的核心能力之一是**作为 MCP 代理**插在 Agent(Claude Code / Co
   "mcpServers": {
     "vigil": {
       "command": "C:\\Vigil\\vigil-hub.exe",
-      "args": ["serve", "--stdio", "--ledger", "C:\\Vigil\\ledger.sqlite"]
+      "args": ["serve", "--stdio", "--ledger", "C:\\Vigil\\ledger.sqlite3"]
     }
   }
 }
@@ -68,16 +71,11 @@ vigil-hub serve: started stdio MCP server (PID 12345)
 启动 **Vigils** 桌面应用(`vigils.exe`):
 - Activity Feed 应有 `session.started` 事件(source = `vigil-hub-serve`)
 
-### 3.4 Stage 1 边界说明
+### 3.4 上游 MCP server 转发
 
-**当前版本(v0.3 Stage 1)**:agent 能连上 vigil-hub,`tools/list` 返空(零 upstream attach)。**真实 upstream MCP server 的转发留 Stage 2**。
+`vigil-hub serve --stdio` 配 `--upstream-config`(或经 `vigil-hub wrap` 注入单个 upstream)即可 attach 真实 MCP server:`tools/list` 会**聚合并命名空间化** upstream 工具,每次 tool call 经 firewall / redaction / audit / sandbox 全套策略。
 
-所以:agent 连上后暂时看不到任何工具。这一步的价值是**验证通路**:
-- Vigil 作为 MCP stdio server 协议实现正确
-- Agent 能识别 `vigil` 连接
-- 所有 agent 活动(即使 handshake 阶段)进入 Vigil 的 session / audit 链
-
-Stage 2 会补全上游 attach。如需立即接入真实 MCP server 做评测,请绕过 vigil 直连(但失去审计/审批)。
+更省事的路径:`vigil-hub setup --all` 一条命令把你已配置的 MCP server 全部纳入网关防护(可逆,`--uninstall` 撤销);逐个接入见 [agent-integration.md](agent-integration.md)。
 
 ## 场景 4:查看审计链
 

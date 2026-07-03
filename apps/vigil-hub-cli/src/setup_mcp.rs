@@ -162,6 +162,37 @@ fn classify_one(name: &str, entry: &Value) -> McpServerClass {
             return McpServerClass::AlreadyWrapped { name: name.into() };
         }
 
+        // #15 嵌套 wrap 盲区:历史/手工配置可能被 `stdbuf`/`sh`/`env` 等包装器**前缀**包裹了一个
+        // vigil-hub wrap(`command="stdbuf", args=["-oL","vigil-hub","wrap",...,"--vigil-managed-mcp",...]`)。
+        // 此时 args[0] 不是 "wrap" → 上面 AlreadyWrapped 漏判 → 会被二次 wrap 产生嵌套。精确补判:整 argv
+        // (含 command)里出现 **vigil-hub basename 紧跟 "wrap"** 的相邻 token + sentinel 在场。判为
+        // **Skipped**(非 AlreadyWrapped):Vigil 没写过这种前缀形态、`unwrap_entry` 也只认 args[0]=="wrap",
+        // 故不声称能还原它,只**保证不二次 wrap**(诚实 + fail-safe)。第三方 server 不会有 vigil-hub+wrap
+        // 相邻序列(除非它确在跑 vigil-hub wrap),故不引入漏保护 fail-open。
+        let is_vh_tok = |t: &str| {
+            std::path::Path::new(t)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| {
+                    s.eq_ignore_ascii_case("vigil-hub") || s.eq_ignore_ascii_case("vigil-hub.exe")
+                })
+                .unwrap_or(false)
+        };
+        let argv_tokens: Vec<&str> = std::iter::once(cmd)
+            .chain(args.iter().filter_map(Value::as_str))
+            .collect();
+        if has_sentinel
+            && argv_tokens
+                .windows(2)
+                .any(|w| is_vh_tok(w[0]) && w[1] == "wrap")
+        {
+            return McpServerClass::Skipped {
+                name: name.into(),
+                reason: "appears already wrapped under a wrapper prefix (stdbuf/sh/env...); \
+                         left untouched to avoid double-wrap — unwrap it by hand if needed",
+            };
+        }
+
         // ② Vigil 自己的 server/gateway 条目**绝不 wrap**(会自我嵌套)。
         //    **DEF-002 trigger A 修复**:官方文档把 Vigil 暴露为 MCP server 用的是
         //    `{"command":"vigil-hub","args":["serve",...]}`(args[0]=="serve",非 "wrap"),旧逻辑把它
@@ -229,18 +260,9 @@ fn classify_one(name: &str, entry: &Value) -> McpServerClass {
                 .collect()
         }
     };
-    // F3(Codex holistic MEDIUM):server-id 由 name 派生(`user-<name>` / `local-<hash>-<name>`),
-    // 但网关 attach 时只接受 `^[a-z0-9_-]+$`(namespace::validate_server_id)。若 name 含大写/空格/点/
-    // 斜杠等(Claude server 名可任意),改写会"apply 成功但 wrap 启动失败"(配置坏了却看不出)。
-    // 用**真验证器**校验 name —— 名合法则 `user-`/`local-<hash>-` 前缀拼接后必合法;不合法则 Skip
-    // (不改写),让用户改名后再保护,而非产出一个起不来的网关条目。
-    if vigil_mcp::namespace::validate_server_id(name).is_err() {
-        return McpServerClass::Skipped {
-            name: name.into(),
-            reason: "server name has characters not allowed in a gateway id (use a-z 0-9 _ -); \
-                     rename it in your MCP config to protect it",
-        };
-    }
+    // server 名可含大写/空格/点等任意字符(如 `Playwright`)—— 网关 id 由各派生函数经
+    // [`server_id_component`] 规约(小写 slug + 哈希去歧义),**不再因命名 Skip**(修 F-4:
+    // 专有名词大写命名极常见,让用户手动改名=成规模漏保护)。
 
     // env **键名**(只键不值;绝不读 secret 值)。
     let env_keys: Vec<String> = entry
@@ -249,9 +271,50 @@ fn classify_one(name: &str, entry: &Value) -> McpServerClass {
         .map(|o| o.keys().cloned().collect())
         .unwrap_or_default();
 
+    // #14:`claude mcp add` 可能把整条命令行塞进 `command` 单串、`args` 空(如 "npx -y pkg /path")。
+    // 整串会被当**单一 argv** → execve 找名为 "npx -y ..." 的程序 → ENOENT,server 静默不可用、无 Vigil
+    // 关联提示。args 空且 command 含空白时:无引号 → 按空白拆为 program+args(常见形态,wrap 后正常);
+    // 含引号(带空格的引用参数,形态不确定)→ 诚实跳过,让用户在配置里拆成 command+args 数组。
+    let (command, args): (String, Vec<String>) = if args.is_empty()
+        && command.split_whitespace().nth(1).is_some()
+    {
+        if command.contains('\'') || command.contains('"') {
+            return McpServerClass::Skipped {
+                name: name.into(),
+                reason: "`command` is a single shell string with quotes; split it into a \
+                             `command` + `args` array in your MCP config so Vigil can wrap it",
+            };
+        }
+        let mut parts = command.split_whitespace();
+        let prog = parts.next().unwrap_or(command);
+        // 单串 command 本身就是一次 vigil-hub 调用(wrap/serve/...):此前 has_sentinel 基于**原始**
+        // args(空)算得 false,AlreadyWrapped 与 #15 都漏判;拆分后会把
+        // `vigil-hub wrap ... --vigil-managed-mcp ...` 当普通 server **二次 wrap**(Codex CONFIRM 的幂等
+        // bug)。拆出 program basename 命中 vigil-hub → Skipped:Vigil 没写过这种单串形态、uninstall 也
+        // 认不出(只认 args[0]=="wrap"),故只保证不二次 wrap(诚实 + fail-safe),不声称能还原。
+        if std::path::Path::new(prog)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("vigil-hub") || s.eq_ignore_ascii_case("vigil-hub.exe"))
+            .unwrap_or(false)
+        {
+            return McpServerClass::Skipped {
+                name: name.into(),
+                reason: "single-string `command` is itself a vigil-hub invocation; not wrapping \
+                             (would double-wrap) — split into command+args explicitly if intended",
+            };
+        }
+        (prog.to_string(), parts.map(String::from).collect())
+    } else {
+        // (c)(Codex CONFIRM):单 token 带前后空白(如 "npx ")走 else 分支,trim 掉,避免拿 "npx "
+        // 当 argv0 执行 ENOENT。trim 只剥首尾、保留路径内部空格;结构化条目的 command 本就无首尾空白
+        // → no-op,不破坏逐字往返。
+        (command.trim().to_string(), args)
+    };
+
     McpServerClass::Wrappable {
         name: name.into(),
-        command: command.into(),
+        command,
         args,
         env_keys,
     }
@@ -297,15 +360,45 @@ pub fn wrapped_argv(
 /// 碰撞概率 ~ n²/2¹²⁸,对任何现实项目数天文级不可能(Codex D8 review:8 hex/32-bit 太短,要求 ≥128-bit)。
 const LOCAL_ID_HASH_HEX: usize = 32;
 
-/// 为 **user scope**(顶层 `mcpServers`)的 server 派生 server-id:`user-<name>`。
+/// 把 agent 配置里的 server 名规约成网关 id 合法组件(`^[a-z0-9_-]+$`)。
+///
+/// 名本就合法 → **原样返回**(既有用户的 server-id 逐字不变 = 向后兼容)。含大写/空格/点等
+/// 非法字符(如 `Playwright`)→ 小写化 + 非法字符折叠为 `-`,再追加 `-<sha256(原名)[:8]>`
+/// 去歧义:两个仅大小写不同的名 slug 相同,哈希后缀保证身份不塌缩;同名恒同 id(稳定)。
+/// 全部字符都不可用(如纯中文名)→ 退化为 `srv-<hash>`。修 F-4:此前直接 Skip 让用户手动
+/// 改名 —— 专有名词大写命名极常见,会成规模漏保护。
+fn server_id_component(name: &str) -> String {
+    let is_valid = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-';
+    if !name.is_empty() && name.chars().all(is_valid) {
+        return name.to_string();
+    }
+    let mut slug = String::with_capacity(name.len());
+    for c in name.to_lowercase().chars() {
+        if is_valid(c) {
+            slug.push(c);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let digest = Sha256::digest(name.as_bytes());
+    let hash = &hex::encode(digest)[..8];
+    if slug.is_empty() {
+        format!("srv-{hash}")
+    } else {
+        format!("{slug}-{hash}")
+    }
+}
+
+/// 为 **user scope**(顶层 `mcpServers`)的 server 派生 server-id:`user-<组件>`。
 ///
 /// 加 `user-` 前缀(而非裸 `<name>`)是为与 [`local_scope_server_id`] 的 `local-` 命名空间**可证不相交**
 /// —— Codex D8 R1 指出:裸名会与 local id 撞(用户若把 user-scope server 命名成形似 local id 的串,
 /// 两者在共享账本里塌缩)。两侧都由 Vigil 加 disjoint 前缀后,任意用户取名都不可能跨 scope 撞 id。
 /// 分隔符用 `-`(**非** `:`)—— `:` 不在网关 `SERVER_ID_RE = ^[a-z0-9_-]+$` 字符集内会 attach 失败
-/// (Codex D8 R2 抓的回归);`-` 合法。
+/// (Codex D8 R2 抓的回归);`-` 合法。名含非法字符时经 [`server_id_component`] 规约。
 pub fn user_scope_server_id(name: &str) -> String {
-    format!("user-{name}")
+    format!("user-{}", server_id_component(name))
 }
 
 /// 为 **local scope**(`projects.<path>.mcpServers`)的 server 派生**项目限定** server-id。
@@ -322,7 +415,7 @@ pub fn user_scope_server_id(name: &str) -> String {
 pub fn local_scope_server_id(project_path: &str, name: &str) -> String {
     let digest = Sha256::digest(project_path.as_bytes());
     let hash = &hex::encode(digest)[..LOCAL_ID_HASH_HEX];
-    format!("local-{hash}-{name}")
+    format!("local-{hash}-{}", server_id_component(name))
 }
 
 /// 枚举 **local scope**(`projects.<path>.mcpServers`)所有 server → `(project_path, 分类)`。纯函数。
@@ -340,6 +433,62 @@ pub fn classify_local_scope_servers(claude_cfg: &Value) -> Vec<(String, McpServe
         }
     }
     out
+}
+
+/// 统计 `~/.claude.json` 中已被 Vigil 网关 wrap 的 MCP server 数(user-scope 顶层 +
+/// 各 project local-scope 之和)。供 `setup --status` 报告 MCP-wrap 保护层 —— 修
+/// **ISS-20260621-002**:此前 status 只看原生 hook 的 [`setup::ProtectionState`],用
+/// `setup --mcp` turnkey(只 wrap MCP、不装 hook)的用户被误报 "Protection: not installed"。
+/// best-effort 纯展示:读不到 / 解析失败返回 0(非安全判定,不影响实际防护)。
+pub fn wrapped_server_count(home: &Path) -> usize {
+    let Ok(Some(cfg)) = read_claude_json(&claude_json_path(home)) else {
+        return 0;
+    };
+    let user = classify_user_scope_servers(&cfg)
+        .iter()
+        .filter(|c| matches!(c, McpServerClass::AlreadyWrapped { .. }))
+        .count();
+    let local = classify_local_scope_servers(&cfg)
+        .iter()
+        .filter(|(_, c)| matches!(c, McpServerClass::AlreadyWrapped { .. }))
+        .count();
+    user + local
+}
+
+/// `setup --status` 的逐 agent MCP 网关覆盖统计:`(agent 显示名, 已 wrap 数)`,恒含四个 agent
+/// (0 也返回,渲染层自行取舍)。此前 status 只报 Claude Code 的计数 —— `setup --all` 保护了
+/// Codex/Cursor 的二十余个 server 后,用户无从确认全局覆盖面。best-effort 只读:配置缺失 /
+/// 解析失败按 0 计,状态报告不因单个 agent 配置损坏而失败(与 [`wrapped_server_count`] 同口径)。
+pub fn wrapped_server_counts_all_agents(home: &Path) -> Vec<(&'static str, usize)> {
+    let wrapped_in = |cfg: &Value| {
+        classify_user_scope_servers(cfg)
+            .iter()
+            .filter(|c| matches!(c, McpServerClass::AlreadyWrapped { .. }))
+            .count()
+    };
+    let json_agent = |a: &JsonMcpAgent| {
+        read_claude_json(&a.config_path)
+            .ok()
+            .flatten()
+            .map(|cfg| wrapped_in(&cfg))
+            .unwrap_or(0)
+    };
+    let codex = read_codex_config(&codex_config_path(home))
+        .ok()
+        .flatten()
+        .map(|doc| {
+            classify_codex_servers(&doc)
+                .iter()
+                .filter(|c| matches!(c, McpServerClass::AlreadyWrapped { .. }))
+                .count()
+        })
+        .unwrap_or(0);
+    vec![
+        ("Claude Code", wrapped_server_count(home)),
+        ("Codex", codex),
+        ("Cursor", json_agent(&JsonMcpAgent::cursor(home))),
+        ("Windsurf", json_agent(&JsonMcpAgent::windsurf(home))),
+    ]
 }
 
 /// `setup --mcp`(只读)的预览报告 —— 供 CLI 层渲染。
@@ -626,6 +775,26 @@ impl McpApplyReport {
     }
 }
 
+/// #16:列出 user scope 配置里 Wrappable server 中底层程序在宿主 PATH **不可解析**的 `(name, program)`。
+/// 供 `setup --mcp --apply` 后**非阻塞 WARN** —— 避免给"Protected"虚假安全感(底层程序坏/未装时
+/// server 在 agent 启动才静默失败,无 Vigil 关联提示)。必须在 apply **之前**对原始配置调用(apply 后
+/// 条目变 AlreadyWrapped 不再 Wrappable)。复用网关同款 `resolve_program`(SSOT)。
+pub fn unresolvable_wrappables(home: &Path) -> Vec<(String, String)> {
+    let path = claude_json_path(home);
+    let Ok(Some(cfg)) = read_claude_json(&path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for class in classify_user_scope_servers(&cfg) {
+        if let McpServerClass::Wrappable { name, command, .. } = class {
+            if vigil_mcp::stdio::resolve_program(&command).is_err() {
+                out.push((name, command));
+            }
+        }
+    }
+    out
+}
+
 /// `setup --mcp --apply`:读 → wrap **user scope + local scope**(默认两者都保护)→ 原子写。
 /// `user_scope_only` = true 时只保护 user scope,跳过 local(`local_skipped` 诚实报告)。`dry_run` 只算不写。
 /// home/exe 注入 → 测试走 tempfile。
@@ -734,13 +903,13 @@ pub fn codex_config_path(home: &Path) -> PathBuf {
     home.join(".codex").join("config.toml")
 }
 
-/// 为 Codex `[mcp_servers.<name>]` 条目派生 server-id:`codex-<name>`。
+/// 为 Codex `[mcp_servers.<name>]` 条目派生 server-id:`codex-<组件>`。
 ///
 /// 加 `codex-` 前缀与 [`user_scope_server_id`](`user-`)/ [`local_scope_server_id`](`local-`)
-/// 命名空间不相交。`name` 已由 [`classify_one`] 用真验证器 `validate_server_id` 过滤(`^[a-z0-9_-]+$`),
-/// 故 `codex-<name>` 拼接后必合法(`codex-` 全在字符集内)。
+/// 命名空间不相交。名经 [`server_id_component`] 规约(合法名原样;非法字符 slug + 哈希),
+/// 拼接后必合法(`codex-` 全在字符集内)。
 pub fn codex_scope_server_id(name: &str) -> String {
-    format!("codex-{name}")
+    format!("codex-{}", server_id_component(name))
 }
 
 /// 读 + 解析 `~/.codex/config.toml`(格式保留)。不存在 → `Ok(None)`;损坏 / 超大 → abort
@@ -1116,9 +1285,10 @@ impl JsonMcpAgent {
         }
     }
     /// 派生 server-id:`<prefix>-<name>`(与 `user-`/`local-`/`codex-` 命名空间不相交)。
-    /// `name` 已由 [`classify_one`] 用真验证器过滤,前缀全在 `^[a-z0-9_-]+$` 字符集内,拼接后必合法。
+    /// 名经 [`server_id_component`] 规约(合法名原样;非法字符 slug + 哈希),前缀全在
+    /// `^[a-z0-9_-]+$` 字符集内,拼接后必合法。
     fn server_id(&self, name: &str) -> String {
-        format!("{}-{}", self.id_prefix, name)
+        format!("{}-{}", self.id_prefix, server_id_component(name))
     }
 }
 
@@ -1647,6 +1817,42 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// ISS-20260621-002 守门:`wrapped_server_count` 统计 user-scope + local-scope 中已被 Vigil
+    /// 网关 wrap(`AlreadyWrapped`)的 server 数,供 `setup --status` 报告 MCP-wrap 保护层。
+    #[test]
+    fn wrapped_server_count_counts_already_wrapped_user_and_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let wrapped = |id: &str| {
+            json!({
+                "command": "vigil-hub",
+                "args": ["wrap", "--server-id", id, "--vigil-managed-mcp", "--", "npx", "x"]
+            })
+        };
+        let cfg = json!({
+            "mcpServers": {
+                "plain": { "type": "stdio", "command": "npx", "args": ["x"] }, // Wrappable → 不计
+                "w1": wrapped("w1"),                                            // AlreadyWrapped → 计
+            },
+            "projects": {
+                "/proj/a": { "mcpServers": { "w2": wrapped("w2") } },           // local AlreadyWrapped → 计
+            }
+        });
+        std::fs::write(home.join(".claude.json"), cfg.to_string()).unwrap();
+        assert_eq!(
+            wrapped_server_count(home),
+            2,
+            "应只计 AlreadyWrapped(user w1 + local w2),不计 Wrappable plain"
+        );
+    }
+
+    /// 守门:无 `~/.claude.json` 时 best-effort 返回 0(不 panic)。
+    #[test]
+    fn wrapped_server_count_missing_config_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(wrapped_server_count(dir.path()), 0);
+    }
+
     #[test]
     fn classifies_stdio_remote_and_wrapped() {
         let cfg = json!({
@@ -1694,6 +1900,136 @@ mod tests {
         assert!(classes
             .iter()
             .any(|c| matches!(c, McpServerClass::AlreadyWrapped { name } if name == "already")));
+    }
+
+    #[test]
+    fn single_string_command_splits_into_program_and_args() {
+        // #14:claude mcp add 的单串 command(空 args)→ 拆为 program+args(无引号),wrap 后正常。
+        let cfg = json!({"mcpServers": {
+            "fs": {"command": "npx -y @modelcontextprotocol/server-filesystem /tmp", "args": []}
+        }});
+        let c = classify_user_scope_servers(&cfg);
+        let w = c
+            .iter()
+            .find(|c| matches!(c, McpServerClass::Wrappable { .. }))
+            .expect("wrappable");
+        if let McpServerClass::Wrappable { command, args, .. } = w {
+            assert_eq!(
+                command, "npx",
+                "single-string command must split into program"
+            );
+            assert_eq!(
+                args,
+                &vec![
+                    "-y".to_string(),
+                    "@modelcontextprotocol/server-filesystem".to_string(),
+                    "/tmp".to_string()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn single_string_command_with_quotes_is_skipped() {
+        // #14:含引号(带空格引用参数,形态不确定)→ 诚实跳过,不臆测拆分。
+        let cfg = json!({"mcpServers": {
+            "fs": {"command": "npx -y server \"/path with spaces\"", "args": []}
+        }});
+        let c = classify_user_scope_servers(&cfg);
+        assert!(
+            matches!(c[0], McpServerClass::Skipped { .. }),
+            "quoted single-string command must be Skipped, got {:?}",
+            c[0]
+        );
+    }
+
+    #[test]
+    fn wrapper_prefixed_vigil_wrap_is_skipped_not_rewrapped() {
+        // #15:被 stdbuf 前缀包裹的 vigil-hub wrap(args[0]!="wrap")→ Skipped,防二次 wrap 嵌套。
+        let cfg = json!({"mcpServers": {
+            "nested": {
+                "command": "stdbuf",
+                "args": ["-oL", "vigil-hub", "wrap", "--server-id", "fs", "--vigil-managed-mcp", "--", "npx", "x"]
+            }
+        }});
+        let c = classify_user_scope_servers(&cfg);
+        assert!(
+            matches!(c[0], McpServerClass::Skipped { .. }),
+            "wrapper-prefixed vigil-hub wrap must be Skipped (not re-wrapped), got {:?}",
+            c[0]
+        );
+        // 反向守门:仅含 sentinel 但**无** vigil-hub+wrap 相邻序列的第三方 server 仍 Wrappable(不 fail-open)。
+        let cfg2 = json!({"mcpServers": {
+            "thirdparty": {"command": "npx", "args": ["server", "--vigil-managed-mcp"]}
+        }});
+        let c2 = classify_user_scope_servers(&cfg2);
+        assert!(
+            matches!(c2[0], McpServerClass::Wrappable { .. }),
+            "a third-party server merely containing the sentinel must stay Wrappable, got {:?}",
+            c2[0]
+        );
+    }
+
+    #[test]
+    fn unresolvable_wrappables_flags_missing_program() {
+        // #16:Wrappable server 底层程序在 PATH 不可解析 → 被列出(供非阻塞 WARN,避免虚假 Protected)。
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        std::fs::write(
+            home.join(".claude.json"),
+            json!({"mcpServers": {
+                "badprog": {"command": "/nonexistent/vigil-xyz-not-real", "args": ["x"]}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let u = unresolvable_wrappables(home);
+        assert!(
+            u.iter().any(|(n, _)| n == "badprog"),
+            "missing program must be flagged, got {:?}",
+            u
+        );
+    }
+
+    #[test]
+    fn single_string_vigil_invocation_is_skipped_not_double_wrapped() {
+        // #14 hardening(Codex CONFIRM 的幂等 bug):单串 command 内嵌一次 vigil-hub wrap、args 空 →
+        // has_sentinel 基于空 args 为 false,AlreadyWrapped/#15 漏判;拆分后 program 命中 vigil-hub →
+        // Skipped,绝不二次 wrap。
+        let cfg = json!({"mcpServers": {
+            "selfwrap": {"command": "vigil-hub wrap --server-id x --vigil-managed-mcp -- npx y", "args": []}
+        }});
+        let c = classify_user_scope_servers(&cfg);
+        assert!(
+            matches!(c[0], McpServerClass::Skipped { .. }),
+            "single-string vigil-hub wrap must be Skipped (no double-wrap), got {:?}",
+            c[0]
+        );
+        // 单串 vigil-hub serve(网关自身)同理 → Skipped(否则 wrap 包住自己的 serve)。
+        let cfg2 = json!({"mcpServers": {
+            "selfserve": {"command": "/usr/local/bin/vigil-hub serve --stdio", "args": []}
+        }});
+        let c2 = classify_user_scope_servers(&cfg2);
+        assert!(
+            matches!(c2[0], McpServerClass::Skipped { .. }),
+            "single-string vigil-hub serve must be Skipped, got {:?}",
+            c2[0]
+        );
+    }
+
+    #[test]
+    fn single_token_command_with_trailing_space_is_trimmed() {
+        // (c)(Codex CONFIRM):单 token 带尾随空白 → else 分支 trim,不拿 "npx " 当 argv0 执行 ENOENT。
+        let cfg = json!({"mcpServers": {"t": {"command": "npx ", "args": []}}});
+        let c = classify_user_scope_servers(&cfg);
+        if let McpServerClass::Wrappable { command, .. } = &c[0] {
+            assert_eq!(
+                command, "npx",
+                "trailing space must be trimmed from single-token command"
+            );
+        } else {
+            panic!("expected Wrappable, got {:?}", c[0]);
+        }
     }
 
     #[test]
@@ -1898,9 +2234,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_server_name_skipped_not_wrapped() {
-        // F3(Codex holistic MEDIUM):名含网关 server-id 不允许的字符(大写/空格/点/斜杠)→ Skip,
-        // 否则 apply 成功但 wrap attach 在 validate_server_id 失败 = 坏配置。逐名核对真验证器口径。
+    fn invalid_server_name_wrappable_with_valid_derived_id() {
+        // F-4 修订:名含网关 server-id 不允许的字符(大写/空格/点/斜杠)不再 Skip ——
+        // 派生 id 经 [`server_id_component`] slug 化后必过真验证器,配置键名原样保留。
+        // (旧契约「非法名必 Skip」让 Playwright 这类大写命名成规模漏保护。)
         let cfg = json!({"mcpServers": {
             "Filesystem": {"command": "npx", "args": ["a"]},          // 大写
             "my server": {"command": "npx", "args": ["a"]},          // 空格
@@ -1909,21 +2246,23 @@ mod tests {
             "good-name_1": {"command": "npx", "args": ["a"]}         // 合法
         }});
         let c = classify_user_scope_servers(&cfg);
-        let skipped = |n: &str| {
-            c.iter()
-                .any(|x| matches!(x, McpServerClass::Skipped { name, .. } if name == n))
-        };
-        for bad in ["Filesystem", "my server", "weather.api", "a/b"] {
+        for n in [
+            "Filesystem",
+            "my server",
+            "weather.api",
+            "a/b",
+            "good-name_1",
+        ] {
             assert!(
-                skipped(bad),
-                "非法名 `{bad}` 须 Skipped(否则 wrap 启动失败)"
+                c.iter()
+                    .any(|x| matches!(x, McpServerClass::Wrappable { name, .. } if name == n)),
+                "名 `{n}` 应 Wrappable(id 由派生函数 slug 化)"
             );
+            // 派生 id 必过网关真验证器(原始名不合法时靠 slug + 哈希兜住)
+            vigil_mcp::namespace::validate_server_id(&user_scope_server_id(n))
+                .unwrap_or_else(|e| panic!("`{n}` 的派生 id 必合法:{e:?}"));
         }
-        // 合法名仍 Wrappable
-        assert!(c
-            .iter()
-            .any(|x| matches!(x, McpServerClass::Wrappable { name, .. } if name == "good-name_1")));
-        // 真验证器一致性:被 Skip 的名确实过不了 validate_server_id
+        // 真验证器口径不变:原始非法名裸用仍过不了(slug 收口的必要性)
         assert!(vigil_mcp::namespace::validate_server_id("Filesystem").is_err());
         assert!(vigil_mcp::namespace::validate_server_id("good-name_1").is_ok());
     }
@@ -2233,6 +2572,50 @@ mod tests {
             vigil_mcp::namespace::validate_server_id(id)
                 .unwrap_or_else(|e| panic!("生成的 server-id `{id}` 必须过网关校验:{e:?}"));
         }
+    }
+
+    #[test]
+    fn server_id_component_slugs_invalid_names_stably() {
+        // 合法名**原样**(既有用户的 server-id 逐字不变 = 向后兼容)。
+        assert_eq!(server_id_component("filesystem"), "filesystem");
+        assert_eq!(server_id_component("my_srv-2"), "my_srv-2");
+        // 大写名(F-4 实测场景 `Playwright`)→ 小写 slug + 8hex 哈希;同名恒同、大小写变体不塌缩。
+        let p = server_id_component("Playwright");
+        assert!(
+            p.starts_with("playwright-") && p.len() == "playwright-".len() + 8,
+            "slug+8hex:{p}"
+        );
+        assert_eq!(p, server_id_component("Playwright"), "同名恒同 id(稳定)");
+        assert_ne!(
+            p,
+            server_id_component("playwright"),
+            "大小写变体不得塌缩为同一身份"
+        );
+        // 全非法字符退化 `srv-<hash>`;空格/点折叠为单个 `-`。
+        assert!(server_id_component("数据库").starts_with("srv-"));
+        assert!(server_id_component("My Server.v2").starts_with("my-server-v2-"));
+        // 一切产物(含前缀拼接后)必过网关真验证器。
+        for n in ["Playwright", "My Server.v2", "数据库", "a--B", " x "] {
+            let c = server_id_component(n);
+            vigil_mcp::namespace::validate_server_id(&c)
+                .unwrap_or_else(|e| panic!("slug `{c}` 必合法:{e:?}"));
+        }
+        vigil_mcp::namespace::validate_server_id(&user_scope_server_id("My Server")).unwrap();
+        vigil_mcp::namespace::validate_server_id(&codex_scope_server_id("Chrome DevTools"))
+            .unwrap();
+    }
+
+    #[test]
+    fn classify_accepts_uppercase_server_names_as_wrappable() {
+        // F-4:大写名不再 Skip —— 进入可保护集合(id 由派生函数 slug 化,原配置键名不动)。
+        let cfg = json!({"mcpServers": {"Playwright":
+            {"command": "npx", "args": ["-y", "x"], "type": "stdio"}}});
+        let cls = classify_user_scope_servers(&cfg);
+        assert_eq!(cls.len(), 1);
+        assert!(
+            matches!(&cls[0], McpServerClass::Wrappable { name, .. } if name == "Playwright"),
+            "大写名应 Wrappable,got {cls:?}"
+        );
     }
 
     #[test]
@@ -2792,15 +3175,19 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
         assert!(!run_codex_preview(home, "vigil-hub", true).unwrap().exists);
     }
 
-    /// 非法 server 名(含大写 / 点)→ Skipped(不产出一个起不来的网关条目)。
+    /// 非法 server 名(含大写 / 点)→ Wrappable(F-4 修订:id 经 slug 化派生,不再要求用户改名)。
     #[test]
-    fn codex_invalid_server_name_skipped() {
+    fn codex_invalid_server_name_wrappable_with_valid_id() {
         let doc = "[mcp_servers.\"Bad.Name\"]\ncommand = \"npx\"\nargs = [\"x\"]\n"
             .parse::<DocumentMut>()
             .unwrap();
         let classes = classify_codex_servers(&doc);
         assert_eq!(classes.len(), 1);
-        assert!(matches!(&classes[0], McpServerClass::Skipped { name, .. } if name == "Bad.Name"));
+        assert!(
+            matches!(&classes[0], McpServerClass::Wrappable { name, .. } if name == "Bad.Name"),
+            "非法名应 Wrappable,got {classes:?}"
+        );
+        vigil_mcp::namespace::validate_server_id(&codex_scope_server_id("Bad.Name")).unwrap();
     }
 
     /// 内联表条目形态(`[mcp_servers]` 表内 `foo = { command=.., args=.. }`)也能 wrap/unwrap 往返,

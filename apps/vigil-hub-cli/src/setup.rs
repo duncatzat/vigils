@@ -179,9 +179,51 @@ fn claude_settings_path(home: &Path) -> PathBuf {
     home.join(CLAUDE_DIR).join(SETTINGS_FILE)
 }
 
-/// Claude Code 是否"已安装"= `~/.claude/` 目录存在。
+// 测试中 PATH 检测默认**关**(thread-local 开关,默认 false),保持既有高层 setup 测试 hermetic
+// —— 不受宿主是否装了 claude/codex 等影响。真实 PATH 解析这条生产 glue 由 [`binary_on_path_real`]
+// 的专项测试直接覆盖(评审 #13b),不经此 stub。需验 stub 分支的测试显式置 true。
+#[cfg(test)]
+thread_local! {
+    static TEST_BINARY_ON_PATH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 二进制名是否在宿主 PATH 可解析(生产路径)。复用网关同款 `resolve_program`(SSOT,含 Windows
+/// PATHEXT)。抽成独立函数,使单测能在不破坏其它测试 hermetic 的前提下直接覆盖真实解析(评审 #13b)。
+fn binary_on_path_real(binary: &str) -> bool {
+    vigil_mcp::stdio::resolve_program(binary).is_ok()
+}
+
+/// 生产走 [`binary_on_path_real`];测试走 thread-local 开关(默认关)以保持高层 setup 测试 hermetic。
+fn binary_on_path(binary: &str) -> bool {
+    #[cfg(test)]
+    {
+        let _ = binary;
+        TEST_BINARY_ON_PATH.with(|c| c.get())
+    }
+    #[cfg(not(test))]
+    {
+        binary_on_path_real(binary)
+    }
+}
+
+/// agent 检测:配置目录存在 **或**(给定 CLI 二进制名时)该二进制在宿主 PATH 可解析。
+/// `binary = None` → 仅目录检测(用于 CLI 二进制名不确定的 agent,如 Cursor;评审 #13c)。
+/// 解决 #13:已装(二进制在 PATH)但从未首跑(配置目录尚未生成)的 agent 此前被误判"未安装"。
+pub(crate) fn agent_installed(config_dir: &Path, binary: Option<&str>) -> bool {
+    config_dir.is_dir() || binary.is_some_and(binary_on_path)
+}
+
+/// Claude Code 是否"已安装"= `~/.claude/` 目录存在 **或** `~/.claude.json` 用户级配置文件存在
+/// **或** `claude` 二进制在 PATH。
+///
+/// **修 ISS-20260621-001(QA HIGH)**:此前只查 `~/.claude/` 目录 + `claude` PATH,漏了
+/// `~/.claude.json` —— 而 [`setup_mcp`] 的 MCP 步正是读/改 `~/.claude.json`。导致同一条
+/// `setup --all` 对"Claude Code 是否在场"两步判定**矛盾**:MCP 步据 `~/.claude.json` 成功
+/// wrap,hook 步却判"未检测到"而跳过,最终仍打印 "Protected" —— 而 Claude 的原生工具 secret
+/// 守门 hook 实际缺失(虚假保护承诺)。`~/.claude.json` 是 Claude Code 用户级配置(MCP / projects
+/// / oauth),其存在即 Claude Code 在场 → hook 应安装(install 路径会按需创建 `~/.claude/`)。
 fn claude_detected(home: &Path) -> bool {
-    home.join(CLAUDE_DIR).is_dir()
+    agent_installed(&home.join(CLAUDE_DIR), Some("claude")) || home.join(".claude.json").is_file()
 }
 
 /// 解析默认 ledger 路径(与 desktop `ledger_path::resolve_ledger_path` 同语义,
@@ -246,11 +288,22 @@ pub(crate) fn hook_command_with_cli(exe: &Path, ledger: &Path, cli: Option<&str>
         Some(kind) => format!(" --cli {kind}"),
         None => String::new(),
     };
+    // Claude(cli=None)默认开 `--redact-results`(#12):PostToolUse 硬指纹结果 scrub,无状态、
+    // 独立于 `--inject`,防 agent 把磁盘上真实 ghp_/AKIA 读回模型。其它 CLI 不支持 updatedToolOutput
+    // → 不加(加了也 no-op)。注:这改变 Claude canonical 串 → 既有安装升级后报 Stale(诚实信号:
+    // 重跑 setup 补全新保护),re-setup 后即生效。降级(旧 binary + 新命令)时旧 binary 不识别该 flag
+    // → clap 拒 → exit 2 = deny-all,即 **fail-closed**(安全工具宁拦不漏;非 fail-open;评审 #12d)。
+    let redact_part = if cli.is_none() {
+        " --redact-results"
+    } else {
+        ""
+    };
     format!(
-        "{} hook {}{} --ledger {}",
+        "{} hook {}{}{} --ledger {}",
         shell_quote(&exe.display().to_string()),
         VIGIL_HOOK_MARKER,
         cli_part,
+        redact_part,
         shell_quote(&ledger.display().to_string()),
     )
 }
@@ -637,9 +690,32 @@ pub fn run_with(
     })
 }
 
+/// 把一条 entry 的 hook command 里 `--ledger <值>` 归一为占位符 —— 让 staleness 比较**忽略 ledger 路径**。
+/// ledger 是用户可配的共享审计路径(文档明确建议自定义,以与桌面 GUI 共享),**不应**被当作漂移。exe /
+/// flag / 结构(matcher / timeout / type)仍精确比对,故升级换 binary、缺 PostToolUse、缺 `--redact-results`
+/// 等**真**漂移照常报 Stale。返回 None = 该 entry 不含可识别的单条 command hook 或缺 `--ledger`(本身即非
+/// canonical → 判 Stale)。取**首个** ` --ledger ` 切分:prefix(quoted-exe + hook + marker + 可选 flag)
+/// 不含该字面子串,首个 occurrence 即真 flag;避免 ledger 路径恰含字面 ` --ledger ` 时误切(Codex review
+/// Low;无论如何 fail-safe —— 最坏多报一次 Stale,绝不误判 Active)。
+fn entry_ledger_normalized(entry: &Value) -> Option<Value> {
+    let hooks = entry.get("hooks").and_then(Value::as_array)?;
+    if hooks.len() != 1 {
+        return None;
+    }
+    let cmd = hooks[0].get("command").and_then(Value::as_str)?;
+    let (prefix, ledger) = cmd.split_once(" --ledger ")?;
+    if ledger.trim().is_empty() {
+        return None;
+    }
+    let mut normalized = entry.clone();
+    normalized["hooks"][0]["command"] = Value::String(format!("{prefix} --ledger <vigil-ledger>"));
+    Some(normalized)
+}
+
 /// 诚实判定保护状态:[`CLAUDE_HOOK_EVENTS`] **每个事件**都恰好一条托管条目且 == 当前 canonical
-/// 且 exe 存在 → Active;有任何托管条目但不满足上述(漂移 / 缺事件 / exe 缺失)→ Stale;
-/// 完全无托管条目 → NotInstalled。旧版只注册了 PreToolUse 的安装会被诚实报 Stale(提示重跑 setup 补全)。
+/// (**ledger 路径除外**,见 [`entry_ledger_normalized`])且 exe 存在 → Active;有任何托管条目但不满足上述
+/// (exe/flag 漂移 / 缺事件 / exe 缺失)→ Stale;完全无托管条目 → NotInstalled。旧版只注册 PreToolUse 的
+/// 安装被诚实报 Stale(提示重跑 setup 补全)。
 fn protection_state(
     settings: Option<&Value>,
     canonical_command: &str,
@@ -648,9 +724,11 @@ fn protection_state(
     let Some(s) = settings else {
         return ProtectionState::NotInstalled;
     };
-    let canonical = vigil_entry(canonical_command);
+    // canonical 也按 ledger 归一:status 不带 --ledger 时按默认 ledger 重算 canonical,但注册串可能是用户
+    // 安装时给的自定义 ledger —— 归一后只比 exe/flag/结构,自定义 ledger 不再误报 STALE(真机回归)。
+    let canonical_norm = entry_ledger_normalized(&vigil_entry(canonical_command));
     let mut any_vigil = false;
-    let mut all_canonical = true;
+    let mut all_canonical = canonical_norm.is_some();
     for event in CLAUDE_HOOK_EVENTS {
         let vigil: Vec<&Value> = s
             .get("hooks")
@@ -659,8 +737,8 @@ fn protection_state(
             .map(|arr| arr.iter().filter(|e| is_vigil_entry(e)).collect())
             .unwrap_or_default();
         any_vigil |= !vigil.is_empty();
-        // 恰好一条且等于 canonical 才算该事件就位。
-        all_canonical &= vigil.len() == 1 && vigil[0] == &canonical;
+        // 恰好一条且(ledger 归一后)等于 canonical 才算该事件就位。
+        all_canonical &= vigil.len() == 1 && entry_ledger_normalized(vigil[0]) == canonical_norm;
     }
     if !any_vigil {
         return ProtectionState::NotInstalled;
@@ -737,6 +815,82 @@ mod tests {
         assert_eq!(
             protection_state(Some(&out), &c, &exe()),
             ProtectionState::Active
+        );
+    }
+
+    #[test]
+    fn custom_ledger_install_is_active_not_stale() {
+        // 回归(真机发现):`setup --ledger <自定义共享路径>` 安装后,`setup --status`(不重复 --ledger)
+        // 此前误报 "INSTALLED but STALE / 重跑 setup" —— canonical 用**默认** ledger 重算、与注册串的
+        // 自定义 ledger 不等。ledger 是用户可配的共享审计路径(文档建议自定义以共享桌面 GUI),不应触发漂移。
+        let e = exe();
+        let installed = merge_install(
+            json!({}),
+            &cmd(&e, &PathBuf::from("/shared/team/ledger.sqlite3")),
+        )
+        .1;
+        // status 侧不带 --ledger → 按**默认(不同)** ledger 重算 canonical:
+        let status_canonical = cmd(
+            &e,
+            &PathBuf::from("/home/u/.local/share/Vigil/ledger.sqlite3"),
+        );
+        assert_eq!(
+            protection_state(Some(&installed), &status_canonical, &e),
+            ProtectionState::Active,
+            "custom-ledger install must be Active under status without a matching --ledger"
+        );
+    }
+
+    #[test]
+    fn different_binary_path_is_still_stale() {
+        // 守门:exe 漂移(升级 / 移动 binary)**仍必须**报 Stale —— 本修复只放宽 ledger,不放宽 exe/flag。
+        let installed =
+            merge_install(json!({}), &cmd(Path::new("/old/path/vigil-hub"), &ledger())).1;
+        let cur = exe(); // 当前 exe 与注册的不同路径
+        let status_canonical = cmd(&cur, &ledger());
+        assert_eq!(
+            protection_state(Some(&installed), &status_canonical, &cur),
+            ProtectionState::Stale,
+            "a hook pointing at a different binary path must stay Stale (exe-drift detection preserved)"
+        );
+    }
+
+    #[test]
+    fn missing_ledger_arg_entry_is_stale() {
+        // 守门:注册串缺 `--ledger`(形状异常 / 被手改)→ 归一返回 None → Stale(不误判 Active)。
+        let e = exe();
+        let canonical = cmd(&e, &ledger());
+        let broken_cmd = format!(
+            "{} hook --vigil-managed --redact-results",
+            shell_quote("vigil-hub")
+        );
+        let broken = json!({ "hooks": {
+            "PreToolUse":  [vigil_entry(&broken_cmd)],
+            "PostToolUse": [vigil_entry(&broken_cmd)],
+        }});
+        assert_eq!(
+            protection_state(Some(&broken), &canonical, &e),
+            ProtectionState::Stale,
+            "a managed entry without --ledger must not be reported Active"
+        );
+    }
+
+    #[test]
+    fn ledger_path_containing_ledger_substring_still_active() {
+        // Codex review Low:ledger 路径字面含 " --ledger " 时,split_once(取**首个**)仍切在真 flag 处 →
+        // 归一一致 → Active(rsplit 末段会误切致假 Stale)。fail-safe 硬化验证。
+        let e = exe();
+        let weird = PathBuf::from("/data/x --ledger y/ledger.sqlite3");
+        let (_, settings) = merge_install(json!({}), &cmd(&e, &weird));
+        // status 用**默认(不同且不含该子串)** ledger:
+        let status_canonical = cmd(
+            &e,
+            &PathBuf::from("/home/u/.local/share/Vigil/ledger.sqlite3"),
+        );
+        assert_eq!(
+            protection_state(Some(&settings), &status_canonical, &e),
+            ProtectionState::Active,
+            "a ledger path literally containing ' --ledger ' must still normalize correctly -> Active"
         );
     }
 
@@ -940,14 +1094,21 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_stale_when_command_drifted() {
-        // 装一个旧 ledger 的条目,再用新 ledger 查 status → Stale。
+    fn status_ledger_difference_is_active_not_stale() {
+        // 真机回归(end-to-end run_with):装一个自定义 ledger 的条目,再用**不同** ledger 查 status →
+        // 必须 Active(不是 Stale)。ledger 是用户可配的共享审计路径;`setup --status` 不带 --ledger 会按
+        // 默认重算 canonical,但注册串用的是用户安装时给的路径 —— 二者不同**不构成漂移**。
         let td = tempfile::TempDir::new().unwrap();
         let home = td.path();
         std::fs::create_dir_all(home.join(CLAUDE_DIR)).unwrap();
-        let old_args = SetupArgs::default();
-        run_with(&old_args, home, &exe(), Path::new("/OLD/ledger.sqlite3")).unwrap();
-        // 现在用不同 ledger 查 status
+        run_with(
+            &SetupArgs::default(),
+            home,
+            &exe(),
+            Path::new("/OLD/ledger.sqlite3"),
+        )
+        .unwrap();
+        // 现在用不同 ledger 查 status(模拟用户没重复 --ledger):
         let st = SetupArgs {
             status: true,
             ..Default::default()
@@ -955,8 +1116,8 @@ mod tests {
         let rep = run_with(&st, home, &exe(), Path::new("/NEW/ledger.sqlite3")).unwrap();
         assert_eq!(
             rep.state,
-            ProtectionState::Stale,
-            "drifted command -> Stale, not Active"
+            ProtectionState::Active,
+            "a different --ledger is the user's choice, not drift -> Active"
         );
     }
 
@@ -1083,6 +1244,25 @@ mod tests {
         );
     }
 
+    /// ISS-20260621-001 守门:`~/.claude.json`(Claude Code 用户级配置)存在即视 Claude Code 在场,
+    /// hook 步不再跳过 —— 此前只查 `~/.claude/` 目录 + `claude` PATH 漏了它,致同一条 `setup --all`
+    /// 的 MCP 步(读 `~/.claude.json`)wrap 成功而 hook 步跳过,却仍打印 "Protected"(原生工具守门缺失)。
+    #[test]
+    fn detected_when_claude_json_exists() {
+        let td = tempfile::TempDir::new().unwrap();
+        std::fs::write(td.path().join(".claude.json"), "{\"mcpServers\":{}}").unwrap();
+        let rep = run_with(&SetupArgs::default(), td.path(), &exe(), &ledger()).unwrap();
+        assert!(
+            rep.claude_detected,
+            "~/.claude.json 存在应判定 Claude Code 在场(与 MCP 步一致)"
+        );
+        assert!(rep.changed, "检测到即应安装 hook");
+        assert!(
+            claude_settings_path(td.path()).exists(),
+            "hook 应写入 ~/.claude/settings.json(install 路径按需创建 ~/.claude/)"
+        );
+    }
+
     #[test]
     fn ledger_resolution_precedence() {
         let exp = PathBuf::from("/explicit/l.db");
@@ -1109,6 +1289,53 @@ mod tests {
         assert!(doctor_self_test(), "hook must block a synthetic fake token");
     }
 
+    #[test]
+    fn agent_installed_dir_or_binary_or_neither() {
+        let td = tempfile::TempDir::new().unwrap();
+        let absent = td.path().join("nope");
+        // 1) 二进制在 PATH、目录不存在 → detected(#13 核心:已装未首跑算已安装)。
+        TEST_BINARY_ON_PATH.with(|c| c.set(true));
+        assert!(
+            agent_installed(&absent, Some("claude")),
+            "binary on PATH => detected"
+        );
+        // 2) 既无目录也无二进制 → not detected;binary=None(如 Cursor)→ 仅目录检测。
+        TEST_BINARY_ON_PATH.with(|c| c.set(false));
+        assert!(
+            !agent_installed(&absent, Some("claude")),
+            "neither dir nor binary => not detected"
+        );
+        assert!(
+            !agent_installed(&absent, None),
+            "binary=None + no dir => not detected"
+        );
+        // 3) 目录存在 → detected(向后兼容既有目录检测)。
+        std::fs::create_dir_all(&absent).unwrap();
+        assert!(
+            agent_installed(&absent, Some("claude")),
+            "config dir present => detected"
+        );
+        assert!(
+            agent_installed(&absent, None),
+            "config dir present (binary=None) => detected"
+        );
+    }
+
+    #[test]
+    fn binary_on_path_real_resolves_present_binary() {
+        // 评审 #13b:直接覆盖生产 glue(resolve_program 整合),不经 thread-local stub。
+        // 用 PATH 上必有的二进制(sh/cmd)验证真实解析 true;不存在的名 false。
+        let present = if cfg!(windows) { "cmd" } else { "sh" };
+        assert!(
+            binary_on_path_real(present),
+            "a binary present on PATH must resolve"
+        );
+        assert!(
+            !binary_on_path_real("vigil-nonexistent-binary-xyz"),
+            "a missing binary must not resolve"
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn shell_quote_neutralizes_injection_on_unix() {
@@ -1130,5 +1357,25 @@ mod tests {
         assert!(c.contains(VIGIL_HOOK_MARKER));
         assert!(c.contains(" hook "));
         assert!(c.contains("--ledger"));
+    }
+
+    #[test]
+    fn claude_hook_command_enables_result_redaction_others_do_not() {
+        // #12:Claude canonical hook command 默认带 `--redact-results`(turnkey 开启结果硬指纹 scrub)。
+        let claude = hook_command(Path::new("/opt/vigil-hub"), Path::new("/l/x.db"));
+        assert!(
+            claude.contains("--redact-results"),
+            "Claude hook must enable result scrub: {claude}"
+        );
+        // 其它 CLI(显式 `--cli`)不带(不支持 updatedToolOutput,加了也是 no-op)。
+        let codex = hook_command_with_cli(
+            Path::new("/opt/vigil-hub"),
+            Path::new("/l/x.db"),
+            Some("codex"),
+        );
+        assert!(
+            !codex.contains("--redact-results"),
+            "non-Claude hook must not add it: {codex}"
+        );
     }
 }

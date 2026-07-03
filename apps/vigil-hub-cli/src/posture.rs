@@ -90,6 +90,15 @@ pub enum RiskClass {
     /// `secret://` / `vigil://redact/` 占位符出现在**非 MCP 原生**工具
     /// (占位符本身是无害文本,风险只在"未解析就执行"的体验/语义层)。
     PlaceholderNative,
+    /// **灾难级** shell 命令:不可逆 × 全系统爆炸半径(`rm -rf /`·`~`·`$HOME`、fork bomb、
+    /// `dd of=/dev/*`、`mkfs`、`curl … | sh` 远程直灌 shell)。由 [`crate::command_guard`]
+    /// 分类。**硬底线**:任何档位恒 Deny(类比 [`RiskClass::RawSecret`])—— agent 无论因意图
+    /// 漂移 / 注入 / 参数事故产生此类动作,都不放行。
+    DestructiveCatastrophic,
+    /// **高危** shell 命令:持久化 / 自启(shell rc、cron、systemd、launchd、authorized_keys、
+    /// Windows Run 键)、项目根外的递归删除、`rm -rf $VAR/`(空变量展开事故)。姿态分级:
+    /// Low/Medium=Ask(重新确认,Claude 下即使「允许所有」也会弹),High=Deny。可确认 = 误报可恢复。
+    DangerousCommand,
 }
 
 /// 姿态决策动作。
@@ -123,6 +132,16 @@ pub fn decide(profile: PostureProfile, risk: RiskClass) -> PostureAction {
         (RiskClass::PlaceholderNative, PostureProfile::Low) => PostureAction::Allow,
         (RiskClass::PlaceholderNative, PostureProfile::Medium) => PostureAction::Ask,
         (RiskClass::PlaceholderNative, PostureProfile::High) => PostureAction::Deny,
+        // 灾难级 shell 命令:硬底线,任何档位恒 Deny(不可被档位降级,类比 RawSecret)。
+        (
+            RiskClass::DestructiveCatastrophic,
+            PostureProfile::Low | PostureProfile::Medium | PostureProfile::High,
+        ) => PostureAction::Deny,
+        // 高危 shell 命令:Low/Medium 交确认(默认 Low 也确认 —— 「允许所有」下的backstop
+        // 正是本层价值);High 收紧为 Deny。
+        (RiskClass::DangerousCommand, PostureProfile::Low) => PostureAction::Ask,
+        (RiskClass::DangerousCommand, PostureProfile::Medium) => PostureAction::Ask,
+        (RiskClass::DangerousCommand, PostureProfile::High) => PostureAction::Deny,
     }
 }
 
@@ -319,14 +338,16 @@ mod tests {
         PostureProfile::Medium,
         PostureProfile::High,
     ];
-    const ALL_RISKS: [RiskClass; 3] = [
+    const ALL_RISKS: [RiskClass; 5] = [
         RiskClass::RawSecret,
         RiskClass::LedgerTamper,
         RiskClass::PlaceholderNative,
+        RiskClass::DestructiveCatastrophic,
+        RiskClass::DangerousCommand,
     ];
 
-    /// 期望决策表(与 `decide` 内的 SSOT 表逐项对照;3 档 × 3 风险 = 9 组合)。
-    const EXPECTED_TABLE: [(PostureProfile, RiskClass, PostureAction); 9] = [
+    /// 期望决策表(与 `decide` 内的 SSOT 表逐项对照;3 档 × 5 风险 = 15 组合)。
+    const EXPECTED_TABLE: [(PostureProfile, RiskClass, PostureAction); 15] = [
         // RawSecret:硬底线,任何档位 Deny
         (
             PostureProfile::Low,
@@ -373,6 +394,38 @@ mod tests {
         (
             PostureProfile::High,
             RiskClass::PlaceholderNative,
+            PostureAction::Deny,
+        ),
+        // DestructiveCatastrophic:硬底线,任何档位 Deny
+        (
+            PostureProfile::Low,
+            RiskClass::DestructiveCatastrophic,
+            PostureAction::Deny,
+        ),
+        (
+            PostureProfile::Medium,
+            RiskClass::DestructiveCatastrophic,
+            PostureAction::Deny,
+        ),
+        (
+            PostureProfile::High,
+            RiskClass::DestructiveCatastrophic,
+            PostureAction::Deny,
+        ),
+        // DangerousCommand:Low/Medium 确认,High 拒
+        (
+            PostureProfile::Low,
+            RiskClass::DangerousCommand,
+            PostureAction::Ask,
+        ),
+        (
+            PostureProfile::Medium,
+            RiskClass::DangerousCommand,
+            PostureAction::Ask,
+        ),
+        (
+            PostureProfile::High,
+            RiskClass::DangerousCommand,
             PostureAction::Deny,
         ),
     ];

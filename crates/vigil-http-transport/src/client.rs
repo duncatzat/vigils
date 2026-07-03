@@ -71,6 +71,11 @@ fn default_builder() -> ClientBuilder {
         .no_deflate()
         // 不自动 proxy 系统环境(避免把 token 漏到 corp proxy;用户要 proxy 走 ADR)
         .no_proxy()
+        // **不跟随重定向**(ADR 0021 hostile review CRITICAL)。reqwest 默认跟随 ≤10 跳;
+        // 否则一个通过 validate-time SSRF gate 的公网 URL 可经 3xx 把带 token 的请求
+        // 重定向到 169.254.169.254 / 内网(SSRF gate 只在 attach 期校验一次,跟随重定向
+        // 直接绕过它)。MCP RPC / OAuth 发现路径均无合法重定向需求 → fail-closed 拒跟随。
+        .redirect(reqwest::redirect::Policy::none())
         // TLS 最低 1.2;reqwest 0.12 默认已是 1.2,这里显式声明防回退
         .min_tls_version(reqwest::tls::Version::TLS_1_2)
 }
@@ -100,12 +105,13 @@ impl AuthorizedSender for ReqwestHttpClient {
     ) -> Result<HttpResponse, HttpAuthError> {
         // AuthorizedHttpRequest 的字段集是 HttpRequest 的严格子集;
         // planner 已保证 headers 不含 passthrough(§I-10.3),同时已拼 Authorization。
+        // ADR 0021 MF#1:字段已封印,读取走访问器。
         send_inner(
             &self.inner,
-            req.method,
-            req.url.as_str(),
-            &req.headers,
-            req.body.as_deref(),
+            req.method(),
+            req.url().as_str(),
+            req.headers(),
+            req.body(),
             None,
         )
     }
@@ -118,10 +124,10 @@ impl AuthorizedSender for ReqwestHttpClient {
         // I10b-α2 代码 R1 MUST-FIX 1:per-call timeout 透传到 reqwest RequestBuilder
         send_inner(
             &self.inner,
-            req.method,
-            req.url.as_str(),
-            &req.headers,
-            req.body.as_deref(),
+            req.method(),
+            req.url().as_str(),
+            req.headers(),
+            req.body(),
             Some(timeout),
         )
     }

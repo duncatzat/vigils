@@ -98,7 +98,8 @@ pub use ensemble::EngineAttribution;
 pub mod bootstrap;
 #[cfg(feature = "ort")]
 pub use bootstrap::{
-    ensure_injection_model_available, ensure_model_available, BootstrapError, ModelPaths,
+    ensure_injection_model_available, ensure_model_available, injection_model_cached, model_cached,
+    BootstrapError, ModelPaths,
 };
 
 // `scan_text_with_engine`:`scan_text` 的引擎注入版,行为保留 EmptyInput +
@@ -160,6 +161,17 @@ pub fn scrub_text(text: &str) -> String {
     // 复用 redact_string 的规则执行(PEM + ALL_RULES)但丢弃 findings。
     let mut sink: Vec<String> = Vec::new();
     redact_string(text, &mut sink)
+}
+
+/// 同 [`scrub_text`],但额外返回脱敏串中本次新插入的 `[REDACTED …]` 占位符的字节区间
+/// (相对**输出串**、升序、互不重叠)。供 hook PostToolUse ML 再脱敏把已脱敏占位符标为
+/// "受保护区",避免 daemon ML span 把占位符切碎成破碎嵌套(VIGIL-SEC-OVERLAP-PH)。
+///
+/// **安全**:区间只来自本次脱敏产出,不靠正则识别 `[REDACTED …]` 形态 —— 工具输出可伪造
+/// 假占位符把明文 PII 包进去,按形态保护会让 ML 跳过 → 绕过(见 [`redact_string_with_spans`])。
+pub fn scrub_text_with_spans(text: &str) -> (String, Vec<(usize, usize)>) {
+    let mut sink: Vec<String> = Vec::new();
+    redact_string_with_spans(text, &mut sink)
 }
 
 /// 扫描文本,返回**所有**命中的硬指纹规则名(去重,保留 HARD_RULES 声明顺序)。
@@ -256,10 +268,22 @@ fn redact_value(v: &Value, findings: &mut Vec<String>) -> Value {
 }
 
 fn redact_string(s: &str, findings: &mut Vec<String>) -> String {
+    redact_string_with_spans(s, findings).0
+}
+
+/// 同 [`redact_string`],但额外返回本函数**新插入**的 `[REDACTED …]` 占位符在**输出串**中的
+/// 字节区间(升序、互不重叠)。供 hook PostToolUse ML 再脱敏把这些区间作为"受保护区"——后续
+/// daemon ML span 命中这些区间时做减法,避免把已脱敏的占位符切碎成破碎嵌套(VIGIL-SEC-OVERLAP-PH)。
+///
+/// **安全要点**:返回的区间只标记本函数**此次**产出的占位符,**绝不**靠正则识别 `[REDACTED …]`
+/// 形态 —— 工具输出可伪造假占位符把明文 PII 包进去,若按形态保护会让 ML 跳过 → 绕过脱敏。
+fn redact_string_with_spans(s: &str, findings: &mut Vec<String>) -> (String, Vec<(usize, usize)>) {
     // PEM 块单独处理:整串视为单一 secret,整块替换(不与其他规则叠加)。
     if PEM_RE.is_match(s) {
         findings.push("pem_private_key".to_string());
-        return "[REDACTED pem_private_key]".to_string();
+        let out = "[REDACTED pem_private_key]".to_string();
+        let end = out.len();
+        return (out, vec![(0, end)]);
     }
 
     // ── 单遍 span 收集:所有规则在**原文** s 上各自扫描 ──
@@ -288,7 +312,7 @@ fn redact_string(s: &str, findings: &mut Vec<String>) -> String {
         }
     }
     if hits.is_empty() {
-        return s.to_string();
+        return (s.to_string(), Vec::new());
     }
 
     // findings 契约:每条命中规则名至多记一次(caller 再 sort+dedup,顺序无关)。
@@ -326,12 +350,21 @@ fn redact_string(s: &str, findings: &mut Vec<String>) -> String {
         }
     }
 
-    // 右→左替换避免 index 漂移;merged 已按 start 升序且互不重叠,从后往前安全。
-    let mut out = s.to_string();
-    for (start, end, name) in merged.iter().rev() {
-        out.replace_range(*start..*end, &format!("[REDACTED {name}]"));
+    // ── 左→右构建输出串,同时记录每个占位符在**输出串**中的字节区间 ──
+    // merged 已按 start 升序且互不重叠;依次拼接 [前缀原文]+[占位符],占位符区间自然落在输出串。
+    // 与旧"右→左 replace_range"逐字节等价(每个 merged 区间换成占位符、其余原文保留),额外产出区间。
+    let mut out = String::with_capacity(s.len());
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(merged.len());
+    let mut cursor = 0usize;
+    for (start, end, name) in &merged {
+        out.push_str(&s[cursor..*start]);
+        let ph_start = out.len();
+        out.push_str(&format!("[REDACTED {name}]"));
+        spans.push((ph_start, out.len()));
+        cursor = *end;
     }
-    out
+    out.push_str(&s[cursor..]);
+    (out, spans)
 }
 
 fn collect_strings(v: &Value) -> String {
@@ -684,6 +717,53 @@ mod tests {
         );
         // 3) 内层裸 github token 无 env_assignment 包裹时仍单独正确脱敏(未回归)
         assert_eq!(scrub_text(raw), "[REDACTED github_token]");
+    }
+
+    /// `scrub_text_with_spans`:区间精确标记**本次插入**的占位符(输出串坐标),`.0` 与
+    /// `scrub_text` 逐字节等价(重构未改行为)。供 hook ML 受保护区减法(VIGIL-SEC-OVERLAP-PH)。
+    #[test]
+    fn scrub_with_spans_marks_placeholder_ranges() {
+        // 无命中:原串 + 空区间
+        let (out, spans) = scrub_text_with_spans("just plain text, no secrets");
+        assert_eq!(out, "just plain text, no secrets");
+        assert!(spans.is_empty());
+
+        // `.0` 与 scrub_text 逐字节等价(行为不变)
+        let input = "before AKIAIOSFODNN7EXAMPLE after";
+        assert_eq!(scrub_text_with_spans(input).0, scrub_text(input));
+
+        // 单命中:恰一个区间,切片为良构占位符,首尾原文保留,原值不残留
+        let (out, spans) = scrub_text_with_spans(input);
+        assert_eq!(spans.len(), 1);
+        let (s0, e0) = spans[0];
+        assert!(out[s0..e0].starts_with("[REDACTED "));
+        assert!(out[s0..e0].ends_with(']'));
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(out.starts_with("before "));
+        assert!(out.ends_with(" after"));
+
+        // 多命中(两段不相邻):两区间升序互不重叠,各切片为占位符
+        let two = "k1 AKIAIOSFODNN7EXAMPLE mid ghp_aBcD1234567890aBcD1234567890aBcD1234 z";
+        let (out2, spans2) = scrub_text_with_spans(two);
+        assert_eq!(spans2.len(), 2);
+        assert!(spans2[0].1 <= spans2[1].0, "区间升序互不重叠");
+        for (s, e) in &spans2 {
+            assert!(out2[*s..*e].starts_with("[REDACTED "));
+            assert!(out2[*s..*e].ends_with(']'));
+        }
+
+        // PEM:整串单区间覆盖整个输出
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKC...\n-----END RSA PRIVATE KEY-----";
+        let (outp, spansp) = scrub_text_with_spans(pem);
+        assert_eq!(outp, "[REDACTED pem_private_key]");
+        assert_eq!(spansp, vec![(0, outp.len())]);
+
+        // 重叠并集:KEY=secret 合并为单一区间(无破碎)
+        let (outo, spanso) =
+            scrub_text_with_spans("api_token=ghp_aBcD1234567890aBcD1234567890aBcD1234");
+        assert_eq!(spanso.len(), 1);
+        assert_eq!(&outo[spanso[0].0..spanso[0].1], "[REDACTED env_assignment]");
+        assert_eq!(outo, "[REDACTED env_assignment]");
     }
 
     /// 回归门(Codex review):裸敏感 key **仅** `=` 触发,不收 `:` —— 否则会误吞 URI scheme

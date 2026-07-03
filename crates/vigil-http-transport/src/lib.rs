@@ -17,12 +17,14 @@
 mod client;
 mod jwks;
 mod loopback;
+mod streamable;
 mod upstream;
 mod verifier;
 
 pub use client::ReqwestHttpClient;
 pub use jwks::{AuthorizationServerMetadata, HttpJwksSource};
 pub use loopback::{open_browser, LoopbackCallback, LoopbackServer};
+pub use streamable::StreamableHttpUpstream;
 pub use upstream::{AutoRefreshConfig, HttpUpstream};
 pub use verifier::JwksSignatureVerifier;
 

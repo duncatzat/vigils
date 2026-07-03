@@ -8,6 +8,396 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.4.6-beta.3] — 2026-07-03 — robustness round: OAuth scope wiring fix, `status --json`, dual-engine parity, remote-MCP e2e
+
+A hardening beta. One real gateway fix; everything else strengthens verification coverage.
+
+### Fixed
+
+- **`ScopeNotInAllowList` policy rules now actually fire for OAuth HTTP upstreams.** The gateway
+  previously evaluated every outbound tools/call with a hard-coded non-OAuth scope context, so a
+  configured scope-allowlist Deny rule silently never triggered (false sense of protection). The
+  token's scope set (snapshotted at attach) now reaches policy evaluation: out-of-allowlist scopes
+  deny, an empty scope set fails closed, and non-OAuth upstreams (stdio / bearer / none) are
+  unaffected. Covered by three new integration tests.
+
+### Added
+
+- **`daemon status --json`** — a stable, locale-independent, machine-readable schema
+  (`running`/`pid`/`pii_loaded`/`inj_loaded`/`uptime_secs`/`inflight`; fields are only ever added).
+  Human output is unchanged (still localized). Acceptance scripts prefer it and probe-fallback to
+  pinned-English text on older builds.
+- **Remote-MCP e2e in the unattended acceptance matrix** (`http-e2e.mjs`): proves the protection
+  invariants on the Streamable HTTP upstream path against the published binaries — bearer token
+  reaches the upstream `Authorization` header but never the client or the ledger, the secret-lease
+  four-leg round-trip works over HTTP, an SSE (`text/event-stream`) upstream response is collapsed
+  and re-redacted, raw secrets are not forwarded, and the audit ledger holds no plaintext.
+- **Dual-engine parity guard** (`dual_engine_parity`): the hook path and the MCP-gateway path are
+  fed the same untrusted inputs and must agree (bare secrets deny on both, clean input allows on
+  both, deny reasons never echo the secret) — a regression tripwire for engine drift until the
+  decision cores are unified.
+- **Weekly scheduled acceptance run** (Mondays 03:23 UTC, against the Latest release): upstream
+  agent hook-protocol drift and distribution-service changes get caught without waiting for our
+  next release.
+
+### Docs
+
+- README (both languages): the crates.io `vigil-sdk` release is an early preview on its own
+  cadence and lags this repository; build from source for the current API.
+
+## [v0.4.6-beta.2] — 2026-07-02 — unattended user-acceptance CI (functional + agent-integration + GUI) atop beta.1 polish
+
+A beta focused on findings from a feature-by-feature user-level verification pass (real binaries on
+all three platforms). No security-invariant changes; hard floors are untouched.
+
+### Added
+
+- **Server names with uppercase / spaces / dots are now protectable** (`setup --mcp` / `--all`):
+  gateway server-ids are derived through a slugifier (`Playwright` → `user-playwright-<hash8>`)
+  instead of skipping the server and asking you to rename it in your MCP config. Already-valid
+  names keep their exact ids (backward compatible); case-variants can't collapse into one identity
+  (hash suffix).
+- Bare `vigil-hub posture` / `engine` / `daemon` now default to `show` / `status` instead of
+  printing help.
+
+### Fixed
+
+- `daemon status` uptime was frozen at `0s`; it now reports real elapsed time. `daemon stop` no
+  longer leaks the OS kill helper's localized output (mojibake on non-UTF-8 codepages).
+- `setup --all` output honesty: the `[2/2]` MCP gateway line is scoped ("Claude Code") so per-agent
+  sections aren't misread against a global total; "changes written to <config>" only appears when
+  the file was actually written; agent-CLI status now says "hook not registered" instead of the
+  misleading "not installed".
+- `demo` now points at `vigil-hub setup --all` (the turnkey path) instead of the manual
+  `serve --stdio` flow.
+- `checkpoint` tip is platform-aware — no more Linux-only `chattr +a` advice on Windows; macOS
+  suggests `chflags uappnd`.
+- `setup --mcp` preview skip-reasons are localized in Chinese output; `quickstart` no longer
+  mislabels every skipped server as "http/sse".
+- `--help` for `model` on the standard (non-ML) build says up front that the ML build variant is
+  required, instead of letting you discover it at `model install`.
+- Internal review shorthand removed from `setup --help` text.
+- Desktop: the daemon card no longer promises "start it to enable ML protection" when no model is
+  installed (it now says the daemon would run model-less on the hard-fingerprint floor); Naive UI
+  built-in texts (empty tables, pagination) follow the app language.
+- Extension: internal spec references removed from user-facing text; disabled buttons now look
+  disabled; guarded-site copy matches the actual manifest list.
+
+### Docs
+
+- `docs/user-guide/`: removed commands that don't exist (`ledger verify` / `ledger query` →
+  `vigil-hub verify` + Activity Feed / direct SQLite), corrected the default ledger path
+  (`%LOCALAPPDATA%\Vigil\ledger.sqlite3` and per-OS equivalents, aligned via
+  `VIGIL_LEDGER_PATH`), replaced the stale "Stage 1: `tools/list` returns empty" note with the
+  real upstream-forwarding behavior, and pointed installation at GitHub Releases.
+- README (en/zh): the ML-variant availability note was stale (ML builds ship since v0.4.0);
+  softened "restored byte-for-byte" to the verified claim (only Vigils' own entries are removed,
+  settings restored faithfully).
+
+### Added (test infrastructure)
+
+- **Unattended user-acceptance CI** (`.github/workflows/acceptance.yml`): after every release, three GitHub-hosted platforms download the published assets like a user, verify sha256 + SLSA provenance, and run `user-sim.sh`, `functional-sweep.sh`, `core-e2e.mjs` (privacy-filter + secret-lease four-leg on the real MCP gateway), `agent-compat.sh` (Claude/Codex/Gemini/Cursor native-hook protocol), plus desktop GUI smoke (Windows WebView2 CDP; Linux/macOS install→launch→screenshot). ML model-download e2e stays on internal machines.
+- **`serve --monitor`** (symmetric with `wrap --monitor`): observe-and-audit posture for headless/e2e when there is no GUI approval resolver; hard floors unchanged.
+
+---
+
+## [v0.4.5] — 2026-06-30 — close `VIGIL-SEC-ML-SKIP` (`secret://` face): same-leaf soft-PII redaction restored
+
+### Security
+
+- **`VIGIL-SEC-ML-SKIP` closed (`secret://` face).** `MlScrub::augment` no longer skips ML for an entire
+  string leaf merely because it contains a literal `secret://`. A `secret://<alias>` placeholder is
+  pipeline-produced (reverse-substituted by the redaction pass, its byte range recorded in the
+  `protected` set), so `apply_wire_spans` keeps ML off it via interval subtraction while same-leaf
+  soft-PII (person / address / email) is now scrubbed — closing an ML-recall gap where an
+  attacker-embedded `secret://x` beside soft-PII suppressed semantic redaction (no leak; the
+  hard-fingerprint floor always held). The `vigil://redact/` skip is retained (those Tier-B tokens
+  arrive in tool output, not pipeline-produced, so their ranges can't be trusted into `protected`); a
+  forged `secret://…` in tool output is likewise not in `protected`, so PII it wraps is still scrubbed.
+  Verified by adversarial review, a falsifiable real-machine comparison (old binary suppressed soft-PII
+  vs. fixed binary scrubs it while the `secret://` placeholder survives), and an end-to-end acceptance
+  assertion.
+
+---
+
+## [v0.4.4] — 2026-06-29 — macOS daemon socket robustness on a deep `$HOME` (`sun_path` overflow fix)
+
+On macOS the daemon's default socket path (`~/Library/Application Support/Vigil/vigil-daemon.sock`) could
+exceed the `sockaddr_un.sun_path` limit (104 bytes) under a deep `$HOME` — an enterprise network home
+(`/Network/Servers/…`) or a sandboxed `$TMPDIR` — making `daemon start` fail with a cryptic libc error
+and silently degrading ML protection to the hard-fingerprint floor.
+
+### Fixed
+
+- **`VIGIL_DAEMON_SOCKET` env override** lets the daemon socket path be set explicitly — a short,
+  user-private escape hatch for deep-`$HOME` deployments (and deterministic test sandboxes). Resolved
+  once in `default_socket_name()`, it flows through `daemon.json` to the hook client unchanged, so the
+  server bind and client connect always agree.
+- **Actionable bind-time guard.** A socket path at or over the `sun_path` capacity is now rejected with a
+  clear error naming `VIGIL_DAEMON_SOCKET`, instead of the opaque libc message. Touches none of the
+  single-instance / peer-credential (R1) / stale-reclaim invariants — the env only supplies a string they
+  already consume.
+
+---
+
+## [v0.4.3] — 2026-06-29 — `VIGIL-SEC-OVERLAP-PH`: protected-region subtraction stops broken nested placeholders
+
+The daemon ML pass runs over already-redacted text (containing `[REDACTED …]` placeholders). An ML span
+could over-capture into a placeholder and slice it (`[[REDACTED address]DACTED email]`). No raw value
+leaked (the sliced bytes were placeholder; the real value was already scrubbed), but the model-facing
+output was malformed.
+
+### Fixed
+
+- **`apply_wire_spans` subtracts genuine placeholder ranges.** The redaction pass now reports the byte
+  ranges of the placeholders it inserts (`scrub_text_with_spans`); the hook fuses redact + ML into one
+  pass and plumbs those *genuine* ranges into `apply_wire_spans`, which subtracts them from each ML span
+  and only replaces the bytes outside a placeholder. The ranges come from the pipeline's own output,
+  never from regex-matching `[REDACTED …]` shapes — so a forged placeholder in tool output cannot shield
+  the PII it wraps.
+
+---
+
+## [v0.4.2] — 2026-06-26 — GUI auto-installs the ML engine variant + signed engine manifest (ML last-mile)
+
+### Added
+
+- **One-click ML engine install from the desktop GUI.** The Settings AI-Model card downloads and swaps in
+  the per-platform ML engine variant (format-agnostic zip/tar), closing the last mile so a default
+  install can become ML-capable without manual binary juggling.
+- **Signed engine manifest.** The engine manifest is signed in CI (minisign) and verified against a
+  pubkey embedded in the GUI before any engine swap, so a tampered or man-in-the-middled manifest is
+  rejected.
+
+### Fixed
+
+- Engine-manifest default URL points at the GitHub release asset (the prior `vigils.ai` mirror returned
+  SPA HTML for `/releases/engine/`, breaking the turnkey path).
+
+---
+
+## [v0.4.1] — 2026-06-26 — P1 overlapping-span PII leak fix + v0.4.0 distribution fixes
+
+Release-acceptance testing of v0.4.0 against the published artifacts surfaced a redaction-path leak and
+four packaging/distribution bugs; all are fixed here.
+
+### Security
+
+- **P1: overlapping-span PII leak (two sites).** Two independent span-replacement sites
+  (`vigil-redaction::build_redacted_text`, `vigil-hub-cli::apply_wire_spans`) used right-to-left replace
+  with skip-on-overlap; nested model spans (where the outer span's prefix is PII) leaked the outer
+  plaintext prefix. Both rewritten to **union-merge** (like the gateway `redact_string`), so every byte
+  hit by any span lands in a replacement.
+
+### Fixed
+
+- **Linux `model install` timeout** — a fixed 30 s per-chunk timeout was shorter than a 48 MB chunk needs
+  on a bandwidth-shared link, so the turnkey download failed; loosened.
+- **macOS daemon R1 / stale socket** — `peer_creds().pid()` is `None` on macOS (R1 now falls back to an
+  euid check) and a file socket wasn't reclaimed after an unclean exit (permanent `EADDRINUSE`); both
+  fixed via a private-directory filesystem socket + stale-reclaim in `transport.rs`.
+- **ML archives missing `vigil-native-host`** — the browser native-messaging host is now bundled in the
+  ML variant archives.
+- **Windows `.sha256` CRLF** — checksum files are flagged when they carry CRLF line endings.
+
+---
+
+## [v0.4.0] — 2026-06-26 — resident daemon brings ML privacy filtering to the hook main path (ADR 0024) + model-install turnkey + GUI controls
+
+The AI privacy models (DeBERTa injection + PII NER) now run on the **hook main protection path**, not
+just `serve`/`wrap`. A resident **daemon** holds the warm models so each `vigil-hub hook` invocation
+queries them over a local IPC socket with near-zero added latency — and if the daemon, model, or IPC is
+missing/slow, the hook **falls back to the hard-fingerprint floor** (fail-closed; never fail-open).
+Ported from internal R3 with adversarial review of the redaction path.
+
+### Added
+
+- **Resident daemon for ML-on-hook (ADR 0024).** `vigil-hub daemon start|status|stop` runs a
+  single-instance local-socket server that warm-loads the PII scanner + injection classifier once and
+  serves the hook as a thin IPC client. Peer-credential auth (the client verifies the server PID == the
+  recorded daemon), a streaming read deadline, a daemon-owned audit ledger, and fire-and-forget
+  injection classification keep it bounded and tamper-resistant. ort-gated; a non-ML build or uncached
+  model yields a *model-less* daemon and the hook stays on hard-fingerprint — never fail-open.
+- **`vigil-hub model install|status` turnkey.** One command downloads the privacy + injection models
+  (HTTPS, 16-chunk parallel, SHA-256 pinned, fail-closed on mismatch). `model status` reports per-model
+  cache state; non-ML builds report `unsupported`.
+- **`vigil-hub engine show|set`** persists the engine mode (`hardfp` / `ml` / `auto`) that `serve`,
+  `wrap`, and the hook fall back to when no explicit `--engine` is given (written by the GUI control plane).
+- **Desktop GUI control cards.** Settings gains a **Daemon** card (running / ML-warm status + start/stop)
+  and an **AI Model** card (installed / unsupported state + one-click install), shelling out to the CLI in
+  a separate process so the GUI never loads ort itself.
+- **ML-engine release variant.** Per-platform `vigils-cli-ml-*` archives (with the bundled ONNX Runtime
+  dylib) are published alongside the default hard-fingerprint-only binaries.
+
+### Security
+
+- The hard-fingerprint redaction floor is **unconditional** on every daemon-missing / model-missing /
+  IPC-timeout / non-ort path; ML is strictly additive on top of it. Verified by adversarial review of the
+  ported hook path plus an end-to-end regression test (ML-only mode, daemon absent → floor still scrubs).
+
+---
+
+## [v0.3.0] — 2026-06-22 — remote HTTP/SSE MCP upstreams (OAuth/Bearer) + tamper-evident OAuth trust chain + automatic anchor verification
+
+The first release to put **remote HTTP MCP servers** behind Vigil's firewall, plus two audit-integrity
+hardenings to the new OAuth path. Every security-critical change went through adversarial review.
+
+### Added
+
+- **HTTP / SSE MCP upstreams (ADR 0021).** Remote MCP servers reachable over Streamable HTTP
+  (`application/json` or `text/event-stream`) now flow through Vigil's transport-blind chokepoint, so
+  they inherit the same guarantees as local stdio servers: firewall default-deny, `secret://`
+  detokenize, result redaction, and audit. Three auth sources, all via a sealed planner that cannot
+  pass an incoming `Authorization` header through to the upstream: `none` (public), plain **Bearer**
+  (`env:`/`keyring:` static token), and **OAuth** (rebuilt at `serve` startup from the
+  `add-remote-mcp`-persisted token via AS re-discovery — no browser). SSRF denylist + no-redirect
+  apply to the mcp URL **and** the OAuth discovery endpoints; OAuth fails closed on
+  not-onboarded / wrong-origin / SSRF / issuer drift.
+- **Automatic audit-anchor verification at startup (ADR 0020).** The tamper-anchor was already
+  emitted automatically on shutdown but only verified by the manual `vigil-hub verify` command.
+  `serve` now also verifies the checkpoint anchor automatically at startup (async, non-blocking,
+  stderr-only, warn-only) — so a turnkey user is warned about a full-chain rewrite without having to
+  run anything.
+
+### Changed (security)
+
+- **OAuth token metadata is now bound into the audit hash chain.** The `oauth_token_metadata` rows
+  (issuer / authorization-server / resource) are the root of OAuth token verification but previously
+  lived outside the audit chain — a local DB attacker could flip them undetected. They are now bound
+  to an audit event by stored `event_id` and verified (`verify_chain` + payload compare) on read, so
+  naive tampering, binding-event deletion, and forged-append are all detected. (Honest scope: this
+  reaches the same tamper-*evidence* as the rest of the ledger; tamper-*proofing* against a full
+  consistent rewrite needs external anchoring — see ADR 0020 / `vigil-hub verify`.)
+
+---
+
+## [v0.2.2] — 2026-06-21 — status MCP-wrap reporting + clearer ML-engine error + release hardening
+
+A small follow-up to v0.2.1, from a global code audit + real-machine QA: two user-facing CLI fixes,
+a flaky-test fix, and CI/release-pipeline hardening. The protection logic itself is unchanged; the two
+CLI fixes were validated on real Linux hardware from a user's perspective.
+
+### Fixed
+
+- **`vigil-hub setup --status` now reports MCP-gateway protection.** It previously inspected only the
+  native-tool hook, so a user who set up protection with `setup --mcp` (which wraps MCP servers but
+  installs no hook) was falsely told `Protection: not installed`. Status now shows both layers —
+  `Native hook:` and `MCP gateway: N server(s) wrapped` — and `Protection: ACTIVE` reflects either
+  layer being on.
+- **Clearer error when the ML engine is requested on a non-ML build.** `vigil-hub serve --engine ml`
+  on the default (`vigils-cli-<plat>`) build now names the `--engine ml` flag the user actually passed
+  and points to the ML variant download (`vigils-cli-ml-<plat>`) or a `--features ort` rebuild, instead
+  of naming an internal flag.
+
+### Changed (maintainer / CI)
+
+- **Release pipeline hardened.** The release version gate now also fails fast on stale inter-crate
+  version pins and a Tauri Rust/npm minor mismatch (both bit the v0.2.1 release process). The GitHub
+  release is now created as a draft and published only after every build job succeeds, so a failed
+  build can no longer leave a public release with partial assets.
+- De-flaked an in-process approval-wakeup test (it now measures wakeup latency instead of total
+  wall-clock, removing a CI-load-dependent flake).
+
+---
+
+## [v0.2.1] — 2026-06-21 — ML redaction CLI variant + real-machine validation fixes
+
+Ships the optional ML redaction engine as a prebuilt release artifact (`vigils-cli-ml-<plat>`),
+alongside the default hard-fingerprint CLI, and fixes two bugs that only a 3-platform real-hardware
+validation pass could surface. The ML CLI variant and its model-download path were validated
+end-to-end on real Linux / macOS / Windows hardware (onnxruntime 1.24 dylib `dlopen` + real
+PII/DeBERTa inference); the published `vigils-cli-ml-windows-x64` and `vigils-cli-ml-linux-x64`
+artifacts were re-tested after publishing.
+
+### Added
+
+- **ML CLI variant — `vigils-cli-ml-<plat>` (Linux x64 / macOS arm64 / Windows x64).** A second CLI
+  build alongside the default hard-fingerprint `vigils-cli-<plat>`, built with `--features ort` and
+  bundling the ONNX Runtime 1.24 dynamic library next to `vigil-hub`. Run `vigil-hub serve --engine ml`
+  (or `auto`) to add an OpenAI PII NER model + a DeBERTa prompt-injection classifier on top of the
+  fingerprint rules; the models are fetched on first run (~0.8–1.5 GB, Hugging Face primary + vigils.ai
+  mirror fallback, SHA-256 verified). The two engines coexist (chosen per launch). Validated on real
+  Linux / macOS / Windows hardware (dylib dlopen + real PII/DeBERTa inference). Each asset carries
+  `.sha256` + Sigstore build provenance like the default CLI. ML build floors: Linux glibc ≥ 2.28,
+  macOS ≥ 14.
+
+### Fixed
+
+- **Model download no longer corrupts files on mirrors that don't honor HTTP Range.** The 16-chunk
+  parallel downloader assumed `206 Partial Content`; a Cloudflare-fronted mirror gzip-compresses JSON
+  and returns `200` (full body) to range requests, so every worker wrote the whole file into its chunk
+  slot → 16×-corrupt assembly → SHA-256 mismatch. Only HF-blocked users on the vigils.ai mirror
+  fallback hit this (Hugging Face always returns 206). The downloader now probes range support and
+  streams the file in a single request when a mirror doesn't honor ranges.
+- **ML smoke coverage no longer asserts a known, parked multilingual gap.** The per-label coverage
+  test shared a fixture with the precision/recall benchmark (grown to 90+ zh/ja/ko/de/it/fr samples)
+  and hard-asserted multilingual PII coverage the English-centric model isn't expected to deliver; it
+  now gates on in-scope coverage and reports multilingual recall instead.
+
+### Docs
+
+- README (en + zh) and the mdBook gain a "two redaction engines" explanation (default vs ML, `--engine`
+  usage, first-run model download, platform floors); corrected the CLI asset names in the install table.
+
+## [v0.2.0] — 2026-06-20 — First stable release: turnkey robustness, honest scope
+
+Exits the beta line. This release hardens the one-command turnkey onboarding (`vigil-hub setup`)
+against real-world config shapes, fixes status-reporting and audit bugs found by an end-to-end test
+campaign on a real machine (Claude Code + Codex driven by a live model, k8s-isolated), and states the
+protection boundary honestly so you can rely on Vigils correctly. Every fix is verified by unit tests
+plus a 33-assertion end-to-end suite against the real binary; the riskiest fix was cross-reviewed by
+Codex.
+
+This release also ships merged community contributions: a desktop UI redesign (#5) and Chrome
+extension updates (#2). Thanks to the contributors.
+
+### Fixed
+
+- **`setup --status` no longer reports STALE on a custom `--ledger`.** Installing with a custom shared
+  ledger (the documented way to share the audit trail with the desktop app) made `setup --status`
+  report "INSTALLED but STALE / protection off" — even though protection was active and the self-test
+  passed — and the prompt to re-run `setup` would silently reset the ledger to the default, breaking
+  GUI sharing. Staleness is now ledger-agnostic (the user's ledger path is a choice, not drift);
+  binary-path drift, missing PostToolUse registration, and missing flags still report STALE. Both the
+  Claude (`settings.json`) and Codex/Gemini/Cursor (`hooks.json`) legs are fixed. (#19)
+- **`vigil-hub --version` / `-V` now print the version** instead of erroring with "unexpected argument".
+  A security CLI that can't report its version is a real rough edge (bug reports, upgrade checks). (#20)
+- **`vigil-hub verify` is read-only again.** Verifying a non-existent ledger path created a 221 KB empty
+  database as a side effect and then falsely reported "✓ chain internally valid". It now reports the
+  ledger is missing and creates nothing.
+- **`setup --mcp` handles real-world MCP config shapes.** A single-string `command`
+  (`"npx -y pkg /path"`, as `claude mcp add` writes) is split into program + args instead of becoming
+  an unrunnable single argv; a `vigil-hub wrap` nested under a `stdbuf`/`sh`/`env` prefix is left
+  untouched instead of double-wrapped; and a wrapped server whose program isn't on `PATH` now produces
+  a non-blocking WARNING instead of a false "Protected". (#14, #15, #16)
+- **Turnkey result redaction is on by default for Claude Code**, and agent detection no longer misses
+  an installed-but-not-yet-run agent (detects the `claude` binary on `PATH`, not only `~/.claude/`).
+  (#10, #11)
+- **Restored the `vigil-hub inspect` command** (`protection` / `activity` / `search` / `approvals` /
+  `verify-chain`). Its CLI wiring was accidentally dropped in v0.1.31 (an unrelated checkpoint-anchor
+  port) while the implementation and its README / docs references remained — so following the docs hit
+  "unrecognized subcommand". It works again. (`inspect protection`'s headline counts currently reflect
+  the MCP-gateway path; the `activity` feed shows all events including hook-path denials. Extending the
+  `protection` summary to categorize hook-path events is tracked as a follow-up.)
+
+### Documentation
+
+- **Honest protection boundary.** The introduction and user guide now state plainly what Vigils
+  reliably catches (plaintext credential leaks across 13 fingerprint classes, reversible redaction,
+  tamper-evident audit, approval, sandbox) versus what it does **not** stop (a determined model can
+  evade input-side detection by encoding/chunking a secret or using a channel Vigils doesn't mediate)
+  — and that an egress proxy is the complete fix on the roadmap. No false sense of security.
+- Agent-integration and Codex guidance corrected (hook-first model; Codex needs `wire_api=responses`).
+
+### Verification
+
+- Real-machine end-to-end suite (15 scenario groups, 33 assertions) against the freshly built Linux
+  binary: hook deny for built-in `Bash`/`Write`/`Edit` carrying a bare secret (the reason names the
+  credential type and never echoes it); PostToolUse result scrub; MCP wrap gateway forwarding a real
+  upstream tool call with a full audit trail; descriptor-pinning drift fail-closed; ledger-agnostic
+  status; read-only verify; byte-for-byte uninstall round-trip. Workspace gates green: clippy
+  `-D warnings`, `cargo fmt`, lib tests.
+
 ## [v0.2.0-beta.9] — 2026-06-16 — Second-hop leak hardening (non-boundary result scrub)
 
 A security fix from the same structured project review, confirmed by Codex code review.

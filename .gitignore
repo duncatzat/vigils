@@ -45,6 +45,10 @@ apps/desktop/gen/
 /docs/strategy/
 **/launch-kit/
 
+# 内部 CI/运维资产(gitea runner 部署 / KubeVirt VM autounattend 含 admin 密码 / 诊断脚本带 token)
+# —— 含明文凭据,绝不入任何仓(公开仓尤甚);本地运维 runbook 保持 untracked。
+/scripts/remote/
+
 # Secrets —— 即便我们有 OS Keychain,也兜底禁止任何本地 dotenv 进入 git
 .env
 .env.*
@@ -106,3 +110,6 @@ __pycache__/
 /ref-*.jpeg
 /ref-*.jpg
 /ref-*.png
+
+# release-acceptance suite local config (SSH targets)
+tests/acceptance/config.env

@@ -81,6 +81,29 @@ pub fn ensure_injection_model_available(
     ensure_with_manifest(target_dir, &manifest)
 }
 
+/// `--engine auto` 探测(ADR 0022 D4):OpenAI PII 模型三件套是否**已在本地 cache 命中**
+/// (三件套 sha256 全过),**不触发任何下载 / 网络请求 / ort API 调用**。
+///
+/// - `Some(paths)` = 就绪;caller 可直接启用 ML —— 随后 [`ensure_model_available`] 的
+///   `check_existing` 会以同款条件短路,**不会**重新下载。
+/// - `None` = 缺失 / 不完整;caller 应走硬指纹降级,**绝不**在 auto 下静默触发大文件下载。
+///
+/// 与下载路径 **SSOT**:同 [`placeholder_manifest`] + 同 [`resolve_target_dir`] + 同
+/// `verify::check_existing` sha256 判定,杜绝"探测说有、下载又重拉"的漂移。
+pub fn model_cached(target_dir: Option<&Path>) -> Option<ModelPaths> {
+    let manifest = placeholder_manifest();
+    let dir = resolve_target_dir(target_dir, &manifest).ok()?;
+    verify::check_existing(&dir, &manifest)
+}
+
+/// `--engine auto` 探测:DeBERTa 注入分类器三件套是否已本地命中(不下载)。语义同
+/// [`model_cached`],走 [`injection_classifier_manifest`] 的独立目录。
+pub fn injection_model_cached(target_dir: Option<&Path>) -> Option<ModelPaths> {
+    let manifest = injection_classifier_manifest();
+    let dir = resolve_target_dir(target_dir, &manifest).ok()?;
+    verify::check_existing(&dir, &manifest)
+}
+
 /// 内部入口:接受外部 manifest,便于测试注入 stub server 的 url + 真 sha256。
 ///
 /// 公共 [`ensure_model_available`] 只走 [`placeholder_manifest`];测试场景请用本函数。

@@ -46,6 +46,12 @@ gui = [
     "dep:vigil-mcp",
     "dep:vigil-firewall",
     "dep:vigil-policy",
+    "dep:ureq",
+    "dep:flate2",
+    "dep:tar",
+    "dep:zip",
+    "dep:minisign-verify",
+    "dep:base64",
 ]
 
 [dependencies]
@@ -73,6 +79,14 @@ tauri = { version = "2", optional = true, default-features = false, features = [
 tokio = { workspace = true, optional = true }
 # β5:用户数据目录解析(跨平台);仅 gui feature 需要,运行时定位 ledger 持久化路径
 dirs = { version = "6", optional = true }
+# ML 引擎变体安装(gui):下载(ureq/rustls)+ 解包(flate2/tar/zip 按魔数嗅探)+ 签名引擎清单验签
+# (minisign-verify + base64 解 Tauri 包装的 .sig)。全纯 Rust,无 C 依赖;仅 gui feature 拉。
+ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
+zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
+minisign-verify = { version = "0.2", optional = true }
+base64 = { version = "0.22", optional = true }
 
 [build-dependencies]
 tauri-build = { version = "2", optional = true, default-features = false , features = [] }
@@ -81,3 +95,6 @@ tauri-build = { version = "2", optional = true, default-features = false , featu
 tempfile = { workspace = true }
 vigil-lease = { path = "../../crates/vigil-lease" }
 rusqlite = { workspace = true }
+# 仅测试:测试内现造 minisign 风格预哈希签名,hermetic 验 verify_minisign(无外部工具/网络)。
+ed25519-dalek = "2"
+blake2 = "0.10"

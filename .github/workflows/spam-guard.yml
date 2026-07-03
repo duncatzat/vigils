@@ -1,0 +1,73 @@
+name: Spam guard
+
+# Auto-moderates AI-batch issue spam (coordinated "fake stars" defamation campaign).
+# Trusted people (owner / member / collaborator / prior contributor) are never touched.
+# Any false positive is fully reversible: the issue is only closed+locked+labeled, never deleted,
+# and a maintainer can reopen it in one click. Audit via the `spam` label.
+
+on:
+  issues:
+    types: [opened, reopened, edited]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    # Skip anyone we already trust. Real maintainers/contributors are exempt.
+    if: >
+      github.event.issue.author_association != 'OWNER' &&
+      github.event.issue.author_association != 'MEMBER' &&
+      github.event.issue.author_association != 'COLLABORATOR' &&
+      github.event.issue.author_association != 'CONTRIBUTOR'
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const text = `${issue.title}\n\n${issue.body || ''}`;
+
+            // 1) High-precision campaign vocabulary. A genuine Vigils bug report does NOT
+            //    contain these. Any single hit ⇒ spam. (Star-count defamation + shutdown threats.)
+            const HARD = [
+              /刷\s*star/i, /刷星/, /注水/, /假\s*star/i, /虚假\s*star/i,
+              /僵尸号/, /僵尸粉/, /空壳号/, /空壳账号/, /幽灵账号/, /水军/,
+              /star\s*数据\s*(异常|造假|不对|有问题)/i, /数据造假/, /人为操纵/, /商业刷星/,
+              /举报\s*(已|材料|递|发|平台|官方|github)/i,
+              /(项目|仓库)\s*(访问|入口)?\s*.{0,8}(关停|关闭|终止|下架|封禁)/,
+              /stargazer.{0,16}(异常|空壳|僵尸|幽灵|无仓库|零贡献)/i,
+              /一眼假/, /掺.{0,2}水/, /调查报告.*star/i,
+            ];
+            const hardHit = HARD.some(re => re.test(text));
+
+            // 2) Sockpuppet profile signal — used ONLY to corroborate a star/contributor topic,
+            //    never on its own (a legit first-time reporter can also have a thin profile).
+            let thin = false;
+            try {
+              const { data: u } = await github.rest.users.getByUsername({ username: issue.user.login });
+              const ageDays = (Date.now() - new Date(u.created_at)) / 86400000;
+              thin = u.public_repos === 0 && u.followers === 0 && ageDays < 180;
+            } catch (e) { core.info(`profile lookup failed: ${e.message}`); }
+
+            const topical = /star|stargazer|贡献者|contributor|follower|刷|举报/i.test(text);
+            const isSpam = hardHit || (thin && topical);
+
+            if (!isSpam) { core.info('No spam signal — left for human triage.'); return; }
+
+            const { owner, repo } = context.repo;
+            const n = issue.number;
+            core.notice(`Spam (hardHit=${hardHit}, thin=${thin}) #${n} by @${issue.user.login}`);
+
+            try {
+              await github.rest.issues.addLabels({ owner, repo, issue_number: n, labels: ['spam'] });
+            } catch (e) { core.info(`label: ${e.message}`); }
+
+            await github.rest.issues.update({
+              owner, repo, issue_number: n, state: 'closed', state_reason: 'not_planned',
+            });
+
+            try {
+              await github.rest.issues.lock({ owner, repo, issue_number: n, lock_reason: 'spam' });
+            } catch (e) { core.info(`lock: ${e.message}`); }

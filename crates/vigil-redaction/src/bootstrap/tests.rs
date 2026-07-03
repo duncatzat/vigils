@@ -274,6 +274,128 @@ fn test_check_existing_accepts_deberta_model_onnx() {
     );
 }
 
+// ──────────────────────── (b2) 不可 range mirror → 单流兜底 ────────────────────────
+
+/// 真机镜像 fallback 验证暴露(2026-06-21):vigils.ai 经 Cloudflare 对 `application/json`
+/// 这类 Content-Type 做 on-the-fly 压缩,压缩响应不可 byte-range → 对 16-chunk 的每个
+/// `Range` GET 返 **200 全量**。旧逻辑接受 200 并把整文件写进每个 `.partial.<idx>` →
+/// 组装 16× 损坏 → sha256 mismatch(serve 启动 fail-closed,HF 屏蔽区用户无法获取 ML 模型)。
+///
+/// 修复:`url_supports_ranges`(GET `bytes=0-0` 非 206)预探测 → 走 `download_single_stream`。
+/// 本测试 mock 一个**对所有 Range 都返 200 全量**的 server(模拟不可 range 镜像),断言
+/// `ensure_with_manifest` 仍成功且三件套字节**逐字节正确**(单流拿到正确字节,无 16× 损坏)。
+#[test]
+fn test_non_rangeable_server_falls_back_to_single_stream() {
+    // handler:HEAD 正常返 Content-Length+ETag;GET 一律返完整 200(即便带 Range 也不返 206)
+    let (base_url, _h, counter, server) = spawn_stub_server(|req, _n| {
+        let path = req.url().trim_start_matches('/');
+        let bytes = fixture_bytes(path);
+        if req.method() == &Method::Head {
+            return Response::from_data(Vec::new())
+                .with_header(
+                    Header::from_bytes(&b"Content-Length"[..], bytes.len().to_string()).unwrap(),
+                )
+                .with_header(Header::from_bytes(&b"ETag"[..], "\"nr\"").unwrap());
+        }
+        // 关键:无视 Range,一律 200 全量(CF 压缩 JSON 的不可 range 行为)
+        Response::from_data(bytes)
+    });
+
+    let tmp = TempDir::new().expect("tmp");
+    let manifest = build_test_manifest(&base_url);
+
+    let result = ensure_with_manifest(Some(tmp.path()), &manifest);
+    drop(server);
+
+    let paths = result.expect("non-rangeable server 应经单流兜底成功(而非 16× 损坏)");
+    // 三件套字节必须逐字节 == fixture(证单流拿到正确字节)
+    assert_eq!(
+        std::fs::read(&paths.onnx).unwrap(),
+        fixture_bytes("model_q4f16.onnx"),
+        "onnx 字节应与 fixture 一致(无分块损坏)"
+    );
+    assert_eq!(
+        std::fs::read(&paths.tokenizer).unwrap(),
+        fixture_bytes("tokenizer.json"),
+        "tokenizer 字节应与 fixture 一致(此前 16-chunk 对此类 JSON 损坏)"
+    );
+    assert_eq!(
+        std::fs::read(&paths.config).unwrap(),
+        fixture_bytes("config.json"),
+        "config 字节应与 fixture 一致"
+    );
+    assert!(
+        counter.load(Ordering::SeqCst) > 0,
+        "应有真实网络请求(非 check_existing 缓存命中)"
+    );
+}
+
+/// 锁定不变量(Codex review FIX-REQUIRED):16-chunk 的实际 chunk 请求必须带
+/// `Accept-Encoding: identity`,与 `url_supports_ranges` 探测一致 —— 否则探测(identity)见
+/// 206、实际 chunk(默认编码)被 server 压缩成 200 即损坏。mock server **仅在请求含
+/// `Accept-Encoding: identity` 时对 Range 返 206**,否则返 200 全量。若 chunk 漏带 identity
+/// → 拿 200 → `fetch_chunk_once` 拒 → 下载失败。故 `ensure_with_manifest` 成功即证一致。
+#[test]
+fn test_chunk_requests_send_identity_encoding() {
+    let (base_url, _h, _counter, server) = spawn_stub_server(|req, _n| {
+        let path = req.url().trim_start_matches('/');
+        let bytes = fixture_bytes(path);
+        if req.method() == &Method::Head {
+            return Response::from_data(Vec::new())
+                .with_header(
+                    Header::from_bytes(&b"Content-Length"[..], bytes.len().to_string()).unwrap(),
+                )
+                .with_header(Header::from_bytes(&b"ETag"[..], "\"id\"").unwrap());
+        }
+        let has_identity = req.headers().iter().any(|h| {
+            h.field
+                .as_str()
+                .as_str()
+                .eq_ignore_ascii_case("accept-encoding")
+                && h.value.as_str().eq_ignore_ascii_case("identity")
+        });
+        let range = req
+            .headers()
+            .iter()
+            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("range"))
+            .map(|h| h.value.as_str().to_string());
+        if let Some(r) = range {
+            // 仅 identity 下才认 range → 206;否则模拟"默认编码被压缩 → 不可 range" → 200 全量
+            if has_identity {
+                let r = r.trim_start_matches("bytes=");
+                let parts: Vec<&str> = r.split('-').collect();
+                if parts.len() == 2 {
+                    let start: usize = parts[0].parse().unwrap_or(0);
+                    let end: usize = parts[1].parse().unwrap_or(bytes.len() - 1);
+                    let end = end.min(bytes.len().saturating_sub(1));
+                    if start <= end && start < bytes.len() {
+                        return Response::from_data(bytes[start..=end].to_vec())
+                            .with_status_code(StatusCode(206));
+                    }
+                }
+            }
+            return Response::from_data(bytes).with_status_code(StatusCode(200));
+        }
+        Response::from_data(bytes)
+    });
+
+    let tmp = TempDir::new().expect("tmp");
+    let manifest = build_test_manifest(&base_url);
+    let result = ensure_with_manifest(Some(tmp.path()), &manifest);
+    drop(server);
+
+    let paths = result.expect("chunk 请求带 identity → 探测+chunk header 一致 → 16-chunk 成功");
+    assert_eq!(
+        std::fs::read(&paths.onnx).unwrap(),
+        fixture_bytes("model_q4f16.onnx"),
+        "onnx 字节应正确(证 chunk 带 identity 拿到 206 分块)"
+    );
+    assert_eq!(
+        std::fs::read(&paths.tokenizer).unwrap(),
+        fixture_bytes("tokenizer.json")
+    );
+}
+
 // ────────────────────────────── (c) ──────────────────────────────
 
 #[test]

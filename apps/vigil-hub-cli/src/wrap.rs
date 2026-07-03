@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
-use crate::serve::{self, ServeArgs, ServeError, UpstreamEntry};
+use crate::serve::{self, ServeArgs, ServeError};
 
 /// `wrap` 子命令参数。
 #[derive(Debug, Clone, Default)]
@@ -90,6 +90,7 @@ pub fn run(args: &WrapArgs) -> Result<(), ServeError> {
         // 注入分类器仅 serve 直跑 opt-in;wrap turnkey 不默认拉 738MB 模型(用户可改用 serve 直跑)。
         enable_injection_classifier: false,
         redact_tool_results: true, // 可逆脱敏:结果里的 secret 回模型前再脱敏(网关核心价值)
+        ml_best_effort: false,     // turnkey wrap = 硬指纹底座;ML 走 `serve --engine ml|auto`
         monitor: args.monitor,     // opt-in 非阻塞观察(turnkey 无 GUI resolver 时)
         // DEF-004:边界根缺省 CWD(wrap 由 agent 在项目目录启动)。
         project_roots: serve::resolve_project_roots(&args.project_roots),
@@ -135,11 +136,7 @@ pub fn run(args: &WrapArgs) -> Result<(), ServeError> {
             .filter_map(|k| std::env::var(k).ok().map(|v| (k.clone(), v)))
             .collect()
     };
-    let entry = UpstreamEntry {
-        name: server_id,
-        argv: command,
-    };
-    serve::attach_stdio_upstream(&ledger, &hub, &entry, &env)?;
+    serve::attach_stdio_upstream(&ledger, &hub, &server_id, &command, &env)?;
 
     // 启动提示走 **stderr**(stdout 是给 agent 的 MCP 协议通道,**不得污染**)。
     // 只打印命令名 argv[0],**不**打印完整 argv(防 argv 里偶含 secret 被回显)。
@@ -160,8 +157,8 @@ pub fn run(args: &WrapArgs) -> Result<(), ServeError> {
     };
     eprintln!(
         "vigil-hub wrap: guarding MCP server `{server}` cmd `{cmd}` (PID {pid}); audit ledger -> {ledger}; project boundary -> {boundary}. {posture}.",
-        server = entry.name,
-        cmd = entry.argv.first().map(String::as_str).unwrap_or("?"),
+        server = server_id,
+        cmd = command.first().map(String::as_str).unwrap_or("?"),
         pid = std::process::id(),
         ledger = ledger_display,
     );

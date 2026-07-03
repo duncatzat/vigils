@@ -153,12 +153,12 @@ fn incoming_authorization_header_is_never_forwarded_to_upstream() {
     .unwrap();
 
     // 最终上游 request 无 client token
-    let serialized = serde_json::to_string(&req.headers).unwrap();
+    let serialized = serde_json::to_string(req.headers()).unwrap();
     assert!(!serialized.contains("CLIENT_EVIL_TOKEN"));
     assert!(!serialized.contains("CLIENT_LEAK"));
     // Authorization 只能是 gateway 签出的
     let auth = req
-        .headers
+        .headers()
         .iter()
         .find(|(k, _)| k == "Authorization")
         .unwrap();
@@ -286,7 +286,7 @@ fn scoped_token_authorizes_mock_tools_call_successfully() {
     .unwrap();
     // Authorization 来自 gateway
     let auth_hdr = authorized
-        .headers
+        .headers()
         .iter()
         .find(|(k, _)| k == "Authorization")
         .unwrap();
@@ -295,10 +295,10 @@ fn scoped_token_authorizes_mock_tools_call_successfully() {
     // 7. 发送 → mock upstream 返 200
     let resp = mock
         .send(&vigil_http_auth::HttpRequest {
-            url: authorized.url.clone(),
-            method: authorized.method,
-            headers: authorized.headers.clone(),
-            body: authorized.body.clone(),
+            url: authorized.url().clone(),
+            method: authorized.method(),
+            headers: authorized.headers().to_vec(),
+            body: authorized.body().map(|b| b.to_vec()),
         })
         .unwrap();
     assert_eq!(resp.status, 200);

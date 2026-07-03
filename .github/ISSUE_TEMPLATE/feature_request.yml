@@ -1,0 +1,47 @@
+name: ✨ Feature request
+description: Propose a concrete, in-scope improvement to Vigils.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Vigils is a **focused local AI-agent secret-firewall** (agent control + secret redaction +
+        tamper-evident audit). Proposals must be **concrete and in-scope**.
+
+        > ⚠️ Vague wishes, "please add everything", off-topic, or promotional requests — and questions
+        > dressed up as feature requests — will be **closed**. For open-ended ideas, start a
+        > [Discussion](https://github.com/duncatzat/vigils/discussions) first.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checklist
+      description: All required.
+      options:
+        - label: I searched [existing issues](https://github.com/duncatzat/vigils/issues?q=is%3Aissue) and [discussions](https://github.com/duncatzat/vigils/discussions) and this is **not** a duplicate.
+          required: true
+        - label: This is a **concrete feature within Vigils' scope** (local agent control / secret redaction / audit) — not a question, support request, or promotion.
+          required: true
+        - label: I will keep this proposal civil and on-topic, and I agree to follow the [Code of Conduct](https://github.com/duncatzat/vigils/blob/main/CODE_OF_CONDUCT.md).
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: The specific user problem or use case. A "nice to have" with no concrete problem will be closed.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you want Vigils to do, concretely. Mention the surface (CLI / desktop / extension / SDK) it touches.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed, and why this one.
+    validations:
+      required: false

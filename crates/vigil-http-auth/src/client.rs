@@ -141,10 +141,10 @@ impl AuthorizedSender for MockHttpClient {
         // 把 AuthorizedHttpRequest 投影回 HttpRequest 复用 mock 查表;
         // 真实装(reqwest)会直接发出去,**不**经 HttpRequest。
         let projected = HttpRequest {
-            url: req.url.clone(),
-            method: req.method,
-            headers: req.headers.clone(),
-            body: req.body.clone(),
+            url: req.url().clone(),
+            method: req.method(),
+            headers: req.headers().to_vec(),
+            body: req.body().map(|b| b.to_vec()),
         };
         self.send(&projected)
     }

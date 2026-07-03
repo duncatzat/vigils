@@ -42,6 +42,10 @@ oauth2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# command_guard:危险 shell 命令分类器(hook 路径破坏性/持久化/RCE 防线)。
+regex = { workspace = true }
+once_cell = { workspace = true }
+shlex = { workspace = true }
 # `vigil-hub demo` 零设置首次体验:驱动真 Hub 需 args 规范化哈希(scope 预批准走真 Allow 路径)+
 # 本地生成形似真实的 demo secret(getrandom)+ tamper 演示直接改账本一行(rusqlite,与 vigil-audit
 # 同 bundled SQLite)。均 workspace 依赖,已随 vigil-audit/vigil-lease 链入二进制。
@@ -64,6 +68,20 @@ toml_edit = "0.25"
 vigil-desktop = { path = "../desktop", default-features = false }
 vigil-runner = { path = "../../crates/vigil-runner" }
 vigil-ui-protocol = { path = "../../crates/vigil-ui-protocol" }
+# P2.3 daemon IPC(ADR 0024):跨平台本地 socket(UDS / Windows named pipe)的瘦客户端 +
+# 服务端 transport。用成熟 crate 而非手写 named-pipe FFI(安全边界,减少 unsafe 出错面);
+# R1 peer-credential + R2 读截止 在其 raw fd/handle 上另加(见 daemon/transport.rs)。
+interprocess = "2"
+
+# CLI/帮助文本国际化(i18n):按系统语言(Windows 用户默认 UI 语言 / Unix LANG 等)选择
+# 中/英输出。workspace `unsafe_code = "forbid"` 禁止自写 Windows `GetUserDefaultLocaleName`
+# FFI;sys-locale 封装各平台 locale 探测(纯封装,MIT OR Apache-2.0,跨平台)。
+sys-locale = "0.3"
+
+# macOS daemon R1:`peer_creds().pid()` 在 macOS UDS 恒 None(无 SO_PEERCRED),euid 可用。
+# 用 rustix(安全封装,本 crate 仍 forbid unsafe)取自身 euid 与对端比对。版本对齐 lock 既有 1.x。
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 # CLI 级集成测试用(β R1 MUST-FIX 4):InMemorySecretStore 注入 + mock AS

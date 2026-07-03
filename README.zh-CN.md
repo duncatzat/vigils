@@ -80,7 +80,7 @@ Vigils 是一个由聚焦单一职责的 crate 组成的 Rust workspace,外加�
 | **远程鉴权** | `vigil-http-auth` / `vigil-http-transport` | OAuth(JWT + opaque)、token 刷新(singleflight)、真 TLS |
 | **UI 协议** | `vigil-ui-protocol` | 桌面 UI 的强类型命令/响应契约 |
 | **浏览器** | `vigil-browser` | 扩展桥接的脱敏分类器 + 审计 |
-| **SDK** | `vigil-sdk` | 引擎之上的瘦封装、SemVer 稳定 |
+| **SDK** | `vigil-sdk` | 引擎之上的瘦封装、SemVer 稳定。crates.io 上的发布是独立节奏的早期预览版,落后于本仓库;要用最新 API 请从源码构建 |
 
 **App 与二进制:**
 
@@ -92,6 +92,8 @@ Vigils 是一个由聚焦单一职责的 crate 组成的 Rust workspace,外加�
 | — | `extensions/chrome-mv3` | Chrome MV3 扩展(纯 vanilla JS,零 npm 依赖) |
 
 ## 安装
+
+> **新手?→ [安装指南:下载哪个文件 + 首次运行步骤](https://duncatzat.github.io/vigils/getting-started/installation.zh-CN.html)**（[English](https://duncatzat.github.io/vigils/getting-started/installation.html)）—— 1 分钟、按系统手把手(含 Windows/macOS 的未签名 App 放行提示)。
 
 **最快** —— 一行装好 CLI,然后直接看[快速开始](#快速开始):
 
@@ -108,9 +110,28 @@ Linux** 的预构建安装包与二进制:
 
 | 平台 | 桌面应用 | CLI |
 |---|---|---|
-| **Windows** | `.exe`(NSIS)/ `.msi` | `vigil-hub.exe`(在 `vigils-cli-…-windows-msvc.zip` 内) |
-| **macOS** | `.dmg` | `vigil-hub`(在 `vigils-cli-…-apple-darwin.tar.gz` 内) |
-| **Linux** | `.AppImage` / `.deb` / `.rpm` | `vigil-hub`(在 `vigils-cli-…-linux-gnu.tar.gz` 内) |
+| **Windows** | `.exe`(NSIS)/ `.msi` | `vigil-hub.exe`(在 `vigils-cli-windows-x64.zip` 内) |
+| **macOS** | `.dmg` | `vigil-hub`(在 `vigils-cli-macos-arm64.tar.gz` 内) |
+| **Linux** | `.AppImage` / `.deb` / `.rpm` | `vigil-hub`(在 `vigils-cli-linux-x64.tar.gz` 内) |
+
+### 两种脱敏引擎:硬指纹(默认)或 ML
+
+两个 CLI 构建跑的是完全相同的防火墙 / 审计 / 审批内核 —— 唯一区别在于文本抵达模型、日志或屏幕*之前*剥离密钥与 PII 的**脱敏引擎**:
+
+| 构建 | Release 资产 | 脱敏 | 首跑成本 |
+|---|---|---|---|
+| **默认** —— 硬指纹 | `vigils-cli-<plat>` | 13+ 类结构化凭据与 PII,固定模式规则 —— 确定性、即时、零模型 | 无 |
+| **ML** | `vigils-cli-ml-<plat>` | 在上述基础上**外加** OpenAI PII NER 模型 + DeBERTa 提示注入分类器 —— 更广的语义 PII(人名、地址、日期)与软注入信号 | 捆 ONNX Runtime dylib;首次 `--engine ml` 运行按需下载 ~0.8–1.5 GB 模型 |
+
+二者**并存** —— 引擎按启动选择,单个 ML 构建即可服务任意模式:
+
+```bash
+vigil-hub serve --engine hardfp   # 仅硬指纹规则(默认构建的行为)
+vigil-hub serve --engine ml       # 严格 ML:首跑下载模型,不可用则 fail-closed 拒启
+vigil-hub serve --engine auto     # 仅当模型已缓存且 dylib 就位才启用 ML;否则降级硬指纹,绝不下载
+```
+
+模型从 Hugging Face(主源)拉取,带 [vigils.ai](https://vigils.ai) 镜像 fallback,逐文件 SHA-256 校验(fail-closed)。ML 构建把 [ONNX Runtime](https://onnxruntime.ai) 1.24 捆在 `vigil-hub` 同目录。**ML** 构建的平台地板:**Linux glibc ≥ 2.28**、**macOS ≥ 14** —— 默认硬指纹构建则没有。_(ML 构建自 v0.4.0 起随每个 release 发布 —— 认准 `vigils-cli-ml-*` 资产。)_
 
 > 早期版本未签名;首次运行时系统可能弹出 Gatekeeper / SmartScreen 提示。
 
@@ -155,7 +176,7 @@ vigil-hub setup --all       # 一步全保护
 ```bash
 vigil-hub setup --mcp --doctor    # 接入前预检:每个被包裹的 MCP server 真能启动吗?(PATH 检查,只读)
 vigil-hub inspect protection      # 用过 agent 后:一眼看清 Vigils 拦了什么(裸 secret 拦截、泄漏脱敏、链完整)
-vigil-hub setup --all --uninstall # 干净移除全部(你的配置逐字节还原)
+vigil-hub setup --all --uninstall # 干净移除全部(只删 Vigils 自己的条目;你的配置如实还原)
 ```
 
 重启 Claude Code(或开新会话)即受保护。这是从 GitHub 下载到真实防护的最快路径。

@@ -24,8 +24,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── 0. Pre-flight gate:绝不从未过 CI 的提交切发布 ────────────────────
+  # v0.4.5 复盘:tag 从 fmt-红的提交切(产物本身 OK,但 Release workflow 不跑
+  # fmt/clippy/test,红提交照样发布)。此 job 镜像 ci.yml 的 Rust 门;
+  # create-release 依赖它 → 任一检查失败则不创建 Release、不发布任何产物。
+  preflight:
+    name: Pre-flight (fmt / clippy / test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # System deps for Tauri / GTK on Linux (matches ci.yml)
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
   # ── 1. 创建（或复用）Release ───────────────────────────────────────────
   create-release:
+    needs: preflight
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
@@ -50,6 +85,35 @@ jobs:
             exit 1
           fi
 
+      # ISS-20260621-006: two release-killing drifts the 3-way gate above does NOT catch — they
+      # otherwise fail LATE (dependency resolution / desktop build) AFTER the Release object exists.
+      # Fail fast here, before the release is created.
+      - name: Verify inter-crate pins + Tauri Rust/npm alignment
+        shell: bash
+        run: |
+          set -euo pipefail
+          want="${{ steps.resolve.outputs.tag }}"; want="${want#v}"
+          # (1) inter-crate path-dep version pins must equal the workspace version — they are NOT
+          # auto-tracked, and a stale pin breaks pre-release dependency resolution (bit v0.2.1-rc.1).
+          bad=0
+          while IFS= read -r line; do
+            v=$(printf '%s' "$line" | sed -E 's/.*version *= *"([^"]+)".*/\1/')
+            if [ "$v" != "$want" ]; then echo "  stale pin (want $want): $line"; bad=1; fi
+          done < <(grep -rhE 'path *=' crates/*/Cargo.toml apps/*/Cargo.toml 2>/dev/null | grep -E 'version *= *"' || true)
+          if [ "$bad" = 1 ]; then
+            echo "::error::inter-crate path-dep version pin(s) not at $want — bump every pin with the version (docs/releasing-gotchas.md)."
+            exit 1
+          fi
+          # (2) the Tauri Rust crate (Cargo.lock) and npm @tauri-apps/api must share major.minor, else
+          # `cargo tauri build` refuses to build (bit the desktop job when cargo update drifted 2.10->2.11).
+          rust_tauri=$(grep -A1 '^name = "tauri"$' Cargo.lock | grep -m1 '^version = ' | sed -E 's/.*"([0-9]+\.[0-9]+)\..*/\1/')
+          npm_tauri=$(grep -m1 '"@tauri-apps/api"' apps/desktop/ui/package.json | sed -E 's/.*"[~^]?([0-9]+\.[0-9]+)\..*/\1/')
+          echo "inter-crate pins OK at $want; tauri Rust=$rust_tauri npm @tauri-apps/api=$npm_tauri"
+          if [ "$rust_tauri" != "$npm_tauri" ]; then
+            echo "::error::Tauri Rust ($rust_tauri) vs npm @tauri-apps/api ($npm_tauri) major.minor mismatch — cargo tauri build will refuse. Run: npm --prefix apps/desktop/ui install @tauri-apps/api@^$rust_tauri @tauri-apps/cli@^$rust_tauri."
+            exit 1
+          fi
+
       # Release notes = English CHANGELOG section + a clearly-separated Chinese section
       # (never interleaved) + Downloads/footer. Single source of truth: the curated notes
       # live in CHANGELOG.md / CHANGELOG.zh-CN.md, not duplicated here.
@@ -68,10 +132,15 @@ jobs:
               inblk { print }
             ' "$1"
           }
-          # English body (authoritative).
+          # English body (authoritative). A stable tag MUST carry a "## [<tag>]" CHANGELOG section:
+          # v0.4.1–v0.4.4 shipped with fallback notes precisely because this step silently fell back
+          # when the section was missing. Fail stable builds; beta/rc (tag carries '-') may fall back.
           extract CHANGELOG.md > "$notes" || true
           if [ ! -s "$notes" ]; then
-            printf 'Vigils %s — a local-first control plane for AI agents.\n' "$tag" > "$notes"
+            case "$tag" in
+              *-*) printf 'Vigils %s — a local-first control plane for AI agents.\n' "$tag" > "$notes" ;;
+              *) echo "::error::CHANGELOG.md has no '## [$tag]' section — add it (and CHANGELOG.zh-CN.md) before tagging a stable release" >&2; exit 1 ;;
+            esac
           fi
           # Chinese as a clearly-separated section (never interleaved).
           zh="$(extract CHANGELOG.zh-CN.md 2>/dev/null || true)"
@@ -86,7 +155,8 @@ jobs:
             printf '%s\n' '- **Browser extension** (guard pasting/typing secrets into AI web apps, Chrome MV3): `vigils-chrome-extension.zip` — unzip, then load unpacked at `chrome://extensions`.'
             printf '%s\n\n' '- The `.sig` and `Vigils.app.tar.gz` files are desktop auto-updater artifacts — you do not need to download them.'
             printf '%s\n\n' 'New here? Full setup & agent-integration guide: https://duncatzat.github.io/vigils'
-            printf '%s\n\n' 'Early releases are unsigned; your OS may show a Gatekeeper / SmartScreen prompt on first run.'
+            printf '%s\n' 'Every asset carries **Sigstore build provenance** (SLSA) — verify any download came from this repo'"'"'s official CI with:'
+            printf '%s\n\n' '`gh attestation verify <file> --repo duncatzat/vigils`. (Not yet OS-code-signed — Authenticode/notarization — so your OS may still show a Gatekeeper / SmartScreen prompt on first run.)'
             printf '%s\n' 'Apache-2.0 · https://vigils.ai · [Full changelog](https://github.com/duncatzat/vigils/blob/main/CHANGELOG.md)'
           } >> "$notes"
           echo "path=$notes" >> "$GITHUB_OUTPUT"
@@ -96,7 +166,9 @@ jobs:
         with:
           tag_name: ${{ steps.resolve.outputs.tag }}
           name: Vigils ${{ steps.resolve.outputs.tag }}
-          draft: false
+          # ISS-20260621-005: create as DRAFT; the `finalize` job flips it to published only after
+          # every build job succeeds, so a failed build never leaves a public partial release.
+          draft: true
           # pre-release tags (e.g. v0.2.0-beta.1, v0.2.0-rc.1) carry a `-`; mark them as
           # pre-release on GitHub so a beta isn't listed as the latest stable. A final tag
           # (v0.2.0) has no `-` and is published as a normal release.
@@ -128,6 +200,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # CI 卫生:key 含 OS 镜像版本,防 ubuntu-22.04/24.04 共享 target/(见 v0.4.0 gtk GLIBC 事故)。
+          prefix-key: "v0-rust-${{ matrix.os }}"
 
       - name: Install Linux deps (keyring / secret-service)
         # robust:按 runner OS 判定而非钉死版本字符串(改 runner 版本不漏装 = 不静默断 keyring 链)。
@@ -203,12 +278,14 @@ jobs:
         run: |
           $f = "vigils-cli-${{ matrix.plat }}.${{ matrix.archive }}"
           $h = (Get-FileHash -Algorithm SHA256 "dist/$f").Hash.ToLower()
-          Set-Content -Path "dist/$f.sha256" -Value "$h  $f" -Encoding ascii
+          # LF (not CRLF) so `sha256sum -c` works in Unix-y environments / git-bash / WSL
+          Set-Content -Path "dist/$f.sha256" -Value "$h  $f`n" -NoNewline -Encoding ascii
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
+          draft: true # ISS-005: stay draft until `finalize` publishes after all builds pass
           files: |
             dist/vigils-cli-${{ matrix.plat }}.${{ matrix.archive }}
             dist/vigils-cli-${{ matrix.plat }}.${{ matrix.archive }}.sha256
@@ -220,6 +297,138 @@ jobs:
         with:
           subject-path: dist/vigils-cli-${{ matrix.plat }}.${{ matrix.archive }}
 
+  # ── 2b. CLI ML 变体（3 平台,--features ort + 捆 onnxruntime 1.24.4 dylib）──────
+  # 加性资产:**不动**默认硬指纹件(cli job)。ML 变体 = vigil-hub --features ort + exe 同目录
+  # onnxruntime 1.24.4 dylib(运行期 prepare_ort_dylib_path 自动 dlopen)。用户
+  # `vigil-hub serve --engine ml` 首跑按需下载 OpenAI PII + DeBERTa 模型(HF 主源 + vigils.ai
+  # 镜像 fallback)。资产名 vigils-cli-ml-<plat>,与默认 vigils-cli-<plat> 并存。
+  # ★ 真机验证(2026-06-21):Linux x64 / macOS arm64 / Windows x64 三平台 onnxruntime 1.24.4
+  #   dylib dlopen + 真 PII/DeBERTa 推理全绿。glibc 地板:ML Linux 由 onnxruntime manylinux_2_28
+  #   wheel 决定 ≈ 2.28(高于默认件 zigbuild 的 2.17 —— ML 为可选高级件,可接受);macOS 需 14+
+  #   (wheel macosx_14_0)。zigbuild 仍把 vigil-hub 二进制本身的 glibc 符号下沉到 2.17(不额外抬高地板)。
+  cli-ml:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,   plat: linux-x64,   archive: tar.gz, bindir: "target/x86_64-unknown-linux-gnu/release", pip_platform: "manylinux_2_28_x86_64" }
+          - { os: macos-latest,   plat: macos-arm64, archive: tar.gz, bindir: "target/release",                          pip_platform: "macosx_14_0_arm64" }
+          - { os: windows-latest, plat: windows-x64, archive: zip,    bindir: "target/release",                          pip_platform: "win_amd64" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # CI 卫生:key 含 OS 镜像版本,防 ubuntu-22.04/24.04 共享 target/(见 v0.4.0 gtk GLIBC 事故)。
+          prefix-key: "v0-rust-${{ matrix.os }}"
+
+      - name: Install Linux deps (keyring / secret-service)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libssl-dev
+
+      - name: Install zig + cargo-zigbuild (Linux glibc floor)
+        if: runner.os == 'Linux'
+        run: |
+          pip3 install ziglang==0.13.0
+          cargo install cargo-zigbuild --version 0.19.8 --locked
+
+      # vigil-hub --features ort(ort load-dynamic:编译期不链 dylib,运行期 dlopen)。仅 vigil-hub
+      # (ML 用于 serve/firewall;vigil-native-host 是浏览器 native messaging,与 ML 无关,不打包)。
+      - name: Build vigil-hub --features ort (Linux — zigbuild glibc 2.17 floor)
+        if: runner.os == 'Linux'
+        run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17 --features ort --bin vigil-hub -p vigil-hub-cli
+      - name: Build vigil-hub --features ort (macOS / Windows — native)
+        if: runner.os != 'Linux'
+        run: cargo build --release --features ort --bin vigil-hub -p vigil-hub-cli
+
+      # onnxruntime 1.24.4 native dylib(ort api-24 ABI 必须 1.24.x)。**直接从 PyPI JSON API 取对应
+      # 平台 wheel URL 并 curl**,不靠 `pip download` 解析 —— ubuntu runner 的 python 版本可能没有
+      # 1.24.4 兼容 wheel(pip 报 "No matching distribution",只解到 1.23.2);win/mac runner 凑巧能解到。
+      # runner python 只用 urllib(取 JSON)+ zipfile(解 wheel),与 python 版本无关;curl 取 wheel。
+      # wheel 内 capi/ 的 native lib 与 cp 标签无关,取 cp312 + matrix.pip_platform 那一个;排除
+      # pybind11/cpython python 绑定,只留 onnxruntime 运行库(主 lib + providers_shared)。
+      - name: Fetch onnxruntime 1.24.4 dylib (PyPI wheel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=$(command -v python || command -v python3)
+          meta=$("$PY" -c "import urllib.request,json; d=json.load(urllib.request.urlopen('https://pypi.org/pypi/onnxruntime/1.24.4/json')); f=next(f for f in d['urls'] if f['filename'].endswith('.whl') and '${{ matrix.pip_platform }}' in f['filename'] and 'cp312' in f['filename']); print(f['url'], f['digests']['sha256'])")
+          url=${meta%% *}; sha=${meta##* }
+          echo "onnxruntime wheel: $url (sha256 $sha)"
+          mkdir -p ort-wheel
+          curl -sSL --fail --retry 3 -o ort-wheel/ort.whl "$url"
+          # fail-closed:校验 wheel sha256 对账 PyPI 摘要,污染/损坏的下载不进签名 release 产物
+          "$PY" -c "import hashlib,sys; got=hashlib.sha256(open('ort-wheel/ort.whl','rb').read()).hexdigest(); sys.exit(0 if got=='$sha' else 'wheel sha256 MISMATCH: %s != %s'%(got,'$sha'))"
+          cd ort-wheel
+          "$PY" -c "import zipfile,os; z=zipfile.ZipFile('ort.whl'); [open(os.path.basename(n),'wb').write(z.read(n)) for n in z.namelist() if 'capi/' in n and not n.endswith('/') and any(e in n for e in ('.so','.dylib','.dll')) and 'pybind11' not in n and 'cpython' not in n]"
+          ls -la
+
+      # vigil-hub + onnxruntime 主库 → mlpkg/,dylib 用 prepare_ort_dylib_path 期望的 exe 同目录
+      # 规范名(win onnxruntime.dll / mac libonnxruntime.dylib / linux libonnxruntime.so)。
+      - name: Stage ML payload (binary + exe-adjacent dylib)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p mlpkg
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "${{ matrix.bindir }}/vigil-hub.exe" mlpkg/
+            cp ort-wheel/onnxruntime.dll mlpkg/
+            cp ort-wheel/onnxruntime_providers_shared.dll mlpkg/ 2>/dev/null || true
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            cp "${{ matrix.bindir }}/vigil-hub" mlpkg/
+            cp ort-wheel/libonnxruntime.*.dylib mlpkg/libonnxruntime.dylib
+          else
+            cp "${{ matrix.bindir }}/vigil-hub" mlpkg/
+            cp ort-wheel/libonnxruntime.so.* mlpkg/libonnxruntime.so
+          fi
+          ls -la mlpkg
+
+      - name: Package ML (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          set -e
+          mkdir -p dist
+          tar -C mlpkg -czf "dist/vigils-cli-ml-${{ matrix.plat }}.tar.gz" .
+      - name: Package ML (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "mlpkg/*" -DestinationPath "dist/vigils-cli-ml-${{ matrix.plat }}.zip"
+
+      - name: Checksum ML (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          set -e
+          cd dist
+          shasum -a 256 "vigils-cli-ml-${{ matrix.plat }}.${{ matrix.archive }}" > "vigils-cli-ml-${{ matrix.plat }}.${{ matrix.archive }}.sha256"
+      - name: Checksum ML (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $f = "vigils-cli-ml-${{ matrix.plat }}.${{ matrix.archive }}"
+          $h = (Get-FileHash -Algorithm SHA256 "dist/$f").Hash.ToLower()
+          # LF (not CRLF) so `sha256sum -c` works in Unix-y environments / git-bash / WSL
+          Set-Content -Path "dist/$f.sha256" -Value "$h  $f`n" -NoNewline -Encoding ascii
+
+      - name: Upload ML to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          draft: true # ISS-005: stay draft until `finalize` publishes after all builds pass
+          files: |
+            dist/vigils-cli-ml-${{ matrix.plat }}.${{ matrix.archive }}
+            dist/vigils-cli-ml-${{ matrix.plat }}.${{ matrix.archive }}.sha256
+
+      - name: Attest build provenance (ML CLI)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/vigils-cli-ml-${{ matrix.plat }}.${{ matrix.archive }}
+
   # ── 3. 桌面安装包（3 平台,Tauri bundle）─────────────────────────────
   desktop:
     needs: create-release
@@ -227,7 +436,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  plat: linux-x86_64 }
+          # Desktop GUI built on ubuntu-22.04 (glibc 2.35) not ubuntu-latest (24.04 / glibc 2.39)
+          # to lower the runtime floor: covers Ubuntu 22.04+, Debian 12+. The GUI links system
+          # webkit2gtk so it can't use the CLI's zig glibc-2.17 trick; 22.04 has webkit2gtk-4.1.
+          - { os: ubuntu-22.04,   plat: linux-x86_64 }
           - { os: macos-latest,   plat: darwin-aarch64 }
           - { os: windows-latest, plat: windows-x86_64 }
     runs-on: ${{ matrix.os }}
@@ -247,9 +459,12 @@ jobs:
           node-version: 20
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # CI 卫生:key 含 OS 镜像版本,防 ubuntu-22.04/24.04 共享 target/(见 v0.4.0 gtk GLIBC 事故)。
+          prefix-key: "v0-rust-${{ matrix.os }}"
 
       - name: Install Linux Tauri system deps
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
@@ -303,6 +518,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
+          draft: true # ISS-005: stay draft until `finalize` publishes after all builds pass
           files: |
             target/release/bundle/**/*-setup.exe
             target/release/bundle/**/*-setup.exe.sig
@@ -346,6 +562,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
+          draft: true # ISS-005: stay draft until `finalize` publishes after all builds pass
           files: latest-${{ matrix.plat }}.json
 
   # ── 4. Chrome MV3 扩展（zip,供用户 load unpacked）──────────────────────
@@ -364,6 +581,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.create-release.outputs.tag }}
+          draft: true # ISS-005: stay draft until `finalize` publishes after all builds pass
           files: dist/vigils-chrome-extension.zip
 
       # D25:为浏览器扩展 zip 生成 build provenance。
@@ -371,3 +589,70 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/vigils-chrome-extension.zip
+
+  # ── 5. Signed engine manifest (SHA trust anchor for desktop ML-engine auto-install)──────────
+  # Aggregate the cli-ml `.sha256` sidecars → engine-manifest.json (per-platform url+sha256) →
+  # minisign-sign with the release key → upload. The desktop GUI fetches + verifies this manifest
+  # (reusing the Tauri-updater minisign pubkey) to SHA-pin the ML engine download — the download
+  # source itself cannot forge a valid signature. The manifest carries the URLs too, so the GUI
+  # never hardcodes asset names (handles the Windows .zip / Unix .tar.gz divergence).
+  # Draft-safe: if this job fails the release stays a draft (finalize needs it).
+  engine-manifest:
+    needs: [create-release, cli-ml]
+    runs-on: ubuntu-latest
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Download cli-ml checksums from the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p sums
+          gh release download "${{ needs.create-release.outputs.tag }}" \
+            --repo "${{ github.repository }}" --pattern "vigils-cli-ml-*.sha256" --dir sums
+          ls -la sums
+      - name: Build engine-manifest.json
+        run: node scripts/gen-engine-manifest.mjs "${{ needs.create-release.outputs.tag }}" "${{ github.repository }}" sums
+      - name: Sign engine-manifest.json (minisign, release key)
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        run: |
+          set -euo pipefail
+          cargo install tauri-cli --version "^2"
+          # tauri signer writes engine-manifest.json.sig (base64-wrapped minisign); GUI fetches `.minisig`
+          cargo tauri signer sign engine-manifest.json
+          mv engine-manifest.json.sig engine-manifest.json.minisig
+      - name: Upload signed engine manifest to the draft release
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          draft: true
+          files: |
+            engine-manifest.json
+            engine-manifest.json.minisig
+
+  # ── 6. Finalize ───────────────────────────────────────────────────────────
+  # ISS-20260621-005: publish the release (draft -> public) ONLY after every build job succeeded.
+  # If any build fails this job is skipped (needs: all builds) and the release stays a draft, so a
+  # failed build never leaves a public release with missing/partial assets. Mirrors — and now
+  # enforces in CI — the manual rc-then-promote discipline in docs/releasing-gotchas.md.
+  finalize:
+    needs: [create-release, cli, cli-ml, desktop, extension, engine-manifest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release after all builds succeeded
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.create-release.outputs.tag }}"
+          # pre-release tags carry a `-` (e.g. v0.2.2-rc.1) → mark prerelease, not Latest.
+          if [[ "$tag" == *-* ]]; then pre=true; latest=false; else pre=false; latest=true; fi
+          echo "publishing $tag (prerelease=$pre, latest=$latest)"
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease="$pre" --latest="$latest"

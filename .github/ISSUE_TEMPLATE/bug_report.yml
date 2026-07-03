@@ -1,0 +1,95 @@
+name: 🐞 Bug report
+description: Report a reproducible defect in Vigils. (Questions / help → use Discussions, not Issues.)
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping make Vigils better. **Please fill in every required field.**
+
+        > ⚠️ Low-effort, vague, off-topic, promotional, or duplicate reports — and anything that is a
+        > question rather than a reproducible bug — will be **closed without further response**.
+        > Questions, ideas, and support belong in
+        > [Discussions](https://github.com/duncatzat/vigils/discussions).
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checklist
+      description: All of these are required. Reports that don't honestly satisfy them will be closed.
+      options:
+        - label: I searched [existing issues](https://github.com/duncatzat/vigils/issues?q=is%3Aissue) (open and closed) and this is **not** a duplicate.
+          required: true
+        - label: This is a **concrete, reproducible bug** — not a question, support request, idea, or off-topic/promotional post.
+          required: true
+        - label: I read the [documentation](https://duncatzat.github.io/vigils/) and the relevant troubleshooting section.
+          required: true
+        - label: I will keep this report **civil, factual, and on-topic**, and I agree to follow the project's [Code of Conduct](https://github.com/duncatzat/vigils/blob/main/CODE_OF_CONDUCT.md).
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Vigils version
+      description: "Run `vigil-hub --version`, or give the release tag you downloaded."
+      placeholder: "e.g. vigil-hub 0.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which part of Vigils?
+      options:
+        - CLI (vigil-hub)
+        - Desktop app
+        - Chrome extension
+        - SDK (vigil-sdk)
+        - MCP gateway / hook
+        - Other / not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: install-source
+    attributes:
+      label: How did you install it?
+      description: Where did the binary come from? (A bug in a self-modified/old build is hard to act on.)
+      placeholder: "e.g. GitHub release v0.2.0 asset, cargo install, built from source"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect instead?
+      description: A clear, specific description of the actual vs. expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Exact steps to reproduce
+      description: Numbered steps with the **exact commands**. A bug we cannot reproduce cannot be fixed.
+      placeholder: |
+        1. vigil-hub setup --ledger ...
+        2. <run the agent / command ...>
+        3. Observed: ...
+           Expected: ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / output
+      description: "Paste terminal output or error messages. **Redact any real secrets, tokens, or private paths first.**"
+      render: shell
+    validations:
+      required: false

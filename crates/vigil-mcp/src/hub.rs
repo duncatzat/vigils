@@ -344,6 +344,12 @@ pub struct Hub {
     oracle: Arc<dyn DescriptorOracle>,
     router: Mutex<ToolRouter>,
     upstreams: Mutex<HashMap<String, Arc<dyn McpUpstream>>>,
+    /// OAuth HTTP upstream 的 token scope 集(`server_id` → attach 期 scope 快照)。
+    /// 只有经 [`Hub::attach_upstream_with_oauth_scopes`] 挂上的 upstream 有条目;查无 →
+    /// 该 upstream 的出站评估走 [`OAuthScopeContext::NonOauth`](`ScopeNotInAllowList` 不适用)。
+    /// 快照语义:token auto-refresh 后 scope 若缩窄,按旧(更宽)集合评估只会更严不会更宽
+    /// (fail-safe 方向);扩权需重新 onboard + attach,快照随之更新。
+    upstream_oauth_scopes: Mutex<HashMap<String, Vec<String>>>,
     /// V1.1(Codex code R2):**序列化所有 stdio attach**。`spawn_attach_stdio_upstream` 全程持有,
     /// 让"早 dup 检查 → spawn → insert"对同一/不同 server_id 的并发 attach 串行 —— 杜绝两并发同名
     /// 调用都过早检查后各 spawn 一个进程再 drop 的副作用泄漏。**不**阻塞请求热路径(请求只锁
@@ -426,6 +432,7 @@ impl Hub {
             oracle,
             router: Mutex::new(ToolRouter::default()),
             upstreams: Mutex::new(HashMap::new()),
+            upstream_oauth_scopes: Mutex::new(HashMap::new()),
             attach_lock: Mutex::new(()),
             config,
             session_id: Mutex::new(None),
@@ -551,63 +558,28 @@ impl Hub {
     /// 启发式 always-on 兜底。改为与 descriptor 扫描**同款双检测器结构**,补齐这条平行扫描点的
     /// 不对称缺口。
     fn audit_result_injection(&self, invocation: &ToolInvocation, result_text: &str) {
-        // CPU 放大防护:启发式正则 + tokenizer 都对全文 O(n);注入指令通常在开头 → cap 16KB 前缀。
-        let scan = injection_scan_prefix(result_text);
-
-        // 检测器 1:启发式元指令正则(always-on,确定性、窄覆盖)。
-        let heuristic_hits = vigil_redaction::scan_meta_instructions(scan).len();
-        // 检测器 2:DeBERTa(feature gate;无 ort 恒 None → 退化为纯启发式,与 descriptor 扫描一致)。
+        // ADR 0023:组装作业 → DeBERTa 在场则**带外**扫描(主路径不等 738MB 推理),否则同步兜底。
+        // 扫描 / 审计 / risk 语义全在 `finish_injection_audit`,两条路径逐字节一致。
+        let job = InjectionJob {
+            session_id: invocation.session_id.clone(),
+            text: result_text.to_string(),
+            kind: InjectionJobKind::Result {
+                invocation_id: invocation.invocation_id.clone(),
+                server_id: invocation.server_id.clone(),
+                tool_name: invocation.tool_name.clone(),
+            },
+        };
         #[cfg(feature = "ort")]
-        let deberta_score = self.injection_classify_opt(result_text);
-        #[cfg(not(feature = "ort"))]
-        let deberta_score: Option<f32> = None;
-        let deberta_hit = matches!(deberta_score, Some(s) if s >= INJECTION_CLASSIFIER_THRESHOLD);
-
-        // 两检测器都未命中 → 静默(软信号 fail-safe;常态零噪声)。
-        if heuristic_hits == 0 && !deberta_hit {
+        if let Some(classifier) = &self.injection_classifier {
+            dispatch_injection_async(Arc::clone(&self.ledger), Arc::clone(classifier), job);
             return;
         }
-
-        // 软信号 risk delta:两层针对**同一段 result**,取 max 不累加(对齐 descriptor 扫描)。
-        let risk_delta = {
-            let h = if heuristic_hits > 0 {
-                vigil_redaction::META_INSTRUCTION_RISK_DELTA as i64
-            } else {
-                0
-            };
-            let d = if deberta_hit {
-                INJECTION_CLASSIFIER_RISK_DELTA
-            } else {
-                0
-            };
-            h.max(d)
-        };
-
-        if risk_delta > 0 {
-            let _ = self
-                .ledger
-                .bump_session_risk(&invocation.session_id, risk_delta);
-        }
-        let _ = self.ledger.append_event(
-            &invocation.session_id,
-            "tool_result.injection_suspected",
-            &json!({
-                "invocation_id": invocation.invocation_id,
-                "server_id": invocation.server_id,
-                "tool_name": invocation.tool_name,
-                // 零回显:启发式命中数 + deberta 概率(2 位)/命中 + result sha 前缀,绝不带原文。
-                "heuristic_hits": heuristic_hits,
-                "deberta_score": deberta_score.map(round2),
-                "deberta_hit": deberta_hit,
-                "risk_delta": risk_delta,
-                "signal": "soft",
-                "result_sha256_prefix": sha256_hex_prefix(scan),
-            }),
-            Some(&format!(
-                "result_injection_suspected server:{} tool:{} heuristic:{} deberta_hit:{}",
-                invocation.server_id, invocation.tool_name, heuristic_hits, deberta_hit
-            )),
-        );
+        // 同步兜底:非-ort(启发式-only)/ ort 但未 load classifier(deberta 恒 None)。
+        #[cfg(feature = "ort")]
+        let deberta_score = self.injection_classify_opt(&job.text);
+        #[cfg(not(feature = "ort"))]
+        let deberta_score: Option<f32> = None;
+        finish_injection_audit(&self.ledger, &job, deberta_score);
     }
 
     /// P0 注入防护 Slice 3(T6)+ Slice C(T7):对 tool descriptor 的 description(+ input
@@ -641,64 +613,30 @@ impl Hub {
             return;
         }
 
-        // 检测器 1:启发式元指令正则(确定性、窄覆盖)
-        let heuristic_hits = vigil_redaction::scan_meta_instructions(&corpus).len();
-
-        // 检测器 2:DeBERTa 序列分类(feature gate;无 ort 恒 None → 行为退化为纯启发式,
-        // 与 Slice 3 一致)。warm session 在 serve 启动期已 load,此处只做一次推理。
-        #[cfg(feature = "ort")]
-        let deberta_score = self.injection_classify_opt(&corpus);
-        #[cfg(not(feature = "ort"))]
-        let deberta_score: Option<f32> = None;
-        let deberta_hit = matches!(deberta_score, Some(s) if s >= INJECTION_CLASSIFIER_THRESHOLD);
-
-        // 两检测器都未命中 → 不审计、不 bump(保持 Slice 3 行为:无命中即静默)。
-        if heuristic_hits == 0 && !deberta_hit {
-            return;
-        }
-
-        // 软信号 risk delta:两层针对**同一段 corpus**,取 max 不累加(单次投毒不应被双倍计分)。
-        let risk_delta = {
-            let h = if heuristic_hits > 0 {
-                vigil_redaction::META_INSTRUCTION_RISK_DELTA as i64
-            } else {
-                0
-            };
-            let d = if deberta_hit {
-                INJECTION_CLASSIFIER_RISK_DELTA
-            } else {
-                0
-            };
-            h.max(d)
-        };
-
+        // ADR 0023:corpus 组装后 → DeBERTa 在场则**带外**扫描(主路径不等推理),否则同步兜底。
+        // 扫描 / 审计 / risk 语义全在 `finish_injection_audit`,两条路径逐字节一致。
         let session_id = self
             .current_session_id()
             .unwrap_or_else(|_| "system".to_string());
-
-        // 先 bump risk(软信号累积,跨进程经 sessions.risk_score 可见),再写零回显审计事件。
-        if risk_delta > 0 {
-            let _ = self.ledger.bump_session_risk(&session_id, risk_delta);
+        let job = InjectionJob {
+            session_id,
+            text: corpus,
+            kind: InjectionJobKind::Descriptor {
+                server_id: server_id.to_string(),
+                tool_name: tool_name.to_string(),
+            },
+        };
+        #[cfg(feature = "ort")]
+        if let Some(classifier) = &self.injection_classifier {
+            dispatch_injection_async(Arc::clone(&self.ledger), Arc::clone(classifier), job);
+            return;
         }
-        let _ = self.ledger.append_event(
-            &session_id,
-            "tool_descriptor.meta_instruction",
-            &json!({
-                "server_id": server_id,
-                "tool_name": tool_name,
-                "match_count": heuristic_hits,
-                // 零回显:deberta 概率(2 位)+ corpus sha 前缀,绝不带 descriptor 原文。
-                "deberta_score": deberta_score.map(round2),
-                "deberta_hit": deberta_hit,
-                "risk_delta": risk_delta,
-                "signal": "soft",
-                "corpus_sha256_prefix": sha256_hex_prefix(&corpus),
-            }),
-            Some(&format!(
-                "descriptor_meta_instruction server:{server_id} tool:{tool_name} \
-                 heuristic:{heuristic_hits} deberta_hit:{deberta_hit}"
-            )),
-        );
+        // 同步兜底:非-ort(启发式-only)/ ort 但未 load classifier(deberta 恒 None)。
+        #[cfg(feature = "ort")]
+        let deberta_score = self.injection_classify_opt(&job.text);
+        #[cfg(not(feature = "ort"))]
+        let deberta_score: Option<f32> = None;
+        finish_injection_audit(&self.ledger, &job, deberta_score);
     }
 
     /// 在真实 spawn 上游 stdio 进程**之前**检查 command hash 是否漂移。
@@ -761,6 +699,25 @@ impl Hub {
             ));
         }
         g.insert(server_id.to_string(), upstream);
+        Ok(())
+    }
+
+    /// 同 [`Hub::attach_upstream`],并记录该 upstream 的 OAuth token scope 集(attach 期快照),
+    /// 让 `Condition::ScopeNotInAllowList` 在本 upstream 的出站 tools/call 评估上生效——
+    /// 空集也如实记录(评估走 `Scopes(vec![])`,fail-closed 触发)。非 OAuth upstream
+    /// (stdio / Bearer / 无鉴权)用 [`Hub::attach_upstream`],评估走 `NonOauth`(条件不适用)。
+    pub fn attach_upstream_with_oauth_scopes(
+        &self,
+        server_id: &str,
+        argv: &[String],
+        upstream: Arc<dyn McpUpstream>,
+        oauth_scopes: Vec<String>,
+    ) -> Result<(), HubError> {
+        self.attach_upstream(server_id, argv, upstream)?;
+        self.upstream_oauth_scopes
+            .lock()
+            .map_err(|_| HubError::LockPoisoned)?
+            .insert(server_id.to_string(), oauth_scopes);
         Ok(())
     }
 
@@ -1128,15 +1085,33 @@ impl Hub {
             AliasAwareScanResult::Clean | AliasAwareScanResult::AllAliased => {
                 // 通过:要么全无命中,要么所有硬指纹命中都落在 `secret://` alias 段里
             }
-            AliasAwareScanResult::RawSecret { rule } => {
+            AliasAwareScanResult::RawSecret {
+                rule,
+                alias_shadowed,
+            } => {
+                // ISS-A:`KEY=secret://alias` 被 env_assignment 残留触发时,通用的"use secret://
+                // alias"提示是误导(agent 已经用了 alias)。alias_shadowed 时给**赋值形不 detokenize**
+                // 的准确提示 + workaround;真裸 secret 仍走通用提示。两者 deny 不变(纵深防御一致)。
+                let reason = if alias_shadowed {
+                    format!(
+                        "secret:// alias inside a KEY=value assignment (rule={rule}); aliases are not \
+                         detokenized in assignment shape — move it to a non-assignment position"
+                    )
+                } else {
+                    format!("raw secret detected in args (rule={rule}); use secret:// alias")
+                };
+                let client_message: &str = if alias_shadowed {
+                    "secret:// alias cannot be used inside a KEY=value assignment; place the alias in \
+                     a non-assignment position — a header, query parameter, or standalone JSON value"
+                } else {
+                    "raw secret detected in tool arguments; use secret:// alias"
+                };
                 let dec = DecisionRecord {
                     decision_id: Uuid::new_v4().to_string(),
                     invocation_id: invocation_id.clone(),
                     decision: DecisionKind::Deny,
                     risk_score: 100,
-                    reasons: vec![format!(
-                        "raw secret detected in args (rule={rule}); use secret:// alias"
-                    )],
+                    reasons: vec![reason],
                     policy_ids: vec!["hub-hard-secret-gate".into()],
                     created_at: 0,
                 };
@@ -1164,7 +1139,7 @@ impl Hub {
 
                 return Ok(Some(req.error(
                     JsonRpcError::VIGIL_DENIED,
-                    "raw secret detected in tool arguments; use secret:// alias",
+                    client_message,
                     Some(json!({"rule": rule, "decision_id": dec.decision_id})),
                 )));
             }
@@ -1243,14 +1218,23 @@ impl Hub {
         }
 
         // Firewall 评估
-        // I10c-β2:当前 MCP Hub 路径是 stdio MCP(无 OAuth);未来 HTTP MCP 集成点
-        // 会在此处根据 route.kind 区分,并从 `ResolvedAccessToken.scope_set` 构造
-        // `OAuthScopeContext::Scopes`,让 `Condition::ScopeNotInAllowList` 生效。
-        let outcome = self.firewall.evaluate(
-            &invocation,
-            self.oracle.as_ref(),
-            OAuthScopeContext::NonOauth,
-        )?;
+        // OAuth HTTP upstream(经 `attach_upstream_with_oauth_scopes` 挂上)从 attach 期
+        // scope 快照构造 `OAuthScopeContext::Scopes`,让 `Condition::ScopeNotInAllowList`
+        // 生效(空 scope 集也显式 `Scopes(vec![])` → fail-closed);stdio / Bearer / 无鉴权
+        // upstream 查无条目 → `NonOauth`(条件不适用)。
+        let scope_ctx = {
+            let g = self
+                .upstream_oauth_scopes
+                .lock()
+                .map_err(|_| HubError::LockPoisoned)?;
+            match g.get(&route.server_id) {
+                Some(scopes) => OAuthScopeContext::Scopes(scopes.clone()),
+                None => OAuthScopeContext::NonOauth,
+            }
+        };
+        let outcome = self
+            .firewall
+            .evaluate(&invocation, self.oracle.as_ref(), scope_ctx)?;
         match outcome {
             FirewallOutcome::Allowed { decision, .. } => {
                 self.invoke_upstream(req, &invocation, &route, None, decision)
@@ -1605,6 +1589,183 @@ impl Hub {
     }
 }
 
+// ─────────────────── ADR 0023:注入软信号带外执行(同步隐私 / 异步注入)───────────────────
+
+/// ADR 0023:带外注入扫描的并发上限。超过即丢弃本次软信号扫描(背压,绝不阻塞主路径)。
+/// 软信号语义允许丢弃 —— 命中只累积 risk + 审计,**绝不**门控当前请求。
+#[cfg(feature = "ort")]
+const INJECTION_ASYNC_CAP: usize = 4;
+
+/// 进程级在途带外注入扫描线程数(每 serve 一个 Hub)。配 [`INJECTION_ASYNC_CAP`] 限并发。
+#[cfg(feature = "ort")]
+static INJECTION_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII:带外注入线程持有,确保**任何**退出路径(正常完成 / `classify` panic unwind)都归还在途
+/// 计数 —— 防 panic 跳过 `fetch_sub` 致计数永久泄漏、最终楔死 cap、静默丢弃所有后续软信号扫描
+/// (hostile review #4)。
+#[cfg(feature = "ort")]
+struct InjectionInflightGuard;
+#[cfg(feature = "ort")]
+impl Drop for InjectionInflightGuard {
+    fn drop(&mut self) {
+        INJECTION_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 一次待扫的注入软信号作业(同步路径与带外线程共用;纯数据,无 ort 依赖,故非 cfg-gated)。
+struct InjectionJob {
+    session_id: String,
+    /// 待扫文本(result 原文 / descriptor 汇总 corpus),已由 caller 组装后 move 进作业。
+    text: String,
+    kind: InjectionJobKind,
+}
+
+/// 注入作业两种审计形态(result 注入 / descriptor 元指令),字段即各自零回显审计 payload 所需。
+enum InjectionJobKind {
+    Result {
+        invocation_id: String,
+        server_id: String,
+        tool_name: String,
+    },
+    Descriptor {
+        server_id: String,
+        tool_name: String,
+    },
+}
+
+/// ADR 0023:注入软信号的 merge + bump risk + **零回显**审计 —— 同步路径与带外 worker 共用,
+/// 保证两条路径扫描/审计语义**逐字节一致**(无漂移)。
+///
+/// `deberta_score`:同步非-ort 路径 / ort 未 load classifier → `None`(退化纯启发式);带外线程传
+/// DeBERTa `classify` 结果。两检测器对同一文本取 **max** risk_delta **不累加**(对齐既有
+/// descriptor/result 扫描不变量;单次投毒不双倍计分)。命中即 bump session risk(累积,跨进程经
+/// `sessions.risk_score` 可见)+ 写零回显审计。**绝不** deny / 改写。
+fn finish_injection_audit(ledger: &Ledger, job: &InjectionJob, deberta_score: Option<f32>) {
+    // 启发式扫描 + 零回显审计锚点 sha 的范围按 kind 区分(还原 ADR 0023 前的既有行为,避免回归):
+    //   - Result:16KB 前缀 —— result 是 attacker 可控的大文本,正则 O(n) 需 CPU 防护(OLD
+    //     `audit_result_injection` 即对 `injection_scan_prefix(result_text)` 扫描)。
+    //   - Descriptor:**全 corpus**,不 cap —— descriptor 源受限(tool 定义,非 attacker-result),
+    //     OLD `audit_descriptor_meta_instructions` 对 `&corpus` 全量扫描;若在此 cap 会让深埋 >16KB
+    //     的元指令投毒漏检、且 `corpus_sha256_prefix` 锚点漂移。
+    // DeBERTa 概率由 caller / 带外线程统一在 16KB 前缀上算(两 kind 一致,匹配 OLD `injection_classify_opt`
+    // 内部的 tokenizer cap),故仅启发式+sha 在此按 kind 区分,deberta_score 直接消费。
+    let scan: &str = match &job.kind {
+        InjectionJobKind::Result { .. } => injection_scan_prefix(&job.text),
+        InjectionJobKind::Descriptor { .. } => &job.text,
+    };
+    let heuristic_hits = vigil_redaction::scan_meta_instructions(scan).len();
+    let deberta_hit = matches!(deberta_score, Some(s) if s >= INJECTION_CLASSIFIER_THRESHOLD);
+    // 两检测器都未命中 → 静默(软信号 fail-safe;常态零噪声)。
+    if heuristic_hits == 0 && !deberta_hit {
+        return;
+    }
+    let risk_delta = {
+        let h = if heuristic_hits > 0 {
+            vigil_redaction::META_INSTRUCTION_RISK_DELTA as i64
+        } else {
+            0
+        };
+        let d = if deberta_hit {
+            INJECTION_CLASSIFIER_RISK_DELTA
+        } else {
+            0
+        };
+        h.max(d)
+    };
+    if risk_delta > 0 {
+        let _ = ledger.bump_session_risk(&job.session_id, risk_delta);
+    }
+    match &job.kind {
+        InjectionJobKind::Result {
+            invocation_id,
+            server_id,
+            tool_name,
+        } => {
+            let _ = ledger.append_event(
+                &job.session_id,
+                "tool_result.injection_suspected",
+                &json!({
+                    "invocation_id": invocation_id,
+                    "server_id": server_id,
+                    "tool_name": tool_name,
+                    "heuristic_hits": heuristic_hits,
+                    "deberta_score": deberta_score.map(round2),
+                    "deberta_hit": deberta_hit,
+                    "risk_delta": risk_delta,
+                    "signal": "soft",
+                    "result_sha256_prefix": sha256_hex_prefix(scan),
+                }),
+                Some(&format!(
+                    "result_injection_suspected server:{server_id} tool:{tool_name} \
+                     heuristic:{heuristic_hits} deberta_hit:{deberta_hit}"
+                )),
+            );
+        }
+        InjectionJobKind::Descriptor {
+            server_id,
+            tool_name,
+        } => {
+            let _ = ledger.append_event(
+                &job.session_id,
+                "tool_descriptor.meta_instruction",
+                &json!({
+                    "server_id": server_id,
+                    "tool_name": tool_name,
+                    "match_count": heuristic_hits,
+                    "deberta_score": deberta_score.map(round2),
+                    "deberta_hit": deberta_hit,
+                    "risk_delta": risk_delta,
+                    "signal": "soft",
+                    "corpus_sha256_prefix": sha256_hex_prefix(scan),
+                }),
+                Some(&format!(
+                    "descriptor_meta_instruction server:{server_id} tool:{tool_name} \
+                     heuristic:{heuristic_hits} deberta_hit:{deberta_hit}"
+                )),
+            );
+        }
+    }
+}
+
+/// ADR 0023:把注入软信号作业派给**带外** capped detached 线程(仅 ort + classifier 在场时调用)。
+/// 主路径不阻塞(738MB DeBERTa 推理移出同步热路径);超 cap 或 spawn 失败 → 丢弃 + warn(软信号可丢)。
+/// 残留边界:serve 进程在带外线程完成前退出会丢失个别软信号审计(可接受 —— 非门控、跨进程 risk 仍累积)。
+#[cfg(feature = "ort")]
+fn dispatch_injection_async(
+    ledger: Arc<Ledger>,
+    classifier: Arc<vigil_redaction::InjectionClassifier>,
+    job: InjectionJob,
+) {
+    use std::sync::atomic::Ordering;
+    if INJECTION_INFLIGHT.fetch_add(1, Ordering::SeqCst) >= INJECTION_ASYNC_CAP {
+        INJECTION_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+        eprintln!(
+            "vigil-hub: injection scan queue full (cap {INJECTION_ASYNC_CAP}); \
+             dropping one soft-signal scan (no gate impact)"
+        );
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("vigil-injection".into())
+        .spawn(move || {
+            // RAII 归还在途计数:正常完成 *或* `classify` panic unwind 都经 Drop 释放 slot(#4)。
+            let _slot = InjectionInflightGuard;
+            let scan = injection_scan_prefix(&job.text);
+            // 软信号 fail-safe:空文本 / 推理失败 → None(绝不 brick)。
+            let deberta_score = if scan.trim().is_empty() {
+                None
+            } else {
+                classifier.classify(scan).ok()
+            };
+            finish_injection_audit(&ledger, &job, deberta_score);
+        });
+    if spawned.is_err() {
+        // spawn 失败(罕见:线程上限/OOM)→ 回退计数;job 已 move 进闭包,丢弃本次软信号扫描。
+        INJECTION_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+        eprintln!("vigil-hub: injection scan thread spawn failed; dropping one soft-signal scan");
+    }
+}
+
 /// 注入扫描前缀 cap:大 result 限 CPU —— 启发式正则 + DeBERTa tokenizer 都对全文 O(n);注入
 /// 指令通常在开头(与 injection.rs 512-token 截断同理),故 cap 到 16KB 前缀。截到最近 UTF-8
 /// 边界避免切多字节 char(→ `&str` 索引 panic)。启发式扫描与 `injection_classify_opt` 共用
@@ -1683,6 +1844,13 @@ pub(crate) enum AliasAwareScanResult {
     RawSecret {
         /// 首个命中的硬指纹规则名(与 `vigil_redaction::detect_hard_secret` 返值一致)。
         rule: &'static str,
+        /// True 当命中规则是 `env_assignment` **且 alias 本身就是那个赋值的 value** —— 即 agent 把
+        /// alias 放进 `KEY=value` 赋值形(`KEY=secret://x`),alias 被剥成 NUL 后残留的 `KEY=<NUL>`
+        /// 仍命中赋值规则。**精确判定**(非"同串恰好有 alias"):整段移除 alias 后 `env_assignment`
+        /// 不再命中才算(否则真裸 secret 在别处的赋值里,alias 只是同串 → false)。仅用于给 agent
+        /// **更准的提示消息**;**不**改变 deny(纵深防御不变,见 `hub_alias_detokenize.rs:251-254`:
+        /// alias 在赋值形里刻意不 detokenize)。
+        alias_shadowed: bool,
     },
 }
 
@@ -1711,13 +1879,15 @@ pub(crate) enum AliasAwareScanResult {
 pub(crate) fn scan_args_for_raw_secrets(args: &Value) -> AliasAwareScanResult {
     let mut saw_aliased_hit = false;
 
-    fn walk(v: &Value, saw_aliased_hit: &mut bool) -> Option<&'static str> {
+    // 返回 `(rule, alias_shadowed)`:alias_shadowed 见 [`AliasAwareScanResult::RawSecret`] 文档
+    // (命中所在串含被 strip 的 alias **且** rule==env_assignment —— alias 落在赋值形里被残留触发)。
+    fn walk(v: &Value, saw_aliased_hit: &mut bool) -> Option<(&'static str, bool)> {
         match v {
             Value::String(s) => scan_string(s, saw_aliased_hit),
             Value::Array(arr) => {
                 for item in arr {
-                    if let Some(rule) = walk(item, saw_aliased_hit) {
-                        return Some(rule);
+                    if let Some(hit) = walk(item, saw_aliased_hit) {
+                        return Some(hit);
                     }
                 }
                 None
@@ -1727,12 +1897,12 @@ pub(crate) fn scan_args_for_raw_secrets(args: &Value) -> AliasAwareScanResult {
                     // R2 BLOCKER 1 修复:object **key 也必须扫**(否则 `{"ghp_..."_real: "x"}`
                     // 可绕过 B4 直传原 key)。key 不可能承载 `secret://alias` 语义(alias
                     // 只在 value 里有意义;即使 key 含 `secret://xxx`,也视作可疑输入),
-                    // 所以 key 上的命中直接判 RawSecret,不走 alias 豁免路径。
+                    // 所以 key 上的命中直接判 RawSecret,不走 alias 豁免路径(alias_shadowed=false)。
                     if let Some(rule) = vigil_redaction::detect_hard_secret(k) {
-                        return Some(rule);
+                        return Some((rule, false));
                     }
-                    if let Some(rule) = walk(val, saw_aliased_hit) {
-                        return Some(rule);
+                    if let Some(hit) = walk(val, saw_aliased_hit) {
+                        return Some(hit);
                     }
                 }
                 None
@@ -1742,11 +1912,21 @@ pub(crate) fn scan_args_for_raw_secrets(args: &Value) -> AliasAwareScanResult {
         }
     }
 
-    fn scan_string(s: &str, saw_aliased_hit: &mut bool) -> Option<&'static str> {
+    fn scan_string(s: &str, saw_aliased_hit: &mut bool) -> Option<(&'static str, bool)> {
         let stripped = strip_aliases(s);
         // 在剥掉 alias 段后的文本上扫硬指纹
         if let Some(rule) = vigil_redaction::detect_hard_secret(&stripped) {
-            return Some(rule);
+            // alias_shadowed:命中是 `env_assignment` **且 alias 本身就是那个赋值的 value**。
+            // 精度(双评审 codex+hostile 都指出旧 `stripped != s` 过松:`"secret://ok PWD=raw"`
+            // 会把真裸 secret 误标 shadowed):把 alias **整段移除**(空串)后,若 `env_assignment`
+            // **不再**命中,则 alias 即该赋值 value(`KEY=secret://x` → `KEY=` 无 value 不命中);
+            // 若仍命中,说明真裸 secret 在别处的赋值里(`secret://ok PWD=raw` → ` PWD=raw` 仍命中)
+            // → 不标 shadowed,保留通用提示。委托同一 detector,无正则漂移;只影响文案不改 deny。
+            let alias_shadowed = rule == "env_assignment"
+                && stripped.as_str() != s
+                && vigil_redaction::detect_hard_secret(&strip_aliases_with(s, ""))
+                    != Some("env_assignment");
+            return Some((rule, alias_shadowed));
         }
         // 若 stripped 后无命中,但原串命中 → 说明命中都落在 alias 段内(合法)
         if vigil_redaction::detect_hard_secret(s).is_some() {
@@ -1755,8 +1935,11 @@ pub(crate) fn scan_args_for_raw_secrets(args: &Value) -> AliasAwareScanResult {
         None
     }
 
-    if let Some(rule) = walk(args, &mut saw_aliased_hit) {
-        return AliasAwareScanResult::RawSecret { rule };
+    if let Some((rule, alias_shadowed)) = walk(args, &mut saw_aliased_hit) {
+        return AliasAwareScanResult::RawSecret {
+            rule,
+            alias_shadowed,
+        };
     }
     if saw_aliased_hit {
         AliasAwareScanResult::AllAliased
@@ -1777,6 +1960,15 @@ pub(crate) fn scan_args_for_raw_secrets(args: &Value) -> AliasAwareScanResult {
 /// 白名单选定依据:URL path-safe 字符(RFC 3986 `unreserved` + `/`),足以承载
 /// 典型 alias 名(`secret://gh/rw` / `secret://stripe.live_key` / `secret://my-api_v2`)。
 fn strip_aliases(s: &str) -> String {
+    strip_aliases_with(s, "\0")
+}
+
+/// 同 [`strip_aliases`],但 alias token 用 `replacement` 替换。`"\0"`=默认 NUL 占位
+/// (断词边界,见 [`strip_aliases`]);`""`=**整段移除**,仅用于 ISS-A 判定"alias 是否就是
+/// `env_assignment` 命中的那个赋值 value":移除 alias 后若 `env_assignment` 不再命中,则该
+/// alias 即赋值 value(`KEY=secret://x`),否则真裸 secret 在别处(`secret://x TOKEN=raw`)。
+/// 该判定**只**影响 deny 消息文案,**不**影响 deny 本身(deny 已由 NUL 版 `stripped` 触发)。
+fn strip_aliases_with(s: &str, replacement: &str) -> String {
     const ALIAS_PREFIX: &str = "secret://";
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
@@ -1792,8 +1984,8 @@ fn strip_aliases(s: &str) -> String {
             while j < bytes.len() && is_alias_body_char(bytes[j]) {
                 j += 1;
             }
-            // 整段 alias token([i, j)) 替换为单个 NUL(长度无关,不影响硬指纹扫描)
-            out.push('\x00');
+            // 整段 alias token([i, j)) 替换为 `replacement`(NUL 占位 / 空串移除)
+            out.push_str(replacement);
             i = j;
         } else {
             // 非 alias 起点:逐字符拷过去(注意 UTF-8 边界)
@@ -2205,7 +2397,7 @@ mod tests {
         // 真 ghp_ 直传必须 RawSecret
         let args = json!({"token": "ghp_1234567890abcdef1234567890abcdef12345678"});
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "github_token"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "github_token"),
             other => panic!("期望 RawSecret(github_token),得到 {other:?}"),
         }
     }
@@ -2233,7 +2425,7 @@ mod tests {
             "b": "ghp_1234567890abcdef1234567890abcdef12345678"
         });
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "github_token"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "github_token"),
             other => panic!("期望 RawSecret(github_token),得到 {other:?}"),
         }
     }
@@ -2250,7 +2442,7 @@ mod tests {
             }
         });
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "github_token"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "github_token"),
             other => panic!("期望 RawSecret(github_token),得到 {other:?}"),
         }
     }
@@ -2260,7 +2452,7 @@ mod tests {
         // 自由文本形态 `FOO_API_KEY=...` 命中 env_assignment 规则
         let args = json!({"cmd": "export OPENAI_API_KEY=sk-realsecret1234567890ABCDEFghij"});
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => {
+            AliasAwareScanResult::RawSecret { rule, .. } => {
                 // 命中规则可能是 env_assignment 或 openai_api_key;HARD_RULES 顺序决定首个
                 assert!(
                     rule == "env_assignment" || rule == "openai_api_key",
@@ -2272,6 +2464,89 @@ mod tests {
     }
 
     #[test]
+    fn scan_args_alias_in_assignment_sets_alias_shadowed() {
+        // ISS-A:`KEY=secret://alias` 经 strip→`KEY=<NUL>` 仍命中 env_assignment(纵深防御正确 deny),
+        // 但 alias_shadowed=true → 给 agent "赋值形不 detokenize" 的准确提示而非误导的 "use secret://"。
+        let args = json!({"cmd": "DEPLOY_KEY=secret://mytoken"});
+        match scan_args_for_raw_secrets(&args) {
+            AliasAwareScanResult::RawSecret {
+                rule,
+                alias_shadowed,
+            } => {
+                assert_eq!(rule, "env_assignment");
+                assert!(
+                    alias_shadowed,
+                    "alias 落在赋值形里被残留触发 → alias_shadowed 必为 true"
+                );
+            }
+            other => panic!("期望 RawSecret(env_assignment, shadowed),得到 {other:?}"),
+        }
+
+        // 真裸 secret(无 alias)→ alias_shadowed=false,保留通用 "use secret:// alias" 提示。
+        let raw = json!({"token": "ghp_1234567890abcdef1234567890abcdef12345678"});
+        match scan_args_for_raw_secrets(&raw) {
+            AliasAwareScanResult::RawSecret {
+                rule,
+                alias_shadowed,
+            } => {
+                assert_eq!(rule, "github_token");
+                assert!(
+                    !alias_shadowed,
+                    "无 alias 的真裸 secret → alias_shadowed 必为 false"
+                );
+            }
+            other => panic!("期望 RawSecret(github_token, 非 shadowed),得到 {other:?}"),
+        }
+
+        // 精度:同串含 alias + 真 ghp(非赋值形)→ 命中 github_token(非 env_assignment)→
+        // alias_shadowed=false(不把真裸 secret 误判成"赋值形 alias",避免误导提示)。
+        let mixed = json!({"x": "secret://ok ghp_1234567890abcdef1234567890abcdef12345678"});
+        match scan_args_for_raw_secrets(&mixed) {
+            AliasAwareScanResult::RawSecret {
+                rule,
+                alias_shadowed,
+            } => {
+                assert_eq!(rule, "github_token");
+                assert!(
+                    !alias_shadowed,
+                    "真裸 secret 命中非 env_assignment → 不标 shadowed"
+                );
+            }
+            other => panic!("期望 RawSecret(github_token),得到 {other:?}"),
+        }
+
+        // 双评审 counterexample:真裸 env_assignment secret(`PWD=hunter2`)+ **别处**恰好有 alias →
+        // 旧 `stripped != s` 会误标 shadowed;精确判定后必须 false(移除 alias 后 env_assignment 仍命中)。
+        let raw_env_plus_alias = json!({"cmd": "secret://ok DATABASE_PASSWORD=hunter2plaintext"});
+        match scan_args_for_raw_secrets(&raw_env_plus_alias) {
+            AliasAwareScanResult::RawSecret {
+                rule,
+                alias_shadowed,
+            } => {
+                assert_eq!(rule, "env_assignment");
+                assert!(
+                    !alias_shadowed,
+                    "真裸 env_assignment secret + 别处 alias → 不标 shadowed(精度:移除 alias 仍命中)"
+                );
+            }
+            other => panic!("期望 RawSecret(env_assignment, 非 shadowed),得到 {other:?}"),
+        }
+
+        // 空白容忍:`API_KEY = secret://x`(`=` 两侧空白)alias 仍是赋值 value → shadowed=true。
+        let spaced = json!({"cmd": "API_KEY = secret://mytoken"});
+        match scan_args_for_raw_secrets(&spaced) {
+            AliasAwareScanResult::RawSecret {
+                rule,
+                alias_shadowed,
+            } => {
+                assert_eq!(rule, "env_assignment");
+                assert!(alias_shadowed, "赋值形含空白时 alias 仍是 value → shadowed");
+            }
+            other => panic!("期望 RawSecret(env_assignment, shadowed),得到 {other:?}"),
+        }
+    }
+
+    #[test]
     fn scan_args_adversarial_secret_prefix_without_path() {
         // 对抗:`secret://` 空 alias + 后跟真 key(中间有空格终止 alias 段)
         // 真 key 不会被 alias 切掉,仍应命中
@@ -2279,7 +2554,7 @@ mod tests {
             "cmd": "secret:// ghp_1234567890abcdef1234567890abcdef12345678"
         });
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "github_token"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "github_token"),
             other => panic!("期望 RawSecret(github_token),得到 {other:?}"),
         }
     }
@@ -2291,7 +2566,7 @@ mod tests {
             "cmd": "Secret://ghp_1234567890abcdef1234567890abcdef12345678"
         });
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "github_token"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "github_token"),
             other => panic!("期望 RawSecret(大小写必须严格):得到 {other:?}"),
         }
     }
@@ -2303,7 +2578,7 @@ mod tests {
             "cmd": "secret:/ghp_1234567890abcdef1234567890abcdef12345678"
         });
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "github_token"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "github_token"),
             other => panic!("期望 RawSecret(单斜杠不算 alias):得到 {other:?}"),
         }
     }
@@ -2316,7 +2591,7 @@ mod tests {
             "ghp_1234567890abcdef1234567890abcdef12345678": "harmless_value"
         });
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "github_token"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "github_token"),
             other => panic!("object key 里的真 key 必须被拦:得到 {other:?}"),
         }
     }
@@ -2330,7 +2605,7 @@ mod tests {
             }
         });
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "anthropic_api_key"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "anthropic_api_key"),
             other => panic!("嵌套 object key 里的真 key 必须被拦:得到 {other:?}"),
         }
     }
@@ -2343,7 +2618,7 @@ mod tests {
             "cmd": "secret://ok|ghp_1234567890abcdef1234567890abcdef12345678"
         });
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "github_token"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "github_token"),
             other => panic!("`|` 分隔后的 raw secret 必须不被 alias 吞:得到 {other:?}"),
         }
     }
@@ -2355,7 +2630,7 @@ mod tests {
             "cmd": "secret://ok</x><y>ghp_1234567890abcdef1234567890abcdef12345678</y>"
         });
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "github_token"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "github_token"),
             other => panic!("XML tag 分隔后的 raw secret 必须不被 alias 吞:得到 {other:?}"),
         }
     }
@@ -2367,7 +2642,7 @@ mod tests {
             "cmd": "secret://ok\\ghp_1234567890abcdef1234567890abcdef12345678"
         });
         match scan_args_for_raw_secrets(&args) {
-            AliasAwareScanResult::RawSecret { rule } => assert_eq!(rule, "github_token"),
+            AliasAwareScanResult::RawSecret { rule, .. } => assert_eq!(rule, "github_token"),
             other => panic!("`\\` 分隔后的 raw secret 必须不被 alias 吞:得到 {other:?}"),
         }
     }

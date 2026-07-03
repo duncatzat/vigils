@@ -41,5 +41,6 @@
 
 # 中文 (Chinese)
 
+- [安装 Vigils](./getting-started/installation.zh-CN.md)
 - [验证你的下载](./getting-started/verifying-downloads.zh-CN.md)
 - [Agent 接入与测试指南](./getting-started/agent-integration.zh-CN.md)

@@ -324,8 +324,38 @@ fn merge_uninstall_agent(spec: &AgentHookSpec, mut settings: Value) -> (bool, Va
     (changed, settings)
 }
 
-/// 诚实保护状态:该面**每个**注册事件都恰好一条托管条目且 == canonical 且 exe 存在 → Active;
-/// 有任何托管条目但不满足(漂移/缺事件/exe 缺失)→ Stale;全无 → NotInstalled。
+/// 把一条托管条目里 hook command 的 `--ledger <值>` 归一为占位符 —— 让 staleness **忽略 ledger 路径**
+/// (与 `setup::entry_ledger_normalized` 同策:ledger 是用户可配的共享审计路径,不应判漂移;exe / flag /
+/// 结构仍精确比对)。两种 [`EntryStyle`] 各取各的 command 字段。返回 None = 取不到 command 或缺 `--ledger`
+/// (本身非 canonical → Stale)。取**首个** ` --ledger ` 切分(prefix 不含该字面子串;避免 ledger 路径
+/// 恰含字面时误切,Codex review Low,fail-safe)。
+fn entry_ledger_normalized(style: EntryStyle, entry: &Value) -> Option<Value> {
+    let cmd = match style {
+        EntryStyle::Nested => entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .filter(|h| h.len() == 1)?
+            .first()?
+            .get("command")
+            .and_then(Value::as_str)?,
+        EntryStyle::Flat => entry.get("command").and_then(Value::as_str)?,
+    };
+    let (prefix, ledger) = cmd.split_once(" --ledger ")?;
+    if ledger.trim().is_empty() {
+        return None;
+    }
+    let new_cmd = Value::String(format!("{prefix} --ledger <vigil-ledger>"));
+    let mut normalized = entry.clone();
+    match style {
+        EntryStyle::Nested => normalized["hooks"][0]["command"] = new_cmd,
+        EntryStyle::Flat => normalized["command"] = new_cmd,
+    }
+    Some(normalized)
+}
+
+/// 诚实保护状态:该面**每个**注册事件都恰好一条托管条目且 == canonical(**ledger 路径除外**,见
+/// [`entry_ledger_normalized`])且 exe 存在 → Active;有任何托管条目但不满足(exe/flag 漂移 / 缺事件 /
+/// exe 缺失)→ Stale;全无 → NotInstalled。
 fn agent_state(
     spec: &AgentHookSpec,
     settings: Option<&Value>,
@@ -338,7 +368,10 @@ fn agent_state(
     let mut any_managed = false;
     let mut all_canonical = true;
     for ev in spec.events {
-        let canonical = canonical_entry(spec.style, command, ev);
+        // canonical 也按 ledger 归一:status 不带 --ledger 时按默认 ledger 重算,但注册串可能是用户安装
+        // 时给的自定义 ledger —— 归一后只比 exe/flag/结构,自定义 ledger 不再误报 STALE。
+        let canonical_norm =
+            entry_ledger_normalized(spec.style, &canonical_entry(spec.style, command, ev));
         let managed: Vec<&Value> = s
             .get("hooks")
             .and_then(|h| h.get(ev.event))
@@ -350,7 +383,9 @@ fn agent_state(
             })
             .unwrap_or_default();
         any_managed |= !managed.is_empty();
-        all_canonical &= managed.len() == 1 && managed[0] == &canonical;
+        all_canonical &= canonical_norm.is_some()
+            && managed.len() == 1
+            && entry_ledger_normalized(spec.style, managed[0]) == canonical_norm;
     }
     if !any_managed {
         return ProtectionState::NotInstalled;
@@ -446,7 +481,10 @@ pub fn run_agent_hook(
     ledger: &Path,
     op: AgentHookOp,
 ) -> Result<AgentHookReport, SetupError> {
-    let detected = spec.detect_dir.is_dir();
+    // 检测 = 配置目录存在 或 agent CLI 二进制在 PATH 可解析(#13:覆盖"已装未首跑")。
+    // Cursor 的 CLI 二进制名歧义(`cursor` 多为 GUI launcher)→ 仅目录检测,避免误判(评审 #13c)。
+    let path_binary = (spec.agent != "cursor").then_some(spec.agent);
+    let detected = crate::setup::agent_installed(&spec.detect_dir, path_binary);
     let command = hook_command_with_cli(exe, ledger, Some(spec.agent));
     let existing = read_settings(&spec.config_path)?; // 非法 JSON → abort(MalformedConfig)
     let state = agent_state(spec, existing.as_ref(), &command, exe);
@@ -932,7 +970,9 @@ mod tests {
     // ── 诚实状态:漂移 → Stale ──
 
     #[test]
-    fn drifted_command_reports_stale() {
+    fn ledger_difference_is_active_but_reinstall_applies_new_ledger() {
+        // 真机回归(E13 在 Codex 面发现):装 ledger A 的条目,再用 ledger B 查 status → 必须 Active。
+        // ledger 是用户可配的共享审计路径,不构成漂移(与 Claude 面 status_ledger_difference_* 同策)。
         let (_td, spec) = detected_spec(gemini_spec);
         run_agent_hook(
             &spec,
@@ -941,11 +981,14 @@ mod tests {
             AgentHookOp::Install { dry_run: false },
         )
         .unwrap();
-        // 换 ledger 路径 = canonical 漂移 → Stale(诚实,不夸大保护)。
         let other = PathBuf::from("/data/Vigil/other.sqlite3");
         let rep = run_agent_hook(&spec, &exe(), &other, AgentHookOp::Status).unwrap();
-        assert_eq!(rep.state, ProtectionState::Stale);
-        // 重跑 install 自愈回 Active。
+        assert_eq!(
+            rep.state,
+            ProtectionState::Active,
+            "a different --ledger is the user's choice, not drift -> Active"
+        );
+        // 但显式重跑 install --ledger B 仍把注册串更新到 B(install 精确幂等,尊重用户显式选择)。
         let rep = run_agent_hook(
             &spec,
             &exe(),
@@ -953,8 +996,31 @@ mod tests {
             AgentHookOp::Install { dry_run: false },
         )
         .unwrap();
-        assert!(rep.changed);
+        assert!(
+            rep.changed,
+            "explicit re-install with a new --ledger updates the registration"
+        );
         assert_eq!(rep.state, ProtectionState::Active);
+    }
+
+    #[test]
+    fn agent_exe_drift_reports_stale() {
+        // 守门:exe 漂移(升级 / 移动 binary)在 agent 面仍**必须**报 Stale —— 本修复只放宽 ledger。
+        let (_td, spec) = detected_spec(gemini_spec);
+        run_agent_hook(
+            &spec,
+            Path::new("/old/path/vigil-hub"),
+            &ledger(),
+            AgentHookOp::Install { dry_run: false },
+        )
+        .unwrap();
+        let cur = exe(); // 当前 exe 与注册的不同路径
+        let rep = run_agent_hook(&spec, &cur, &ledger(), AgentHookOp::Status).unwrap();
+        assert_eq!(
+            rep.state,
+            ProtectionState::Stale,
+            "a hook pointing at a different binary path must stay Stale (exe-drift preserved)"
+        );
     }
 
     // ── Codex hooks 开关警告(只警告不改写)──

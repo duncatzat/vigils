@@ -66,7 +66,7 @@ vigil-hub setup --all
 
 ```bash
 vigil-hub setup --mcp --doctor    # pre-flight: will each wrapped MCP server actually start? (read-only PATH check)
-vigil-hub inspect protection      # after using your agent: what Vigils caught (secrets blocked, leaks redacted, chain intact)
+vigil-hub verify                  # after using your agent: confirm the tamper-evident audit chain is intact (the desktop app shows what was caught)
 vigil-hub setup --all --uninstall # remove everything (config restored byte-for-byte)
 ```
 

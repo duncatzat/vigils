@@ -1,4 +1,6 @@
-# Installation — Vigil v0.2
+# Installation — Vigil
+
+> **从 [GitHub Releases](https://github.com/duncatzat/vigils/releases) 获取当前版本产物**(CLI 三平台 zip/tar、桌面安装包、ML 变体、Chrome 扩展,全部带 `.sha256` 与 minisign 签名)。下文示例中的 `dist/v0.2/` 目录布局是**旧版打包形态**,仅作路径示意;复制到 PATH、注册扩展 / native-host 等步骤在各版本通用。较新命令(`setup` / `posture` / `demo` 等)见 [getting-started](getting-started.md) 与 [`CHANGELOG.md`](../../CHANGELOG.md)。
 
 ## 1. 系统要求
 
@@ -82,7 +84,7 @@ cd C:\Vigil
 # 双击不会出窗口。GUI 唯一入口 = vigil-desktop-gui.exe
 ```
 
-首次启动会在 `%APPDATA%\Vigil\` 下创建 SQLite ledger。
+首次启动会在 `%LOCALAPPDATA%\Vigil\ledger.sqlite3` 创建 SQLite ledger(**是 `%LOCALAPPDATA%`,不是 `%APPDATA%`/Roaming,文件名带 `3`**;Linux = `~/.local/share/Vigil/ledger.sqlite3`,macOS = `~/Library/Application Support/Vigil/ledger.sqlite3`)。
 
 ## 4. Linux 安装(v0.2 起支持 GUI)
 
@@ -134,7 +136,7 @@ vigil-native-host install --extension-id <EXTENSION_ID>
 
 ```powershell
 # Windows
-.\vigil-hub.exe --version      # 应打印 vigil-hub 0.0.1 左右
+.\vigil-hub.exe --version      # 应打印 vigil-hub 版本号(如 vigil-hub 0.4.6)
 .\vigil-native-host.exe status # 应打印 installed: true + manifest 路径
 ```
 
@@ -149,7 +151,7 @@ Chrome 打开 `chrome://extensions` → "Vigil" 项 → 展开 service worker �
 .\vigil-native-host.exe uninstall
 Remove-Item -Recurse C:\Vigil
 # Chrome 扩展页手动移除
-# %APPDATA%\Vigil\ 的 ledger 数据(审计链)按需保留/删除
+# %LOCALAPPDATA%\Vigil\ledger.sqlite3 的 ledger 数据(审计链)按需保留/删除
 ```
 
 Linux/macOS 对应:`rm` binary + `vigil-native-host uninstall` + 清 `~/.config/Vigil/` 或 `~/Library/Application Support/Vigil/`。

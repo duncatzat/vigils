@@ -1,0 +1,16 @@
+# Issue template chooser configuration.
+# blank_issues_enabled: false → contributors must pick a structured form instead of opening a
+# free-form (spam-prone) blank issue. (Note: this gates the template-chooser UI, not direct URLs;
+# it is paired with a Code of Conduct, required form fields, and — during attacks — repository
+# Interaction Limits + abuse reporting, which are the actual hard controls.)
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Read the documentation first
+    url: https://duncatzat.github.io/vigils/
+    about: Most "how do I…" / "is X supported" answers are already in the docs and troubleshooting guide. Please check before filing.
+  - name: ❓ Questions, usage help & open discussion
+    url: https://github.com/duncatzat/vigils/discussions
+    about: How-to questions, support, ideas, and general discussion belong in Discussions — NOT in Issues. Issues are only for actionable, reproducible bug reports and concrete, in-scope feature requests.
+  - name: 🔒 Report a security vulnerability (privately)
+    url: https://github.com/duncatzat/vigils/security/policy
+    about: Do NOT open a public issue for security vulnerabilities. Disclose privately per our Security Policy so users aren't put at risk.

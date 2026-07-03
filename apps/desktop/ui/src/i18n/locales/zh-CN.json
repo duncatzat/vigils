@@ -277,7 +277,31 @@
     "anchor_error": "锚定失败: {msg}",
     "onnx_not_implemented": "当前版本 ONNX PII 模型下载由 vigil-hub CLI 管理，桌面端尚未接入真实模型镜像。",
     "version_label": "版本",
-    "identifier_label": "应用标识"
+    "identifier_label": "应用标识",
+    "daemon": {
+      "title": "守护进程（常驻引擎）",
+      "subtitle": "常驻 daemon 守住已暖载的 AI 模型，让 hook 主路径零冷启动跑 ML。启动它即为你的 agent 开启 ML 防护。",
+      "subtitle_no_model": "当前未安装 AI 模型：现在启动只会以无模型方式运行（hook 保持硬指纹底座）。先在上方安装 AI 模型，daemon 才能暖载 ML 防护。",
+      "status_stopped": "未运行",
+      "status_warming": "启动中 · 暖载模型",
+      "status_running": "运行中",
+      "status_ml": "运行中 · ML 已暖",
+      "start": "启动守护",
+      "stop": "停止守护",
+      "error": "守护操作失败: {msg}"
+    },
+    "model": {
+      "title": "AI 模型",
+      "subtitle": "本地隐私模型（DeBERTa 注入 + PII，各约 738MB）。首次启用安全下载（HTTPS + SHA 校验）。",
+      "status_unknown": "状态未知",
+      "phase2": "Phase 2",
+      "installed": "已安装",
+      "not_installed": "未安装",
+      "unsupported": "需 ML 变体",
+      "install": "安装 AI 模型",
+      "install_ml_engine": "安装 ML 引擎",
+      "error": "模型安装失败: {msg}"
+    }
   },
   "detail": {
     "drawer_title": "审批详情",

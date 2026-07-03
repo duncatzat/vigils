@@ -15,7 +15,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.1.0",
+    "@tauri-apps/api": "^2.11.1",
     "naive-ui": "^2.40.1",
     "pinia": "^2.2.6",
     "vue": "^3.5.13",
@@ -23,7 +23,7 @@
     "vue-router": "^4.5.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.1.0",
+    "@tauri-apps/cli": "^2.11.3",
     "@tsconfig/node22": "^22.0.0",
     "@types/node": "^22.10.2",
     "@typescript-eslint/eslint-plugin": "^8.18.0",

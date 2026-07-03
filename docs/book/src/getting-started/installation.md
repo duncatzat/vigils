@@ -1,77 +1,86 @@
-# Installation
+# Install Vigils
 
-Download the latest installers from the
-[**Releases page**](https://github.com/duncatzat/vigils/releases/latest). Replace
-`<version>` below with the release you downloaded (e.g. `0.1.7`).
+> 简体中文：[安装 Vigils](./installation.zh-CN.md)
 
-> Early releases aren't OS-code-signed yet, so your OS may show a Gatekeeper / SmartScreen
-> prompt on first run. Every artifact is still independently verifiable — see
-> [**Verifying your download**](./verifying-downloads.md) ([中文](./verifying-downloads.zh-CN.md))
-> for `gh attestation verify` (build provenance) and checksums.
+## 1. Which download do I want?
 
-## Desktop app (end users)
+| I want to… | Download | Where |
+|---|---|---|
+| **Use the app** — see activity, approve actions (a window/GUI) | the **desktop installer** for my OS | [§2](#2-desktop-app) |
+| **Guard my AI coding agent** — Claude Code / Codex / Cursor / Zed | the **CLI** (`vigils-cli-…`) | [§3](#3-cli--guard-your-coding-agent-30-seconds) |
+| **Guard pasting into AI websites** — ChatGPT / Claude / Gemini | the **browser extension** | [§4](#4-browser-extension-chrome) |
 
-The installed program is **Vigils** (executable `vigils` / `vigils.exe`).
+Most people want the **desktop app**. Developers wiring up an agent want the **CLI**.
+All files live on the [**Releases page**](https://github.com/duncatzat/vigils/releases/latest)
+(replace `<version>` below with the one you grabbed, e.g. `0.3.0`).
 
-### Linux
+---
 
-```bash
-sudo dpkg -i Vigils_<version>_amd64.deb           # Debian / Ubuntu
-sudo rpm -i  Vigils-<version>-1.x86_64.rpm         # Fedora / RHEL
-chmod +x Vigils_<version>_amd64.AppImage && ./Vigils_<version>_amd64.AppImage   # portable
-```
+## 2. Desktop app
+
+Pick your OS, download, run. First launch shows a one-time "unknown developer" prompt
+(we're not OS-code-signed yet) — the steps to allow it are below.
 
 ### Windows
-
-- **NSIS**: double-click `Vigils_<version>_x64-setup.exe` (SmartScreen → *More info* → *Run anyway*).
-- **MSI**: `msiexec /i Vigils_<version>_x64_en-US.msi`
+1. Download **`Vigils_<version>_x64-setup.exe`** → double-click.
+2. If a blue **"Windows protected your PC"** box appears → **More info → Run anyway**.
+3. Done. *(The warning fades on its own as more people install.)*
 
 ### macOS (Apple Silicon)
+1. Download **`Vigils_<version>_aarch64.dmg`** → open it → drag **Vigils** to **Applications**.
+2. First launch is blocked ("Apple could not verify…"). To allow it **once**:
+   **  System Settings → Privacy & Security → scroll down → "Open Anyway" → confirm with Touch ID / password.**
+3. Done — it won't ask again.
 
-Open `Vigils_<version>_aarch64.dmg`, drag **Vigils** to *Applications*, then clear the
-quarantine flag (unsigned build):
+> *Terminal alternative (power users):* `xattr -dr com.apple.quarantine /Applications/Vigils.app`
+> This is the standard one-time step for any not-yet-notarized app; signing is planned.
 
+### Linux  (Ubuntu 22.04+ / Debian 12+)
 ```bash
-xattr -d com.apple.quarantine /Applications/Vigils.app
+sudo dpkg -i Vigils_<version>_amd64.deb            # Debian / Ubuntu
+sudo rpm  -i Vigils-<version>-1.x86_64.rpm          # Fedora / RHEL
+chmod +x Vigils_<version>_amd64.AppImage && ./Vigils_<version>_amd64.AppImage   # portable, any distro
 ```
+> **On an older distro** (the desktop GUI needs glibc ≥ 2.35)? Use the **[CLI](#3-cli--guard-your-coding-agent-30-seconds)**
+> instead — it runs on practically any Linux (glibc ≥ 2.17).
 
-### Auto-update
+---
 
-Installed apps check for updates over the Tauri auto-updater (Ed25519-signed). See
-[Auto-Update](../ops/auto-update.md).
+## 3. CLI — guard your coding agent (30 seconds)
 
-## Rust SDK (developers)
-
-```toml
-[dependencies]
-vigil-sdk = "0.1"
-```
-
-Published on [crates.io](https://crates.io/crates/vigil-sdk) /
-[docs.rs](https://docs.rs/vigil-sdk). See [SDK Quickstart](./sdk-quickstart.md).
-
-## Browser extension (Chrome MV3)
-
-Redacts secrets / PII before paste or submit on AI sites (ChatGPT / Claude / Gemini /
-Perplexity):
-
-1. `chrome://extensions` → enable **Developer mode** → **Load unpacked** → select
-   `extensions/chrome-mv3/`.
-2. The extension talks to the desktop app's **native host** (registered by the desktop
-   installer / `vigil-native-host install`).
-
-## CLI agent gateway
-
-For embedding Vigils as an MCP gateway in front of your agent (Claude Code / Codex /
-Cursor / Zed):
-
-- **Prebuilt**: download `vigils-cli-<target>.tar.gz` (or `.zip` on Windows) from the
-  release — it contains `vigil-hub` and `vigil-native-host`.
-- **From source**: `cargo install --path apps/vigil-hub-cli`
-
+Install it with one line:
 ```bash
-vigil-hub serve --stdio    # MCP agent entry point
+curl -fsSL https://vigils.ai/install.sh | sh        # macOS / Linux
 ```
+```powershell
+irm https://vigils.ai/install.ps1 | iex             # Windows (PowerShell)
+```
+*(Or download `vigils-cli-<os>` from Releases and unpack it — it contains `vigil-hub`.)*
 
-See the [Agent Integration & Test guide](./agent-integration.md) for per-agent config
+Then turn on protection:
+```bash
+vigil-hub setup       # auto-detects Claude Code / Codex / Cursor and wires the guard
+```
+Restart your agent — that's it. Raw secrets are now blocked from its tool calls, and every
+block is recorded in a tamper-evident local ledger. Kick the tires with **`vigil-hub demo`**
+(zero setup). Per-agent details: [Agent Integration](./agent-integration.md)
 ([中文](./agent-integration.zh-CN.md)).
+
+> **ML variant** (optional, semantic PII + prompt-injection detection): download
+> `vigils-cli-ml-<os>` instead and run `vigil-hub serve --engine ml`. Floors: Linux glibc ≥ 2.28,
+> macOS ≥ 14. See [Privacy Filter](../concepts/privacy-filter.md).
+
+---
+
+## 4. Browser extension (Chrome)
+
+Redacts secrets / PII before you paste or submit on AI sites. Load it via
+`chrome://extensions` → **Developer mode** → **Load unpacked** → pick `extensions/chrome-mv3/`.
+*(It pairs with the desktop app's native host, registered by the desktop installer.)*
+
+---
+
+**Worried it's authentic?** Every download has a SHA-256 checksum and a cryptographic build
+attestation — [Verifying your download](./verifying-downloads.md)
+([中文](./verifying-downloads.zh-CN.md)).
+Building Vigils into your own Rust app? [SDK Quickstart](./sdk-quickstart.md).

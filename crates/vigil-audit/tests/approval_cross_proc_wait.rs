@@ -139,28 +139,41 @@ fn in_proc_approve_still_wakes_via_condvar_not_polling() {
 
     let l_clone = Arc::clone(&l);
     let approval_id_clone = approval_id.clone();
+    // 记录 approve **实际触发**时刻,使断言只衡量「唤醒延迟」(approve → wait 返回),与
+    // approver 的 100ms sleep 解耦。此前断言 `t0(wait前)..elapsed < 450ms` 把 sleep 计入,
+    // 而 `thread::sleep` 在加载的 CI runner 上无上界 overshoot → 与 ISS-20260621-004 同类
+    // wall-clock flaky(co_approval)。100ms sleep 仍保留:确保 main 先进入 cv.wait_timeout 再 notify。
+    let approve_at = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let approve_at_w = Arc::clone(&approve_at);
     let approver = thread::spawn(move || {
         thread::sleep(Duration::from_millis(100));
+        *approve_at_w.lock().unwrap() = Some(Instant::now());
         l_clone
             .approve(&approval_id_clone, ApprovalScope::Once, Some("in-proc"))
             .unwrap();
     });
 
-    let t0 = Instant::now();
     let resolution = l
         .wait_for_resolution(&approval_id, Duration::from_secs(10))
         .unwrap()
         .expect("in-proc 应返回 Some");
-    let elapsed = t0.elapsed();
+    let returned_at = Instant::now();
     approver.join().unwrap();
 
     assert_eq!(resolution.status, ApprovalStatus::Approved);
 
-    // in-proc 由 Condvar 立即唤醒;100ms approve + Condvar 几乎 0ms 延迟 → 总 < 250ms。
-    // 若 > 500ms 说明退化到轮询路径,违反 ISS-019 设计。
+    // in-proc 由 Condvar **立即**唤醒:approve → wait 返回的唤醒延迟应 ~0(亚毫秒~低毫秒)。
+    // 若退化到轮询(ISS-019 设计禁止),需等到下一个 WAIT_POLL_INTERVAL(500ms)轮询边界,
+    // 唤醒延迟接近数百毫秒。200ms 阈值两侧充裕,且**不含** approver sleep,故不受 CI 负载下
+    // sleep overshoot 影响(根治 ISS-004 同类 wall-clock flaky)。
+    let approve_at = approve_at
+        .lock()
+        .unwrap()
+        .expect("approver 应已记录 approve 时刻");
+    let wakeup_latency = returned_at.saturating_duration_since(approve_at);
     assert!(
-        elapsed < Duration::from_millis(450),
-        "in-proc Condvar wakeup 应 < 450ms,实际 {elapsed:?} —— 可能退化到轮询"
+        wakeup_latency < Duration::from_millis(200),
+        "in-proc Condvar 唤醒延迟应 < 200ms,实际 {wakeup_latency:?} —— 可能退化到轮询"
     );
 }
 
