@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Vigils Browser Guard",
   "short_name": "Vigils",
-  "version": "0.1.10",
+  "version": "0.2.0",
   "description": "Vigils 浏览器守门:普通模式在浏览器内检测你粘贴 / 输入 / 提交进 AI 网站的密钥、token 和连接串,命中后提示脱敏或阻断。",
   "minimum_chrome_version": "120",
   "icons": {
