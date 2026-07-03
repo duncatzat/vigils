@@ -55,8 +55,10 @@ jobs:
           version=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           echo "workspace version: $version"
 
-          # vigil-sdk's normal-dependency closure (all previously published at 0.1.8).
-          crates="vigil-types vigil-redaction vigil-runner-types vigil-policy vigil-audit vigil-sandbox-linux vigil-ui-protocol vigil-lease vigil-runner vigil-firewall vigil-mcp vigil-sdk"
+          # vigil-sdk's normal-dependency closure. vigil-runner / vigil-sandbox-linux are
+          # intentionally absent: they are dev-/internal-only (never published) and
+          # vigil-sandbox-linux lacks crates.io metadata — keep the publish surface minimal.
+          crates="vigil-types vigil-redaction vigil-runner-types vigil-policy vigil-audit vigil-ui-protocol vigil-lease vigil-firewall vigil-mcp vigil-sdk"
 
           published() {
             local n="$1" path
