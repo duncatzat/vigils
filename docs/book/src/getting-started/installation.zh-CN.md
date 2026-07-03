@@ -70,8 +70,10 @@ vigil-hub setup       # 自动探测 Claude Code / Codex / Cursor 并接好守�
 
 ## 4. 浏览器扩展(Chrome)
 
-在 AI 网站上粘贴/提交前先脱敏密钥与 PII。安装:`chrome://extensions` → 开 **开发者模式** →
-**加载已解压的扩展程序** → 选 `extensions/chrome-mv3/`。*(它与桌面 App 的 native host 配合,后者由桌面安装包注册。)*
+在 AI 网站上粘贴/提交前先脱敏密钥与 PII。从 Chrome 应用商店一键安装
+[**Vigils Browser Guard**](https://chromewebstore.google.com/detail/vigils-browser-guard/ffmgaglmcimapacgmoejaobfjdpmopch) ——
+普通模式开箱即用,无需桌面 App。可选:配合桌面 App 的 native host 解锁深度脱敏。
+开发版:`chrome://extensions` → 开 **开发者模式** → **加载已解压的扩展程序** → 选 `extensions/chrome-mv3/`。
 
 ---
 

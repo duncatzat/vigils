@@ -154,8 +154,10 @@ installers, and the extension zip are all attested. Full guide (per-OS steps + t
 prompt): [**Verifying your download**](https://duncatzat.github.io/vigils/getting-started/verifying-downloads.html)
 ([中文](https://duncatzat.github.io/vigils/getting-started/verifying-downloads.zh-CN.html)).
 
-The **Chrome extension** lives in `extensions/chrome-mv3/` — load it unpacked via
-`chrome://extensions` → *Developer mode* → *Load unpacked* (it talks to `vigil-native-host`).
+The **Chrome extension** ([**Vigils Browser Guard**](https://chromewebstore.google.com/detail/vigils-browser-guard/ffmgaglmcimapacgmoejaobfjdpmopch))
+installs in one click from the Chrome Web Store — consumer mode scans in-browser and works out of
+the box; pairing with `vigil-native-host` unlocks deep redaction. Source lives in
+`extensions/chrome-mv3/` (dev builds: `chrome://extensions` → *Developer mode* → *Load unpacked*).
 
 ## Quick Start
 

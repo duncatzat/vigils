@@ -103,7 +103,9 @@ Expected behavior:
 
 ## Chrome Web Store
 
-The extension is now live on the Chrome Web Store. Install directly from the store — one click, no manual loading required.
+The extension is live on the Chrome Web Store as [**Vigils Browser Guard**](https://chromewebstore.google.com/detail/vigils-browser-guard/ffmgaglmcimapacgmoejaobfjdpmopch).
+Install directly from the store — one click, no manual loading required. (The store build can lag
+this directory by a review cycle; load unpacked for the latest.)
 
 ## Popup
 

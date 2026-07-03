@@ -135,8 +135,10 @@ vigil-hub serve --engine auto     # 仅当模型已缓存且 dylib 就位才启�
 
 > 早期版本未签名;首次运行时系统可能弹出 Gatekeeper / SmartScreen 提示。
 
-**Chrome 扩展**在 `extensions/chrome-mv3/` —— 经 `chrome://extensions` → *开发者模式* →
-*加载已解压的扩展程序* 以未打包方式载入(它与 `vigil-native-host` 通信)。
+**Chrome 扩展**([**Vigils Browser Guard**](https://chromewebstore.google.com/detail/vigils-browser-guard/ffmgaglmcimapacgmoejaobfjdpmopch))
+已上架 Chrome 应用商店,一键安装 —— 普通模式在浏览器内检测、开箱即用;配合 `vigil-native-host`
+可解锁深度脱敏。源码在 `extensions/chrome-mv3/`(开发版经 `chrome://extensions` → *开发者模式* →
+*加载已解压的扩展程序* 载入)。
 
 ## 快速开始
 

@@ -103,7 +103,7 @@ token=ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ
 
 ## Chrome 应用商店
 
-扩展已正式上线 Chrome 应用商店，一键安装，即装即用。
+扩展已以 [**Vigils Browser Guard**](https://chromewebstore.google.com/detail/vigils-browser-guard/ffmgaglmcimapacgmoejaobfjdpmopch) 正式上线 Chrome 应用商店，一键安装，即装即用。（商店版本可能比本目录晚一个审核周期；要用最新代码可按上文加载已解压目录。）
 
 ## Popup
 

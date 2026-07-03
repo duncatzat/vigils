@@ -74,9 +74,11 @@ block is recorded in a tamper-evident local ledger. Kick the tires with **`vigil
 
 ## 4. Browser extension (Chrome)
 
-Redacts secrets / PII before you paste or submit on AI sites. Load it via
+Redacts secrets / PII before you paste or submit on AI sites. Install
+[**Vigils Browser Guard**](https://chromewebstore.google.com/detail/vigils-browser-guard/ffmgaglmcimapacgmoejaobfjdpmopch)
+from the Chrome Web Store — consumer mode works out of the box, no desktop app required.
+Optional: pairing with the desktop app's native host unlocks deep redaction. Dev builds:
 `chrome://extensions` → **Developer mode** → **Load unpacked** → pick `extensions/chrome-mv3/`.
-*(It pairs with the desktop app's native host, registered by the desktop installer.)*
 
 ---
 
