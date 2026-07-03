@@ -7,7 +7,7 @@
 //   - 将候选文本 + origin + event_kind 送到 background service worker,
 //     收到 Response 后按 action 执行:
 //       "allow"  → 放行
-//       "redact" → 阻断原事件,用 Response.redacted_text 替换输入框文本,重新 dispatch 同类事件
+//       "confirm_redact" → 阻断原事件,待用户确认后用 Response.redacted_text 继续
 //       "block"  → 阻断事件,短暂提示用户
 //
 // 安全契约(ADR 0009 §I-9):
@@ -27,15 +27,61 @@
 //   - primaryInput 不可定位时(heterogeneous form)仍降级 block,保留 fail-safe 语义
 //
 // 已知简化(留给 α3 / β):
-//   - α3:popup 展示最近 N 条 finding + 用户临时豁免
-//   - β:Enter submit allow 后走真实 trusted submit event(当前仍 `execCommand insertLineBreak`,
-//     R1 标为可接受 MVP 折衷,β Playwright E2E 覆盖后再换)
+//   - α3:popup 展示最近 N 条 finding
+//   - β:contenteditable Enter 提交仍缺可靠的自动续发原语;当前 confirm/allow 均 fail-closed
+//     给出显式 toast,用户确认后需手动再次触发发送
 
 (() => {
     "use strict";
 
+    if (globalThis.__vigilBrowserGuardLoaded) {
+        globalThis.__vigilBrowserGuardDisabled = false;
+        return;
+    }
+    globalThis.__vigilBrowserGuardLoaded = true;
+    globalThis.__vigilBrowserGuardDisabled = false;
+
     const ORIGIN = location.origin;
     const INPUT_DEBOUNCE_MS = 700;
+
+    function isGuardDisabled() {
+        return globalThis.__vigilBrowserGuardDisabled === true;
+    }
+
+    function disableGuard() {
+        globalThis.__vigilBrowserGuardDisabled = true;
+        closeSafePrompt();
+        closeRiskPrompt();
+        if (toastEl) toastEl.remove();
+        for (const frame of document.querySelectorAll("[data-vigil-input-ring]")) {
+            if (frame instanceof HTMLElement) clearInputVigilFrame(frame);
+        }
+    }
+
+    function enableGuard() {
+        globalThis.__vigilBrowserGuardDisabled = false;
+        for (const el of document.querySelectorAll(
+            "input, textarea, [contenteditable='true'], [role='textbox']",
+        )) {
+            if (el instanceof HTMLElement && adaptTarget(el)) {
+                setInputVigilState(el, "guarded");
+            }
+        }
+    }
+
+    chrome.runtime.onMessage.addListener((msg) => {
+        if (!msg || typeof msg.type !== "string") return false;
+        if (typeof msg.origin === "string" && msg.origin !== ORIGIN) return false;
+        if (msg.type === "vigil_disable_guard") {
+            disableGuard();
+            return false;
+        }
+        if (msg.type === "vigil_enable_guard") {
+            enableGuard();
+            return false;
+        }
+        return false;
+    });
 
     // ───────────────────────── 极简通知 UI(固定在页面顶部) ─────────────────────────
 
@@ -54,9 +100,9 @@
                 right: "16px",
                 bottom: "16px",
                 zIndex: "2147483647",
-                maxWidth: "min(420px, calc(100vw - 32px))",
+                maxWidth: "min(320px, calc(100vw - 32px))",
                 padding: "10px 14px",
-                borderRadius: "6px",
+                borderRadius: "12px",
                 boxShadow: "0 12px 32px rgba(15, 23, 42, 0.28)",
                 fontFamily: "system-ui, -apple-system, sans-serif",
                 fontSize: "13px",
@@ -64,9 +110,9 @@
                 fontWeight: "600",
                 color: "#fff",
                 pointerEvents: "none",
-                transition: "opacity 0.2s, transform 0.2s",
+                transition: "opacity 0.25s ease, transform 0.25s ease",
                 opacity: "0",
-                transform: "translateY(8px)",
+                transform: "translateX(12px) translateY(8px)",
                 whiteSpace: "normal",
             });
         }
@@ -79,20 +125,293 @@
     function showToast(message, tone /* "info" | "warn" | "error" */) {
         // 懒创建;Vue / naive 那一套不可用(content script 是独立 JS world)
         if (!ensureToastMounted()) return;
-        const color =
-            tone === "error" ? "#b91c1c" : tone === "warn" ? "#b45309" : "#1e40af";
-        toastEl.style.background = color;
+        const colorMap = {
+            error: "var(--vigil-toast-bg-error)",
+            warn: "var(--vigil-toast-bg-warn)",
+            info: "var(--vigil-toast-bg-info)",
+        };
+        toastEl.style.background = colorMap[tone] || colorMap.info;
         // 用 textContent(Vue 默认插值同效),杜绝站点 HTML 注入 contaminate Vigil 提示
         toastEl.textContent = message;
         toastEl.style.opacity = "1";
-        toastEl.style.transform = "translateY(0)";
+        toastEl.style.transform = "translateX(0) translateY(0)";
         clearTimeout(showToast._t);
         showToast._t = setTimeout(() => {
             if (toastEl) {
                 toastEl.style.opacity = "0";
-                toastEl.style.transform = "translateY(8px)";
+                toastEl.style.transform = "translateX(12px) translateY(4px)";
             }
-        }, 4000);
+        }, 3500);
+    }
+
+    let riskPromptEl = null;
+    let riskPromptTarget = null;
+    let riskPromptArrowEl = null;
+    function closeRiskPrompt() {
+        if (riskPromptEl) {
+            riskPromptEl.remove();
+            riskPromptEl = null;
+        }
+        riskPromptTarget = null;
+        riskPromptArrowEl = null;
+    }
+
+    function findingLabel(finding) {
+        if (finding && typeof finding === "object" && typeof finding.label === "string") {
+            return finding.label;
+        }
+        const kind = typeof finding === "string" ? finding : finding && finding.kind;
+        const labels = {
+            openai_api_key: "OpenAI API key",
+            anthropic_api_key: "Anthropic API key",
+            google_api_key: "Google API key",
+            github_token: "GitHub token",
+            gitlab_pat: "GitLab token",
+            slack_webhook: "Slack webhook",
+            stripe_secret_key: "Stripe secret key",
+            aws_access_key_id: "AWS access key",
+            jwt: "JWT",
+            env_assignment: ".env 变量",
+            database_url: "数据库连接串",
+            pem_private_key: "私钥",
+        };
+        return labels[kind] || String(kind || "未知风险");
+    }
+
+    function primaryFindingLabel(findings) {
+        const first = findings && findings.length > 0 ? findings[0] : null;
+        return findingLabel(first || "风险内容");
+    }
+
+    function clampNumber(value, min, max) {
+        return Math.max(min, Math.min(value, max));
+    }
+
+    function positionRiskPrompt() {
+        if (!riskPromptEl) return;
+        const margin = 14;
+        const gap = 14;
+        const promptWidth = Math.min(
+            riskPromptEl.offsetWidth || 300,
+            window.innerWidth - margin * 2,
+        );
+        const promptHeight = riskPromptEl.offsetHeight || 150;
+
+        riskPromptEl.style.right = "auto";
+        riskPromptEl.style.bottom = "auto";
+
+        let left = window.innerWidth - promptWidth - margin;
+        let top = window.innerHeight - promptHeight - margin;
+        let placement = "fallback";
+
+        if (riskPromptTarget) {
+            const rect = riskPromptTarget.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+                const fitsAbove = rect.top - gap - promptHeight >= margin;
+                const fitsRight = rect.right + gap + promptWidth <= window.innerWidth - margin;
+                const fitsBelow = rect.bottom + gap + promptHeight <= window.innerHeight - margin;
+
+                // 首选：输入框右上角（右对齐，上方）
+                if (fitsAbove) {
+                    placement = "above";
+                    left = rect.right - promptWidth;
+                    top = rect.top - promptHeight - gap;
+                } else if (fitsRight) {
+                    // 上方没空间，放右侧
+                    placement = "right";
+                    left = rect.right + gap;
+                    top = rect.top;
+                } else if (fitsBelow) {
+                    // 右侧也没空间，放下方右对齐
+                    placement = "below";
+                    left = rect.right - promptWidth;
+                    top = rect.bottom + gap;
+                }
+            }
+        }
+
+        left = clampNumber(left, margin, window.innerWidth - promptWidth - margin);
+        top = clampNumber(top, margin, window.innerHeight - promptHeight - margin);
+        riskPromptEl.style.left = `${left}px`;
+        riskPromptEl.style.top = `${top}px`;
+        riskPromptEl.setAttribute("data-vigil-placement", placement);
+
+        if (riskPromptArrowEl) {
+            Object.assign(riskPromptArrowEl.style, {
+                display: placement === "fallback" ? "none" : "block",
+                left: "auto",
+                right: "auto",
+                top: "auto",
+                bottom: "auto",
+                transform: "rotate(45deg)",
+                border: "0",
+            });
+            if (placement === "right") {
+                Object.assign(riskPromptArrowEl.style, {
+                    left: "-6px",
+                    top: "calc(50% - 6px)",
+                    borderLeft: "1px solid var(--vigil-prompt-border)",
+                    borderBottom: "1px solid var(--vigil-prompt-border)",
+                });
+            } else if (placement === "above") {
+                Object.assign(riskPromptArrowEl.style, {
+                    bottom: "-6px",
+                    left: "calc(50% - 6px)",
+                    borderRight: "1px solid var(--vigil-prompt-border)",
+                    borderBottom: "1px solid var(--vigil-prompt-border)",
+                });
+            } else if (placement === "below") {
+                Object.assign(riskPromptArrowEl.style, {
+                    top: "-6px",
+                    left: "calc(50% - 6px)",
+                    borderLeft: "1px solid var(--vigil-prompt-border)",
+                    borderTop: "1px solid var(--vigil-prompt-border)",
+                });
+            }
+        }
+    }
+
+    function mountPromptBase(title, findings, anchor) {
+        closeSafePrompt();
+        closeRiskPrompt();
+        const parent = document.body || document.documentElement;
+        if (!parent) return null;
+
+        const box = document.createElement("div");
+        box.setAttribute("data-vigil-risk-prompt", "");
+        box.setAttribute("role", "dialog");
+        box.setAttribute("aria-live", "polite");
+        Object.assign(box.style, {
+            position: "fixed",
+            zIndex: "2147483647",
+            width: "min(300px, calc(100vw - 32px))",
+            padding: "14px",
+            borderRadius: "14px",
+            background: "var(--vigil-prompt-bg)",
+            color: "var(--vigil-prompt-fg)",
+            boxShadow: "var(--vigil-prompt-shadow)",
+            fontFamily: "system-ui, -apple-system, sans-serif",
+            fontSize: "13px",
+            lineHeight: "1.45",
+            border: "1px solid var(--vigil-prompt-border)",
+            boxSizing: "border-box",
+            animation: "vigil-prompt-in 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards, vigil-prompt-pulse 1.8s ease-in-out 0.3s 1",
+            transition: "opacity 0.2s ease, transform 0.2s ease",
+        });
+
+        const arrow = document.createElement("div");
+        arrow.setAttribute("data-vigil-risk-arrow", "");
+        Object.assign(arrow.style, {
+            position: "absolute",
+            width: "12px",
+            height: "12px",
+            background: "var(--vigil-prompt-bg)",
+            boxSizing: "border-box",
+        });
+        box.appendChild(arrow);
+
+        const heading = document.createElement("div");
+        heading.style.fontWeight = "750";
+        heading.style.marginBottom = "6px";
+        heading.style.fontSize = "13px";
+        heading.textContent = title;
+        box.appendChild(heading);
+
+        const body = document.createElement("div");
+        body.style.color = "var(--vigil-prompt-muted)";
+        body.textContent = "建议先脱敏再发送。";
+        box.appendChild(body);
+
+        const privacy = document.createElement("div");
+        privacy.style.marginTop = "6px";
+        privacy.style.color = "var(--vigil-prompt-muted)";
+        privacy.style.opacity = "0.7";
+        privacy.textContent = "原文未离开你的浏览器。";
+        box.appendChild(privacy);
+
+        const actions = document.createElement("div");
+        actions.style.display = "flex";
+        actions.style.gap = "8px";
+        actions.style.marginTop = "14px";
+        actions.style.justifyContent = "flex-end";
+        box.appendChild(actions);
+
+        parent.appendChild(box);
+        riskPromptEl = box;
+        riskPromptArrowEl = arrow;
+        riskPromptTarget = getInputFrameTarget(anchor) || anchor;
+        positionRiskPrompt();
+        return actions;
+    }
+
+    function promptButton(label, tone) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = label;
+        Object.assign(btn.style, {
+            border: "1px solid transparent",
+            borderRadius: "8px",
+            padding: "7px 12px",
+            cursor: "pointer",
+            fontWeight: "700",
+            fontSize: "12px",
+            transition: "background 0.15s ease, border-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease, filter 0.15s ease",
+        });
+        if (tone === "primary") {
+            Object.assign(btn.style, {
+                color: "var(--vigil-btn-primary-fg)",
+                background: "var(--vigil-btn-primary-bg)",
+                borderColor: "var(--vigil-btn-primary-border)",
+            });
+            btn.addEventListener("mouseenter", () => {
+                btn.style.filter = "brightness(1.08)";
+                btn.style.boxShadow = "0 2px 8px rgba(245, 158, 11, 0.30)";
+            });
+            btn.addEventListener("mouseleave", () => {
+                btn.style.filter = "none";
+                btn.style.boxShadow = "none";
+            });
+        } else {
+            Object.assign(btn.style, {
+                color: "var(--vigil-btn-secondary-fg)",
+                background: "var(--vigil-btn-secondary-bg)",
+                borderColor: "var(--vigil-btn-secondary-border)",
+            });
+            btn.addEventListener("mouseenter", () => {
+                btn.style.background = "rgba(255,255,255,0.95)";
+                btn.style.borderColor = "#d97706";
+            });
+            btn.addEventListener("mouseleave", () => {
+                btn.style.background = "var(--vigil-btn-secondary-bg)";
+                btn.style.borderColor = "var(--vigil-btn-secondary-border)";
+            });
+        }
+        btn.addEventListener("mousedown", () => { btn.style.transform = "scale(0.96)"; });
+        btn.addEventListener("mouseup", () => { btn.style.transform = "scale(1)"; });
+        return btn;
+    }
+
+    function showRiskPrompt(response, anchor, onRedact) {
+        const findings = response.findings || [];
+        const actions = mountPromptBase(`检测到 ${primaryFindingLabel(findings)}`, findings, anchor);
+        if (!actions) return;
+        const redactBtn = promptButton("脱敏后继续", "primary");
+        redactBtn.addEventListener("click", () => {
+            closeRiskPrompt();
+            onRedact(response.redacted_text || "");
+        });
+        const blockBtn = promptButton("阻断", "secondary");
+        blockBtn.addEventListener("click", closeRiskPrompt);
+        actions.append(redactBtn, blockBtn);
+    }
+
+    function showBlockPrompt(response, anchor) {
+        const findings = response.findings || [];
+        const actions = mountPromptBase(`已阻断 ${primaryFindingLabel(findings)}`, findings, anchor);
+        if (!actions) return;
+        const closeBtn = promptButton("关闭", "secondary");
+        closeBtn.addEventListener("click", closeRiskPrompt);
+        actions.appendChild(closeBtn);
     }
 
     let safePromptEl = null;
@@ -176,7 +495,12 @@
         if (!parent) return;
         vigilStyleEl = document.createElement("style");
         vigilStyleEl.setAttribute("data-vigil-style", "");
+        const prefersDark =
+            typeof window.matchMedia === "function" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const isDark = prefersDark ? true : false;
         vigilStyleEl.textContent = [
+            /* ring animation (existing) */
             "@property --vigil-ring-glow-alpha {",
             "  syntax: '<number>';",
             "  inherits: false;",
@@ -185,6 +509,43 @@
             "@keyframes vigil-redact-ring-breathe {",
             "  0%, 100% { --vigil-ring-glow-alpha: 0; }",
             "  50% { --vigil-ring-glow-alpha: 0.55; }",
+            "}",
+            /* toast animation */
+            "@keyframes vigil-toast-in {",
+            "  from { opacity: 0; transform: translateX(-12px) translateY(8px); }",
+            "  to   { opacity: 1; transform: translateX(0) translateY(0); }",
+            "}",
+            "@keyframes vigil-toast-out {",
+            "  from { opacity: 1; transform: translateX(0) translateY(0); }",
+            "  to   { opacity: 0; transform: translateX(-12px) translateY(4px); }",
+            "}",
+            /* prompt slide-in */
+            "@keyframes vigil-prompt-in {",
+            "  from { opacity: 0; transform: translateY(10px) scale(0.97); }",
+            "  to   { opacity: 1; transform: translateY(0) scale(1); }",
+            "}",
+            /* prompt arrow pulse for attention */
+            "@keyframes vigil-prompt-pulse {",
+            "  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.35); }",
+            "  50%  { box-shadow: 0 0 0 6px rgba(245, 158, 11, 0); }",
+            "}",
+            /* shared CSS variables */
+            ":root {",
+            "  --vigil-toast-bg-info: " + (isDark ? "#1e3a8a" : "#1e40af") + ";",
+            "  --vigil-toast-bg-warn: " + (isDark ? "#7c2d12" : "#b45309") + ";",
+            "  --vigil-toast-bg-error: " + (isDark ? "#7f1d1d" : "#b91c1c") + ";",
+            "  --vigil-prompt-bg: " + (isDark ? "#0f172a" : "#ffffff") + ";",
+            "  --vigil-prompt-fg: " + (isDark ? "#f8fafc" : "#111827") + ";",
+            "  --vigil-prompt-muted: " + (isDark ? "#94a3b8" : "#374151") + ";",
+            "  --vigil-prompt-border: " + (isDark ? "rgba(245, 158, 11, 0.45)" : "rgba(245, 158, 11, 0.30)") + ";",
+            "  --vigil-prompt-shadow: " + (isDark ? "0 20px 48px rgba(0, 0, 0, 0.50)" : "0 16px 36px rgba(15, 23, 42, 0.18)") + ";",
+            "  --vigil-btn-primary-bg: " + (isDark ? "#f59e0b" : "#f59e0b") + ";",
+            "  --vigil-btn-primary-fg: " + (isDark ? "#0f172a" : "#111827") + ";",
+            "  --vigil-btn-primary-border: " + (isDark ? "#d97706" : "#d97706") + ";",
+            "  --vigil-btn-secondary-bg: " + (isDark ? "rgba(255,255,255,0.08)" : "rgba(255,255,255,0.72)") + ";",
+            "  --vigil-btn-secondary-fg: " + (isDark ? "#e2e8f0" : "#44403c") + ";",
+            "  --vigil-btn-secondary-border: " + (isDark ? "rgba(255,255,255,0.12)" : "#d6d3d1") + ";",
+            "  --vigil-safe-bg: " + (isDark ? "rgba(245, 158, 11, 0.10)" : "rgba(255, 251, 235, 0.92)") + ";",
             "}",
         ].join("\n");
         parent.appendChild(vigilStyleEl);
@@ -322,21 +683,24 @@
             Object.assign(safePromptEl.style, {
                 position: "fixed",
                 zIndex: "2147483647",
-                maxWidth: "min(420px, calc(100vw - 32px))",
-                padding: "7px 8px",
-                borderRadius: "10px",
-                border: "1px solid rgba(245, 158, 11, 0.5)",
-                boxShadow: "0 12px 28px rgba(15, 23, 42, 0.22)",
+                maxWidth: "min(360px, calc(100vw - 32px))",
+                padding: "8px 12px",
+                borderRadius: "12px",
+                border: "1px solid var(--vigil-prompt-border)",
+                boxShadow: "var(--vigil-prompt-shadow)",
                 fontFamily: "system-ui, -apple-system, sans-serif",
                 fontSize: "12px",
-                lineHeight: "1.35",
+                lineHeight: "1.45",
                 fontWeight: "600",
                 letterSpacing: "0",
-                color: "#111827",
-                background: "rgba(255, 251, 235, 0.86)",
-                backdropFilter: "blur(8px)",
+                color: "var(--vigil-prompt-fg)",
+                background: "var(--vigil-safe-bg)",
+                backdropFilter: "blur(10px) saturate(1.6)",
+                WebkitBackdropFilter: "blur(10px) saturate(1.6)",
                 userSelect: "none",
                 pointerEvents: "auto",
+                animation: "vigil-prompt-in 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards",
+                transition: "opacity 0.2s ease, transform 0.2s ease",
             });
         }
         if (!safePromptEl.isConnected) parent.appendChild(safePromptEl);
@@ -349,18 +713,43 @@
         if (!safePromptEl || !promptTarget) return;
         const rect = promptTarget.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return;
-        const promptWidth = Math.min(safePromptEl.offsetWidth || 420, window.innerWidth - 32);
-        const promptHeight = safePromptEl.offsetHeight || 38;
-        const left = Math.max(
-            16,
-            Math.min(rect.right - promptWidth - 8, window.innerWidth - promptWidth - 16),
-        );
-        const top = Math.max(
-            16,
-            Math.min(rect.bottom - promptHeight - 8, window.innerHeight - promptHeight - 16),
-        );
+        const promptWidth = Math.min(safePromptEl.offsetWidth || 360, window.innerWidth - 32);
+        const promptHeight = safePromptEl.offsetHeight || 40;
+        const gap = 10;
+        const margin = 16;
+
+        let left;
+        let top;
+        let placement = "above";
+
+        // 首选：输入框右上角（右对齐，上方）
+        if (rect.top - gap - promptHeight >= margin) {
+            placement = "above";
+            top = rect.top - gap - promptHeight;
+            left = rect.right - promptWidth;
+        } else if (rect.right + gap + promptWidth <= window.innerWidth - margin) {
+            // 上方没空间，放右侧
+            placement = "right";
+            top = rect.top;
+            left = rect.right + gap;
+        } else if (rect.bottom + gap + promptHeight <= window.innerHeight - margin) {
+            // 右侧也没空间，放下方右对齐
+            placement = "below";
+            top = rect.bottom + gap;
+            left = rect.right - promptWidth;
+        } else {
+            // fallback：紧贴上方
+            placement = "above";
+            top = Math.max(margin, rect.top - promptHeight - 4);
+            left = rect.right - promptWidth;
+        }
+
+        left = clampNumber(left, margin, window.innerWidth - promptWidth - margin);
+        top = clampNumber(top, margin, window.innerHeight - promptHeight - margin);
+
         safePromptEl.style.left = `${left}px`;
         safePromptEl.style.top = `${top}px`;
+        safePromptEl.setAttribute("data-vigil-placement", placement);
     }
 
     function closeSafePrompt() {
@@ -441,26 +830,47 @@
         btn.type = "button";
         btn.textContent = label;
         Object.assign(btn.style, {
-            borderRadius: "7px",
-            padding: "3px 8px",
+            borderRadius: "8px",
+            padding: "4px 10px",
             font: "inherit",
             fontWeight: variant === "primary" ? "750" : "650",
-            lineHeight: "1.25",
+            lineHeight: "1.3",
             cursor: "pointer",
             whiteSpace: "nowrap",
+            transition: "background 0.15s ease, border-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease",
         });
         if (variant === "primary") {
             Object.assign(btn.style, {
-                border: "1px solid #d97706",
-                background: "#f59e0b",
-                color: "#111827",
+                border: "1px solid var(--vigil-btn-primary-border)",
+                background: "var(--vigil-btn-primary-bg)",
+                color: "var(--vigil-btn-primary-fg)",
             });
+            btn.addEventListener("mouseenter", () => {
+                btn.style.filter = "brightness(1.1)";
+                btn.style.boxShadow = "0 2px 8px rgba(245, 158, 11, 0.35)";
+            });
+            btn.addEventListener("mouseleave", () => {
+                btn.style.filter = "none";
+                btn.style.boxShadow = "none";
+            });
+            btn.addEventListener("mousedown", () => { btn.style.transform = "scale(0.96)"; });
+            btn.addEventListener("mouseup", () => { btn.style.transform = "scale(1)"; });
         } else {
             Object.assign(btn.style, {
-                border: "1px solid #d6d3d1",
-                background: "rgba(255, 255, 255, 0.72)",
-                color: "#44403c",
+                border: "1px solid var(--vigil-btn-secondary-border)",
+                background: "var(--vigil-btn-secondary-bg)",
+                color: "var(--vigil-btn-secondary-fg)",
             });
+            btn.addEventListener("mouseenter", () => {
+                btn.style.background = "rgba(255,255,255,0.95)";
+                btn.style.borderColor = "#d97706";
+            });
+            btn.addEventListener("mouseleave", () => {
+                btn.style.background = "var(--vigil-btn-secondary-bg)";
+                btn.style.borderColor = "var(--vigil-btn-secondary-border)";
+            });
+            btn.addEventListener("mousedown", () => { btn.style.transform = "scale(0.96)"; });
+            btn.addEventListener("mouseup", () => { btn.style.transform = "scale(1)"; });
         }
         return btn;
     }
@@ -469,11 +879,17 @@
         "scroll",
         () => {
             clearTimeout(promptRepositionTimer);
-            promptRepositionTimer = setTimeout(positionSafePrompt, 16);
+            promptRepositionTimer = setTimeout(() => {
+                positionSafePrompt();
+                positionRiskPrompt();
+            }, 16);
         },
         true,
     );
-    window.addEventListener("resize", positionSafePrompt);
+    window.addEventListener("resize", () => {
+        positionSafePrompt();
+        positionRiskPrompt();
+    });
 
     // ───────────────────────── SW 请求 ─────────────────────────
 
@@ -486,6 +902,11 @@
         return new Promise((resolve) => {
             let replied = false;
             try {
+                if (isGuardDisabled()) {
+                    replied = true;
+                    resolve({ action: "allow", findings: [], _disabled: true });
+                    return;
+                }
                 // runtime 缺失守门:扩展上下文失效(reload/更新/卸载)时 chrome.runtime 可能
                 // 为 undefined。显式 fail-closed,而非依赖属性访问抛错(行为等价但更清晰)。
                 const runtime =
@@ -773,6 +1194,10 @@
     }
 
     function formatFindingLabel(kind) {
+        if (kind && typeof kind === "object" && typeof kind.label === "string") {
+            return kind.label;
+        }
+        kind = typeof kind === "string" ? kind : kind && kind.kind;
         const labels = {
             aws_access_key_id: "AWS Access Key",
             aws_access_key: "AWS Access Key",
@@ -863,6 +1288,7 @@
     }
 
     function scheduleInputCheck(target, adapter) {
+        if (isGuardDisabled()) return;
         adapter = adapter || adaptTarget(target);
         if (!adapter || !(target instanceof Element)) return;
         if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
@@ -888,6 +1314,7 @@
             lastWritten: prev.lastWritten,
         };
         next.timer = setTimeout(async () => {
+            if (isGuardDisabled()) return;
             const current = inputChecks.get(target);
             if (!current || current.seq !== next.seq) return;
             const ad = adaptTarget(target);
@@ -907,34 +1334,27 @@
                 if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
                 return;
             }
-            if (resp.action === "redact" && typeof resp.redacted_text === "string") {
+            if (
+                resp.action === "confirm_redact" &&
+                typeof resp.redacted_text === "string"
+            ) {
                 const safeText = toDisplayRedactedText(resp.redacted_text);
-                showSafeVersionPrompt({
-                    target,
-                    findings: resp.findings,
-                    onUse: () => {
-                        const currentAdapter = adaptTarget(target);
-                        if (!currentAdapter) return;
-                        if (currentAdapter.getText() !== latestAgain) {
-                            showToast("Vigils: 输入内容已变化,请重新触发安全检查。", "warn");
-                            return;
-                        }
-                        // 经 writeFieldByExtension 登记 lastWritten,随后的自写 input 事件
-                        // 按精确匹配跳过,保留 master 的防绕过语义。
-                        writeFieldByExtension(target, currentAdapter, safeText);
-                        showToast("Vigils 已使用安全版本替换输入内容。", "info");
-                    },
-                    onCancel: () => {
-                        showToast("Vigils 已取消本次安全替换。", "info");
-                    },
+                showRiskPrompt(resp, target, () => {
+                    const currentAdapter = adaptTarget(target);
+                    if (!currentAdapter) return;
+                    if (currentAdapter.getText() !== latestAgain) {
+                        showToast("Vigils: 输入内容已变化,请重新触发安全检查。", "warn");
+                        return;
+                    }
+                    writeFieldByExtension(target, currentAdapter, safeText);
+                    showToast("Vigils: 已脱敏后写入", "info");
                 });
                 return;
             }
 
             writeFieldByExtension(target, latestAdapter, "");
             if (target instanceof HTMLElement) setInputVigilState(target, "block");
-            const reason = resp._error || (resp.findings || []).join(", ") || "block";
-            showToast(`Vigils: 输入内容被阻断(${reason})`, "error");
+            showBlockPrompt(resp, target);
         }, INPUT_DEBOUNCE_MS);
         inputChecks.set(target, next);
     }
@@ -942,6 +1362,7 @@
     document.addEventListener(
         "input",
         (ev) => {
+            if (isGuardDisabled()) return;
             try {
                 const adapted = adaptEventTarget(ev);
                 if (adapted) {
@@ -960,6 +1381,7 @@
     document.addEventListener(
         "focusin",
         (ev) => {
+            if (isGuardDisabled()) return;
             const adapted = adaptEventTarget(ev);
             if (adapted && adapted.target instanceof HTMLElement) {
                 setInputVigilState(adapted.target, "guarded");
@@ -973,6 +1395,7 @@
     document.addEventListener(
         "paste",
         async (ev) => {
+            if (isGuardDisabled()) return;
             const adapted = adaptEventTarget(ev);
             if (!adapted) return; // 非文本输入,放行
             const { target, adapter } = adapted;
@@ -1019,35 +1442,29 @@
                 if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
                 return;
             }
-            if (resp.action === "redact" && typeof resp.redacted_text === "string") {
-                const safeText = toDisplayRedactedText(resp.redacted_text);
-                showSafeVersionPrompt({
-                    target,
-                    findings: resp.findings,
-                    onUse: () => {
-                        const currentAdapter = adaptTarget(target);
-                        if (!currentAdapter) return;
-                        if (
-                            pasteSnapshot &&
-                            currentAdapter.getText() !== pasteSnapshot.text
-                        ) {
-                            showToast("Vigils: 输入内容已变化,请重新粘贴安全版本。", "warn");
-                            return;
-                        }
-                        // 在快照位置插入显示归一后的脱敏文本(不抹掉框内既有内容)
-                        insertAtPasteSnapshot(target, currentAdapter, safeText, pasteSnapshot);
-                        showToast("Vigils 已插入安全版本。", "info");
-                    },
-                    onCancel: () => {
-                        showToast("Vigils 已取消本次粘贴。", "info");
-                    },
+            if (
+                resp.action === "confirm_redact" &&
+                typeof resp.redacted_text === "string"
+            ) {
+                showRiskPrompt(resp, target, (redactedText) => {
+                    const currentAdapter = adaptTarget(target);
+                    if (!currentAdapter) return;
+                    if (pasteSnapshot && currentAdapter.getText() !== pasteSnapshot.text) {
+                        showToast("Vigils: 输入内容已变化,请重新粘贴安全版本。", "warn");
+                        return;
+                    }
+                    insertAtPasteSnapshot(
+                        target,
+                        currentAdapter,
+                        toDisplayRedactedText(redactedText),
+                        pasteSnapshot,
+                    );
+                    showToast("Vigils: 已脱敏后写入", "info");
                 });
                 return;
             }
-            // block / 未知 action / 协议错误 —— fail-closed
             if (target instanceof HTMLElement) setInputVigilState(target, "block");
-            const reason = resp._error || (resp.findings || []).join(", ") || "block";
-            showToast(`Vigils: 粘贴被阻断(${reason})`, "error");
+            showBlockPrompt(resp, target);
         },
         true, // 捕获阶段,抢先拿到 event
     );
@@ -1113,9 +1530,28 @@
     //     其他站点 listener 正常参与。本 listener 检查 allow-once 即短路
     const allowedOnce = new WeakSet();
 
+    function continueSubmit(form, submitter) {
+        allowedOnce.add(form);
+        if (typeof form.requestSubmit === "function") {
+            form.requestSubmit(submitter);
+        } else {
+            form.submit();
+        }
+    }
+
+    function continueContenteditableSubmit(target, message) {
+        if (target instanceof HTMLElement) setInputVigilState(target, "block");
+        showToast(
+            message ||
+                "Vigils: 当前页面无法自动继续发送，请确认内容后手动再次发送。",
+            "warn",
+        );
+    }
+
     document.addEventListener(
         "submit",
         async (ev) => {
+            if (isGuardDisabled()) return;
             const form = ev.target;
             if (!(form instanceof HTMLFormElement)) return;
             // allow-once 短路(R1 MUST-FIX 1)
@@ -1133,61 +1569,45 @@
             const resp = await callBackground("submit", text);
             if (resp.action === "allow") {
                 // 允许 —— 标 allow-once 并重新触发,保留站点 validation + 其他 listener
-                allowedOnce.add(form);
-                if (typeof form.requestSubmit === "function") {
-                    form.requestSubmit(submitter);
-                } else {
-                    // 极旧浏览器 fallback(MV3 要求 Chrome 120+,requestSubmit 一定有)
-                    form.submit();
-                }
+                continueSubmit(form, submitter);
                 return;
             }
-            if (resp.action === "redact" && typeof resp.redacted_text === "string") {
-                // α2:form-level redact 真写 —— 仅在 primaryInput 明确定位时执行,
-                // primaryInput=null(heterogeneous form)仍降级 block + 提示,保留 fail-safe
+            if (
+                resp.action === "confirm_redact" &&
+                typeof resp.redacted_text === "string"
+            ) {
                 if (primaryInput) {
                     const ad = adaptTarget(primaryInput);
-                    if (ad) {
-                        const safeText = toDisplayRedactedText(resp.redacted_text);
-                        const originalText = ad.getText();
-                        const site = getSiteAdapter();
-                        const siteLabel = site ? `[${site.label}] ` : "";
-                        showSafeVersionPrompt({
-                            target: primaryInput,
-                            findings: resp.findings,
-                            onUse: () => {
-                                const currentAdapter = adaptTarget(primaryInput);
-                                if (!currentAdapter) return;
-                                if (currentAdapter.getText() !== originalText) {
-                                    showToast(
-                                        "Vigils: 提交内容已变化,请重新触发安全检查。",
-                                        "warn",
-                                    );
-                                    return;
-                                }
-                                writeFieldByExtension(primaryInput, currentAdapter, safeText);
+                    const originalText = ad ? ad.getText() : "";
+                    showRiskPrompt(resp, primaryInput, (redactedText) => {
+                        if (primaryInput) {
+                            const currentAdapter = adaptTarget(primaryInput);
+                            if (!currentAdapter) return;
+                            if (currentAdapter.getText() !== originalText) {
                                 showToast(
-                                    `Vigils 已为${siteLabel || "当前输入"}应用安全版本，请确认后再提交。`,
-                                    "info",
+                                    "Vigils: 提交内容已变化,请重新触发安全检查。",
+                                    "warn",
                                 );
-                            },
-                            onCancel: () => {
-                                showToast("Vigils 已取消本次提交。", "info");
-                            },
-                        });
-                        return;
-                    }
+                                return;
+                            }
+                            writeFieldByExtension(
+                                primaryInput,
+                                currentAdapter,
+                                toDisplayRedactedText(redactedText),
+                            );
+                            continueSubmit(form, submitter);
+                            showToast("Vigils: 已脱敏后写入", "info");
+                        } else {
+                            showToast("Vigils: 无法定位输入框，已阻断", "error");
+                        }
+                    });
+                    return;
                 }
-                // primaryInput 不可用 → 降级 block
-                showToast(
-                    `Vigils 检测到 ${formatFindingList(resp.findings)}，但无法定位具体输入框完成脱敏。请手工清理后再提交。`,
-                    "warn",
-                );
+                showToast("Vigils: 无法定位输入框，已阻断", "error");
                 return;
             }
-            const reason = resp._error || (resp.findings || []).join(", ") || "block";
             if (primaryInput instanceof HTMLElement) setInputVigilState(primaryInput, "block");
-            showToast(`Vigils: 提交被阻断(${reason})`, "error");
+            showBlockPrompt(resp, primaryInput);
         },
         true,
     );
@@ -1196,6 +1616,7 @@
     document.addEventListener(
         "keydown",
         async (ev) => {
+            if (isGuardDisabled()) return;
             if (ev.key !== "Enter" || ev.shiftKey || ev.isComposing) return;
             const target = ev.target;
             if (!(target instanceof HTMLElement)) return;
@@ -1207,43 +1628,39 @@
             ev.stopPropagation();
             const resp = await callBackground("submit", text);
             if (resp.action === "allow") {
-                // 放行 —— 重新 dispatch 一个 Enter(避免触发本 listener 递归:dispatch 的事件
-                // 在 capture 阶段也会到本 handler,但 isTrusted=false,站点代码未必处理;
-                // MVP 简化:直接调用 document.execCommand("insertLineBreak") 让用户手动 submit)
-                document.execCommand("insertLineBreak");
+                continueContenteditableSubmit(
+                    target,
+                    "Vigils: 已允许本次内容，请确认内容后手动再次发送。",
+                );
                 return;
             }
-            if (resp.action === "redact" && typeof resp.redacted_text === "string") {
+            if (
+                resp.action === "confirm_redact" &&
+                typeof resp.redacted_text === "string"
+            ) {
                 const ad = adaptTarget(target);
-                if (ad) {
-                    const safeText = toDisplayRedactedText(resp.redacted_text);
-                    const originalText = ad.getText();
-                    showSafeVersionPrompt({
+                const originalText = ad ? ad.getText() : "";
+                showRiskPrompt(resp, target, (redactedText) => {
+                    const currentAdapter = adaptTarget(target);
+                    if (!currentAdapter) return;
+                    if (currentAdapter.getText() !== originalText) {
+                        showToast("Vigils: 提交内容已变化,请重新触发安全检查。", "warn");
+                        return;
+                    }
+                    writeFieldByExtension(
                         target,
-                        findings: resp.findings,
-                        onUse: () => {
-                            const currentAdapter = adaptTarget(target);
-                            if (!currentAdapter) return;
-                            if (currentAdapter.getText() !== originalText) {
-                                showToast(
-                                    "Vigils: 提交内容已变化,请重新触发安全检查。",
-                                    "warn",
-                                );
-                                return;
-                            }
-                            writeFieldByExtension(target, currentAdapter, safeText);
-                            showToast("Vigils 已应用安全版本，请确认后再提交。", "info");
-                        },
-                        onCancel: () => {
-                            showToast("Vigils 已取消本次提交。", "info");
-                        },
-                    });
-                }
+                        currentAdapter,
+                        toDisplayRedactedText(redactedText),
+                    );
+                    continueContenteditableSubmit(
+                        target,
+                        "Vigils: 已脱敏后写入，请确认内容后手动再次发送。",
+                    );
+                });
                 return;
             }
-            const reason = resp._error || (resp.findings || []).join(", ") || "block";
             if (target instanceof HTMLElement) setInputVigilState(target, "block");
-            showToast(`Vigils: 提交被阻断(${reason})`, "error");
+            showBlockPrompt(resp, target);
         },
         true,
     );

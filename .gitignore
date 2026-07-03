@@ -31,6 +31,8 @@ apps/desktop/gen/
 /.spec-workflow/
 /.claude/
 /.codex-session-*/
+/.superpowers/
+/.worktrees/
 # Codex MCP 意外重定向产物(stdout JSON 流 `10`)
 /10
 # Codex review 协作 prompt(本机协作产物,引本地路径,不发布)

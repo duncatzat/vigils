@@ -10,89 +10,139 @@
 <body class="options-body">
   <header>
     <h1>Vigils 选项</h1>
-    <span class="subtitle">配置 / 注册助手</span>
+    <span class="subtitle">推荐保护与网站权限</span>
   </header>
 
   <section class="section">
-    <h2>扩展 ID</h2>
-    <p class="desc">
-      用这个 ID 向 Native Host 注册本扩展(<code>allowed_origins</code> 白名单)。
-    </p>
-    <div class="id-row">
-      <code id="extension-id" class="id-value">—</code>
-      <button id="copy-id-btn" type="button">复制</button>
+    <h2>推荐保护</h2>
+    <div class="recommend-card">
+      <strong>普通用户推荐开启</strong>
+      <span class="mode-chip">普通模式</span>
+      <p>粘贴、输入和发送时在浏览器内检查 token、密钥和连接串；发现风险时提示脱敏或阻断。</p>
     </div>
+    <input class="hidden" type="radio" name="vigil-mode" value="consumer">
+    <input class="hidden" type="radio" name="vigil-mode" value="enterprise">
+    <p id="mode-hint" class="hint">普通保护中：检测在浏览器内完成。</p>
   </section>
 
   <section class="section">
-    <h2>Native Host 注册命令</h2>
+    <h2>已保护网站</h2>
     <p class="desc">
-      在已构建 <code>vigil-native-host</code> 二进制的机器上,**一次性**运行:
+      ChatGPT、Claude、Gemini、Perplexity 等常见 AI 网站已内置保护。你也可以添加自己的 HTTPS 网站。
     </p>
-    <pre id="install-cmd" class="install-cmd" aria-label="install command"></pre>
-    <div class="action-row">
-      <button id="copy-cmd-btn" type="button">复制命令</button>
-      <span id="copy-cmd-hint" class="copy-hint"></span>
-    </div>
-    <details class="more">
-      <summary>其它子命令</summary>
-      <ul>
-        <li><code id="uninstall-cmd"></code> —— 卸载 Host manifest / 注册表(幂等)</li>
-        <li><code id="status-cmd"></code> —— 查当前注册状态</li>
-      </ul>
-      <p class="desc">
-        完整参考:<code>vigil-native-host --help</code>
-      </p>
+    <form id="custom-site-form" class="custom-site-form">
+      <label class="visually-hidden" for="custom-site-input">目标域名</label>
+      <input
+        id="custom-site-input"
+        class="custom-site-input"
+        type="text"
+        inputmode="url"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="example.com"
+      />
+      <button id="custom-site-add-btn" type="submit">添加</button>
+    </form>
+    <p id="custom-site-hint" class="copy-hint"></p>
+    <ul id="custom-site-list" class="custom-site-list"></ul>
+    <p id="custom-site-empty" class="desc">尚未添加自定义网站。</p>
+  </section>
+
+  <section class="section">
+    <h2>隐私说明</h2>
+    <p class="desc">
+      普通保护在浏览器内完成检测；原文不会写入 storage、console 或页面全局对象。最近事件只保存风险类型、网站和处理结果等元数据。
+    </p>
+    <details id="advanced-settings" class="advanced-settings">
+      <summary>高级设置</summary>
+
+      <div class="advanced-block">
+        <h3>扩展 ID</h3>
+        <p class="desc">用于排查问题或后续企业 provider 对接时识别当前扩展实例。</p>
+        <div class="id-row">
+          <code id="extension-id" class="id-value">—</code>
+          <button id="copy-id-btn" type="button">复制</button>
+        </div>
+        <p id="extension-id-hint" class="hint"></p>
+      </div>
+
+      <div id="enterprise-section" class="advanced-block">
+        <h3>企业连接</h3>
+        <p class="desc">企业模式接口已预留，未配置 provider 时仍使用普通保护。</p>
+        <label for="enterprise-provider-type">Provider 类型</label>
+        <select id="enterprise-provider-type" disabled>
+          <option value="disabled">尚未配置</option>
+          <option value="native_host">Native Host</option>
+          <option value="localhost">Localhost Agent</option>
+          <option value="https_api">企业 HTTPS API</option>
+          <option value="wasm">浏览器内 Wasm</option>
+        </select>
+
+        <label for="enterprise-data-policy">数据策略</label>
+        <select id="enterprise-data-policy" disabled>
+          <option value="local_only">local_only：不发送原文</option>
+          <option value="metadata_only">metadata_only：只发送元数据</option>
+          <option value="raw_allowed">raw_allowed：允许发送原文</option>
+        </select>
+      </div>
+
+      <div class="advanced-block">
+        <h3>自定义风险类型</h3>
+        <p class="desc">适合内部 token 或团队约定的密钥前缀。第一版使用“前缀 + 最小长度”，避免普通用户误写复杂规则。</p>
+        <div class="custom-risk-example">
+          <div class="custom-risk-example-head">
+            <strong>案例</strong>
+            <button id="custom-risk-example-fill-btn" type="button" class="secondary-btn">使用这个案例</button>
+          </div>
+          <p>名称：公司内部 Token</p>
+          <p>前缀：<code>corp_</code>，最小长度：<code>12</code>，处理方式：建议脱敏</p>
+          <p>测试文本：<code>corp_abcdefghijklmnop</code></p>
+        </div>
+        <form id="custom-risk-form" class="custom-risk-form">
+          <label for="custom-risk-name">名称</label>
+          <input id="custom-risk-name" type="text" autocomplete="off" placeholder="公司内部 Token" maxlength="48" />
+
+          <label for="custom-risk-prefix">前缀</label>
+          <input id="custom-risk-prefix" type="text" autocomplete="off" spellcheck="false" placeholder="corp_" maxlength="64" />
+
+          <label for="custom-risk-min-length">最小长度</label>
+          <input id="custom-risk-min-length" type="number" min="6" max="256" value="24" />
+
+          <label for="custom-risk-action">处理方式</label>
+          <select id="custom-risk-action">
+            <option value="confirm_redact">建议脱敏</option>
+            <option value="block">直接阻断</option>
+          </select>
+
+          <button id="custom-risk-add-btn" type="submit">添加类型</button>
+        </form>
+        <p id="custom-risk-hint" class="copy-hint"></p>
+        <ul id="custom-risk-list" class="custom-risk-list"></ul>
+        <p id="custom-risk-empty" class="desc">尚未添加自定义风险类型。</p>
+      </div>
+
+      <div class="advanced-block">
+        <h3>权限 / 守门清单</h3>
+        <ul class="minimal-list">
+          <li><code>storage</code> —— 仅保存自定义网站、模式和 UI 设置等元数据,不保存页面原文</li>
+          <li><code>scripting</code> —— 对用户授权的自定义网站动态注入守门脚本</li>
+          <li><code>activeTab</code> —— 供 popup 读取当前页状态和打开选项页使用</li>
+          <li>host_permissions:ChatGPT / Claude / Gemini / Perplexity 及已列入 manifest 的国内 AI 站点</li>
+          <li>optional_host_permissions:用户主动添加的 HTTPS 域名</li>
+          <li>实时提示在网页输入框内显示;Options 仅用于模式和权限说明</li>
+          <li>CSP <code>script-src 'self'</code>,禁 <code>unsafe-eval</code> / 内联 script</li>
+          <li>原文永不入 chrome.storage / console.log(ADR 0009 §I-9.1)</li>
+        </ul>
+      </div>
     </details>
-  </section>
-
-  <section class="section">
-    <h2>守门档位</h2>
-    <p class="desc">
-      决定命中硬指纹后 Vigils 的行为。默认 <strong>balanced</strong>;
-      in-memory 会话级设置(浏览器重启恢复默认)。
-    </p>
-    <fieldset class="tier-fieldset" id="tier-fieldset">
-      <legend class="visually-hidden">tier</legend>
-      <label class="tier-row">
-        <input type="radio" name="tier" value="strict" />
-        <span class="tier-label">
-          <strong>strict</strong> — 公开 AI 网站;命中 secret 一律阻断
-        </span>
-      </label>
-      <label class="tier-row">
-        <input type="radio" name="tier" value="balanced" />
-        <span class="tier-label">
-          <strong>balanced</strong>(默认)— 脱敏后继续,最佳 UX
-        </span>
-      </label>
-      <label class="tier-row">
-        <input type="radio" name="tier" value="recall-first" />
-        <span class="tier-label">
-          <strong>recall-first</strong> — 企业外发 / 工单;多类 PII 命中也阻断
-        </span>
-      </label>
-    </fieldset>
-    <p id="tier-hint" class="copy-hint"></p>
-  </section>
-
-  <section class="section">
-    <h2>权限 / 守门清单</h2>
-    <ul class="minimal-list">
-      <li><code>nativeMessaging</code> —— 与本机 Host 通信(唯一运行期敏感权限)</li>
-      <li>host_permissions:ChatGPT / Claude / Gemini / Perplexity 及已列入 manifest 的国内 AI 站点</li>
-      <li>实时提示在网页输入框内显示;Options 仅用于安装、档位和权限说明</li>
-      <li>CSP <code>script-src 'self'</code>,禁 <code>unsafe-eval</code> / 内联 script</li>
-      <li>原文永不写入 chrome.storage,也不打印到 console.log</li>
-    </ul>
   </section>
 
   <footer>
     <small>
-      源码 + 协议契约见 <code>crates/vigil-browser</code> + <code>apps/native-host</code>。
+      企业连接属于高级能力，普通用户不需要安装 Native Host 或桌面应用。
     </small>
   </footer>
 
-  <script src="options.js"></script>
+  <script type="module" src="options.js"></script>
 </body>
 </html>

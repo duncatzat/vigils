@@ -1,347 +1,296 @@
-// I09b-α3 popup:展示最近 findings(只读 in-memory 环形队列)+ 清空 + 跳转 options。
-//
-// 安全契约:
-//   - §I-9.1:findings 条目不含原文;只有 origin / event_kind / action / findings enum 列表 / ts
-//   - CSP `script-src 'self'`:所有 DOM 文本用 textContent(无 innerHTML / outerHTML),
-//     即使 origin 字段被后端污染也只作纯文本展示(XSS 安全)
-//   - 无 chrome.storage 依赖(最小权限,延续 β1 manifest 削减后的 `permissions: ["nativeMessaging"]`)
+import { normalizeCustomSiteInput } from "./custom-sites.js";
 
+// 普通用户版 popup:当前页面保护状态 + 安全事件摘要。
+// 安全契约:只展示 origin / action / finding 类型等元数据,不读取或保存页面原文。
 (() => {
     "use strict";
 
     const listEl = document.getElementById("findings-list");
-    const emptyHintEl = document.getElementById("empty-hint");
-    const countLabel = document.getElementById("count-label");
-    const refreshBtn = document.getElementById("refresh-btn");
+    const emptyStateEl = document.getElementById("empty-state");
     const clearBtn = document.getElementById("clear-btn");
     const optionsLink = document.getElementById("options-link");
-    const installHint = document.getElementById("install-hint");
-    const statusPill = document.getElementById("status-pill");
-    const statusLabel = document.getElementById("status-label");
-    // α4 exempt UI refs
-    const exemptLabel = document.getElementById("exempt-label");
-    const exemptRemaining = document.getElementById("exempt-remaining");
-    const exempt5mBtn = document.getElementById("exempt-5m-btn");
-    const exempt10mBtn = document.getElementById("exempt-10m-btn");
-    const exemptClearBtn = document.getElementById("exempt-clear-btn");
+    const headerStatus = document.getElementById("header-status");
+    const statusText = document.getElementById("status-text");
+    const statusDomain = document.getElementById("status-domain");
+    const banner = document.getElementById("banner");
+    const bannerDomain = document.getElementById("banner-domain");
+    const protectBtn = document.getElementById("protect-btn");
+    const foldHeader = document.getElementById("fold-header");
+    const foldBody = document.getElementById("fold-body");
+    const eventCount = document.getElementById("event-count");
+
+    let currentPageSite = null;
+    let lastRenderedFindings = "";
 
     function fmtTs(ts) {
         try {
             return new Date(ts).toLocaleTimeString();
         } catch {
-            return String(ts);
+            return String(ts || "");
         }
     }
 
-    /**
-     * 渲染 findings 列表。**全程使用 DOM API + textContent**,严禁 innerHTML —
-     * origin / findings enum 值来自 Rust 端,按脱敏契约应不含恶意 HTML,但扩展 popup
-     * 作为信任边界内的 UI,仍保持"所有 backend 数据纯文本插入"不变量(与 I08b UI 一致)。
-     */
+    function sendRuntimeMessage(msg) {
+        return new Promise((resolve) => {
+            chrome.runtime.sendMessage(msg, (resp) => {
+                if (chrome.runtime.lastError) {
+                    resolve({ ok: false, _error: chrome.runtime.lastError.message });
+                    return;
+                }
+                resolve(resp || {});
+            });
+        });
+    }
+
+    function queryActiveTab() {
+        return new Promise((resolve) => {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+                if (chrome.runtime.lastError) {
+                    resolve(null);
+                    return;
+                }
+                resolve(Array.isArray(tabs) && tabs.length > 0 ? tabs[0] : null);
+            });
+        });
+    }
+
+    function permissionsContains(pattern) {
+        return new Promise((resolve) => {
+            chrome.permissions.contains({ origins: [pattern] }, (allowed) => {
+                if (chrome.runtime.lastError) {
+                    resolve(false);
+                    return;
+                }
+                resolve(Boolean(allowed));
+            });
+        });
+    }
+
+    function requestOriginPermission(pattern) {
+        return new Promise((resolve) => {
+            chrome.permissions.request({ origins: [pattern] }, (granted) => {
+                if (chrome.runtime.lastError) {
+                    resolve({ granted: false, _error: chrome.runtime.lastError.message });
+                    return;
+                }
+                resolve({ granted: Boolean(granted) });
+            });
+        });
+    }
+
+    function setHeaderStatus(tone) {
+        if (!headerStatus) return;
+        headerStatus.className = "header-status";
+        if (tone === "warn") {
+            headerStatus.classList.add("warn");
+        } else if (tone === "muted") {
+            headerStatus.classList.add("muted");
+        }
+    }
+
+    function setPageStatus(title, domain, tone, canProtect) {
+        if (statusText) statusText.textContent = title;
+        if (statusDomain) statusDomain.textContent = domain ? `· ${domain}` : "";
+        setHeaderStatus(tone);
+
+        if (banner) {
+            banner.classList.toggle("hidden", !canProtect);
+            if (canProtect && bannerDomain) {
+                bannerDomain.textContent = domain || "当前网站";
+            }
+        }
+    }
+
+    function eventKindLabel(kind) {
+        const labels = {
+            paste: "粘贴时",
+            input: "输入时",
+            submit: "发送前",
+        };
+        return labels[kind] || "操作时";
+    }
+
+    function actionIconClass(action) {
+        if (action === "block") return "block";
+        if (action === "allow") return "allow";
+        return "warn";
+    }
+
+    function actionIconText(action) {
+        if (action === "block") return "✕";
+        if (action === "allow") return "✓";
+        return "⚠️";
+    }
+
+    function findingLabel(kind) {
+        const labels = {
+            openai_api_key: "OpenAI API Key",
+            anthropic_api_key: "Anthropic API Key",
+            google_api_key: "Google API Key",
+            github_token: "GitHub Token",
+            gitlab_pat: "GitLab Token",
+            slack_webhook: "Slack Webhook",
+            stripe_secret_key: "Stripe Secret Key",
+            aws_access_key_id: "AWS Access Key",
+            jwt: "JWT",
+            env_assignment: ".env 变量",
+            database_url: "数据库连接串",
+            pem_private_key: "私钥",
+        };
+        return labels[kind] || String(kind || "风险内容");
+    }
+
     function renderFindings(items) {
-        // 清空 list(textContent = "" 安全清空,replaceChildren 更现代 + 清晰)
+        const hash = JSON.stringify(items);
+        if (hash === lastRenderedFindings) return;
+        lastRenderedFindings = hash;
+
         listEl.replaceChildren();
 
         if (!Array.isArray(items) || items.length === 0) {
-            emptyHintEl.classList.remove("hidden");
+            emptyStateEl.classList.remove("hidden");
             listEl.classList.add("hidden");
-            countLabel.textContent = "0 条";
+            if (eventCount) {
+                eventCount.classList.add("hidden");
+                eventCount.textContent = "0";
+            }
             return;
         }
 
-        emptyHintEl.classList.add("hidden");
+        emptyStateEl.classList.add("hidden");
         listEl.classList.remove("hidden");
-        countLabel.textContent = `${items.length} 条`;
+        if (eventCount) {
+            eventCount.classList.remove("hidden");
+            eventCount.textContent = String(items.length);
+        }
 
         for (const it of items) {
             const li = document.createElement("li");
+            li.classList.add("event-row");
 
-            // 第一列:action tag
-            const tag = document.createElement("span");
-            tag.className = `tag tag-${it.action || "block"}`;
-            tag.textContent = (it.action || "block").toUpperCase();
-            li.appendChild(tag);
+            const iconClass = actionIconClass(it.action);
+            const iconText = actionIconText(it.action);
+            const findingNames = Array.isArray(it.findings) && it.findings.length > 0
+                ? it.findings.map(findingLabel).join("、")
+                : "风险内容";
 
-            // 第二列:meta + findings + ts
-            const col = document.createElement("div");
+            li.innerHTML = `
+                <div class="event-row-icon ${iconClass}">${iconText}</div>
+                <div class="event-row-body">
+                    <div class="title">${eventKindLabel(it.event_kind)}检测到 ${findingNames}</div>
+                    <div class="meta">${it.origin || "当前网站"} · ${fmtTs(it.ts)}</div>
+                </div>
+                <div class="event-row-arrow">›</div>
+            `;
 
-            const metaLine = document.createElement("div");
-            metaLine.className = "meta-line";
-            const ts = document.createElement("code");
-            ts.textContent = fmtTs(it.ts);
-            metaLine.appendChild(ts);
-            metaLine.append(" · ");
-            const kind = document.createElement("span");
-            kind.textContent = it.event_kind || "?";
-            metaLine.appendChild(kind);
-            metaLine.append(" · ");
-            const origin = document.createElement("code");
-            origin.textContent = it.origin || "?";
-            metaLine.appendChild(origin);
-            col.appendChild(metaLine);
-
-            if (Array.isArray(it.findings) && it.findings.length > 0) {
-                const fLine = document.createElement("div");
-                fLine.className = "findings-inline";
-                for (const f of it.findings) {
-                    const c = document.createElement("code");
-                    c.textContent = String(f);
-                    fLine.appendChild(c);
-                }
-                col.appendChild(fLine);
-            }
-
-            li.appendChild(col);
             listEl.appendChild(li);
         }
     }
 
-    function refresh() {
-        chrome.runtime.sendMessage({ type: "vigil_recent_findings" }, (resp) => {
-            if (chrome.runtime.lastError) {
-                // SW 冷启动时偶尔会 "Could not establish connection";静默,下次 refresh 再试
-                renderFindings([]);
+    async function refreshEvents() {
+        const resp = await sendRuntimeMessage({ type: "vigil_recent_findings" });
+        renderFindings((resp && resp.findings) || []);
+    }
+
+    async function refreshModeLabel() {
+        const resp = await sendRuntimeMessage({ type: "vigil_get_mode" });
+        const mode = resp && resp.mode === "enterprise" ? "enterprise" : "consumer";
+        if (mode === "enterprise") {
+            if (statusText) statusText.textContent = "企业保护";
+            setHeaderStatus("ok");
+        }
+    }
+
+    async function refreshCurrentPage() {
+        const tab = await queryActiveTab();
+        const url = tab && typeof tab.url === "string" ? tab.url : "";
+        let parsed = null;
+        try {
+            parsed = new URL(url);
+        } catch {
+            parsed = null;
+        }
+
+        if (!parsed || !["http:", "https:"].includes(parsed.protocol)) {
+            currentPageSite = null;
+            setPageStatus("未保护", "", "muted", false);
+            return;
+        }
+
+        currentPageSite = normalizeCustomSiteInput(parsed.hostname);
+        const pattern = currentPageSite && currentPageSite.ok
+            ? currentPageSite.pattern
+            : `${parsed.origin}/*`;
+        const allowed = await permissionsContains(pattern);
+        if (allowed) {
+            setPageStatus("保护中", parsed.hostname, "ok", false);
+            return;
+        }
+
+        setPageStatus(
+            "待授权",
+            parsed.hostname,
+            "warn",
+            Boolean(currentPageSite && currentPageSite.ok),
+        );
+    }
+
+    async function protectCurrentSite() {
+        if (!currentPageSite || !currentPageSite.ok) return;
+        protectBtn.disabled = true;
+        try {
+            const permission = await requestOriginPermission(currentPageSite.pattern);
+            if (!permission.granted) {
+                setPageStatus("待授权", currentPageSite.host, "warn", true);
                 return;
             }
-            renderFindings((resp && resp.findings) || []);
+            const added = await sendRuntimeMessage({
+                type: "vigil_add_custom_site",
+                site: currentPageSite,
+            });
+            if (!added || !added.ok) {
+                setPageStatus("待授权", "保存保护网站失败", "warn", true);
+                return;
+            }
+            setPageStatus("保护中", currentPageSite.host, "ok", false);
+        } finally {
+            protectBtn.disabled = false;
+        }
+    }
+
+    clearBtn.addEventListener("click", () => {
+        chrome.runtime.sendMessage({ type: "vigil_clear_findings" }, () => {
+            lastRenderedFindings = "";
+            refreshEvents();
+        });
+    });
+
+    // 折叠事件列表
+    if (foldHeader) {
+        foldHeader.addEventListener("click", () => {
+            foldHeader.classList.toggle("open");
+            foldBody.classList.toggle("open");
         });
     }
 
-    // 事件绑定:addEventListener 非 inline onclick(CSP `script-src 'self'` 下 inline
-    // handler 也会被拒;addEventListener 总是 self-hosted 安全)
-    clearBtn.addEventListener("click", () => {
-        chrome.runtime.sendMessage({ type: "vigil_clear_findings" }, () => {
-            // chrome.runtime.lastError 忽略,后续 refresh 自然反映空状态
-            refresh();
-        });
-    });
-
-    refreshBtn.addEventListener("click", () => {
-        refresh();
-        refreshExempt();
-        refreshTier();
-    });
+    protectBtn.addEventListener("click", protectCurrentSite);
 
     optionsLink.addEventListener("click", (ev) => {
         ev.preventDefault();
-        // MV3 正确姿势:chrome.runtime.openOptionsPage() 处理 pop-up / tab 两种场景
         if (chrome.runtime.openOptionsPage) {
             chrome.runtime.openOptionsPage();
         }
     });
 
-    installHint.addEventListener("click", (ev) => {
-        ev.preventDefault();
-        if (chrome.runtime.openOptionsPage) {
-            chrome.runtime.openOptionsPage();
-        }
-    });
-
-    // ═══════════════════ α4 session-scoped 豁免 ═══════════════════
-    //
-    // popup 负责 UI,SW 持豁免 Map(tab_id + origin → until ms epoch)。
-    // popup 打开时查 active tab,把 {tab_id, origin} 作为对 SW 所有 exempt 消息的必填参数。
-    //
-    // 安全约束(与 SW 端对齐):
-    //   - activeTab 权限:chrome.tabs.query({active, currentWindow}) 返当前激活 tab 的 url + id
-    //   - 非 http(s) origin(chrome://, file://)不允许豁免(Host 本来就拒,无谓制造豁免项)
-    //   - 按钮文案明示 5m / 10m(SW 端硬上限 10m),避免用户误点长时间失守
-
-    /** @type {{ tabId: number, origin: string } | null} 当前激活 tab,null 代表不可豁免 */
-    let currentTab = null;
-
-    function setHeaderStatus(label, tone) {
-        if (!statusPill || !statusLabel) return;
-        statusLabel.textContent = label;
-        statusPill.classList.toggle("status-pill-warn", tone === "warn");
-        statusPill.classList.toggle("status-pill-muted", tone === "muted");
-    }
-
-    /** 定位当前 tab + origin;非 http(s) 视为不可豁免(返 null)。 */
-    async function loadCurrentTab() {
-        try {
-            const tabs = await chrome.tabs.query({
-                active: true,
-                currentWindow: true,
-            });
-            const tab = tabs && tabs[0];
-            if (!tab || typeof tab.id !== "number" || !tab.url) return null;
-            let origin;
-            try {
-                origin = new URL(tab.url).origin;
-            } catch {
-                return null;
-            }
-            if (!origin.startsWith("https://") && !origin.startsWith("http://")) {
-                return null;
-            }
-            return { tabId: tab.id, origin };
-        } catch {
-            return null;
-        }
-    }
-
-    /** 查 SW 豁免状态 + 渲染 UI。 */
-    function refreshExempt() {
-        if (!currentTab) {
-            setHeaderStatus("不支持", "muted");
-            exemptLabel.textContent = "当前页不支持豁免(非 http/https)";
-            exemptLabel.classList.remove("exempt-active");
-            exemptRemaining.textContent = "";
-            exempt5mBtn.disabled = true;
-            exempt10mBtn.disabled = true;
-            exemptClearBtn.classList.add("hidden");
-            return;
-        }
-        chrome.runtime.sendMessage(
-            {
-                type: "vigil_get_exempt",
-                tab_id: currentTab.tabId,
-                origin: currentTab.origin,
-            },
-            (resp) => {
-                if (chrome.runtime.lastError) {
-                    // SW 冷启动或短暂不可达;保持上一次渲染状态
-                    return;
-                }
-                if (resp && resp.exempt) {
-                    setHeaderStatus("已豁免", "warn");
-                    exemptLabel.textContent = "当前页已豁免";
-                    exemptLabel.classList.add("exempt-active");
-                    const remainMs = Math.max(0, resp.until - Date.now());
-                    exemptRemaining.textContent = `剩余 ${formatDuration(remainMs)}`;
-                    exempt5mBtn.disabled = true;
-                    exempt10mBtn.disabled = true;
-                    exemptClearBtn.classList.remove("hidden");
-                } else {
-                    setHeaderStatus("保护中", "ok");
-                    exemptLabel.textContent = "当前页面保护中";
-                    exemptLabel.classList.remove("exempt-active");
-                    exemptRemaining.textContent = "";
-                    exempt5mBtn.disabled = false;
-                    exempt10mBtn.disabled = false;
-                    exemptClearBtn.classList.add("hidden");
-                }
-            },
-        );
-    }
-
-    function formatDuration(ms) {
-        if (ms <= 0) return "0s";
-        const total = Math.ceil(ms / 1000);
-        const mins = Math.floor(total / 60);
-        const secs = total % 60;
-        if (mins === 0) return `${secs}s`;
-        return `${mins}m${String(secs).padStart(2, "0")}s`;
-    }
-
-    function setExempt(durationMs) {
-        if (!currentTab) return;
-        chrome.runtime.sendMessage(
-            {
-                type: "vigil_set_exempt",
-                tab_id: currentTab.tabId,
-                origin: currentTab.origin,
-                duration_ms: durationMs,
-            },
-            () => {
-                refreshExempt();
-                refresh();
-            },
-        );
-    }
-
-    exempt5mBtn.addEventListener("click", () => setExempt(5 * 60 * 1000));
-    exempt10mBtn.addEventListener("click", () => setExempt(10 * 60 * 1000));
-    exemptClearBtn.addEventListener("click", () => {
-        if (!currentTab) return;
-        chrome.runtime.sendMessage(
-            {
-                type: "vigil_clear_exempt",
-                tab_id: currentTab.tabId,
-                origin: currentTab.origin,
-            },
-            () => {
-                refreshExempt();
-                refresh();
-            },
-        );
-    });
-
-    // ISS-007:tier 快速切换;复用 options 页同一 SW 消息,不新增权限 / storage。
-    const tierButtons = Array.from(document.querySelectorAll(".tier-btn"));
-    const tierHintEl = document.getElementById("tier-hint");
-    let currentTier = null;
-    let tierSwitchPending = false;
-
-    function setTierHint(msg, tone) {
-        if (!tierHintEl) return;
-        tierHintEl.textContent = msg || "";
-        tierHintEl.classList.toggle("tier-hint-warn", tone === "warn");
-    }
-
-    function renderTier(tier) {
-        currentTier = tier || null;
-        for (const btn of tierButtons) {
-            const active = btn.dataset.tier === currentTier;
-            btn.classList.toggle("tier-btn-active", active);
-            btn.setAttribute("aria-pressed", active ? "true" : "false");
-            btn.disabled = tierSwitchPending;
-        }
-        if (currentTier) setTierHint(currentTier, "ok");
-    }
-
-    function refreshTier() {
-        if (tierSwitchPending) return;
-        chrome.runtime.sendMessage({ type: "vigil_get_tier" }, (resp) => {
-            if (chrome.runtime.lastError || !resp || !resp.tier) {
-                renderTier(null);
-                setTierHint("档位未知", "warn");
-                return;
-            }
-            renderTier(resp.tier);
-        });
-    }
-
-    for (const btn of tierButtons) {
-        btn.addEventListener("click", () => {
-            const next = btn.dataset.tier;
-            if (!next || next === currentTier) return;
-            tierSwitchPending = true;
-            for (const b of tierButtons) b.disabled = true;
-            setTierHint("切换中...");
-            chrome.runtime.sendMessage(
-                { type: "vigil_set_tier", tier: next },
-                (resp) => {
-                    tierSwitchPending = false;
-                    if (chrome.runtime.lastError || !resp || !resp.ok) {
-                        renderTier(currentTier);
-                        setTierHint(
-                            `切换失败:${(resp && resp._error) || "unknown"}`,
-                            "warn",
-                        );
-                        return;
-                    }
-                    renderTier(resp.tier);
-                    refresh();
-                },
-            );
-        });
-    }
-
-    // 首次渲染:先查 active tab 再查豁免状态 + findings + tier
-    (async () => {
-        currentTab = await loadCurrentTab();
-        refreshExempt();
-        refresh();
-        refreshTier();
+    (() => {
+        setHeaderStatus("muted");
+        refreshEvents();
+        refreshCurrentPage();
+        refreshModeLabel();
     })();
 
-    // popup 是短命 document,不需要 MutationObserver;但偶尔用户让 popup 开着时
-    // 手动触发一次再渲染无害 —— 2s 一次轻量 refresh(同步 findings + exempt 倒计时 + tier)
     setInterval(() => {
-        refresh();
-        refreshExempt();
-        refreshTier();
+        refreshEvents();
+        refreshCurrentPage();
     }, 2000);
 })();

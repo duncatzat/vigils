@@ -3,17 +3,21 @@
   "name": "Vigils Browser Guard",
   "short_name": "Vigils",
   "version": "0.1.10",
-  "description": "Vigils 浏览器守门:对你粘贴 / 输入 / 提交进 AI 网站的文本做密钥与 PII 硬指纹检测,经本机 Native Host(com.vigil.host)原地脱敏。原文仅在 Host 内存停留,分类完立即 drop。",
+  "description": "Vigils 浏览器守门:普通模式在浏览器内检测你粘贴 / 输入 / 提交进 AI 网站的密钥、token 和连接串,命中后提示脱敏或阻断。",
+  "minimum_chrome_version": "120",
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
-  "minimum_chrome_version": "120",
   "permissions": [
-    "nativeMessaging",
-    "activeTab"
+    "activeTab",
+    "storage",
+    "scripting"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",
@@ -72,7 +76,8 @@
     "default_icon": {
       "16": "icons/icon-16.png",
       "32": "icons/icon-32.png",
-      "48": "icons/icon-48.png"
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
     }
   },
   "options_ui": {

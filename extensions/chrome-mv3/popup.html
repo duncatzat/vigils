@@ -4,73 +4,62 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Vigils</title>
-  <!--
-    I09b-α3 popup:展示最近 findings(origin / event_kind / action / findings)。
-    不拉原文(ADR §I-9.1),数据 in-memory 只活 SW 生命周期内。
-    CSP `script-src 'self'` 严格;所有 JS 在外链 popup.js,无 inline script。
-  -->
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
   <header>
-    <div>
-      <h1>Vigils</h1>
-      <span class="subtitle">paste/input/submit 保护</span>
+    <div class="header-left">
+      <div class="header-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      </div>
+      <div class="header-title">Vigils</div>
     </div>
-    <span id="status-pill" class="status-pill" aria-label="保护状态">
-      <span class="status-dot"></span>
-      <span id="status-label">保护中</span>
-    </span>
+    <div id="header-status" class="header-status"></div>
   </header>
 
-  <section class="actions">
-    <div class="actions-main">
-      <div class="count-block">
-        <span class="count-title">最近记录</span>
-        <span id="count-label" class="count-label">0 条</span>
-      </div>
-      <button id="refresh-btn" type="button" title="刷新最近记录和当前状态">刷新</button>
-      <button id="clear-btn" type="button" title="清空 in-memory 最近记录">清空</button>
-      <a id="options-link" href="#" title="打开扩展选项页">选项</a>
-    </div>
-    <div class="tier-switch" aria-label="保护档位">
-      <div class="tier-buttons" role="group" aria-label="快速切换保护档位">
-        <button type="button" class="tier-btn" data-tier="strict">strict</button>
-        <button type="button" class="tier-btn" data-tier="balanced">balanced</button>
-        <button type="button" class="tier-btn" data-tier="recall-first">recall-first</button>
-      </div>
-      <span id="tier-hint" class="tier-hint" aria-live="polite"></span>
-    </div>
-  </section>
+  <div id="status-bar" class="status-bar">
+    <strong id="status-text">检查中</strong>
+    <span class="dot">·</span>
+    <span id="status-domain">当前页面</span>
+  </div>
 
-  <!-- α4 session-scoped 豁免(仅当前 tab + origin);用户主动放行的逃生阀 -->
-  <section class="exempt-section">
-    <div id="exempt-status" class="exempt-status">
-      <span id="exempt-label">当前页面保护中</span>
-      <span id="exempt-remaining" class="exempt-remaining"></span>
+  <div id="banner" class="banner hidden">
+    <span class="banner-icon">🔒</span>
+    <div class="banner-text">
+      <strong id="banner-domain">example.com</strong>
+      <span>未受保护，授权后自动检测敏感内容</span>
     </div>
-    <div class="exempt-actions">
-      <button id="exempt-5m-btn" type="button" title="豁免当前页 5 分钟">豁免 5m</button>
-      <button id="exempt-10m-btn" type="button" title="豁免当前页 10 分钟(上限)">豁免 10m</button>
-      <button id="exempt-clear-btn" type="button" class="hidden" title="立即结束豁免">结束豁免</button>
-    </div>
-  </section>
+    <button id="protect-btn" type="button" class="banner-btn">授权</button>
+  </div>
 
-  <section id="findings-section" aria-live="polite">
-    <div id="empty-hint" class="empty-hint">
-      尚无记录 —— 触发 paste 或 submit 后即可看到。
-      若所有记录都是 <code>block</code> 且错误含 <code>host_disconnected</code>,请先
-      <a id="install-hint" href="#">注册 Native Host</a>。
+  <div class="divider" id="divider"></div>
+
+  <div id="findings-section">
+    <div id="fold-header" class="fold-header">
+      <div class="fold-header-left">
+        <span class="fold-label">事件列表</span>
+        <span id="event-count" class="badge hidden">0</span>
+      </div>
+      <svg id="fold-chevron" class="chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6l4 4 4-4"/></svg>
     </div>
-    <ul id="findings-list" class="findings-list hidden" role="list"></ul>
-  </section>
+    <div id="fold-body" class="fold-body">
+      <ul id="findings-list" class="event-list hidden" role="list"></ul>
+      <div id="empty-state" class="empty-state">
+        <div class="empty-state-icon">✅</div>
+        <div class="empty-state-title">一切正常</div>
+        <div class="empty-state-desc">暂无检测到敏感内容</div>
+      </div>
+      <div class="clear-btn">
+        <button id="clear-btn" type="button" class="clear-btn-inner">清空</button>
+      </div>
+    </div>
+  </div>
 
   <footer>
-    <small>
-      原文仅在本机 Native Host 内存停留,分类完立即丢弃,绝不落盘。
-    </small>
+    <a id="options-link" href="#">设置</a>
+    <span class="privacy">本地检测</span>
   </footer>
 
-  <script src="popup.js"></script>
+  <script type="module" src="popup.js"></script>
 </body>
 </html>

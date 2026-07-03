@@ -1,47 +1,197 @@
-# chrome-mv3 — Vigils Browser Guard Extension
+# Vigils Browser Guard
 
-Chrome MV3 扩展,I09b-α1 提供 paste / input / submit 守门 + 与本机 Native Host(`com.vigil.host`)通信。
+[English](README.md) | [中文](README.zh-CN.md)
 
-## 当前范围(I09b-α1)
+## Overview
 
-- ✅ `manifest.json`:真实 MV3 配置(name / version 0.1.10 / host_permissions / content_scripts / CSP);permissions 最小化为 `nativeMessaging` + `activeTab`
-- ✅ `background.js`:service worker,`chrome.runtime.connectNative` 长连接 + pending-request map + UUIDv4 `request_id` + 10s TTL;ErrorFrame 按 error 字段优先分流(含 Rust 侧 Option request_id 场景):有 request_id 精准路由 block,无 request_id 立即 **全 pending fail-closed block**(R1 MUST-FIX 2)
-- ✅ `content-script.js`:paste + 防抖 input + submit + contenteditable Enter 路径 + 简易 `textContent` toast;submit allow 走 `form.requestSubmit(submitter)` + `WeakSet` allow-once(R1 MUST-FIX 1 保留 HTML validation + 其他 submit listener 参与)
-  - **覆盖模型**:manifest 注入的**所有** host 都受**通用** paste/input/keydown 守门保护(与站点无关,主保护层)。content script 以 `all_frames: true` 注入匹配站点 iframe。**深选择器**(`siteAdapters.findPrimaryInput`,form-submit 主输入精确定位)目前覆盖 ChatGPT / Claude / Gemini / Perplexity 4 站;国内 AI 站点(DeepSeek / 豆包 / Kimi / 通义 / 千问 / 智谱 / 元宝 / 文心 / 星火)**仅靠通用守门**,深选择器待真站点 DOM 核验后补(无 adapter 时降级 form 聚合 / fail-safe block,绝不外发原文)
-- ✅ 协议严格对齐 `crates/vigil-browser/src/protocol.rs`(`BrowserCheckRequest` / `BrowserCheckResponse` / `BrowserErrorFrame`)
+Vigils Browser Guard is a Chrome MV3 extension that checks sensitive content when you paste, type, or submit it to AI websites.
 
-## Native Host 注册
+In the default consumer mode, it does not require a Native Host, desktop app, or terminal setup. Detection runs inside the browser. When Vigils finds risky content, it prompts you to either continue with a redacted version or block the action.
 
-Native messaging host 必须注册到 Chrome 指定目录(OS 特定):
+## Highlights
 
-- **Windows**:注册表 `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.vigil.host` 指向 host manifest json 的绝对路径
-- **macOS**:`~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.vigil.host.json`
-- **Linux**:`~/.config/google-chrome/NativeMessagingHosts/com.vigil.host.json`
+- **Built for everyday users**: Install the extension and start using it without setting up a local service.
+- **Browser-local scanning**: Uses lightweight JavaScript rules to detect common secrets and tokens.
+- **Paste and submit guardrails**: Covers paste, debounced input, submit, and common contenteditable Enter flows.
+- **Contextual page prompt**: Risk prompts appear near the active input instead of being hidden in a page corner.
+- **One-click site protection**: The popup shows the current page status and lets you add custom HTTPS sites.
+- **Safe event history**: The popup shows only risk type, website, and action metadata. It does not store original text.
+- **Enterprise-ready interface**: Future enterprise providers can use Native Host, localhost agent, HTTPS API, or Wasm.
 
-Host manifest 需包含 `allowed_origins`(扩展 ID `chrome-extension://<id>/`)以授权此扩展连接。具体注册脚本延 β(需要知道打包后的扩展 ID)。
+## Use Cases
 
-## 安全契约(ADR 0009 §I-9)
+Vigils is useful when you often paste code, config, logs, or environment variables into AI tools:
 
-本目录遵守以下不变量:
+- Avoid accidentally sending GitHub Tokens, OpenAI API Keys, or database URLs to ChatGPT, Claude, Gemini, Perplexity, and similar tools.
+- Detect sensitive values before pasting `.env` files, logs, or config snippets.
+- Get low-friction protection with local scanning and explicit confirmation.
 
-- **§I-9.1 text in-memory only**:原文经 `chrome.runtime.sendMessage` → service worker → Native Host,中间**不写** `chrome.storage` / `console.log` / `window.*`
-- **§I-9.3 特权 scheme fail-closed**:`file://` / `chrome://` / `chrome-extension://` / `devtools://` / `about://` 由 Native Host 拒;service worker 层对非 http(s) origin 做同等早退(`origin_denied_sw` reason code)
-- **§I-9.5 1 MB 帧上限**:Native Host 层规范化拒绝;service worker 做 32 MB 字符早退兜底(`too_large_sw` reason code)
-- **§D6 三态执行**:service worker 按 Response.action ∈ {allow, redact, block} 原样转发;非法 action / 协议错误帧 → fail-closed `block`
-- **toast 不 HTML 注入**:`textContent` 赋值,拒绝 `innerHTML`(content-script.js)
-- **纯 vanilla JS**:无外部 npm 依赖,零构建步骤,manifest 声明的文件可直接 "load unpacked" 加载
+## Supported Websites
 
-## 后续规划
+The extension is injected into these sites by default:
 
-- **α2**:按站点深度选择器(ChatGPT `#prompt-textarea` / Claude contenteditable / etc.)的精确 adapter,替代通用 textarea 降级
-- **α3**:popup UI 展示最近 N 条 finding + 用户临时豁免(session-scoped allow)
-- **β**:E2E(Playwright + headed Chrome + 构造含 hard-secret 的 paste),三平台打包,Host manifest 注册脚本
-- **后续迭代**:options page / 用户自定义 host 白名单 / i18n
+- ChatGPT
+- Claude
+- Gemini
+- Perplexity
+- DeepSeek
+- Doubao
+- Kimi
+- Tongyi / Qianwen
+- Zhipu
+- Tencent Yuanbao
+- Wenxin Yiyan
+- iFlytek Spark
 
-## 本地加载(开发)
+You can also add other HTTPS websites in the extension options. Vigils will request permission for that site and dynamically inject the generic guard script.
 
-1. Chrome `chrome://extensions/` → 打开 Developer mode
-2. Load unpacked → 选 `extensions/chrome-mv3/`
-3. 访问任一受支持站点(ChatGPT / Claude / Gemini / Perplexity / DeepSeek / 豆包 / Kimi / 通义 / 千问 / 智谱 / 元宝 / 文心 / 星火),touch paste / input / submit → 若 Native Host 未注册,应看到 "Vigils: 粘贴被阻断(host_disconnected)" 或输入/提交阻断提示(fail-closed)
+## Detectable Risk Types
 
-Native Host 注册脚本未在 α1 范围,用户需按上文手工注册,或等 β 提供注册 CLI。
+Consumer mode currently detects and redacts:
+
+- OpenAI API Key
+- Anthropic API Key
+- Google API Key
+- GitHub Token
+- GitLab Personal Access Token
+- Slack Webhook
+- Stripe Secret Key
+- AWS Access Key ID
+- JWT
+- Database URL
+- `.env`-style assignment
+- PEM private key
+- Custom prefix-based risk rules configured in Advanced settings
+
+Most tokens and connection strings trigger a "continue with redaction" prompt. High-risk content such as PEM private keys is blocked directly.
+
+Paste and submit checks run before the original content is inserted or sent. Manual input checks run after a short debounce and are a best-effort cleanup layer; pages that read typed text immediately can still observe it before the debounce finishes.
+
+## Privacy and Security Promises
+
+Consumer mode follows these rules:
+
+- Original text is not written to `chrome.storage`
+- Original text is not written to `console.log`
+- Original text is not attached to `window.*` or other page globals
+- Popup event history stores only metadata such as risk type, website, time, and action
+- Page prompts are rendered with DOM APIs and `textContent`, not `innerHTML`
+- Unknown or invalid decisions fail closed and are blocked by default
+
+Enterprise mode is a reserved capability, not the default path for everyday users. Native Host is only one possible future enterprise provider implementation.
+
+## Install and Try
+
+The current version is intended for development-mode loading:
+
+1. Open Chrome `chrome://extensions/`
+2. Enable Developer mode
+3. Click Load unpacked
+4. Select this directory: `extensions/chrome-mv3/`
+5. Open a protected AI website
+6. Paste a test token, for example:
+
+```text
+token=ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ
+```
+
+Expected behavior:
+
+- A risk prompt appears near the input box
+- You can choose to continue with redaction or block the action
+- The redacted text no longer contains the original token
+
+## Chrome Web Store
+
+The extension is now live on the Chrome Web Store. Install directly from the store — one click, no manual loading required.
+
+## Popup
+
+The popup is designed for everyday users and focuses on:
+
+- Whether the current page is protected
+- Whether the current page needs permission
+- The "Protect current site" button
+- Recent safety events
+- First-use onboarding
+
+It does not expose Native Host, provider, or policy-tier concepts by default.
+
+## Options
+
+The options page keeps the default experience simple:
+
+- Recommended protection
+- Protected websites
+- Add custom websites
+- Privacy notes
+
+Enterprise connection, custom risk types, extension ID, and technical permission details live under Advanced settings.
+
+## Project Structure
+
+```text
+extensions/chrome-mv3/
+├── icons/
+├── manifest.json
+├── background.js
+├── content-script.js
+├── custom-sites.js
+├── popup.html
+├── popup.js
+├── popup.css
+├── options.html
+├── options.js
+├── options.css
+├── redaction-rules.js
+├── risk-decision.js
+├── scanner-pipeline.js
+├── providers/
+│   ├── consumer-js-provider.js
+│   └── enterprise-provider.js
+└── tests/
+```
+
+Core layers:
+
+- `content-script.js`: Listens to paste, debounced input, submit, and contenteditable Enter events, then shows in-page risk prompts.
+- `background.js`: Handles message routing, mode management, custom-site permissions, and safety event caching.
+- `custom-sites.js`: Normalizes user-provided HTTPS domains for optional protection.
+- `redaction-rules.js`: Browser-local detection, redaction, and custom prefix-based risk rules.
+- `risk-decision.js`: Converts scan results into `allow`, `confirm_redact`, or `block`.
+- `scanner-pipeline.js`: Combines the consumer provider and future enterprise providers.
+
+## Development and Tests
+
+Run the Chrome extension tests:
+
+```bash
+node --test extensions/chrome-mv3/tests/*.test.mjs
+```
+
+The extension has no frontend build step. It uses native MV3, HTML, CSS, and JavaScript.
+
+## Enterprise Provider Interface
+
+Everyday users do not need an enterprise provider. Enterprise mode can later integrate with:
+
+- Native Host
+- localhost agent
+- Enterprise HTTPS API
+- Browser-side Wasm
+- Other managed providers
+
+The goal is to let organizations move scanning and policy decisions into a controlled environment while preserving the zero-setup consumer experience.
+
+## Roadmap
+
+- Add more token and cloud credential types
+- Improve deep input adapters for more AI websites
+- Add fuller E2E test coverage
+- Improve safety event explanations and risk education
+- Add enterprise provider examples
+- ~~Package and publish to the Chrome Web Store~~ ✅ Done
+
+## License
+
+See the repository root license.
