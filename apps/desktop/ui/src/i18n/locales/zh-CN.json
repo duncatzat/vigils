@@ -283,6 +283,7 @@
       "subtitle": "常驻 daemon 守住已暖载的 AI 模型，让 hook 主路径零冷启动跑 ML。启动它即为你的 agent 开启 ML 防护。",
       "subtitle_no_model": "当前未安装 AI 模型：现在启动只会以无模型方式运行（hook 保持硬指纹底座）。先在上方安装 AI 模型，daemon 才能暖载 ML 防护。",
       "status_stopped": "未运行",
+      "status_warming": "启动中 · 暖载模型",
       "status_running": "运行中",
       "status_ml": "运行中 · ML 已暖",
       "start": "启动守护",

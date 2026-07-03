@@ -98,6 +98,9 @@ fn no_window(_cmd: &mut Command) {}
 fn run_cli_capture(engine: &Path, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new(engine);
     cmd.args(args);
+    // 子进程输出只供 GUI 机器解析(如 `model status` 的 "installed" 行判定)—— 钉英文,
+    // 否则 CLI 按系统语言输出中文时行匹配恒 false(locale 事故面)。用户可见文案由前端 i18n 渲染。
+    cmd.env("VIGIL_LANG", "en");
     no_window(&mut cmd);
     let out = cmd
         .output()
@@ -123,9 +126,12 @@ fn status_line_installed(out: &str, prefix: &str) -> bool {
 /// daemon 运行态(GUI 守护卡)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
-    /// daemon 是否在运行(`daemon status` 报 `running`)。
+    /// daemon 是否在运行(`daemon status --json` 的 `running`)。
     pub running: bool,
-    /// 隐私 PII 模型是否已暖载(running 时从 status 行解析;model-less daemon = false)。
+    /// start 已发出、模型暖载中(daemon.json 尚未就绪;`status --json` reason=warming)。
+    /// 暖载最长约 45s —— 前端据此显示「启动中」而非误导性的「未运行」。
+    pub warming: bool,
+    /// 隐私 PII 模型是否已暖载(model-less daemon = false)。
     pub pii_loaded: bool,
     /// 引擎二进制是否就位(false → 守护卡只读,提示先部署引擎)。
     pub engine_present: bool,
@@ -144,23 +150,25 @@ pub struct ModelStatus {
     pub engine_present: bool,
 }
 
-/// 只读:daemon 运行态。`vigil-hub daemon status` 退出码恒 0,解析 stdout 行。引擎缺失 →
-/// `running=false` + `engine_present=false`(不报错,前端优雅提示)。
+/// 只读:daemon 运行态。走 `daemon status --json` 稳定 schema(字段只增不删)—— 此前解析
+/// 英文人类行 `daemon: running (`,CLI 按系统语言输出中文时会恒判未运行(locale 事故面)。
+/// 引擎缺失 → `running=false` + `engine_present=false`(不报错,前端优雅提示)。
 pub fn daemon_status(app: &AppHandle) -> Result<DaemonStatus, String> {
     let Some(engine) = resolve_engine(app) else {
         return Ok(DaemonStatus {
             running: false,
+            warming: false,
             pii_loaded: false,
             engine_present: false,
         });
     };
-    let out = run_cli_capture(&engine, &["daemon", "status"]).unwrap_or_default();
-    // 精确匹配运行行 `daemon: running (pid=...` —— 区别于 `daemon: not running` / `not responding`。
-    let running = out.contains("daemon: running (");
-    let pii_loaded = running && out.contains("pii_loaded=true");
+    let out = run_cli_capture(&engine, &["daemon", "status", "--json"]).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+    let running = v["running"] == true;
     Ok(DaemonStatus {
         running,
-        pii_loaded,
+        warming: !running && v["reason"] == "warming",
+        pii_loaded: running && v["pii_loaded"] == true,
         engine_present: true,
     })
 }

@@ -59,6 +59,15 @@ pub fn run_start(lang: Lang) -> Result<(), String> {
         Lang::Zh => format!("绑定 socket 失败(可能已有 daemon 在运行):{e}"),
     })?;
 
+    // 暖载可长达 ORT_INIT_TIMEOUT_SECS(45s),期间 daemon.json 尚未写入,`status` 会误报
+    // 「未运行」(用户刚敲完 start 却被告知什么都没发生)。bind 成功后先落 warming 标记,
+    // daemon.json 写成后移除;`status` 据此报「启动中」。崩溃 / 超时 abort 残留的标记由
+    // status 侧按 mtime(超过 WARMING_MARKER_FRESH_SECS 视为陈旧)自愈,不进任何安全路径。
+    let warming_marker = daemon_info_path().map(warming_marker_path);
+    if let Some(m) = &warming_marker {
+        let _ = std::fs::write(m, std::process::id().to_string());
+    }
+
     // ort 暖载层(ADR 0024):**在 serve spawn 任何线程之前**(进程仍单线程)暖载 PII scanner —— 复用
     // serve 的 ort init 纪律(dylib 稳源 + loader-lock 安全超时 abort)。best-effort:模型未缓存 /
     // init 失败 → None → model-less(hook 落硬指纹,**非 fail-open**)。非 ort 构建恒 None。
@@ -110,6 +119,11 @@ pub fn run_start(lang: Lang) -> Result<(), String> {
         Lang::En => format!("failed to write daemon.json: {e}"),
         Lang::Zh => format!("写入 daemon.json 失败:{e}"),
     })?;
+    // daemon.json 已就位 → 「启动中」窗口结束,移除 warming 标记(早期 Err 返回留下的
+    // 残留由 status 侧 mtime 规则自愈,见上)。
+    if let Some(m) = &warming_marker {
+        let _ = std::fs::remove_file(m);
+    }
 
     match lang {
         Lang::En => eprintln!(
@@ -144,9 +158,19 @@ pub fn run_start(lang: Lang) -> Result<(), String> {
     Ok(())
 }
 
-/// `daemon status --json` 的三态(与人类可读输出同一判定,只换 render)。
+/// warming 标记新鲜窗口:超过此秒数的标记视为崩溃 / 超时 abort 残留,按未运行处理并清理。
+const WARMING_MARKER_FRESH_SECS: u64 = 120;
+
+/// warming 标记路径:`daemon.json` 旁的 `daemon.json.warming`(bind 成功 → 暖载完成的窗口内存在)。
+fn warming_marker_path(info_path: std::path::PathBuf) -> std::path::PathBuf {
+    info_path.with_extension("json.warming")
+}
+
+/// `daemon status --json` 的状态(与人类可读输出同一判定,只换 render)。
 enum StatusState {
     NotRunning,
+    /// start 已 bind、模型暖载中(daemon.json 尚未写入,warming 标记新鲜)。
+    Warming,
     Running {
         pid: u32,
         pii_loaded: bool,
@@ -167,6 +191,10 @@ fn status_json(state: &StatusState) -> serde_json::Value {
         StatusState::NotRunning => serde_json::json!({
             "running": false,
             "reason": "not-running",
+        }),
+        StatusState::Warming => serde_json::json!({
+            "running": false,
+            "reason": "warming",
         }),
         StatusState::Running {
             pid,
@@ -196,6 +224,34 @@ fn status_json(state: &StatusState) -> serde_json::Value {
 /// `json=true` 输出 [`status_json`] 的稳定 schema(供脚本/CI;人类文案走 i18n 会随语言变)。
 pub fn run_status(lang: Lang, json: bool) -> Result<(), String> {
     let Some(info) = daemon_info_path().and_then(|p| read_daemon_info(&p)) else {
+        // daemon.json 缺失 ≠ 一定未运行:start 已 bind、模型暖载中的窗口(最长约 45s)里
+        // 标记文件存在。新鲜 → 如实报「启动中」;陈旧(崩溃 / 超时 abort 残留)→ 清理并按未运行。
+        let marker = daemon_info_path().map(warming_marker_path);
+        let warming_fresh = marker.as_deref().is_some_and(|m| {
+            std::fs::metadata(m)
+                .and_then(|md| md.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age.as_secs() < WARMING_MARKER_FRESH_SECS)
+        });
+        if warming_fresh {
+            if json {
+                println!("{}", status_json(&StatusState::Warming));
+            } else {
+                println!(
+                    "{}",
+                    tr(
+                        lang,
+                        "daemon: starting (warming the ML models, typically a few seconds to ~1 minute) -- re-run this command to check progress",
+                        "daemon:启动中(正在暖载 ML 模型,通常几秒到约 1 分钟)—— 稍后再次运行本命令查看进展",
+                    )
+                );
+            }
+            return Ok(());
+        }
+        if let Some(m) = &marker {
+            let _ = std::fs::remove_file(m); // 陈旧残留自愈(文件不存在时删除无害)
+        }
         if json {
             println!("{}", status_json(&StatusState::NotRunning));
         } else {
@@ -203,8 +259,8 @@ pub fn run_status(lang: Lang, json: bool) -> Result<(), String> {
                 "{}",
                 tr(
                     lang,
-                    "daemon: not running (no daemon.json)",
-                    "daemon:未运行(无 daemon.json)",
+                    "daemon: not running (start it with `vigil-hub daemon start`)",
+                    "daemon:未运行(用 `vigil-hub daemon start` 启动)",
                 )
             );
         }
@@ -283,8 +339,8 @@ pub fn run_stop(lang: Lang) -> Result<(), String> {
             "{}",
             tr(
                 lang,
-                "daemon: not running (no daemon.json)",
-                "daemon:未运行(无 daemon.json)",
+                "daemon: not running; nothing to stop.",
+                "daemon:未运行,无需停止。",
             )
         );
         return Ok(());
@@ -353,7 +409,7 @@ fn kill_pid(lang: Lang, pid: u32) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_token, status_json, StatusState};
+    use super::{generate_token, status_json, warming_marker_path, StatusState};
 
     #[test]
     fn generate_token_is_32_hex_chars_and_varies() {
@@ -364,8 +420,15 @@ mod tests {
         assert_ne!(a, b, "per-launch token 应随机不同");
     }
 
-    /// `--json` 稳定 schema 三态守门:脚本/CI 断言 `"running":true|false` + 各字段名。
-    /// 字段只增不删不改名 —— 本测试即该纪律的回归锚。
+    /// warming 标记路径派生:`daemon.json` → 同目录 `daemon.json.warming`。
+    #[test]
+    fn warming_marker_path_is_sibling_of_daemon_json() {
+        let p = warming_marker_path(std::path::PathBuf::from("/x/y/daemon.json"));
+        assert_eq!(p, std::path::PathBuf::from("/x/y/daemon.json.warming"));
+    }
+
+    /// `--json` 稳定 schema 守门:脚本/CI 断言 `"running":true|false` + 各字段名。
+    /// 字段只增不删不改名 —— 本测试即该纪律的回归锚(`warming` 为新增 reason 枚举值,合规)。
     #[test]
     fn status_json_stable_schema_three_states() {
         let running = status_json(&StatusState::Running {
@@ -390,5 +453,9 @@ mod tests {
         assert_eq!(stale["running"], false);
         assert_eq!(stale["reason"], "stale-or-unresponsive");
         assert_eq!(stale["recorded_pid"], 42);
+
+        let warming = status_json(&StatusState::Warming);
+        assert_eq!(warming["running"], false);
+        assert_eq!(warming["reason"], "warming");
     }
 }

@@ -394,6 +394,15 @@ function updatePollingInterval(v: number | null): void {
               }}
             </NTag>
             <NTag
+              v-else-if="daemon?.warming"
+              size="small"
+              :bordered="false"
+              type="warning"
+              data-testid="daemon-state"
+            >
+              {{ t("settings.daemon.status_warming") }}
+            </NTag>
+            <NTag
               v-else
               size="small"
               :bordered="false"
@@ -403,7 +412,7 @@ function updatePollingInterval(v: number | null): void {
               {{ t("settings.daemon.status_stopped") }}
             </NTag>
             <NButton
-              v-if="!daemon?.running"
+              v-if="!daemon?.running && !daemon?.warming"
               size="small"
               tertiary
               :loading="busy === 'daemon:start'"

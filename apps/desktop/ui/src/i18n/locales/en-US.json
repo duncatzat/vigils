@@ -283,6 +283,7 @@
       "subtitle": "A resident daemon holds the warm AI model so the hook main path runs ML with zero cold-start. Start it to enable ML protection for your agent.",
       "subtitle_no_model": "No AI model installed yet: starting now runs model-less (the hook stays on the hard-fingerprint floor). Install the AI model above first so the daemon can warm ML protection.",
       "status_stopped": "STOPPED",
+      "status_warming": "STARTING · WARMING MODELS",
       "status_running": "RUNNING",
       "status_ml": "RUNNING · ML WARM",
       "start": "Start daemon",

@@ -526,22 +526,22 @@ pub fn run<R: Read>(args: &HookArgs, stdin: &mut R) -> HookOutcome {
     let mut limited = stdin.by_ref().take(MAX_HOOK_INPUT_BYTES + 1);
     if limited.read_to_string(&mut buf).is_err() {
         return HookOutcome::Deny(
-            "Vigil hook: could not read PreToolUse input from stdin (blocked fail-closed).".into(),
+            "Vigil hook: could not read the hook event from stdin (blocked fail-closed).".into(),
         );
     }
     if buf.len() as u64 > MAX_HOOK_INPUT_BYTES {
         return HookOutcome::Deny(
-            "Vigil hook: PreToolUse input exceeds the safe size limit (blocked fail-closed)."
-                .into(),
+            "Vigil hook: the hook event exceeds the safe size limit (blocked fail-closed).".into(),
         );
     }
 
     // 2) 解析 JSON。解析失败 = 畸形事件 → fail-closed deny。
+    //    消息用「hook event」而非写死「PreToolUse」—— 同一入口也接 PostToolUse 等事件(F-12)。
     let raw: Value = match serde_json::from_str(&buf) {
         Ok(v) => v,
         Err(_) => {
             return HookOutcome::Deny(
-                "Vigil hook: malformed PreToolUse input (blocked fail-closed).".into(),
+                "Vigil hook: malformed hook event input (blocked fail-closed).".into(),
             );
         }
     };
