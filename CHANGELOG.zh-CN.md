@@ -8,6 +8,41 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.4.6-beta.4] — 2026-07-03 — hook 路径 Command Guard + daemon 暖载可观测 + GUI locale 误判修复
+
+新增一条防护线的 beta;其余为第四轮逐功能用户级验证(三平台真二进制)收敛的可观测性
+与 locale 缺口。硬地板不受影响。
+
+### 新增
+
+- **Command Guard —— hook 路径的危险命令防线**(#53、#54)。MCP 网关路径本就会分类破坏性
+  shell 命令,但 hook 路径(Claude Code / Cursor / Codex 的 `Bash` 工具)此前只扫
+  secret / 占位符 —— 用户开「允许所有命令」时,agent 因意图漂移 / 提示注入 / 参数事故跑出的
+  `rm -rf ~`、`curl … | sh`、写 crontab 等命令会直接穿过。本防线**只判效果、不判意图**
+  (denylist,无 ML):灾难级动作(文件系统清除、裸写块设备、fork bomb)任何姿态恒拒 ——
+  与明文密钥同级的硬地板;高危动作(持久化 / 自启、远程下载直灌 shell、项目根之外的递归删除、
+  `rm -rf $VAR/` 空展开事故)按姿态分级 Ask(High=Deny)。项目根感知压误报:项目内的
+  `rm -rf ./node_modules` 放行,同一命令指向 `~` 则被拦。诚实边界:这是防事故与低成本注入的
+  护栏,不是沙箱 —— 深度混淆可以绕过。
+- **daemon 暖载窗口可观测**(#55):模型暖载最长约 45s,此前这段时间里 `daemon status`
+  会在你刚执行 `daemon start` 后报「未运行」。现在 warming 标记让窗口可见:status 报
+  「启动中(正在暖载 ML 模型)」,`--json` 增 `reason:"warming"`(字段只增不删),
+  陈旧标记自愈。
+- **`setup --status` 显示全 agent 网关覆盖**(#55):此前只显示 Claude Code 的计数 ——
+  `setup --all` 为 Codex/Cursor 包好二十多个 server 后,status 里无从确认全局覆盖面。
+  现在:`已防护 23 个服务器(Claude Code 2 / Codex 11 / Cursor 10)`。
+
+### 修复
+
+- **非英文系统上桌面应用可能恒判 daemon「未运行」**(#55):它解析的是英文人类可读
+  `daemon status` 行,而该行随系统语言本地化。现改走 `daemon status --json` 稳定 schema,
+  并对机器解析的子进程输出统一钉 `VIGIL_LANG=en`(model status 的 "installed" 行解析存在
+  同族隐患,一并根治)。守护卡同时新增第三态「启动中 · 暖载模型」,替代暖载期间误导性的
+  「未运行」,并隐藏启动按钮避免 bind 冲突。
+- hook fail-closed 消息不再写死「PreToolUse」(同一入口也接 PostToolUse 事件);daemon
+  冷态 / stop 文案去掉内部黑话「无 daemon.json」;posture 中文档位词在 CLI help 与 GUI
+  之间对齐(宽松 / 适中 / 严格)。
+
 ## [v0.4.6-beta.3] — 2026-07-03 — 稳健性打磨:OAuth scope 接线修复、`status --json`、双引擎 parity、远程 MCP e2e
 
 加固向 beta:一个真实网关修复,其余全部是验证覆盖面的加强。
