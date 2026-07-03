@@ -294,6 +294,14 @@ fn classify_rm(argv: &[String], project_root: Option<&str>) -> Option<CommandRis
                 category: GuardCategory::SuspiciousExpansion,
                 detail: "recursive rm on an unquoted `$VAR/…` path — expands to the filesystem root if the variable is empty",
             });
+        } else if is_current_dir_wipe(t) {
+            // `rm -rf .` / `rm -rf *`:清空整个当前目录 —— 用户列的「项目被删除」正是此形态。
+            // 判 Dangerous(可确认)而非 Catastrophic:清 build 子目录内容有时是正当操作。
+            set(CommandRisk {
+                tier: GuardTier::Dangerous,
+                category: GuardCategory::OutsideProjectDeletion,
+                detail: "recursive rm of the entire current directory (`.`/`*`) — wipes everything here, e.g. the whole project",
+            });
         } else if is_outside_project(t, project_root) {
             set(CommandRisk {
                 tier: GuardTier::Dangerous,
@@ -473,6 +481,15 @@ fn is_system_root_path(t: &str) -> bool {
     SYSTEM.contains(&t)
 }
 
+/// 「清空整个当前目录」形态:`.` / `./` / `*` / `./*` / `.*` / `$PWD`。
+/// 递归删除这些 = 删掉当前目录下**一切**(常是整个项目)。**不**含 `./subdir`(具体子目录,放行)。
+fn is_current_dir_wipe(t: &str) -> bool {
+    matches!(
+        t,
+        "." | "./" | "*" | "./*" | ".*" | "$PWD" | "${PWD}" | "$PWD/*" | "${PWD}/*"
+    )
+}
+
 /// 未加引号的 `$VAR/…` / `${VAR}/…` 目标(空变量 → 展开成根)。
 fn is_bare_var_expansion(t: &str) -> bool {
     static RE: Lazy<Regex> = Lazy::new(|| re(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/"));
@@ -598,7 +615,7 @@ mod tests {
 
     #[test]
     fn in_project_rm_is_allowed() {
-        // 项目内递归删除 = 日常,绝不拦。
+        // 项目内**具体子目录/文件**递归删除 = 日常,绝不拦。
         for cmd in [
             "rm -rf ./node_modules",
             "rm -rf build",
@@ -608,6 +625,17 @@ mod tests {
         ] {
             assert!(classify(cmd, Some("/proj")).is_none(), "`{cmd}` 不应命中");
         }
+    }
+
+    #[test]
+    fn whole_current_dir_wipe_is_dangerous() {
+        // 用户列的「项目被删除」:清空整个当前目录(`.`/`*`)→ Dangerous(可确认)。
+        for cmd in ["rm -rf .", "rm -rf *", "rm -rf ./*", "rm -rf ./"] {
+            let r = cat(cmd, Some("/proj"));
+            assert_eq!(r.tier, GuardTier::Dangerous, "`{cmd}` 应判高危");
+        }
+        // 具体子目录不受影响(仍放行)。
+        assert!(classify("rm -rf ./dist", Some("/proj")).is_none());
     }
 
     #[test]
