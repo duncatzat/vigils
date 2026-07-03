@@ -8,6 +8,67 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.4.6] — 2026-07-03 — Command Guard、可独立使用的浏览器扩展、四轮用户级验证
+
+v0.4.6-beta.1 – beta.4 的稳定汇总,外加消费者模式浏览器扩展重构(#32)。两条新防线(hook 路径的
+危险命令防护;不依赖桌面端即可使用的浏览器扩展)、一个真实网关修复(OAuth scope 白名单)、以及由
+三平台真实二进制上四轮逐特性用户级验证驱动的大批文案/可观测性修正。硬地板未动。
+
+### 新增
+
+- **Command Guard —— hook 路径的危险命令防线**(#53, #54)。hook 路径(Claude Code / Cursor /
+  Codex 的 `Bash` 工具)此前只扫密钥 —— 在"放行全部命令"姿态下,跑偏的 agent(意图漂移、提示注入、
+  参数事故)可以执行 `rm -rf ~`、`curl … | sh` 或写 crontab 而不触发任何拦截。守卫**按效果分类,
+  不猜意图**(denylist,无 ML):灾难级动作(清盘、裸设备写入、fork 炸弹)在任何姿态下一律拒绝 ——
+  与裸密钥同级的硬地板;危险级动作(持久化/自启动、远程执行安装、项目根之外的删除、`rm -rf $VAR/`
+  空展开事故)按姿态分级 Ask(High=Deny)。项目根感知压低误报。诚实边界:防事故与低成本注入的护栏,
+  不是沙箱。
+- **浏览器扩展开箱即用 —— 不再依赖桌面端**(#32;Chrome 应用商店
+  [Vigils Browser Guard](https://chromewebstore.google.com/detail/vigils-browser-guard/ffmgaglmcimapacgmoejaobfjdpmopch),
+  0.2.0)。此前扫描硬绑本机 Native Host,未安装时 fail-closed 全阻断 —— 商店版离开桌面端根本
+  没法用。现在检测走 provider 管线:浏览器内消费者扫描器(密钥/token/连接串规则 + 通俗语言提示)
+  为默认,企业 provider 保持可插拔,结果按最严合并(`block > confirm_redact > allow`,未知动作
+  fail-closed)。保护可扩展到任意网站 —— 宽域名权限为可选、按站点运行时授权。Popup 与设置页围绕
+  "当前页面保护状态"重新设计。原文依旧不出浏览器、不落 `chrome.storage`;`nativeMessaging` 不再
+  是默认权限。
+- **Daemon 暖载可观测**(#55):模型暖载(约 45s)期间 `daemon status` 显示"启动中(正在预热 ML
+  模型)"而非"未运行";`daemon status --json` 提供稳定、与语言无关的机读 schema(字段只增不改);
+  过期标记自愈。
+- **`setup --status` 展示全 agent 的网关覆盖面** —— 如
+  `23 server(s) wrapped (Claude Code 2 / Codex 11 / Cursor 10)`。
+- **大写/空格/点号的 server 名可保护了**(`setup --mcp` / `--all`):经 slugifier 派生网关 id
+  (`Playwright` → `user-playwright-<hash8>`);原本合法的名字保持原 id 不变。
+- **CLI 中英双语**(按系统语言)。裸 `posture` / `engine` / `daemon` 默认执行 `show`/`status`;
+  `serve --monitor` 为无 GUI 的 headless/e2e 提供观察审计姿态。
+- **验证基础设施**:每次发布后三平台无人值守用户级验收 CI(像用户一样下载已发布产物、校验
+  sha256 + SLSA 溯源、跑功能/agent 集成/GUI 冒烟)、远程 MCP e2e(在 Streamable HTTP 上游上
+  证明保护不变量)、双引擎一致性绊线(hook 路径与 MCP 网关必须同判)、扩展测试接入 CI、每周对
+  Latest 的定时验收、以及发布前置门禁(tag 永远不会从 fmt/clippy/test 红的提交上发出)。
+
+### 修复
+
+- **`ScopeNotInAllowList` 策略规则对 OAuth HTTP 上游真正生效了。**网关此前用硬编码的非 OAuth
+  scope 上下文评估所有出站 tools/call,配置的 scope 白名单 Deny 规则静默失效。现在 token 的
+  scope 集抵达策略评估:白名单外拒绝、空 scope 集 fail-closed、stdio/bearer/none 上游不受影响。
+- **桌面端在非英文系统上不再误判 daemon 状态**(#55):机读子进程输出固定
+  (`VIGIL_LANG=en`、`--json`);daemon 卡片新增"启动中 · 预热模型"第三态,取代暖载期误导性的
+  "已停止"。
+- `daemon status` 运行时长不再冻结在 `0s`;`daemon stop` 不再泄漏 OS kill 助手的本地化输出
+  (非 UTF-8 代码页乱码)。
+- 输出如实化批次:`setup --all` 按 agent 限定范围、"已写入配置"只在真写入时出现;agent CLI 状态
+  改说"hook 未注册"而非"未安装";`demo` 指向一键的 `setup --all`;`checkpoint` 提示按平台给出;
+  `setup --mcp` 跳过原因本地化;标准构建的 `model --help` 开头即说明需要 ML 构建;姿态级别名
+  CLI 与 GUI 一致(宽松 / 适中 / 严格);hook fail-closed 文案不再硬编码 "PreToolUse"。
+- 桌面端:未装模型时 daemon 卡片不再承诺 ML 防护;Naive UI 内建文案跟随应用语言。扩展:面向用户
+  的文案移除内部规格引用;禁用按钮有禁用观感。
+
+### 文档
+
+- `docs/user-guide/`:移除不存在的命令、纠正默认账本路径、替换过期的 "tools/list 返回空" 说明、
+  安装指向 GitHub Releases。
+- README + book(中英):扩展改为从 Chrome 应用商店安装;crates.io `vigil-sdk` 为独立节奏的早期
+  预览;ML 构建可用性说明更新(自 v0.4.0 起随发布提供)。
+
 ## [v0.4.6-beta.4] — 2026-07-03 — hook 路径 Command Guard + daemon 暖载可观测 + GUI locale 误判修复
 
 新增一条防护线的 beta;其余为第四轮逐功能用户级验证(三平台真二进制)收敛的可观测性

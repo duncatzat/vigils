@@ -8,6 +8,86 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.4.6] — 2026-07-03 — Command Guard, a standalone browser extension, and four user-level verification passes
+
+The stable roll-up of v0.4.6-beta.1 – beta.4, plus the consumer-mode browser-extension rework
+(#32). Two new protection surfaces (dangerous commands on the hook path; a browser extension that
+works without the desktop app), one real gateway fix (OAuth scope allow-lists), and a large
+honesty/observability batch driven by four feature-by-feature user-level verification passes on
+real binaries across all three platforms. Hard floors are untouched.
+
+### Added
+
+- **Command Guard — a dangerous-command line of defense on the hook path** (#53, #54). The hook
+  path (Claude Code / Cursor / Codex `Bash` tools) previously only scanned for secrets — with
+  "allow all commands" enabled, an agent gone sideways (intent drift, prompt injection, parameter
+  accidents) could run `rm -rf ~`, `curl … | sh`, or write a crontab entry without tripping
+  anything. The guard classifies **effects, not intent** (denylist, no ML): catastrophic actions
+  (filesystem wipe, raw device writes, fork bombs) are always denied at any posture — a hard
+  floor like raw secrets — while dangerous ones (persistence/autostart, remote-exec installs,
+  deletions outside the project root, `rm -rf $VAR/` empty-expansion accidents) get
+  posture-graded Ask (High=Deny). Project-root awareness keeps false positives down. Honest
+  boundary: a guardrail against accidents and low-effort injection, not a sandbox.
+- **The browser extension now works out of the box — no desktop app required** (#32; Chrome Web
+  Store listing [Vigils Browser Guard](https://chromewebstore.google.com/detail/vigils-browser-guard/ffmgaglmcimapacgmoejaobfjdpmopch),
+  0.2.0). Scanning was previously hard-wired to the local Native Host and failed closed to
+  *block* when it wasn't installed — which made the store build unusable without the desktop
+  app. Detection now runs behind a provider pipeline: an in-browser consumer scanner
+  (key/token/connection-string rules with plain-language prompts) is the default, an enterprise
+  provider stays pluggable, and results merge strictest-wins (`block > confirm_redact > allow`;
+  unknown actions fail closed). Protection can be extended to any site — the broad host
+  permission is optional and granted per-site at runtime. Popup and options were redesigned
+  around the current page's protection status. Raw text still never leaves the browser and never
+  touches `chrome.storage`; `nativeMessaging` is no longer a default permission.
+- **Daemon warm-up is observable** (#55): during the ~45s model warm-up, `daemon status` says
+  "starting (warming the ML models)" instead of "not running"; `daemon status --json` provides a
+  stable, locale-independent machine schema (fields are only ever added); stale markers
+  self-heal.
+- **`setup --status` shows gateway coverage across all agents** — e.g.
+  `23 server(s) wrapped (Claude Code 2 / Codex 11 / Cursor 10)`.
+- **Server names with uppercase / spaces / dots are now protectable** (`setup --mcp` / `--all`)
+  via a slugifier (`Playwright` → `user-playwright-<hash8>`); already-valid names keep their
+  exact ids.
+- **The CLI speaks Chinese and English** (system-language detection). Bare `posture` / `engine` /
+  `daemon` default to `show`/`status`; `serve --monitor` gives headless/e2e an observe-and-audit
+  posture.
+- **Verification infrastructure**: unattended user-acceptance CI on three platforms after every
+  release (download the published assets like a user, verify sha256 + SLSA provenance, run
+  functional / agent-integration / GUI smoke), remote-MCP e2e proving the protection invariants
+  over Streamable HTTP, a dual-engine parity tripwire (hook path and MCP gateway must agree),
+  extension tests wired into CI, a weekly scheduled acceptance run against Latest, and a release
+  pre-flight gate so a tag can never ship from a commit that failed fmt/clippy/test.
+
+### Fixed
+
+- **`ScopeNotInAllowList` policy rules now actually fire for OAuth HTTP upstreams.** The gateway
+  previously evaluated every outbound tools/call with a hard-coded non-OAuth scope context, so a
+  configured scope-allowlist Deny rule silently never triggered. The token's scope set now
+  reaches policy evaluation: out-of-allowlist scopes deny, an empty scope set fails closed,
+  stdio/bearer/none upstreams are unaffected.
+- **The desktop app no longer misreads the daemon on non-English systems** (#55): machine-parsed
+  subprocess output is pinned (`VIGIL_LANG=en`, `--json`), and the daemon card gained a
+  "STARTING · WARMING MODELS" state instead of a misleading "STOPPED" during warm-up.
+- `daemon status` uptime is no longer frozen at `0s`; `daemon stop` no longer leaks the OS kill
+  helper's localized output (mojibake on non-UTF-8 codepages).
+- Output-honesty batch: `setup --all` per-agent scoping and "changes written" only when true;
+  agent-CLI status says "hook not registered" instead of "not installed"; `demo` points at the
+  turnkey `setup --all`; `checkpoint` tips are platform-aware; `setup --mcp` skip-reasons are
+  localized; `model --help` on the standard build says up front that the ML variant is required;
+  posture level names are consistent between CLI and GUI (宽松 / 适中 / 严格); hook fail-closed
+  messages no longer hardcode "PreToolUse".
+- Desktop: the daemon card no longer promises ML protection when no model is installed; Naive UI
+  built-in texts follow the app language. Extension: internal spec references removed from
+  user-facing copy; disabled buttons look disabled.
+
+### Docs
+
+- `docs/user-guide/`: removed commands that don't exist, corrected the default ledger path,
+  replaced the stale "tools/list returns empty" note, pointed installation at GitHub Releases.
+- README + book (en/zh): the extension installs from the Chrome Web Store listing; crates.io
+  `vigil-sdk` is an early preview on its own cadence; the ML-variant availability note was
+  brought current (ML builds ship since v0.4.0).
+
 ## [v0.4.6-beta.4] — 2026-07-03 — Command Guard on the hook path + daemon warm-up observability + GUI locale fix
 
 A beta adding one new protection line, plus observability/locale gaps closed by a fourth
