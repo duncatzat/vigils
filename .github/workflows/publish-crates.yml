@@ -1,0 +1,91 @@
+name: Publish crates
+
+# Publishes the vigil-sdk dependency closure to crates.io at the current workspace
+# version. Manual-only (workflow_dispatch) with a typed confirmation — publishing is
+# irreversible (versions can be yanked but never reused). Requires the
+# CARGO_REGISTRY_TOKEN repository secret (crates.io API token with publish scope).
+#
+# Ordering: instead of hard-coding the dependency topology, run up to 3 rounds —
+# each round publishes what it can and retries the rest (cargo >=1.66 waits for the
+# index to see freshly published deps, so a correct order converges in one round;
+# rounds only exist as a safety net). Already-published versions are skipped, so the
+# workflow is idempotent and safe to re-run after a partial failure.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "publish" to confirm publishing to crates.io'
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish dependency closure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard confirmation
+        if: ${{ inputs.confirm != 'publish' }}
+        run: |
+          echo '::error::input "confirm" must be exactly "publish" — aborting.'
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish (topological via retry rounds, idempotent)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo '::error::CARGO_REGISTRY_TOKEN secret is not set.'
+            exit 1
+          fi
+          version=$(grep -m1 -E '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "workspace version: $version"
+
+          # vigil-sdk's normal-dependency closure (all previously published at 0.1.8).
+          crates="vigil-types vigil-redaction vigil-runner-types vigil-policy vigil-audit vigil-sandbox-linux vigil-ui-protocol vigil-lease vigil-runner vigil-firewall vigil-mcp vigil-sdk"
+
+          published() {
+            local n="$1" path
+            path="${n:0:2}/${n:2:2}/$n"   # all our crate names are >3 chars
+            curl -sf -A "vigils-publish-workflow (github.com/duncatzat/vigils)" \
+              "https://index.crates.io/$path" | grep -q "\"vers\":\"$version\""
+          }
+
+          for round in 1 2 3; do
+            pending=""
+            for c in $crates; do
+              if published "$c"; then
+                echo "SKIP $c@$version — already on crates.io"
+                continue
+              fi
+              echo "--- publishing $c@$version (round $round)"
+              if cargo publish -p "$c"; then
+                echo "OK $c@$version"
+              else
+                pending="$pending $c"
+              fi
+            done
+            crates="${pending# }"
+            [ -z "$crates" ] && break
+            echo "retrying next round for: $crates"
+          done
+
+          if [ -n "$crates" ]; then
+            echo "::error::failed to publish after 3 rounds: $crates"
+            exit 1
+          fi
+          echo "All crates published at $version."
