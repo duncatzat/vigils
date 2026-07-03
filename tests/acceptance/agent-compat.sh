@@ -69,5 +69,22 @@ for cli in claude codex gemini cursor; do
   [ "$RC" = 0 ] && ok "$cli: clean input not blocked (exit 0)" || no "$cli: clean input blocked (exit $RC)"
 done
 
+# --- Command Guard:危险命令防线(hook 侧 backstop —— 用户开「允许所有」时的最后一道)---
+# 探测式:喂灾难级 `rm -rf ~` 作 Claude Bash PreToolUse 事件。含 command_guard 的新构建
+# 恒 Deny(exit 2);早于本特性的构建(<= v0.4.6-beta.3)不拦 → 优雅 SKIP(不误红历史 release)。
+# 平常命令(cargo build)在**任何**构建上都不得被拦(零误报硬断言)。
+echo "== Command Guard (rm -rf ~ -> deny; mundane -> allow) =="
+CG_EV="{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"session_id\":\"cg\",\"tool_input\":{\"command\":\"rm -rf ~\"}}"
+printf '%s' "$CG_EV" | "$HUB" hook --cli claude >/dev/null 2>&1; CG_RC=$?
+MUND_EV="{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\",\"session_id\":\"cg\",\"tool_input\":{\"command\":\"cargo build --release\"}}"
+printf '%s' "$MUND_EV" | "$HUB" hook --cli claude >/dev/null 2>&1; MUND_RC=$?
+if [ "$CG_RC" = 2 ]; then
+  ok "Command Guard: catastrophic rm -rf ~ denied (exit 2)"
+  [ "$MUND_RC" = 0 ] && ok "Command Guard: mundane cargo build not blocked" \
+    || no "Command Guard: mundane command wrongly blocked (exit $MUND_RC)"
+else
+  echo "  SKIP Command Guard: this build predates command_guard (rm -rf ~ exit=$CG_RC)"
+fi
+
 printf '\n========== AGENT-COMPAT SUMMARY: %d passed, %d failed ==========\n' "$P" "$F"
 [ "$F" = 0 ]

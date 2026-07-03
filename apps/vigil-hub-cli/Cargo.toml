@@ -42,6 +42,10 @@ oauth2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# command_guard:危险 shell 命令分类器(hook 路径破坏性/持久化/RCE 防线)。
+regex = { workspace = true }
+once_cell = { workspace = true }
+shlex = { workspace = true }
 # `vigil-hub demo` 零设置首次体验:驱动真 Hub 需 args 规范化哈希(scope 预批准走真 Allow 路径)+
 # 本地生成形似真实的 demo secret(getrandom)+ tamper 演示直接改账本一行(rusqlite,与 vigil-audit
 # 同 bundled SQLite)。均 workspace 依赖,已随 vigil-audit/vigil-lease 链入二进制。
