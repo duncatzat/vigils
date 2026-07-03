@@ -4,7 +4,7 @@
 
 ## Overview
 
-Vigils Browser Guard is a Chrome MV3 extension that checks sensitive content before you copy, paste, or submit it to AI websites.
+Vigils Browser Guard is a Chrome MV3 extension that checks sensitive content when you paste, type, or submit it to AI websites.
 
 In the default consumer mode, it does not require a Native Host, desktop app, or terminal setup. Detection runs inside the browser. When Vigils finds risky content, it prompts you to either continue with a redacted version or block the action.
 
@@ -12,7 +12,7 @@ In the default consumer mode, it does not require a Native Host, desktop app, or
 
 - **Built for everyday users**: Install the extension and start using it without setting up a local service.
 - **Browser-local scanning**: Uses lightweight JavaScript rules to detect common secrets and tokens.
-- **Copy-paste guardrails**: Covers paste, input, submit, and common contenteditable input flows.
+- **Paste and submit guardrails**: Covers paste, debounced input, submit, and common contenteditable Enter flows.
 - **Contextual page prompt**: Risk prompts appear near the active input instead of being hidden in a page corner.
 - **One-click site protection**: The popup shows the current page status and lets you add custom HTTPS sites.
 - **Safe event history**: The popup shows only risk type, website, and action metadata. It does not store original text.
@@ -61,8 +61,11 @@ Consumer mode currently detects and redacts:
 - Database URL
 - `.env`-style assignment
 - PEM private key
+- Custom prefix-based risk rules configured in Advanced settings
 
 Most tokens and connection strings trigger a "continue with redaction" prompt. High-risk content such as PEM private keys is blocked directly.
+
+Paste and submit checks run before the original content is inserted or sent. Manual input checks run after a short debounce and are a best-effort cleanup layer; pages that read typed text immediately can still observe it before the debounce finishes.
 
 ## Privacy and Security Promises
 
@@ -119,15 +122,17 @@ The options page keeps the default experience simple:
 - Add custom websites
 - Privacy notes
 
-Enterprise connection, extension ID, and technical permission details live under Advanced settings.
+Enterprise connection, custom risk types, extension ID, and technical permission details live under Advanced settings.
 
 ## Project Structure
 
 ```text
 extensions/chrome-mv3/
+├── icons/
 ├── manifest.json
 ├── background.js
 ├── content-script.js
+├── custom-sites.js
 ├── popup.html
 ├── popup.js
 ├── popup.css
@@ -145,9 +150,10 @@ extensions/chrome-mv3/
 
 Core layers:
 
-- `content-script.js`: Listens to paste, input, and submit events, then shows in-page risk prompts.
+- `content-script.js`: Listens to paste, debounced input, submit, and contenteditable Enter events, then shows in-page risk prompts.
 - `background.js`: Handles message routing, mode management, custom-site permissions, and safety event caching.
-- `redaction-rules.js`: Browser-local detection and redaction rules.
+- `custom-sites.js`: Normalizes user-provided HTTPS domains for optional protection.
+- `redaction-rules.js`: Browser-local detection, redaction, and custom prefix-based risk rules.
 - `risk-decision.js`: Converts scan results into `allow`, `confirm_redact`, or `block`.
 - `scanner-pipeline.js`: Combines the consumer provider and future enterprise providers.
 

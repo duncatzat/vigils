@@ -4,7 +4,7 @@
 
 ## 简介
 
-Vigils Browser Guard 是一个 Chrome MV3 扩展，用来在你把密钥、token、连接串等敏感内容复制、粘贴或发送到 AI 网站之前做本地检查。
+Vigils Browser Guard 是一个 Chrome MV3 扩展，用来在你把密钥、token、连接串等敏感内容粘贴、输入或发送到 AI 网站时做本地检查。
 
 默认的普通模式不需要安装 Native Host、不需要桌面应用、不需要终端命令。检测在浏览器内完成，命中风险时，页面会提示你选择“脱敏后继续”或“阻断”。
 
@@ -12,7 +12,7 @@ Vigils Browser Guard 是一个 Chrome MV3 扩展，用来在你把密钥、token
 
 - **面向普通用户**: 安装扩展后即可使用，不需要配置本机服务。
 - **浏览器内检测**: 默认使用本地 JavaScript 规则扫描常见密钥和 token。
-- **复制粘贴守门**: 覆盖 paste、input、submit 和常见 contenteditable 输入场景。
+- **粘贴与发送守门**: 覆盖 paste、防抖 input、submit 和常见 contenteditable Enter 场景。
 - **贴近输入框提示**: 风险提示会优先出现在输入框附近，而不是藏在页面角落。
 - **一键保护网站**: Popup 会显示当前页面保护状态，并支持添加自定义 HTTPS 网站。
 - **安全事件记录**: Popup 只展示风险类型、网站和处理结果，不保存原文。
@@ -23,7 +23,7 @@ Vigils Browser Guard 是一个 Chrome MV3 扩展，用来在你把密钥、token
 Vigils 适合经常把代码、配置、日志或环境变量粘贴到 AI 工具里的用户，例如：
 
 - 向 ChatGPT、Claude、Gemini、Perplexity 等工具提问时，避免误发 GitHub Token、OpenAI API Key、数据库连接串。
-- 复制 `.env`、日志、配置片段前，自动发现可能包含的敏感值。
+- 粘贴 `.env`、日志、配置片段时，自动发现可能包含的敏感值。
 - 在普通用户模式下获得“本地检查 + 明确确认”的低门槛保护。
 
 ## 当前支持的网站
@@ -61,8 +61,11 @@ Vigils 适合经常把代码、配置、日志或环境变量粘贴到 AI 工具
 - 数据库连接串
 - `.env` 风格变量
 - PEM 私钥
+- 高级设置中配置的自定义前缀风险类型
 
 其中，大多数 token 和连接串会提示“脱敏后继续”；PEM 私钥等高风险内容会直接阻断。
+
+粘贴和发送检查会在原文写入或发送前执行。手动输入检查会在短暂防抖后执行，属于尽力清理层；如果页面在防抖结束前立即读取输入内容，仍可能先看到原文。
 
 ## 隐私与安全承诺
 
@@ -119,15 +122,17 @@ Options 默认只保留普通用户需要的内容：
 - 添加自定义网站
 - 隐私说明
 
-企业连接、扩展 ID、权限技术清单位于“高级设置”中。
+企业连接、自定义风险类型、扩展 ID、权限技术清单位于“高级设置”中。
 
 ## 项目结构
 
 ```text
 extensions/chrome-mv3/
+├── icons/
 ├── manifest.json
 ├── background.js
 ├── content-script.js
+├── custom-sites.js
 ├── popup.html
 ├── popup.js
 ├── popup.css
@@ -145,9 +150,10 @@ extensions/chrome-mv3/
 
 核心分层：
 
-- `content-script.js`: 监听页面 paste、input、submit，并显示页面内风险提示。
+- `content-script.js`: 监听页面 paste、防抖 input、submit 和 contenteditable Enter，并显示页面内风险提示。
 - `background.js`: 负责消息编排、模式管理、自定义网站权限和安全事件缓存。
-- `redaction-rules.js`: 浏览器内扫描和脱敏规则。
+- `custom-sites.js`: 规范化用户添加的 HTTPS 自定义保护域名。
+- `redaction-rules.js`: 浏览器内扫描、脱敏规则和自定义前缀风险类型。
 - `risk-decision.js`: 将扫描结果转为 `allow`、`confirm_redact` 或 `block`。
 - `scanner-pipeline.js`: 普通 provider 与企业 provider 的组合入口。
 
