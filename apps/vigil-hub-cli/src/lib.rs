@@ -9,6 +9,7 @@
 #![allow(missing_docs)]
 
 pub mod add_remote;
+pub mod command_guard;
 pub mod daemon;
 pub mod demo;
 pub mod engine_config;
