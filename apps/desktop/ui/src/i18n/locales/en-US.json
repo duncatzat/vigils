@@ -79,7 +79,11 @@
     "decision_monitor": "MONITOR",
     "rules_active": "Policy rules active: {count}",
     "servers_registered": "Servers registered: {count}",
-    "privacy_findings_count": "Privacy findings: {count}"
+    "privacy_findings_count": "Privacy findings: {count}",
+    "browser_guard_ml": "Browser guard: local engine registered · ML running",
+    "browser_guard_hardfp": "Browser guard: local engine registered (hard fingerprints)",
+    "browser_guard_off": "Browser guard: local engine not registered",
+    "browser_guard_unknown": "Browser guard: status unknown"
   },
   "approval": {
     "page_title": "Approval Queue",

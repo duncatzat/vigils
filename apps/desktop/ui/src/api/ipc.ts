@@ -652,6 +652,17 @@ export async function daemonStatus(): Promise<DaemonStatus> {
   return await invoke<DaemonStatus>("daemon_status");
 }
 
+/** 对应 Rust `vigil_desktop::browser_guard::BrowserGuardStatus`(native host 注册态,只读)。 */
+export interface BrowserGuardStatus {
+  registered: boolean;
+  manifest_exists: boolean;
+  registry_present: boolean | null;
+}
+
+export async function browserGuardStatus(): Promise<BrowserGuardStatus> {
+  return await invoke<BrowserGuardStatus>("browser_guard_status");
+}
+
 /** 写：detached 启动常驻 daemon（暖载 ML 供 hook 主路径）。回最新状态。 */
 export async function daemonStart(): Promise<DaemonStatus> {
   return await invoke<DaemonStatus>("daemon_start");

@@ -13,6 +13,8 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+/// 浏览器防线卡(Protection Overview):native host 注册态(只读,详见模块内注释)。
+pub mod browser_guard;
 /// I08b-β1 Tauri `#[tauri::command]` 真白名单 SSOT(与 build.rs 通过 `include!` 共用)。
 ///
 /// 详见 `commands.rs` 顶部注释(因 include! 约束采用 `//` 而非 `//!`)。
