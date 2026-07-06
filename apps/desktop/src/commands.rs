@@ -66,6 +66,8 @@ pub const INVOKE_COMMANDS: &[&str] = &[
     "model_install",
     // ML 引擎变体安装(让 GUI 用户的 ML 真正可用)
     "download_ml_engine",
+    // 浏览器防线卡(Protection Overview —— native host 注册态,1 read)
+    "browser_guard_status",
 ];
 
 #[cfg(test)]
@@ -81,7 +83,7 @@ mod tests {
     fn invoke_commands_count_in_sync() {
         assert_eq!(
             INVOKE_COMMANDS.len(),
-            29,
+            30,
             "INVOKE_COMMANDS 漂移 —— 新增/删除 handler 时必须同步:\n\
              1) 本文件 `apps/desktop/src/commands.rs`\n\
              2) `apps/desktop/src/bin/vigils.rs` 的 `tauri::generate_handler!` 列表\n\

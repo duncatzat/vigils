@@ -24,10 +24,13 @@ import {
   listPrivacyFindings,
   listRecentEvents,
   protectionSummary,
+  browserGuardStatus,
+  daemonStatus,
   verifyChain,
   type ChainVerifyReport,
   type EventSummary,
   type PrivacyFindingDto,
+  type BrowserGuardStatus,
   type ProtectionSummary,
   type SessionView,
 } from "@/api/ipc";
@@ -46,6 +49,8 @@ const serversStore = useServersStore();
 
 // ─────────────────────────── State ───────────────────────────
 const summary = ref<ProtectionSummary | null>(null);
+const browserGuard = ref<BrowserGuardStatus | null>(null);
+const browserGuardMl = ref<boolean>(false);
 const summaryLoading = ref(false);
 const recentEvents = ref<EventSummary[]>([]);
 const recentEventsLoading = ref(false);
@@ -81,6 +86,22 @@ async function loadRecentEvents(): Promise<void> {
   }
 }
 
+async function loadBrowserGuard(): Promise<void> {
+  try {
+    browserGuard.value = await browserGuardStatus();
+  } catch (e) {
+    // non-fatal: the line shows "unknown"
+    console.error("browserGuardStatus failed", e);
+    browserGuard.value = null;
+  }
+  try {
+    const d = await daemonStatus();
+    browserGuardMl.value = Boolean(d && d.running);
+  } catch {
+    browserGuardMl.value = false;
+  }
+}
+
 async function loadPrivacyFindings(): Promise<void> {
   privacyLoading.value = true;
   try {
@@ -102,6 +123,7 @@ async function loadAll(): Promise<void> {
     serversStore.refresh(),
     loadRecentEvents(),
     loadPrivacyFindings(),
+    loadBrowserGuard(),
   ]);
   // Treat the moment we first load as the last verification timestamp
   lastVerifiedAt.value = Date.now();
@@ -112,6 +134,14 @@ onMounted(() => loadAll());
 
 // ─────────────────────────── Derived metrics ───────────────────────────
 const blockedAttempts = computed(() => summary.value?.raw_secrets_blocked ?? 0);
+const browserGuardLine = computed(() => {
+  const g = browserGuard.value;
+  if (!g) return t("protection.browser_guard_unknown");
+  if (!g.registered) return t("protection.browser_guard_off");
+  return browserGuardMl.value
+    ? t("protection.browser_guard_ml")
+    : t("protection.browser_guard_hardfp");
+});
 const chainIntact = computed(() => chainReport.value?.ok ?? summary.value?.chain_intact ?? true);
 
 const activeSessions = computed(
@@ -357,6 +387,9 @@ async function exportSession(sessionId: string): Promise<void> {
             </div>
             <div class="flex justify-between">
               <span class="text-vigils-text-secondary">{{ t("protection.privacy_findings_count", { count: privacyFindingTotal }) }}</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-vigils-text-secondary">{{ browserGuardLine }}</span>
             </div>
           </div>
         </div>

@@ -58,6 +58,8 @@ gui = [
 vigil-types = { path = "../../crates/vigil-types" }
 vigil-ui-protocol = { path = "../../crates/vigil-ui-protocol" }
 vigil-audit = { path = "../../crates/vigil-audit" }
+# 浏览器防线卡(Protection Overview):直调 native host 注册状态(install::status,只读)。
+vigil-native-host = { path = "../native-host" }
 vigil-runner = { path = "../../crates/vigil-runner", default-features = false }
 # v0.5 P1 ADR 0014 α1:GUI bin embed Hub 骨架(默认关闭;features = ["gui"] 拉)。
 # `vigil-firewall.default-features = false`:防默认拉 ort feature(ISS-008 P2 模型路径,
