@@ -171,15 +171,20 @@ node --test extensions/chrome-mv3/tests/*.test.mjs
 
 当前扩展没有前端构建步骤，使用原生 MV3、HTML、CSS 和 JavaScript。
 
-## 企业 Provider 预留
+## 企业 Provider
 
-普通用户不需要企业 provider。企业模式后续可以接入：
+普通用户不需要企业 provider。第一个真实后端现已可用：
 
-- Native Host
-- localhost agent
-- 企业 HTTPS API
-- 浏览器内 Wasm
-- 其他受管 provider
+- **本机 Vigils 引擎（Native Host）** —— 已实现。在选项页切到企业模式并选择「本机
+  Vigils 引擎」。前提：已安装 Vigils CLI/桌面版并注册 native messaging host（步骤见
+  用户文档「Browser extension」一节；注册命令需要选项页顶部的扩展 ID）。启用后检查
+  路由到本机 `vigil-native-host` 进程：硬指纹检测（13 类凭证），本机 ML daemon 运行
+  时叠加语义 PII 识别（邮箱 / 人名 / 电话等）。原文只送**本机进程**、不出设备（仅在
+  host 内存停留，分类完即丢弃）。已启用但 host 不可达时，检查 fail-closed 为阻断，
+  绝不静默降级。
+- localhost agent —— 规划中
+- 企业 HTTPS API —— 规划中
+- 浏览器内 Wasm —— 规划中
 
 设计目标是让企业用户可以把扫描和策略判断迁移到受控环境，同时保留普通用户的零配置体验。
 
@@ -189,7 +194,7 @@ node --test extensions/chrome-mv3/tests/*.test.mjs
 - 补充更多 AI 网站的深度输入框适配
 - 增加更完整的 E2E 测试
 - 改进安全事件说明和风险解释
-- 接入企业 provider 示例
+- ~~接入第一个企业 provider（本机 Vigils 引擎 / Native Host）~~ ✅ 已完成
 - ~~打包发布到 Chrome Web Store~~ ✅ 已完成
 
 ## 许可

@@ -181,3 +181,87 @@ test("configured but unavailable enterprise provider fails closed", async () => 
     assert.equal(result.action, "block");
     assert.equal(result.error, "enterprise_provider_failed");
 });
+
+// ── native host 后端(raw_allowed = 本机进程,原文不出设备)集成 ──
+
+function nativeHostLikeProvider(overrides = {}) {
+    return {
+        name: "native_host",
+        seen: [],
+        async check(request) {
+            this.seen.push(request);
+            if (overrides.throwError) throw new Error("host_disconnected");
+            return {
+                request_id: request.request_id,
+                action: overrides.action || "redact",
+                findings: overrides.findings || [
+                    { kind: "github_token", source: "native_host" },
+                    { kind: "private_email", source: "native_host_ml" },
+                ],
+                redacted_text: overrides.redacted_text,
+                source: "native_host",
+            };
+        },
+    };
+}
+
+test("enterprise raw_allowed passes full text to the local native host backend", async () => {
+    const provider = nativeHostLikeProvider({ action: "allow", findings: [] });
+    await checkWithScannerPipeline(request("plain text with alice@example.com"), {
+        mode: "enterprise",
+        enterprise: { provider, dataPolicy: "raw_allowed" },
+    });
+    assert.equal(provider.seen.length, 1);
+    assert.equal(
+        provider.seen[0].text,
+        "plain text with alice@example.com",
+        "raw_allowed(本机 native host)必须收到全文才能分类",
+    );
+});
+
+test("enterprise native host block wins over consumer confirm_redact", async () => {
+    const provider = nativeHostLikeProvider({
+        action: "block",
+        findings: [{ kind: "pem_private_key", source: "native_host" }],
+    });
+    const result = await checkWithScannerPipeline(
+        request("token ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD"),
+        { mode: "enterprise", enterprise: { provider, dataPolicy: "raw_allowed" } },
+    );
+    assert.equal(result.action, "block", "后端 block 必须胜过本地 confirm_redact(取最严)");
+    const kinds = result.findings.map((f) => f.kind);
+    assert.ok(kinds.includes("github_token"), "本地 findings 保留");
+    assert.ok(kinds.includes("pem_private_key"), "后端 findings 并入");
+});
+
+test("enterprise native host redaction (hardfp+ML) overrides consumer redaction on tie", async () => {
+    const provider = nativeHostLikeProvider({
+        action: "redact",
+        redacted_text: "token [REDACTED github_token] mail [REDACTED private_email]",
+    });
+    const result = await checkWithScannerPipeline(
+        request("token ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD mail alice@example.com"),
+        { mode: "enterprise", enterprise: { provider, dataPolicy: "raw_allowed" } },
+    );
+    assert.equal(result.action, "confirm_redact", "host 的 redact 归一为 confirm_redact");
+    assert.match(
+        result.redacted_text,
+        /\[REDACTED private_email\]/,
+        "同级最严时后端(hardfp+ML 更全)的 redacted_text 胜出",
+    );
+    assert.ok(
+        result.findings.some((f) => f.kind === "private_email"),
+        "ML 语义标签并入 findings",
+    );
+});
+
+test("enterprise native host failure fails closed to block with local findings kept", async () => {
+    const provider = nativeHostLikeProvider({ throwError: true });
+    const result = await checkWithScannerPipeline(
+        request("token ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD"),
+        { mode: "enterprise", enterprise: { provider, dataPolicy: "raw_allowed" } },
+    );
+    assert.equal(result.action, "block", "已启用的后端不可达必须 fail-closed(不静默降级)");
+    assert.equal(result.error, "enterprise_provider_failed");
+    assert.ok(result.findings.some((f) => f.kind === "github_token"), "本地 findings 保留");
+});

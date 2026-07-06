@@ -68,21 +68,29 @@
 
       <div id="enterprise-section" class="advanced-block">
         <h3>企业连接</h3>
-        <p class="desc">企业模式接口已预留，未配置 provider 时仍使用普通保护。</p>
-        <label for="enterprise-provider-type">Provider 类型</label>
-        <select id="enterprise-provider-type" disabled>
-          <option value="disabled">尚未配置</option>
-          <option value="native_host">Native Host</option>
-          <option value="localhost">Localhost Agent</option>
-          <option value="https_api">企业 HTTPS API</option>
-          <option value="wasm">浏览器内 Wasm</option>
+        <p class="desc">企业模式可将检查路由到更强的扫描后端；未配置时仍使用普通保护。</p>
+        <label for="enterprise-provider-type">扫描后端</label>
+        <select id="enterprise-provider-type">
+          <option value="none">尚未配置（普通保护）</option>
+          <option value="native_host">本机 Vigils 引擎</option>
+          <option value="localhost" disabled>Localhost Agent（规划中）</option>
+          <option value="https_api" disabled>企业 HTTPS API（规划中）</option>
+          <option value="wasm" disabled>浏览器内 Wasm（规划中）</option>
         </select>
+        <p id="enterprise-status" class="hint"></p>
+        <div id="enterprise-native-guide" class="hidden">
+          <p class="desc">启用本机引擎需要先安装 Vigils CLI（或桌面版）并完成本机引擎注册——
+            步骤见用户文档「Browser extension」一节；注册时会用到上方「扩展 ID」。完成后回到
+            此页重新选择「本机 Vigils 引擎」。</p>
+          <p class="desc">本机引擎：原文仅送本机进程内存、不出设备；含硬指纹检测，本机 ML
+            引擎运行时自动叠加语义识别（邮箱 / 人名 / 电话等）。</p>
+        </div>
 
         <label for="enterprise-data-policy">数据策略</label>
         <select id="enterprise-data-policy" disabled>
           <option value="local_only">local_only：不发送原文</option>
           <option value="metadata_only">metadata_only：只发送元数据</option>
-          <option value="raw_allowed">raw_allowed：允许发送原文</option>
+          <option value="raw_allowed">本机引擎：原文仅送本机进程（不出设备）</option>
         </select>
       </div>
 

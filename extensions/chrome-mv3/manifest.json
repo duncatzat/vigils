@@ -16,6 +16,9 @@
     "storage",
     "scripting"
   ],
+  "optional_permissions": [
+    "nativeMessaging"
+  ],
   "optional_host_permissions": [
     "https://*/*"
   ],
