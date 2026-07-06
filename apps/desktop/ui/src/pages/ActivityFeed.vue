@@ -78,6 +78,10 @@ const EVENT_TYPE_OPTIONS: SelectOption[] = [
   { label: "server.command_drifted", value: "server.command_drifted" },
   { label: "server.command_re_approved", value: "server.command_re_approved" },
   { label: "server.command_drift_rejected", value: "server.command_drift_rejected" },
+  // 浏览器扩展守门(native host 写入共享账本;payload.action = allow|redact|block)
+  { label: "browser.paste_checked", value: "browser.paste_checked" },
+  { label: "browser.input_checked", value: "browser.input_checked" },
+  { label: "browser.submit_checked", value: "browser.submit_checked" },
 ];
 
 const decisionOptions: SelectOption[] = [
@@ -101,6 +105,10 @@ function fmtTime(ts: number): string {
 }
 
 function displayType(eventType: string): string {
+  // browser.<kind>_checked → browser.<kind>(保留动作语义,只剥状态后缀)。
+  if (eventType.startsWith("browser.")) {
+    return eventType.replace(/_checked$/, "");
+  }
   // Strip the canonical suffix so the table reads like the prototype.
   return eventType.replace(
     /\.(opened|decided|executed|execute_failed|abandoned|recorded|created|resolved|note|minted|revoked|first_approved|re_approved|drift_rejected|command_drifted|command_re_approved|command_drift_rejected)$/,
@@ -146,6 +154,16 @@ function decisionKeyFromPayload(payload: unknown): DecisionKey | null {
       block: "deny",
     };
     return map[p.decision.toLowerCase()] ?? null;
+  }
+  if (typeof p.action === "string") {
+    // browser.*_checked 审计 payload:action = allow | redact | block。
+    // redact(已自动脱敏放行)标 approve 色 —— 传达「有干预处理」,区别于原样放行与阻断。
+    const map: Record<string, DecisionKey> = {
+      allow: "allow",
+      redact: "approve",
+      block: "deny",
+    };
+    return map[p.action.toLowerCase()] ?? null;
   }
   return null;
 }
