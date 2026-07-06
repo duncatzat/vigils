@@ -196,7 +196,14 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
         const resp = await sendRuntimeMessage({ type: "vigil_get_mode" });
         const mode = resp && resp.mode === "enterprise" ? "enterprise" : "consumer";
         if (mode === "enterprise") {
-            if (statusText) statusText.textContent = "企业保护";
+            // 企业模式:标出实际扫描后端(本机引擎 = 检查在本机 Vigils 进程完成)。
+            const backendResp = await sendRuntimeMessage({ type: "vigil_get_enterprise_backend" });
+            const backend =
+                backendResp && backendResp.backend === "native_host" ? "native_host" : "none";
+            if (statusText) {
+                statusText.textContent =
+                    backend === "native_host" ? "企业保护 · 本机引擎" : "企业保护";
+            }
             setHeaderStatus("ok");
         }
     }
