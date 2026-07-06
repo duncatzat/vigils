@@ -77,7 +77,11 @@ block is recorded in a tamper-evident local ledger. Kick the tires with **`vigil
 Redacts secrets / PII before you paste or submit on AI sites. Install
 [**Vigils Browser Guard**](https://chromewebstore.google.com/detail/vigils-browser-guard/ffmgaglmcimapacgmoejaobfjdpmopch)
 from the Chrome Web Store — consumer mode works out of the box, no desktop app required.
-Optional: pairing with the desktop app's native host unlocks deep redaction. Dev builds:
+Optional deep redaction: install the Vigils CLI, register the native messaging host
+(`vigil-native-host install --extension-id <ID>`, ID shown in the extension's Options),
+then pick "Local Vigils engine" under enterprise mode in Options — checks route to the
+local engine (hard fingerprints + ML PII when the daemon runs); raw text never leaves
+the device. Dev builds:
 `chrome://extensions` → **Developer mode** → **Load unpacked** → pick `extensions/chrome-mv3/`.
 
 ---

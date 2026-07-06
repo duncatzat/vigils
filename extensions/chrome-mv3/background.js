@@ -23,6 +23,7 @@
 import { normalizeCustomSiteInput } from "./custom-sites.js";
 import { checkWithScannerPipeline } from "./scanner-pipeline.js";
 import { normalizeCustomRiskRuleInput, normalizeCustomRiskRules } from "./redaction-rules.js";
+import { createNativeHostProvider } from "./providers/native-host-provider.js";
 
 const MAX_TEXT_CHARS = 32 * 1024 * 1024; // 32 MB 字符早退,避免超大文本拖垮 SW 消息处理
 const CUSTOM_SITES_STORAGE_KEY = "customProtectedSites";
@@ -31,9 +32,24 @@ const CUSTOM_CONTENT_SCRIPT_ID = "vigil-custom-protected-sites";
 const MODE_STORAGE_KEY = "vigilMode";
 const MODE_VALUES = Object.freeze(["consumer", "enterprise"]);
 const MODE_DEFAULT = "consumer";
+// 企业后端:none = 接口预留(enterprise_disabled,行为同普通保护);native_host = 本机
+// Vigils 引擎(vigil-native-host:硬指纹 + 可选 daemon ML;原文仅本机进程内存,不出设备)。
+const ENTERPRISE_BACKEND_STORAGE_KEY = "vigilEnterpriseBackend";
+const ENTERPRISE_BACKEND_VALUES = Object.freeze(["none", "native_host"]);
+const ENTERPRISE_BACKEND_DEFAULT = "none";
 const EXTENSION_ORIGIN = `chrome-extension://${chrome.runtime.id}`;
-/** @type {string} 当前模式,in-memory session 级 */
+/** @type {string} 当前模式,storage 持久(见 loadStoredMode)。 */
 let currentMode = MODE_DEFAULT;
+/** @type {string} 当前企业后端,storage 持久。 */
+let currentEnterpriseBackend = ENTERPRISE_BACKEND_DEFAULT;
+/** Native Host provider 单例(port 惰性建立,断连自愈;仅 backend=native_host 时被使用)。 */
+let nativeHostProvider = null;
+function getNativeHostProvider() {
+    if (nativeHostProvider === null) {
+        nativeHostProvider = createNativeHostProvider();
+    }
+    return nativeHostProvider;
+}
 
 // ───────────────────────── 自定义目标网站白名单 ─────────────────────────
 //
@@ -62,6 +78,30 @@ async function loadStoredMode() {
     const got = await storageGet({ [MODE_STORAGE_KEY]: MODE_DEFAULT });
     const mode = got[MODE_STORAGE_KEY];
     currentMode = MODE_VALUES.includes(mode) ? mode : MODE_DEFAULT;
+}
+
+async function loadStoredEnterpriseBackend() {
+    const got = await storageGet({
+        [ENTERPRISE_BACKEND_STORAGE_KEY]: ENTERPRISE_BACKEND_DEFAULT,
+    });
+    const backend = got[ENTERPRISE_BACKEND_STORAGE_KEY];
+    currentEnterpriseBackend = ENTERPRISE_BACKEND_VALUES.includes(backend)
+        ? backend
+        : ENTERPRISE_BACKEND_DEFAULT;
+}
+
+/**
+ * 本次检查的 enterprise 配置。backend=native_host → 注入本机引擎 provider;
+ * dataPolicy="raw_allowed" 在此语境 = 全文送**本机进程**(原文仅其内存,ADR 0009
+ * §I-9.1,不出设备)——远程端点后端未来引入时才用 local_only/metadata_only。
+ * nativeMessaging 权限被撤时 provider.check 抛 native_messaging_unavailable →
+ * pipeline 收敛 block(fail-closed,绝不静默降级为纯浏览器规则)。
+ */
+function enterpriseConfigForCheck() {
+    if (currentEnterpriseBackend === "native_host") {
+        return { provider: getNativeHostProvider(), dataPolicy: "raw_allowed" };
+    }
+    return { dataPolicy: "local_only" };
 }
 
 async function loadCustomSites() {
@@ -428,7 +468,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     {
                         mode: currentMode,
                         consumer: { customRiskRules },
-                        enterprise: { dataPolicy: "local_only" },
+                        enterprise: enterpriseConfigForCheck(),
                     },
                 ))
                     .then((resp) => {
@@ -540,6 +580,46 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return false;
     }
 
+    if (msg.type === "vigil_get_enterprise_backend") {
+        sendResponse({
+            backend: currentEnterpriseBackend,
+            values: ENTERPRISE_BACKEND_VALUES.slice(),
+        });
+        return false;
+    }
+
+    if (msg.type === "vigil_set_enterprise_backend") {
+        const next = typeof msg.backend === "string" ? msg.backend : "";
+        if (!ENTERPRISE_BACKEND_VALUES.includes(next)) {
+            sendResponse({ ok: false, _error: "invalid_backend" });
+            return false;
+        }
+        currentEnterpriseBackend = next;
+        storageSet({ [ENTERPRISE_BACKEND_STORAGE_KEY]: next }).catch(() => {});
+        sendResponse({ ok: true, backend: currentEnterpriseBackend });
+        return false;
+    }
+
+    // options「启用本机引擎」流程的连接探测:向 native host 发一条真实形状的检查
+    // (白名单 origin + 无敏感样例文本),成功往返 = host 已注册可用。
+    if (msg.type === "vigil_probe_native_host") {
+        getNativeHostProvider()
+            .check({
+                request_id: crypto.randomUUID(),
+                origin: "https://chatgpt.com",
+                event_kind: "paste",
+                text: "vigils native host connection probe",
+            })
+            .then((result) => sendResponse({ ok: true, action: result.action }))
+            .catch((err) =>
+                sendResponse({
+                    ok: false,
+                    _error: String(err && err.message ? err.message : err),
+                }),
+            );
+        return true;
+    }
+
     return false; // 未识别消息:让其它可能的 listener 处理或自然 timeout
 });
 
@@ -550,6 +630,12 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName === "local" && changes[MODE_STORAGE_KEY]) {
         const next = changes[MODE_STORAGE_KEY].newValue;
         currentMode = MODE_VALUES.includes(next) ? next : MODE_DEFAULT;
+    }
+    if (areaName === "local" && changes[ENTERPRISE_BACKEND_STORAGE_KEY]) {
+        const next = changes[ENTERPRISE_BACKEND_STORAGE_KEY].newValue;
+        currentEnterpriseBackend = ENTERPRISE_BACKEND_VALUES.includes(next)
+            ? next
+            : ENTERPRISE_BACKEND_DEFAULT;
     }
 });
 
@@ -564,6 +650,7 @@ if (chrome.permissions && chrome.permissions.onRemoved) {
 // ───────────────────────── service worker 生命周期 ─────────────────────────
 
 loadStoredMode().catch(() => {});
+loadStoredEnterpriseBackend().catch(() => {});
 syncCustomContentScripts().catch(() => {});
 
 self.addEventListener("install", () => {
@@ -579,6 +666,7 @@ self.addEventListener("activate", (event) => {
             Promise.all([
                 self.clients.claim(),
                 loadStoredMode(),
+                loadStoredEnterpriseBackend(),
                 syncCustomContentScripts(),
             ]).catch(() => {}),
         );

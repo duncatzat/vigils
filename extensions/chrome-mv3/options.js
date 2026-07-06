@@ -16,6 +16,10 @@ import { normalizeCustomRiskRuleInput } from "./redaction-rules.js";
     const modeInputs = Array.from(document.querySelectorAll("input[name='vigil-mode']"));
     const modeHint = document.getElementById("mode-hint");
     const enterpriseSection = document.getElementById("enterprise-section");
+    const enterpriseProviderSelect = document.getElementById("enterprise-provider-type");
+    const enterpriseDataPolicySelect = document.getElementById("enterprise-data-policy");
+    const enterpriseStatus = document.getElementById("enterprise-status");
+    const enterpriseNativeGuide = document.getElementById("enterprise-native-guide");
     const customRiskForm = document.getElementById("custom-risk-form");
     const customRiskName = document.getElementById("custom-risk-name");
     const customRiskPrefix = document.getElementById("custom-risk-prefix");
@@ -73,6 +77,60 @@ import { normalizeCustomRiskRuleInput } from "./redaction-rules.js";
         flashExtensionIdHint._t = setTimeout(() => {
             extensionIdHint.classList.add("fade");
         }, 1800);
+    }
+
+    function setEnterpriseStatus(text, tone) {
+        if (!enterpriseStatus) return;
+        enterpriseStatus.textContent = text || "";
+        enterpriseStatus.style.color = tone === "warn" ? "#b45309" : tone === "ok" ? "#15803d" : "";
+    }
+
+    function requestNativeMessagingPermission() {
+        return new Promise((resolve) => {
+            chrome.permissions.request({ permissions: ["nativeMessaging"] }, (granted) => {
+                void chrome.runtime.lastError;
+                resolve(Boolean(granted));
+            });
+        });
+    }
+
+    function removeNativeMessagingPermission() {
+        return new Promise((resolve) => {
+            chrome.permissions.remove({ permissions: ["nativeMessaging"] }, () => {
+                void chrome.runtime.lastError;
+                resolve();
+            });
+        });
+    }
+
+    /** 按当前后端同步企业区 UI(select 值 / 数据策略展示 / 状态行)。 */
+    function syncEnterpriseUi(backend) {
+        const active = backend === "native_host";
+        if (enterpriseProviderSelect) {
+            enterpriseProviderSelect.value = active ? "native_host" : "none";
+        }
+        if (enterpriseDataPolicySelect) {
+            enterpriseDataPolicySelect.value = active ? "raw_allowed" : "local_only";
+        }
+        if (!active && enterpriseNativeGuide) {
+            // 指引仅在启用失败时展开;成功/未配置态收起。
+            enterpriseNativeGuide.classList.add("hidden");
+        }
+        setEnterpriseStatus(
+            active
+                ? "已启用本机引擎：检查在本机完成，原文不出设备。"
+                : "未配置扫描后端：企业模式当前仍使用普通保护。",
+            active ? "ok" : "",
+        );
+    }
+
+    async function refreshEnterpriseBackend() {
+        const resp = await sendRuntimeMessage({ type: "vigil_get_enterprise_backend" });
+        syncEnterpriseUi(resp && resp.backend === "native_host" ? "native_host" : "none");
+    }
+
+    async function setEnterpriseBackend(backend) {
+        return sendRuntimeMessage({ type: "vigil_set_enterprise_backend", backend });
     }
 
     function setEnterpriseVisible(mode) {
@@ -308,6 +366,46 @@ import { normalizeCustomRiskRuleInput } from "./redaction-rules.js";
         });
     }
 
+    if (enterpriseProviderSelect) {
+        enterpriseProviderSelect.addEventListener("change", async () => {
+            const wanted = enterpriseProviderSelect.value;
+            if (wanted === "native_host") {
+                // 权限请求必须留在用户手势同步栈附近(change 事件内第一步)。
+                const granted = await requestNativeMessagingPermission();
+                if (!granted) {
+                    setEnterpriseStatus("未授予权限，已取消启用。", "warn");
+                    syncEnterpriseUi("none");
+                    return;
+                }
+                setEnterpriseStatus("正在探测本机引擎…");
+                const probe = await sendRuntimeMessage({ type: "vigil_probe_native_host" });
+                if (!probe || !probe.ok) {
+                    // 探测失败不保存(fail-closed 且不把用户锁进全阻断);展开指引。
+                    await setEnterpriseBackend("none");
+                    syncEnterpriseUi("none");
+                    if (enterpriseNativeGuide) enterpriseNativeGuide.classList.remove("hidden");
+                    setEnterpriseStatus(
+                        `未连接到本机引擎（${(probe && probe._error) || "未知错误"}）。请按下方指引完成安装与注册后重试。`,
+                        "warn",
+                    );
+                    return;
+                }
+                const resp = await setEnterpriseBackend("native_host");
+                if (resp && resp.ok) {
+                    syncEnterpriseUi("native_host");
+                } else {
+                    syncEnterpriseUi("none");
+                    setEnterpriseStatus(`启用失败：${(resp && resp._error) || "未知错误"}`, "warn");
+                }
+                return;
+            }
+            // 回落普通保护:清后端 + 主动撤回可选权限(最小权限)。
+            await setEnterpriseBackend("none");
+            await removeNativeMessagingPermission();
+            syncEnterpriseUi("none");
+        });
+    }
+
     customSiteForm.addEventListener("submit", async (ev) => {
         ev.preventDefault();
         const input = customSiteInput.value;
@@ -403,6 +501,7 @@ import { normalizeCustomRiskRuleInput } from "./redaction-rules.js";
     }
 
     refreshMode();
+    refreshEnterpriseBackend();
     refreshCustomSites();
     refreshCustomRiskRules();
 })();

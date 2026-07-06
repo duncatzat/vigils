@@ -175,13 +175,20 @@ The extension has no frontend build step. It uses native MV3, HTML, CSS, and Jav
 
 ## Enterprise Provider Interface
 
-Everyday users do not need an enterprise provider. Enterprise mode can later integrate with:
+Everyday users do not need an enterprise provider. The first real backend is available now:
 
-- Native Host
-- localhost agent
-- Enterprise HTTPS API
-- Browser-side Wasm
-- Other managed providers
+- **Local Vigils engine (Native Host)** — implemented. In Options, switch to enterprise
+  mode and pick "Local Vigils engine". Requires the Vigils CLI/desktop install with the
+  native messaging host registered (see the user guide's Browser extension section; the
+  registration command needs the extension ID shown in Options). Checks are then routed
+  to the local `vigil-native-host` process: hard-fingerprint detection (13 credential
+  classes), plus semantic PII detection (email / person / phone / …) when the local ML
+  daemon is running. Raw text goes to the **local process only** and never leaves the
+  device (it stays in host memory and is dropped after classification). If the host is
+  enabled but unreachable, checks fail closed to block rather than silently downgrading.
+- localhost agent — planned
+- Enterprise HTTPS API — planned
+- Browser-side Wasm — planned
 
 The goal is to let organizations move scanning and policy decisions into a controlled environment while preserving the zero-setup consumer experience.
 
@@ -191,7 +198,7 @@ The goal is to let organizations move scanning and policy decisions into a contr
 - Improve deep input adapters for more AI websites
 - Add fuller E2E test coverage
 - Improve safety event explanations and risk education
-- Add enterprise provider examples
+- ~~Add the first enterprise provider (local Vigils engine via Native Host)~~ ✅ Done
 - ~~Package and publish to the Chrome Web Store~~ ✅ Done
 
 ## License
