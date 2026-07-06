@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use super::client::{daemon_info_path, read_daemon_info, write_daemon_info, DaemonInfo};
 use super::protocol::{Request, Response, PROTOCOL_VERSION};
-use super::server::DaemonCaps;
-use super::transport::{bind, default_socket_name, query_daemon, serve};
+use super::server::{serve, DaemonCaps};
+use super::transport::{bind, default_socket_name, query_daemon};
 use crate::i18n::Lang;
 
 /// 按语言取静态文案(中 / 英并排)。用户直面命令(`daemon start|status|stop`),输出按系统语言本地化。

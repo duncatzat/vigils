@@ -138,6 +138,20 @@ pub fn handle_connection<S: Read + Write>(stream: &mut S, caps: &DaemonCaps) {
     }
 }
 
+/// server accept 循环:每连接 spawn [`handle_connection`](thread-per-conn,简化;bounded 后续)。
+/// 原居 transport 层;随 transport 抽至 `vigil-daemon-ipc`(纯客户端)后归位服务端本模块。
+pub fn serve(listener: interprocess::local_socket::Listener, caps: DaemonCaps) {
+    use interprocess::local_socket::prelude::*;
+    for conn in listener.incoming() {
+        let mut stream = match conn {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let caps = caps.clone();
+        std::thread::spawn(move || handle_connection(&mut stream, &caps));
+    }
+}
+
 /// 请求 → 响应分发。
 ///
 /// `RedactScan`:有暖载 scanner → 真 `scan` → [`WireFinding`];无 scanner(model-less) → 空 findings
@@ -466,5 +480,99 @@ mod tests {
         let mut s = MockStream::new(Vec::new());
         handle_connection(&mut s, &caps());
         assert!(s.outbound.is_empty(), "无握手 → 不回任何东西,不 panic");
+    }
+
+    // ── 真 socket e2e(bind + serve + R1 + 握手;原居 transport.rs tests,随 serve 归位)──
+
+    fn unique_sock(tag: &str) -> String {
+        // 唯一名(进程 id + tag):防与真 daemon / 并行测试碰撞;**不碰真 daemon.json**。
+        // macOS 用 GenericFilePath(文件路径)→ 落 temp 绝对路径,避免污染 CWD。
+        #[cfg(target_os = "macos")]
+        {
+            std::env::temp_dir()
+                .join(format!("vigil-itest-{}-{}.sock", tag, std::process::id()))
+                .to_string_lossy()
+                .into_owned()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            format!("vigil-itest-{}-{}.sock", tag, std::process::id())
+        }
+    }
+
+    fn spawn_daemon(sock: &str, token: &str, up: u64) {
+        let caps = DaemonCaps {
+            token: token.to_string(),
+            scanner: None,
+            ledger: None,
+            #[cfg(feature = "ort")]
+            injection: None,
+            pii_loaded: false,
+            inj_loaded: false,
+            started: std::time::Instant::now() - std::time::Duration::from_secs(up),
+        };
+        let listener = crate::daemon::transport::bind(sock).unwrap();
+        std::thread::spawn(move || super::serve(listener, caps));
+    }
+
+    /// 同进程 daemon 的 DaemonInfo:`pid = 本进程` → R1 匹配(对端 server pid 即本进程)。
+    fn info_for(sock: &str, token: &str) -> crate::daemon::client::DaemonInfo {
+        crate::daemon::client::DaemonInfo {
+            pid: std::process::id(),
+            socket_path: sock.to_string(),
+            token: token.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            pii_loaded: false,
+            inj_loaded: false,
+        }
+    }
+
+    #[test]
+    fn end_to_end_query_with_real_socket_r1_and_exchange() {
+        // 真 socket 全路径:connect + **R1**(同进程 server pid 匹配)+ 握手 + Status dispatch。
+        let sock = unique_sock("e2e");
+        spawn_daemon(&sock, "itest-token", 1);
+        let resp =
+            crate::daemon::transport::query_with(&info_for(&sock, "itest-token"), &Request::Status);
+        assert!(
+            matches!(resp, Some(Response::Status { uptime_secs: 1, .. })),
+            "真 socket 全路径 Status 往返应成功,got {resp:?}"
+        );
+    }
+
+    #[test]
+    fn r1_accepts_same_process_server_pid() {
+        // R1:对端(同进程 server)pid == expected → query_with 返 Some。
+        let sock = unique_sock("r1ok");
+        spawn_daemon(&sock, "t", 0);
+        let resp = crate::daemon::transport::query_with(&info_for(&sock, "t"), &Request::Status);
+        assert!(resp.is_some(), "R1:对端 server pid == 本进程 pid → 通过");
+    }
+
+    // pid 版 R1 仅非 macOS;macOS 走 euid(同进程必同 euid,无法用 pid 构造拒绝用例)。
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn r1_rejects_wrong_expected_pid() {
+        // R1:对端真实 pid = 本进程;expected 设不可能值 → fail-closed None(防冒充 daemon)。
+        let sock = unique_sock("r1bad");
+        spawn_daemon(&sock, "t", 0);
+        let mut info = info_for(&sock, "t");
+        info.pid = u32::MAX;
+        assert!(
+            crate::daemon::transport::query_with(&info, &Request::Status).is_none(),
+            "R1:对端 pid != expected_pid → None(防冒充)"
+        );
+    }
+
+    #[test]
+    fn handshake_bad_token_over_real_socket_rejected() {
+        // R1 通过(同进程)但 token 错 → 服务端回 Error → query_with 返 None(fail-closed)。
+        let sock = unique_sock("badtok");
+        spawn_daemon(&sock, "right-token", 0);
+        assert!(
+            crate::daemon::transport::query_with(&info_for(&sock, "wrong-token"), &Request::Status)
+                .is_none(),
+            "错 token → 服务端 Error → None"
+        );
     }
 }

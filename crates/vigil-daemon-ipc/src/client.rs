@@ -5,7 +5,7 @@
 //! - [`exchange`]:握手 → 校验 HelloOk 版本 → 请求 → 响应的**序列逻辑**;**任何** IO 错误 /
 //!   版本不符 / 非 HelloOk / `Error` 响应 → `None`(调用方据此降级硬指纹,永不 fail-open)。
 //!
-//! 平台 + 安全层在 [`super::transport`] 实现(`interprocess` 跨平台本地 socket):`connect_and_verify`
+//! 平台 + 安全层在 [`crate::transport`] 实现(`interprocess` 跨平台本地 socket):`connect_and_verify`
 //! 做 **R1** peer-credential 校验(对端 server pid == `daemon.json.pid`,经 `peer_creds`)、`query_daemon`
 //! 用工作线程 + `recv_timeout` 做 **R2** 总读截止。公共 `query_daemon` = `read_daemon_info` →
 //! `connect_and_verify`(R1)→ [`exchange`],全程 fail-closed。
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::protocol::{read_frame, write_frame, Hello, Request, Response, PROTOCOL_VERSION};
+use crate::protocol::{read_frame, write_frame, Hello, Request, Response, PROTOCOL_VERSION};
 
 /// `daemon.json` 契约(daemon 启动期原子写,`0600`;hook 同用户可读)。
 ///
@@ -94,8 +94,9 @@ pub fn write_daemon_info(path: &Path, info: &DaemonInfo) -> std::io::Result<()> 
 /// **fail-closed**:写/读 IO 错误、HelloOk 版本不符、首响应非 HelloOk、或任何 [`Response::Error`]
 /// → `None`。调用方(hook)收到 `None` 即用纯硬指纹结果继续(ADR 0024 D3/D7,**永不 fail-open**)。
 ///
-/// 注:R2 总读截止由**连接层**在调用前对 `stream` 设好(`set_read_timeout` + 单调预算);本函数
-/// 的 `read_frame` 阻塞受该截止约束,截止触发经 `FrameError::Io` → `None`。
+/// 注:本函数的 `read_frame` **自身可无限阻塞**(stream 未设 `set_read_timeout`);R2 总读
+/// 截止由调用方 `transport::query_daemon` 强制 —— 本函数跑在其 detached 工作线程内,主线程
+/// `recv_timeout(deadline)` 到期即弃结果返 `None`(worker 随 one-shot hook 进程退出回收)。
 pub fn exchange<S: Read + Write>(
     stream: &mut S,
     token: &str,
@@ -125,10 +126,10 @@ pub fn exchange<S: Read + Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::protocol::{
+    use super::{exchange, read_daemon_info, DaemonInfo};
+    use crate::protocol::{
         read_frame, write_frame, Hello, Request, Response, ScanKind, WireFinding, PROTOCOL_VERSION,
     };
-    use super::{exchange, read_daemon_info, DaemonInfo};
     use std::io::{Cursor, Read, Write};
 
     /// 预载 inbound(模拟 daemon 响应)+ 捕获 outbound(client 实际写出),验序列逻辑。

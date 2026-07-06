@@ -1,0 +1,31 @@
+[package]
+name = "vigil-daemon-ipc"
+publish = false  # 非 SDK publish set(内部 IPC 契约)— 不上 crates.io;cargo-deny path-dep wildcard 守门
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# daemon IPC(ADR 0024):跨平台本地 socket(UDS / Windows named pipe)。用成熟 crate 而非
+# 手写 named-pipe FFI(安全边界,减少 unsafe 出错面);R1 peer-credential + R2 读截止在其
+# raw fd/handle 上另加(见 transport.rs)。版本与 vigil-hub-cli 服务端同源("2"),cargo
+# 统一解析为同一实例 —— `bind` 返回的 Listener 类型跨 crate 兼容。
+interprocess = "2"
+# daemon.json 规范路径(<data_local>/Vigil/daemon.json)定位。
+dirs = "6"
+
+# macOS daemon R1:`peer_creds().pid()` 在 macOS UDS 恒 None(无 SO_PEERCRED),euid 可用。
+# 用 rustix(安全封装,本 crate 仍 forbid unsafe)取自身 euid 与对端比对。版本对齐 lock 既有 1.x。
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

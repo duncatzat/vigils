@@ -30,7 +30,7 @@
 | 0006 | Secret Lease Broker | I06 | **Accepted(Done)** | R2 ACCEPT(R1 REJECT) | 178 |
 | 0007 | Sandbox Runner | I07 + I07.5 + I07.5+ | **Accepted** | R3 ACCEPT(R1/R2 REJECT)/ I07.5 R3 ACCEPT(R1/R2 REJECT)/ **I07.5+ R1 ACCEPT** | 378(I07 基线 + I07.5 Linux-gated + **I07.5+ +3 helper 单测**) |
 | 0008 | Desktop UI | I08a + I08b α1-α5 + β1 + β3 + β5 | **Accepted(I08a Done;α1-α5 MVP 四页;β1 真白名单;β3 EffectKind 强类型;β5 Ledger 磁盘持久化 + 审计跨会话不变量)** | I08a R3 / α1 R3 / α2 R2 / α3 R3 / α4 R1 / α5 R2 / β1 R2 / β3 R2 / **β5 R2 ACCEPT** | 213(I08a,workspace **408** 零 regression)|
-| 0009 | Browser Extension MVP | I09a + I09b α1/α2/α3/α4/β1 + **I09c 规则扩展第一+第二+第三批** + **ISS-021 跨 crate sync** | **Accepted(I09a + I09b 全 α+β1 全 Codex ACCEPT;I09c 第一/二/三批全 Codex ACCEPT;ISS-021 RULE_PROFILE_VERSION v4 → v5 + 跨 crate PrivacyLabel sync 守门)** | I09a R3 / I09b α1 R2 / α2 R2 / α3 R1 / α4 R1 / β1 R2 / I09c 一批 R2 / 二批 R3 / 三批 R1 ACCEPT / **ISS-021 R2 ACCEPT(R1 CONDITIONAL → R2 ACCEPT)** | 258(I09a);workspace **536**(一批 +3 + 二批 +3 + 三批 +3 classifier tests + rule_sync/golden 同步;I09c RULE_PROFILE_VERSION v1 → v2 → v3 → v4;FindingKind 8 → 13;**+ ISS-021 RULE_PROFILE_VERSION v4 → v5,rule_sync.rs +2(alias 表 + count 守门),merge.rs +4(全 14 Hard kind × PrivacyLabel × 重叠/非重叠 矩阵 golden)**)|
+| 0009 | Browser Extension MVP | I09a + I09b α1/α2/α3/α4/β1 + **I09c 规则扩展第一+第二+第三批** + **ISS-021 跨 crate sync** | **Accepted(I09a + I09b 全 α+β1 全 Codex ACCEPT;I09c 第一/二/三批全 Codex ACCEPT;ISS-021 RULE_PROFILE_VERSION v4 → v5 + 跨 crate PrivacyLabel sync 守门)** | I09a R3 / I09b α1 R2 / α2 R2 / α3 R1 / α4 R1 / β1 R2 / I09c 一批 R2 / 二批 R3 / 三批 R1 ACCEPT / **ISS-021 R2 ACCEPT(R1 CONDITIONAL → R2 ACCEPT)** | 258(I09a);workspace **536**(一批 +3 + 二批 +3 + 三批 +3 classifier tests + rule_sync/golden 同步;I09c RULE_PROFILE_VERSION v1 → v2 → v3 → v4;FindingKind 8 → 13;**+ ISS-021 RULE_PROFILE_VERSION v4 → v5,rule_sync.rs +2(alias 表 + count 守门),merge.rs +4(全 14 Hard kind × PrivacyLabel × 重叠/非重叠 矩阵 golden)**;**+ Phase 1 引擎连接 2026-07-06(daemon 第二客户端,workspace 1270)**)|
 | 0010 | HTTP MCP Auth | I10a | **Accepted(Done — 仅 I10a 认证核心 + mock transport)** | R2 ACCEPT(R1 REJECT) | 294 |
 | 0011 | HTTP Transport + JWKS 验签 | I10b 全段 + I10c-α1/α2/α3/α3+/β2 | **Accepted** | 设计 R4 / I10b α1 R2 / α2 R3 / β R2 / I10c-α1 R4 / α2 R2 / β2 R3 / α3 R2 / **α3+ R3** 全 ACCEPT | 375(α1 +18 / α2 +15 / β +17 / I10c-α1 +5 / α2 +5 / β2 +9 / α3 +6 / **α3+ +3**) |
 | 0012 | 模型分发策略 | ISS-001 spike + ISS-004 + ISS-022(Phase 2 forward 实测)+ **v0.5 P2 bootstrap 实施**(commit `b5419b5`)| **Accepted(Implemented)** | ISS-004 R0 直接 ACCEPT(决策表 + 9 决策 + 反馈固化)/ ISS-022 R0(forward 实测验证 §3.6 并发下载规则)/ **v0.5 P2 R0**(§3.2-§3.7 全实施,placeholder URL/sha256 待 v0.5.1 注入)| 10(`crates/vigil-redaction/src/bootstrap/tests.rs`:happy / sha256 mismatch / ETag 304 / fallback / all-fail / manifest parse / disk full / partial resume / verify-skip / mirror order)|
@@ -659,6 +659,12 @@ ADR 0012 §3.2-§3.7 全实施(commit `b5419b5`):
 - R1 BLOCKER:API 边界未收 "token-resource 绑定" → 新 `resolve_access_token` 封闭入口
 - R1 MUST-FIX:`token_type=Bearer` 未校 → `eq_ignore_ascii_case("Bearer")`
 - R2 NICE-TO-HAVE(2026-04-21 横向清理已消化):`list_metadata` 遇未知 `token_kind` 已改为 `return Err("unknown_token_kind")`,与 `get_metadata` 对齐,`tests/integration.rs::list_metadata_fails_closed_on_unknown_token_kind` 回归覆盖
+
+### ADR 0009 Phase 1「引擎连接」+ ADR 0024 第二客户端(2026-07-06)
+
+- **交付**:`crates/vigil-daemon-ipc` 抽取(protocol/client/transport 客户端侧/wire 四原语,纯移动;hub-cli re-export 保路径)+ native-host `ml_augment`(daemon ML PII 增强,fail-closed 纯加性)+ `BrowserCheckResponse.ml_labels` + 审计 `engine`/`ml_labels`(白名单同步)+ 扩展 JS 透传(不进 tier 决策)
+- **审查**:hostile sub-agent SOUND(A-G 全 OK,0 Crit/High/Med;3 LOW 非阻断,其一 JS 限长已当场加固);远端 fmt/clippy(-D warnings)/test 全绿 **1270/0**(+10)
+- **评估依据**:见引入 PR 描述(四断裂分析 + 能力增量矩阵 + 三阶段方案);Phase 2/3 后续推进
 
 ## 维护约定
 

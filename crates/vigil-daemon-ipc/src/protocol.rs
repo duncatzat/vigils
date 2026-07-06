@@ -9,8 +9,10 @@
 //! 安全不变量(由**连接层**强制,见 ADR 0024 Revised;本模块只管编解码):
 //! - **R1**:握手后必校验对端进程凭据(socket/pipe owner == 当前用户 + server pid ==
 //!   `daemon.json.pid` + 镜像名 = `vigil-hub`);不符 → 当 daemon 不可用 → 硬指纹。
-//! - **R2**:读必须有**覆盖整段流式读的总截止**(单调 `Instant` 预算 + `set_read_timeout`),
-//!   防"握手后挤牙膏"楔死 hook;截止触发的 `WouldBlock`/`TimedOut` 经 [`FrameError::Io`] 上抛。
+//! - **R2**:读必须有**覆盖整段流式读的总截止** —— 由调用方 `transport::query_daemon` 强制:
+//!   连接+exchange 全程跑在 detached 工作线程,主线程 `mpsc::recv_timeout(deadline)` 到期
+//!   即返 `None` 降级硬指纹。流本身**不设** `set_read_timeout`;"握手后挤牙膏"至多滞留
+//!   worker 线程(one-shot hook 进程退出即被 OS 回收),绝不楔死决策路径。
 //! - **R3**:[`Request::ClassifyInjection`] **不含** 任何 ledger/路径字段 —— daemon 用启动期
 //!   绑定的 ledger,绝不打开客户端命名的文件(杜绝任意写 / 跨 session risk 投毒)。
 
@@ -125,7 +127,8 @@ pub struct WireFinding {
 /// 帧错误。**所有变体在客户端侧都收敛为"daemon 不可用 → 硬指纹"**(fail-closed)。
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    /// 底层 IO(含连接层 `set_read_timeout` 触发的 `WouldBlock`/`TimedOut` —— R2 总截止)。
+    /// 底层 IO(读写失败/对端断开)。注:R2 总截止**不**经本变体 —— 它由
+    /// `transport::query_daemon` 的 `recv_timeout` 在调用方强制(worker 里的阻塞读被整体弃结果)。
     #[error("frame io: {0}")]
     Io(#[from] io::Error),
     /// 声明的 body 长度超过 [`MAX_FRAME_BYTES`](拒绝,不分配、不读 body)。
@@ -153,9 +156,10 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, msg: &T) -> Result<(), Fra
 
 /// 读一帧并反序列化为 `T`:先读 4 字节长度 → 校验 ≤ cap → 读满 body → 反序列化。
 ///
-/// **R2 注**:本函数用 `read_exact` 读满声明字节;真正的**总截止**(防"挤牙膏"逐字节拖死 hook)
-/// 由**连接层**在调用前用单调 `Instant` 预算设 `set_read_timeout` 强制 —— 截止触发的
-/// `WouldBlock`/`TimedOut` 经 [`FrameError::Io`] 上抛,调用方据此降级硬指纹。
+/// **R2 注**:本函数用 `read_exact` 读满声明字节,**自身可无限阻塞**(stream 未设读超时);
+/// 真正的**总截止**(防"挤牙膏"逐字节拖死 hook)由 `transport::query_daemon` 强制 ——
+/// 本函数跑在其 detached 工作线程内,主线程 `mpsc::recv_timeout(deadline)` 到期直接
+/// 弃结果返 `None` 降级硬指纹(阻塞中的 worker 随 one-shot hook 进程退出被 OS 回收)。
 pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;

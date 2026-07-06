@@ -94,6 +94,8 @@ pub fn classify(request: &BrowserCheckRequest) -> ClassifyOutcome {
         action,
         findings: kinds,
         redacted_text,
+        // classify 是纯硬指纹层;ML 标签由 host 层(native-host ml_augment)按 daemon 可用性追加。
+        ml_labels: Vec::new(),
     })
 }
 

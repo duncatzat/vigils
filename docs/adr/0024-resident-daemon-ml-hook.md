@@ -199,3 +199,14 @@ hook.run(event):
 **§9 测试矩阵追加(进默认矩阵)**:R2 流式读截止降级测试、R6 Windows DACL 拒绝测试、R3 daemon 绑定固定 ledger(忽略请求路径)测试、R1 peer-credential 不符 → 降级测试。
 
 **实施前必决 gate(P2.3)= R1 + R2 + R3 + R5 + R6**(R4/R7 同批落)。评审定论:对"传输+鉴权+fail-closed"这类 ADR,这四问**就是**交付物,必须实施前解决而非延后 —— 已照办。
+
+## Revised 2026-07-06 — 第二客户端(browser native host)+ IPC 抽 crate
+
+- daemon 客户端面从 hook(+ `daemon status`)扩到 **vigil-native-host**(浏览器 paste 守门
+  ML 增强;ADR 0009 Revised 2026-07-06)。D2(无状态推理 oracle / merge 留客户端)与
+  R1-R3 不变量**原样适用**,零 daemon 端改动。
+- protocol / client / transport(客户端侧)/ wire(WireFinding 应用原语)抽至
+  `crates/vigil-daemon-ipc`(纯移动;hub-cli `daemon/mod.rs` re-export 保路径);`serve`
+  accept 循环归位 `daemon/server.rs`(需 `DaemonCaps`)。
+- 长驻客户端新纪律:R2 的 detached-worker 模式假设 one-shot 进程回收;**长驻调用方必须自带
+  失败冷却/限流**(native host:60s 冷却)。已注记于 `transport::query_daemon` doc。

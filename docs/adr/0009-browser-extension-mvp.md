@@ -351,3 +351,50 @@ pub enum FindingKind {
 | AWS secret key(`[A-Za-z0-9/+=]{40}`)| 熵过低,当前 vigil-redaction 仅硬指纹无熵门控 → 高误报 | 待熵评分框架(同上与 email/phone) |
 | IPv6 literal / 下划线 host 形 DB URL | 第三批 regex 有意收紧;后续 DSN 形态扩展时重新评估 | 待真实泄漏样本驱动 |
 | 运维驱动 finding-level 域分离 hash | 非规则扩展,是 audit payload 结构 | I09c 运维反馈驱动 |
+
+## Revised 2026-07-06(Phase 1「引擎连接」:native host 成为 daemon 第二瘦客户端)
+
+背景与全量评估(现状客观评价 / 外部生态 / 四断裂系统分析 / 能力增量矩阵 / 三阶段方案)
+见引入本段的 PR 描述。本段固化 Phase 1 决策与不变量。
+
+### P1. 决策
+
+1. **连接方式 = daemon(ADR 0024)第二瘦客户端**:host 每请求
+   `query_daemon(RedactScan{kind: Args, text=基底前缀≤16KiB}, 800ms)`;复用 R1(peer-cred)/
+   R2(总截止)/R3(无路径注入)。否决项:扩展内跑 ML(CWS 远程代码禁令 + 模型体积)、
+   host 自持 ort(内存×N / 冷启动 45s / ML 变体分发复杂)。**零 daemon 端改动**
+   (server dispatch 忽略 `kind`,cap 由客户端裁)。
+2. **IPC 抽 crate `vigil-daemon-ipc`**(纯移动):protocol / client / transport(客户端侧;
+   `serve` 归位 `daemon/server.rs`)/ **wire**(hook 的 `apply_wire_spans` 等四个 WireFinding
+   安全应用原语,签名改返 `(String, usize)`)。hub-cli `daemon/mod.rs` re-export 保路径,
+   消费侧零改动;hook 与 native-host 共用 wire 原语,防 VIGIL-SEC-OVERLAP/-PH 修复漂移。
+3. **协议扩展(只加可选字段)**:`BrowserCheckResponse.ml_labels: Vec<String>`
+   (serde default + skip empty,双向兼容;**纯展示层**,不进扩展 tier 决策);
+   审计 payload 白名单 +`engine`("hardfp" | "hardfp+ml")+`ml_labels`(§I-9.2 白名单
+   测试双向同步;均类别级 metadata,无 span 文本)。
+
+### P2. 新增不变量
+
+- **ML 只收紧**:`ml_augment` 仅 Allow→Redact(或纵深 re-scan 触 Block);Block 短路不查;
+  daemon 缺席/超时/Error/engine.json 关闭 → 响应**逐字节等于**纯硬指纹现状(单测黄金对照)。
+- **坐标系结构性守恒**:ML 基底 = 硬指纹层最终文本(Redact→`scrub_text_with_spans`,其
+  `.0 == scrub_text()` 与 `classify` 同源);spans 相对基底前缀,`protected` 减法保占位符完整。
+- **长驻进程失败冷却**:hook 的"one-shot 进程回收阻塞 worker"假设对 Chrome 常驻 host 不成立;
+  `DaemonProbe` 失败后 60s 静默(防 detached worker 累积 + 重复 deadline 延迟),窗口过后自愈。
+- **engine.json 门控**(独立解析,同 SSOT fail-closed 方向):缺失=auto(查,缺席自然降级);
+  显式 hardfp=不查;损坏/坏版本=不查。
+- **daemon 输出按不可信处理**:label 经 `safe_label` sanitize(≤32 alnum+_)去重升序;
+  SW 层再加限长(≤16)+ 仅字符串纵深守门。
+
+### P3. 审查与量化
+
+- hostile sub-agent 审查(2026-07-06)**SOUND**:A(移植保真,与 HEAD 逐逻辑 diff)/
+  B(fail-open 面)/C(坐标系)/D(资源)/E(审计白名单)/F(JS 层)/G(协议兼容)全 OK;
+  0 CRITICAL/HIGH/MED;3 个 LOW/信息级非阻断(慢滴漏 ≤1 worker/60s 已文档化、daemon 可控
+  label 字节入本地账本有界、JS 尺寸上限——第三项已当场加固)。
+- 远端(192.168.252.20,cargo 1.96)`fmt --check` / `clippy --workspace --all-targets
+  -D warnings` / `test --workspace` 全绿:**1270 passed / 0 failed**(基线 1260,+10:
+  wire 13 全量随迁+2 补、native-host ml_augment 10、server e2e 4 随迁)。
+- 后续:Phase 2(posture→tier 统一 + GUI 观测)、Phase 3(setup 编排 + 文档一致性)。
+  Chrome Web Store 消费版扩展(0.2.0,纯 JS consumer 模式)已独立上架;本轮 native host
+  ML 能力对应其 enterprise 模式的 provider 接缝,接线属 Phase 2+ 产品决策。
