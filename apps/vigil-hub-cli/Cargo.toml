@@ -72,6 +72,8 @@ vigil-ui-protocol = { path = "../../crates/vigil-ui-protocol" }
 # 契约)已抽至 vigil-daemon-ipc(供 hook 与 vigil-native-host 共用);本 crate 保留服务端
 # (`daemon::server` accept 循环需 interprocess Listener 类型,与 ipc crate 同版本 "2" 同源解析)。
 vigil-daemon-ipc = { path = "../../crates/vigil-daemon-ipc" }
+# setup --status 浏览器防线行:直调 native host 注册状态(install::status,只读)。
+vigil-native-host = { path = "../native-host" }
 interprocess = "2"
 
 # CLI/帮助文本国际化(i18n):按系统语言(Windows 用户默认 UI 语言 / Unix LANG 等)选择

@@ -287,6 +287,15 @@ pub struct StatusReport {
     pub registry_present: Option<bool>,
 }
 
+impl StatusReport {
+    /// 综合注册判定:manifest 在位且(Windows 上)HKCU 注册表键在位;
+    /// 非 Windows 无注册表概念(`registry_present = None`)→ 仅看 manifest。
+    /// 供 CLI `setup --status` 与桌面 Protection Overview 卡共用,防各自重实现漂移。
+    pub fn is_registered(&self) -> bool {
+        self.manifest_exists && self.registry_present.unwrap_or(true)
+    }
+}
+
 // ─────────────────────────── 内部辅助:跨平台分流 ─────────────────────────────────────
 
 /// 计算 manifest 文件绝对路径(不负责写;全平台共用)。
@@ -619,5 +628,29 @@ mod tests {
         assert!(msg.contains("/tmp/xyz"), "保留目标路径");
         assert!(!msg.contains("Permission denied"), "不透传 io 原文");
         assert!(!msg.contains("os error"), "不透传 os error");
+    }
+
+    #[test]
+    fn status_report_is_registered_matrix() {
+        use std::path::PathBuf;
+        let mk = |manifest_exists, registry_present| super::StatusReport {
+            manifest_path: PathBuf::from("/x/com.vigil.host.json"),
+            manifest_exists,
+            registry_present,
+        };
+        assert!(
+            mk(true, Some(true)).is_registered(),
+            "manifest + 注册表在位"
+        );
+        assert!(
+            mk(true, None).is_registered(),
+            "非 Windows(无注册表概念)仅看 manifest"
+        );
+        assert!(
+            !mk(true, Some(false)).is_registered(),
+            "Windows 注册表键缺失"
+        );
+        assert!(!mk(false, Some(true)).is_registered(), "manifest 缺失");
+        assert!(!mk(false, None).is_registered());
     }
 }

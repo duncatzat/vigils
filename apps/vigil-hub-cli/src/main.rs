@@ -2502,6 +2502,25 @@ fn print_setup_report(
                 tr(lang, "no servers wrapped", "尚未防护任何服务器").to_string()
             }
         );
+        // 浏览器防线(可选层):native host 注册态。直调 install::status(纯文件/注册表
+        // 只读,与桌面 Protection Overview 卡同源判定 is_registered,防重实现漂移)。
+        println!(
+            "  {}{}",
+            tr(lang, "Browser guard: ", "浏览器防线:  "),
+            match vigil_native_host::install::status(None) {
+                Ok(s) if s.is_registered() => tr(
+                    lang,
+                    "native host registered (pick it in the extension's enterprise settings)",
+                    "native host 已注册(在扩展企业设置选择本机引擎后生效)",
+                ),
+                Ok(_) => tr(
+                    lang,
+                    "not registered (optional; see the Browser extension docs)",
+                    "未注册(可选;见浏览器扩展文档)",
+                ),
+                Err(_) => tr(lang, "status unknown", "状态未知"),
+            }
+        );
         if hook_active {
             println!(
                 "  {}{}",

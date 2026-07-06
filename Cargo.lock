@@ -5977,6 +5977,7 @@ dependencies = [
  "vigil-http-transport",
  "vigil-lease",
  "vigil-mcp",
+ "vigil-native-host",
  "vigil-policy",
  "vigil-redaction",
  "vigil-runner",
