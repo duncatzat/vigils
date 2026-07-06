@@ -12,6 +12,7 @@ members = [
     "crates/vigil-redaction",
     "crates/vigil-ui-protocol",
     "crates/vigil-browser",
+    "crates/vigil-daemon-ipc",
     "crates/vigil-http-auth",
     "crates/vigil-http-transport",
     "crates/vigil-sandbox-linux",

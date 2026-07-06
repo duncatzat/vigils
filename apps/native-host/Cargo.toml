@@ -1,5 +1,6 @@
 [package]
 name = "vigil-native-host"
+publish = false  # 非 SDK publish set(app / wasmtime / http / sandbox)— 不上 crates.io;cargo-deny path-dep wildcard 守门
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,7 +21,11 @@ path = "src/lib.rs"
 [dependencies]
 vigil-browser = { path = "../../crates/vigil-browser" }
 vigil-audit = { path = "../../crates/vigil-audit" }
+# ML 增强基底重算(scrub_text_with_spans)+ 改写后纵深 re-scan(scan_hard_findings)。
 vigil-redaction = { path = "../../crates/vigil-redaction" }
+# daemon 第二客户端(ADR 0024;hook 之后):RedactScan 协议 + R1/R2 fail-closed 传输 +
+# WireFinding 安全应用原语。零 ort —— 模型只在 daemon,本 host 保持轻量。
+vigil-daemon-ipc = { path = "../../crates/vigil-daemon-ipc" }
 serde_json = { workspace = true }
 # β1:install/uninstall/status CLI + 跨平台 Chrome Native Messaging Host manifest 注册
 clap = { workspace = true }

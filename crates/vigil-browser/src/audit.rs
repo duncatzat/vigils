@@ -1,7 +1,9 @@
 //! 审计 payload 构造(ADR 0009 §D5)。
 //!
 //! 固定字段白名单:`origin / event_kind / finding_kinds / finding_count /
-//! length_bucket / action / redacted / request_id / rule_profile_version`。
+//! length_bucket / action / redacted / request_id / rule_profile_version /
+//! engine / ml_labels`(后两者:参与本次决策的引擎标识 + ML 命中标签,均为
+//! 类别级 metadata,不含任何 span 文本)。
 //!
 //! **严禁**:原文 / redacted_text / 全量文本 sha256。新增字段须同步更新
 //! `audit_payload_schema_whitelist` 测试。
@@ -35,6 +37,9 @@ pub struct BrowserAuditMeta<'a> {
     pub request_id: &'a str,
     /// 原文字节长度 —— `audit_payload` 只用桶化值
     pub text_len: usize,
+    /// 参与本次决策的引擎:`"hardfp"`(纯硬指纹;daemon 缺席/禁用/Block 短路)或
+    /// `"hardfp+ml"`(daemon ML 扫描成功参与,含"扫过但无命中")。由 host 层填。
+    pub engine: &'static str,
 }
 
 /// 给定 `meta` + `response` 组装审计 payload(仅 metadata,**严格不含** raw text / redacted_text)。
@@ -60,6 +65,8 @@ pub fn build_audit_payload(meta: &BrowserAuditMeta<'_>, response: &BrowserCheckR
         "redacted": matches!(response.action, BrowserAction::Redact),
         "request_id": meta.request_id,
         "rule_profile_version": RULE_PROFILE_VERSION,
+        "engine": meta.engine,
+        "ml_labels": response.ml_labels,
     })
 }
 
@@ -93,6 +100,7 @@ mod tests {
             event_kind: BrowserEventKind::Paste,
             request_id: "rid-1",
             text_len: 42,
+            engine: "hardfp",
         }
     }
 
@@ -105,6 +113,7 @@ mod tests {
                 BrowserAction::Redact => Some("[REDACTED x]".into()),
                 _ => None,
             },
+            ml_labels: Vec::new(),
         }
     }
 
@@ -127,6 +136,8 @@ mod tests {
             "redacted",
             "request_id",
             "rule_profile_version",
+            "engine",
+            "ml_labels",
         ]
         .into_iter()
         .collect();
@@ -154,6 +165,7 @@ mod tests {
             event_kind: BrowserEventKind::Input,
             request_id: "rid-input",
             text_len: 42,
+            engine: "hardfp",
         };
         let resp = mk_resp(BrowserAction::Redact, vec![FindingKind::EnvAssignment]);
         let payload = build_audit_payload(&meta, &resp);
@@ -174,12 +186,14 @@ mod tests {
             event_kind: BrowserEventKind::Paste,
             request_id: "rid-1",
             text_len: SENTINEL.len(),
+            engine: "hardfp+ml",
         };
         let resp = BrowserCheckResponse {
             request_id: "rid-1".into(),
             action: BrowserAction::Redact,
             findings: vec![FindingKind::GithubToken],
             redacted_text: Some("[REDACTED github_token]".into()),
+            ml_labels: vec!["private_email".into()],
         };
         let p = build_audit_payload(&meta, &resp);
         let s = serde_json::to_string(&p).unwrap();

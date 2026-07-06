@@ -101,11 +101,32 @@ fn main() -> ExitCode {
 // ─────────────────────────── default subcommand: run(Chrome exec) ─────────────────────
 
 fn run_stdio_loop() -> ExitCode {
-    // Ledger 路径:环境变量 VIGIL_DB_PATH 优先;否则用用户目录下默认路径
-    let db_path = std::env::var("VIGIL_DB_PATH").ok().map(PathBuf::from);
+    // Ledger 路径(审核 P1 EXT-01 修复):VIGIL_LEDGER_PATH(全产品 canonical)→
+    // VIGIL_DB_PATH(历史别名)→ 默认 <data_local_dir>/Vigil/ledger.sqlite3(与 CLI/桌面
+    // 同账本,浏览器审计事件从此桌面 Activity Feed 可见)。解析为纯函数进 lib 单测守门。
+    let db_path = vigil_native_host::resolve_ledger_path(
+        std::env::var("VIGIL_LEDGER_PATH").ok().as_deref(),
+        std::env::var("VIGIL_DB_PATH").ok().as_deref(),
+        dirs::data_local_dir(),
+    );
+    // 持久账本打不开(锁/权限/目录建不出)→ 降级 in-memory 并继续服务:分类防护优先于
+    // 审计持久化(与 hook/daemon 的 audit best-effort 先例一致),绝不因审计初始化失败
+    // 拒绝守门。警告走 stderr(Chrome 收集到扩展日志;stdout 是 framing 通道,禁止字面量)。
     let ledger = match db_path {
-        Some(p) => Ledger::open(&p),
-        None => Ledger::open_in_memory(), // Chrome 每次启动 host 会新建;I09b 补真实路径
+        Some(p) => {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            Ledger::open(&p).or_else(|e| {
+                eprintln!(
+                    "vigil-native-host: persistent ledger unavailable at {} ({e}); \
+                     falling back to in-memory audit (protection unaffected)",
+                    p.display()
+                );
+                Ledger::open_in_memory()
+            })
+        }
+        None => Ledger::open_in_memory(),
     };
     let ledger = match ledger {
         Ok(l) => l,
@@ -123,7 +144,9 @@ fn run_stdio_loop() -> ExitCode {
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
 
-    match vigil_native_host::run(&mut stdin, &mut stdout, &ledger, &session_id) {
+    // daemon ML 探针:engine.json 门控 + 失败冷却;daemon 缺席 → 行为恒等纯硬指纹(fail-closed)。
+    let ml = vigil_native_host::DaemonProbe::new();
+    match vigil_native_host::run(&mut stdin, &mut stdout, &ledger, &session_id, &ml) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     }
@@ -155,7 +178,7 @@ fn cmd_install(
     };
     match install::install(&cfg, allow_missing_exe, None) {
         Ok(out) => {
-            println!("✓ Vigil Native Host installed");
+            println!("[OK] Vigil Native Host installed");
             println!("  manifest: {}", out.manifest_path.display());
             if let Some(reg) = out.registry_key {
                 println!("  registry: {reg}");
@@ -176,7 +199,7 @@ fn cmd_install(
 fn cmd_uninstall() -> ExitCode {
     match install::uninstall(None) {
         Ok(()) => {
-            println!("✓ Vigil Native Host uninstalled (manifest / registry cleared, 幂等)");
+            println!("[OK] Vigil Native Host uninstalled (manifest / registry cleared, 幂等)");
             ExitCode::SUCCESS
         }
         Err(err) => {

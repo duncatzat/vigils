@@ -50,7 +50,14 @@ fn run_once(req: &BrowserCheckRequest) -> (Ledger, String, serde_json::Value) {
     let input = encode_request(req);
     let mut stdin = Cursor::new(input);
     let mut stdout: Vec<u8> = Vec::new();
-    vigil_native_host::run(&mut stdin, &mut stdout, &ledger, &sid).unwrap();
+    vigil_native_host::run(
+        &mut stdin,
+        &mut stdout,
+        &ledger,
+        &sid,
+        &vigil_native_host::DisabledMlProbe,
+    )
+    .unwrap();
     let frames = decode_responses(&stdout);
     assert_eq!(frames.len(), 1, "每个 request 应产一个 frame");
     (ledger, sid, frames.into_iter().next().unwrap())
@@ -193,7 +200,14 @@ fn oversized_length_prefix_returns_too_large() {
     // 不写 payload(host 应直接 reject 不读 body)
     let mut stdin = Cursor::new(input);
     let mut stdout: Vec<u8> = Vec::new();
-    vigil_native_host::run(&mut stdin, &mut stdout, &ledger, &sid).unwrap();
+    vigil_native_host::run(
+        &mut stdin,
+        &mut stdout,
+        &ledger,
+        &sid,
+        &vigil_native_host::DisabledMlProbe,
+    )
+    .unwrap();
     let frames = decode_responses(&stdout);
     assert_eq!(frames.len(), 1);
     let ef: BrowserErrorFrame = serde_json::from_value(frames[0].clone()).unwrap();
@@ -211,7 +225,14 @@ fn bad_json_payload_returns_bad_json() {
     input.extend_from_slice(body);
     let mut stdin = Cursor::new(input);
     let mut stdout: Vec<u8> = Vec::new();
-    vigil_native_host::run(&mut stdin, &mut stdout, &ledger, &sid).unwrap();
+    vigil_native_host::run(
+        &mut stdin,
+        &mut stdout,
+        &ledger,
+        &sid,
+        &vigil_native_host::DisabledMlProbe,
+    )
+    .unwrap();
     let frames = decode_responses(&stdout);
     assert_eq!(frames.len(), 1);
     let ef: BrowserErrorFrame = serde_json::from_value(frames[0].clone()).unwrap();
@@ -238,7 +259,14 @@ fn multi_frame_sequence_roundtrip() {
     input.extend(encode_request(&req3));
     let mut stdin = Cursor::new(input);
     let mut stdout: Vec<u8> = Vec::new();
-    vigil_native_host::run(&mut stdin, &mut stdout, &ledger, &sid).unwrap();
+    vigil_native_host::run(
+        &mut stdin,
+        &mut stdout,
+        &ledger,
+        &sid,
+        &vigil_native_host::DisabledMlProbe,
+    )
+    .unwrap();
     let frames = decode_responses(&stdout);
     assert_eq!(frames.len(), 3);
     let r1: BrowserCheckResponse = serde_json::from_value(frames[0].clone()).unwrap();

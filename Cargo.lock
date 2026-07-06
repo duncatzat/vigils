@@ -5822,6 +5822,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vigil-daemon-ipc"
+version = "0.4.6"
+dependencies = [
+ "dirs 6.0.0",
+ "interprocess",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "vigil-desktop"
 version = "0.4.6"
 dependencies = [
@@ -5944,7 +5957,6 @@ dependencies = [
  "once_cell",
  "regex",
  "rusqlite",
- "rustix 1.1.4",
  "serde",
  "serde_jcs",
  "serde_json",
@@ -5957,6 +5969,7 @@ dependencies = [
  "url",
  "uuid",
  "vigil-audit",
+ "vigil-daemon-ipc",
  "vigil-desktop",
  "vigil-firewall",
  "vigil-http-auth",
@@ -6023,6 +6036,7 @@ dependencies = [
  "tempfile",
  "vigil-audit",
  "vigil-browser",
+ "vigil-daemon-ipc",
  "vigil-redaction",
  "winreg",
 ]

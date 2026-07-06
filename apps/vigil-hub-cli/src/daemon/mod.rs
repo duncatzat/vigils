@@ -14,7 +14,8 @@
 //! - [`server`]:服务端**单连接处理逻辑**(`handle_connection`,可单测)+ fail-closed 握手 +
 //!   model-less dispatch。**零 ort / 零平台**。
 //! - [`transport`]:`interprocess` 本地 socket + **R1** peer-credential + **R2** 总读截止 +
-//!   单实例(bind 失败守门)。**零 ort**;`query_daemon`(hook 端)+ `bind`/`serve`(daemon 端)。
+//!   单实例(bind 失败守门)。**零 ort**;`query_daemon`(客户端)+ `bind`(daemon 端);
+//!   accept 循环 `serve` 在 [`server`](需 `DaemonCaps`)。
 //!
 //! **已落**:ort 暖载层(`lifecycle::run_start` 暖载 PII scanner + 注入分类器 + R3 绑定自有 canonical
 //! ledger;dispatch 出真 findings / 软信号 risk bump)、`daemon start|stop|status` 子命令、hook 接
@@ -26,8 +27,11 @@
 //! daemon = **无状态推理 oracle**(D2:返 findings,merge/decision 全留 hook)→ 缺/超时/冒充/
 //! 畸形响应 **只抑制 ML recall**,动不了硬指纹 deny 与 PostToolUse withhold → **永不 fail-open**。
 
-pub mod client;
+// protocol / client / transport / wire 已抽至独立 crate `vigil-daemon-ipc`(纯移动,
+// 逻辑与安全不变量不变),使 daemon 瘦客户端不再绑定 Hub CLI 依赖图(首个受益方:
+// vigil-native-host)。此处 re-export 保持 `crate::daemon::*` 既有路径,消费侧零改动;
+// 服务端(handle_connection/DaemonCaps/serve,须持模型与 ledger)与生命周期编排留本地。
+pub use vigil_daemon_ipc::{client, protocol, transport, wire};
+
 pub mod lifecycle;
-pub mod protocol;
 pub mod server;
-pub mod transport;

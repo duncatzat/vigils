@@ -131,6 +131,12 @@ pub struct BrowserCheckResponse {
     /// action=Redact 时为 Some(已经过 scrub + 硬指纹 re-scan 兜底,§I-9.6)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted_text: Option<String>,
+    /// ML(daemon)命中的 PII 标签(经 sanitize 的闭集字符串,如 `private_email`;去重升序)。
+    /// **仅展示层增强**:不参与扩展 tier / action 决策(决策仍由 `findings`/`action` 承载,
+    /// ML 只能把 Allow 收紧为 Redact,由 host 侧完成)。旧扩展忽略未知字段;缺省反序列化为
+    /// 空(`default`,向后兼容 hardfp-only host 的响应)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ml_labels: Vec<String>,
 }
 
 /// Core 层错误码(Host 在 framing 层也会用相同 error schema 返扩展)。
