@@ -41,8 +41,24 @@
     globalThis.__vigilBrowserGuardLoaded = true;
     globalThis.__vigilBrowserGuardDisabled = false;
 
+    // 构建标记(纯版本字符串,无任何用户数据)——写到页面根元素的 data 属性,供在
+    // Console 用 `document.documentElement.dataset.vigilBuild` 一眼确认「装的是不是最新版」。
+    // 排查用户报告时区分「代码 bug」与「装的是旧版」的关键锚点。改动内联守门逻辑时递增。
+    const VIGIL_BUILD = "2026-07-07-inline-ux-3";
+    try {
+        document.documentElement.setAttribute("data-vigil-build", VIGIL_BUILD);
+    } catch (_) {
+        /* documentElement 尚不可用时忽略(document_start 极早期);不影响守门 */
+    }
+
     const ORIGIN = location.origin;
     const INPUT_DEBOUNCE_MS = 700;
+    // 防抖最长等待:真实富文本框架(ProseMirror / Lexical / React 受控组件)在用户输入后
+    // 会**持续派发 input 事件**(重渲染心跳 / 协作光标 / IME),间隔可能 < 防抖窗口,把
+    // 700ms 防抖 timer 无限 reset → 永不 fire → 手动输入永不被检查(用户报告的「检测到
+    // 却不提醒」的真根因:input 根本没查,事件列表的记录来自粘贴路径)。maxWait 保证:自
+    // 首次未决检查起超过此上限,不再推迟,让已排定的检查 fire。
+    const INPUT_MAX_WAIT_MS = 1200;
 
     function isGuardDisabled() {
         return globalThis.__vigilBrowserGuardDisabled === true;
@@ -178,11 +194,6 @@
         return labels[kind] || String(kind || "未知风险");
     }
 
-    function primaryFindingLabel(findings) {
-        const first = findings && findings.length > 0 ? findings[0] : null;
-        return findingLabel(first || "风险内容");
-    }
-
     function clampNumber(value, min, max) {
         return Math.max(min, Math.min(value, max));
     }
@@ -271,31 +282,95 @@
         }
     }
 
-    function mountPromptBase(title, findings, anchor) {
+    // ── 内联品牌图标(SVG 用 createElementNS 构建,不用 innerHTML;content script 隔离
+    //    世界不受页面 CSP 影响)。Aegis 神盾是 Vigil 的品牌符号。──
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    function svgEl(tag, attrs) {
+        const el = document.createElementNS(SVG_NS, tag);
+        for (const k in attrs) el.setAttribute(k, attrs[k]);
+        return el;
+    }
+    function promptAccent(tone) {
+        return tone === "block" ? "#ef4444" : "#f59e0b";
+    }
+    function shieldIcon(color, kind /* "warn" | "block" */) {
+        const svg = svgEl("svg", { width: "18", height: "18", viewBox: "0 0 24 24", fill: "none" });
+        svg.style.flex = "0 0 auto";
+        svg.appendChild(
+            svgEl("path", {
+                d: "M12 2.5l6.4 2.8v5.3c0 4.2-2.7 7.9-6.4 9.4-3.7-1.5-6.4-5.2-6.4-9.4V5.3L12 2.5z",
+                fill: color,
+                "fill-opacity": "0.16",
+                stroke: color,
+                "stroke-width": "1.5",
+                "stroke-linejoin": "round",
+            }),
+        );
+        if (kind === "block") {
+            svg.appendChild(
+                svgEl("path", { d: "M9.6 9.6l4.8 4.8M14.4 9.6l-4.8 4.8", stroke: color, "stroke-width": "1.8", "stroke-linecap": "round" }),
+            );
+        } else {
+            svg.appendChild(svgEl("path", { d: "M12 8v4.3", stroke: color, "stroke-width": "1.8", "stroke-linecap": "round" }));
+            svg.appendChild(svgEl("circle", { cx: "12", cy: "15.4", r: "0.95", fill: color }));
+        }
+        return svg;
+    }
+    function lockIcon() {
+        const svg = svgEl("svg", { width: "12", height: "12", viewBox: "0 0 24 24", fill: "none" });
+        svg.style.flex = "0 0 auto";
+        svg.style.opacity = "0.85";
+        svg.appendChild(svgEl("rect", { x: "5", y: "10.5", width: "14", height: "9.5", rx: "2", fill: "currentColor", "fill-opacity": "0.14", stroke: "currentColor", "stroke-width": "1.6" }));
+        svg.appendChild(svgEl("path", { d: "M8 10.5V7.8a4 4 0 018 0v2.7", stroke: "currentColor", "stroke-width": "1.6", "stroke-linecap": "round" }));
+        return svg;
+    }
+    function findingChip(label, tone /* "risk" | "block" */) {
+        const chip = document.createElement("span");
+        chip.textContent = label;
+        const isBlock = tone === "block";
+        Object.assign(chip.style, {
+            display: "inline-block",
+            padding: "2px 9px",
+            borderRadius: "999px",
+            fontSize: "11px",
+            fontWeight: "650",
+            lineHeight: "1.6",
+            background: isBlock ? "var(--vigil-chip-block-bg)" : "var(--vigil-chip-bg)",
+            color: isBlock ? "var(--vigil-chip-block-fg)" : "var(--vigil-chip-fg)",
+            border: "1px solid " + (isBlock ? "var(--vigil-chip-block-border)" : "var(--vigil-chip-border)"),
+            whiteSpace: "nowrap",
+        });
+        return chip;
+    }
+
+    function mountPromptBase(title, subtitle, findings, anchor, tone /* "risk" | "block" */) {
         closeSafePrompt();
         closeRiskPrompt();
         const parent = document.body || document.documentElement;
         if (!parent) return null;
+        const accent = promptAccent(tone);
 
         const box = document.createElement("div");
         box.setAttribute("data-vigil-risk-prompt", "");
+        box.setAttribute("data-vigil-tone", tone || "risk");
         box.setAttribute("role", "dialog");
         box.setAttribute("aria-live", "polite");
         Object.assign(box.style, {
             position: "fixed",
             zIndex: "2147483647",
-            width: "min(300px, calc(100vw - 32px))",
-            padding: "14px",
-            borderRadius: "14px",
+            width: "min(320px, calc(100vw - 32px))",
+            padding: "15px 16px 14px",
+            borderRadius: "16px",
+            borderTop: `2.5px solid ${accent}`,
             background: "var(--vigil-prompt-bg)",
             color: "var(--vigil-prompt-fg)",
             boxShadow: "var(--vigil-prompt-shadow)",
-            fontFamily: "system-ui, -apple-system, sans-serif",
+            fontFamily: "system-ui, -apple-system, 'Segoe UI', sans-serif",
             fontSize: "13px",
-            lineHeight: "1.45",
+            lineHeight: "1.5",
             border: "1px solid var(--vigil-prompt-border)",
             boxSizing: "border-box",
-            animation: "vigil-prompt-in 0.25s cubic-bezier(0.4, 0, 0.2, 1) forwards, vigil-prompt-pulse 1.8s ease-in-out 0.3s 1",
+            animation: "vigil-prompt-in 0.28s cubic-bezier(0.34, 1.4, 0.5, 1) forwards",
             transition: "opacity 0.2s ease, transform 0.2s ease",
         });
 
@@ -310,30 +385,53 @@
         });
         box.appendChild(arrow);
 
-        const heading = document.createElement("div");
-        heading.style.fontWeight = "750";
-        heading.style.marginBottom = "6px";
-        heading.style.fontSize = "13px";
-        heading.textContent = title;
-        box.appendChild(heading);
+        // 标题行:盾图标 + 标题
+        const head = document.createElement("div");
+        Object.assign(head.style, { display: "flex", alignItems: "center", gap: "8px" });
+        head.appendChild(shieldIcon(accent, tone === "block" ? "block" : "warn"));
+        const titleEl = document.createElement("div");
+        titleEl.style.fontWeight = "750";
+        titleEl.style.fontSize = "13.5px";
+        titleEl.textContent = title;
+        head.appendChild(titleEl);
+        box.appendChild(head);
 
+        // finding chips(去重、最多 4 个;类别名,无原文)
+        const kinds = Array.isArray(findings) ? findings : [];
+        if (kinds.length > 0) {
+            const chipRow = document.createElement("div");
+            Object.assign(chipRow.style, { display: "flex", flexWrap: "wrap", gap: "5px", marginTop: "9px" });
+            const labels = [...new Set(kinds.map((f) => findingLabel(f)))].slice(0, 4);
+            for (const l of labels) chipRow.appendChild(findingChip(l, tone));
+            box.appendChild(chipRow);
+        }
+
+        // 副文案
         const body = document.createElement("div");
         body.style.color = "var(--vigil-prompt-muted)";
-        body.textContent = "建议先脱敏再发送。";
+        body.style.marginTop = "10px";
+        body.textContent = subtitle;
         box.appendChild(body);
 
+        // 隐私保证:锁图标 + 文案
         const privacy = document.createElement("div");
-        privacy.style.marginTop = "6px";
-        privacy.style.color = "var(--vigil-prompt-muted)";
-        privacy.style.opacity = "0.7";
-        privacy.textContent = "原文未离开你的浏览器。";
+        Object.assign(privacy.style, {
+            display: "flex",
+            alignItems: "center",
+            gap: "5px",
+            marginTop: "8px",
+            color: "var(--vigil-prompt-muted)",
+            opacity: "0.9",
+            fontSize: "12px",
+        });
+        privacy.appendChild(lockIcon());
+        const privacyText = document.createElement("span");
+        privacyText.textContent = "原文从未离开你的浏览器";
+        privacy.appendChild(privacyText);
         box.appendChild(privacy);
 
         const actions = document.createElement("div");
-        actions.style.display = "flex";
-        actions.style.gap = "8px";
-        actions.style.marginTop = "14px";
-        actions.style.justifyContent = "flex-end";
+        Object.assign(actions.style, { display: "flex", gap: "8px", marginTop: "14px", justifyContent: "flex-end" });
         box.appendChild(actions);
 
         parent.appendChild(box);
@@ -350,11 +448,12 @@
         btn.textContent = label;
         Object.assign(btn.style, {
             border: "1px solid transparent",
-            borderRadius: "8px",
-            padding: "7px 12px",
+            borderRadius: "9px",
+            padding: "8px 14px",
             cursor: "pointer",
             fontWeight: "700",
-            fontSize: "12px",
+            fontSize: "12.5px",
+            letterSpacing: "0.2px",
             transition: "background 0.15s ease, border-color 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease, filter 0.15s ease",
         });
         if (tone === "primary") {
@@ -393,23 +492,35 @@
 
     function showRiskPrompt(response, anchor, onRedact) {
         const findings = response.findings || [];
-        const actions = mountPromptBase(`检测到 ${primaryFindingLabel(findings)}`, findings, anchor);
+        const actions = mountPromptBase(
+            "检测到敏感内容",
+            "脱敏后即可安全发送，密钥会替换为占位符。",
+            findings,
+            anchor,
+            "risk",
+        );
         if (!actions) return;
         const redactBtn = promptButton("脱敏后继续", "primary");
         redactBtn.addEventListener("click", () => {
             closeRiskPrompt();
             onRedact(response.redacted_text || "");
         });
-        const blockBtn = promptButton("阻断", "secondary");
+        const blockBtn = promptButton("取消", "secondary");
         blockBtn.addEventListener("click", closeRiskPrompt);
         actions.append(redactBtn, blockBtn);
     }
 
     function showBlockPrompt(response, anchor) {
         const findings = response.findings || [];
-        const actions = mountPromptBase(`已阻断 ${primaryFindingLabel(findings)}`, findings, anchor);
+        const actions = mountPromptBase(
+            "已拦截高危内容",
+            "此内容无法安全脱敏，已为你阻止发送。",
+            findings,
+            anchor,
+            "block",
+        );
         if (!actions) return;
-        const closeBtn = promptButton("关闭", "secondary");
+        const closeBtn = promptButton("知道了", "secondary");
         closeBtn.addEventListener("click", closeRiskPrompt);
         actions.appendChild(closeBtn);
     }
@@ -519,15 +630,10 @@
             "  from { opacity: 1; transform: translateX(0) translateY(0); }",
             "  to   { opacity: 0; transform: translateX(-12px) translateY(4px); }",
             "}",
-            /* prompt slide-in */
+            /* prompt spring-in(轻微回弹,配合 cubic-bezier(0.34,1.4,0.5,1)) */
             "@keyframes vigil-prompt-in {",
-            "  from { opacity: 0; transform: translateY(10px) scale(0.97); }",
+            "  from { opacity: 0; transform: translateY(12px) scale(0.94); }",
             "  to   { opacity: 1; transform: translateY(0) scale(1); }",
-            "}",
-            /* prompt arrow pulse for attention */
-            "@keyframes vigil-prompt-pulse {",
-            "  0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.35); }",
-            "  50%  { box-shadow: 0 0 0 6px rgba(245, 158, 11, 0); }",
             "}",
             /* shared CSS variables */
             ":root {",
@@ -546,6 +652,12 @@
             "  --vigil-btn-secondary-fg: " + (isDark ? "#e2e8f0" : "#44403c") + ";",
             "  --vigil-btn-secondary-border: " + (isDark ? "rgba(255,255,255,0.12)" : "#d6d3d1") + ";",
             "  --vigil-safe-bg: " + (isDark ? "rgba(245, 158, 11, 0.10)" : "rgba(255, 251, 235, 0.92)") + ";",
+            "  --vigil-chip-bg: " + (isDark ? "rgba(245, 158, 11, 0.18)" : "rgba(245, 158, 11, 0.12)") + ";",
+            "  --vigil-chip-fg: " + (isDark ? "#fcd34d" : "#b45309") + ";",
+            "  --vigil-chip-border: " + (isDark ? "rgba(245, 158, 11, 0.40)" : "rgba(245, 158, 11, 0.32)") + ";",
+            "  --vigil-chip-block-bg: " + (isDark ? "rgba(239, 68, 68, 0.18)" : "rgba(239, 68, 68, 0.12)") + ";",
+            "  --vigil-chip-block-fg: " + (isDark ? "#fca5a5" : "#b91c1c") + ";",
+            "  --vigil-chip-block-border: " + (isDark ? "rgba(239, 68, 68, 0.40)" : "rgba(239, 68, 68, 0.32)") + ";",
             "}",
         ].join("\n");
         parent.appendChild(vigilStyleEl);
@@ -1300,11 +1412,18 @@
             timer: 0,
             lastText: "",
             lastWritten: null,
+            firstAt: 0,
         };
         // Codex review NEEDS-FIX:仅当全文 === 扩展上次写入的**确切值**才跳过(防循环)。
         // **不**用包含式 redaction 标记匹配 —— 否则用户在普通文本里手打 `[REDACTED ...]`
         // 即可诱导跳过分类,绕过守门。绝不信任用户控制的文本内容。
         if (text === prev.lastWritten) return;
+
+        // maxWait:自首次未决检查起超过上限,不再 reset,让已排定的 timer fire(防框架
+        // 持续派发 input 把防抖饿死)。用 Date.now() 仅作 UI 节流基线,不涉安全 replay。
+        const now = Date.now();
+        const firstAt = prev.firstAt || now;
+        if (prev.timer && now - firstAt >= INPUT_MAX_WAIT_MS) return;
 
         if (prev.timer) clearTimeout(prev.timer);
         const next = {
@@ -1312,23 +1431,34 @@
             timer: 0,
             lastText: text,
             lastWritten: prev.lastWritten,
+            firstAt,
         };
         next.timer = setTimeout(async () => {
             if (isGuardDisabled()) return;
             const current = inputChecks.get(target);
             if (!current || current.seq !== next.seq) return;
+            // 本轮检查启动 —— 重置 maxWait 基线(下一轮从下次输入重新计)。
+            current.firstAt = 0;
             const ad = adaptTarget(target);
             if (!ad) return;
+            // 富文本框架(ProseMirror 类,ChatGPT/DeepSeek 等站点编辑器)会在 input 后异步
+            // normalize 文本(零宽字符/占位节点/重排)。若此处要求「与事件时刻文本严格一致」,
+            // 真实站点的手动输入检查会被恒静默吞掉(用户可见症状:粘贴弹卡、手动输入不弹)。
+            // 停顿窗口内的**用户后续输入**已由 seq+clearTimeout 取消本次 fire —— 能走到这里
+            // 即用户已停顿;以 fire 时刻的**当前文本**为检查基准,框架 normalize 不取消检查。
+            // 自写跳过(防 redact 写回→input→再检查循环)仍按精确匹配守住,安全红线不动。
             const latest = ad.getText();
-            if (!latest || latest !== next.lastText) return;
+            if (!latest) return;
+            if (latest === current.lastWritten) return;
 
             const resp = await callBackground("input", latest);
-            const after = inputChecks.get(target);
-            if (!after || after.seq !== next.seq) return;
-            const latestAdapter = adaptTarget(target);
-            if (!latestAdapter) return;
-            const latestAgain = latestAdapter.getText();
-            if (latestAgain !== latest) return;
+            // 弹卡**无条件**基于 SW 判定 —— 真实站点数据(ChatGPT ProseMirror)证实:富文本
+            // 框架在检查往返期间会 re-render 并**派发额外 input 事件**,使排程序号递增 /
+            // normalize 文本。旧实现在此比较「往返后序号 vs 送检时序号」(以及更早的按
+            // 文本严格相等)→ 往返期间任何框架活动都会让弹卡被静默放弃(用户报告的「守护环
+            // 在、检测到、却不弹卡」)。SW 已判定有风险,弹卡是纯提示,必须呈现。用户若真在
+            // 往返期间续写,新排程会另弹一次(showRiskPrompt 幂等替换旧卡);真正的 TOCTOU
+            // 只在**写回**时收口(recheck 当前文本)。
 
             if (resp.action === "allow") {
                 if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
@@ -1338,21 +1468,40 @@
                 resp.action === "confirm_redact" &&
                 typeof resp.redacted_text === "string"
             ) {
-                const safeText = toDisplayRedactedText(resp.redacted_text);
-                showRiskPrompt(resp, target, () => {
+                showRiskPrompt(resp, target, async () => {
+                    // 写回前对**当前**输入框文本重新脱敏 —— 写回的永远是当前内容的脱敏版,
+                    // 消除 TOCTOU(框架 normalize / 用户在弹卡期间续写都安全:不会用过时的
+                    // 脱敏版覆盖新内容,也不会因框架微调而拒绝写回)。
                     const currentAdapter = adaptTarget(target);
                     if (!currentAdapter) return;
-                    if (currentAdapter.getText() !== latestAgain) {
-                        showToast("Vigils: 输入内容已变化,请重新触发安全检查。", "warn");
-                        return;
+                    const currentText = currentAdapter.getText();
+                    if (!currentText) return;
+                    const recheck = await callBackground("input", currentText);
+                    if (
+                        recheck.action === "confirm_redact" &&
+                        typeof recheck.redacted_text === "string"
+                    ) {
+                        writeFieldByExtension(
+                            target,
+                            currentAdapter,
+                            toDisplayRedactedText(recheck.redacted_text),
+                        );
+                        if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
+                        showToast("Vigils: 已脱敏后写入", "info");
+                    } else if (recheck.action === "allow") {
+                        if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
+                        showToast("Vigils: 当前内容已安全", "info");
+                    } else {
+                        writeFieldByExtension(target, currentAdapter, "");
+                        if (target instanceof HTMLElement) setInputVigilState(target, "block");
+                        showToast("Vigils: 含高危密钥,已清除", "warn");
                     }
-                    writeFieldByExtension(target, currentAdapter, safeText);
-                    showToast("Vigils: 已脱敏后写入", "info");
                 });
                 return;
             }
 
-            writeFieldByExtension(target, latestAdapter, "");
+            const blockAdapter = adaptTarget(target);
+            if (blockAdapter) writeFieldByExtension(target, blockAdapter, "");
             if (target instanceof HTMLElement) setInputVigilState(target, "block");
             showBlockPrompt(resp, target);
         }, INPUT_DEBOUNCE_MS);
@@ -1447,18 +1596,19 @@
                 typeof resp.redacted_text === "string"
             ) {
                 showRiskPrompt(resp, target, (redactedText) => {
+                    // 写回脱敏后的**粘贴文本**(不含敏感)到当前光标处。**不**再要求「框内容 ===
+                    // 粘贴时刻快照」—— 富文本框架在弹卡期间 normalize 会让精确相等失败,导致
+                    // 脱敏版被拒绝写入(用户报告:多次粘贴不叠加、后续粘贴无结果)。脱敏文本插到
+                    // 任何位置都安全,故容忍框架微调,只在当前选区插入(保留框内既有内容 → 叠加)。
                     const currentAdapter = adaptTarget(target);
                     if (!currentAdapter) return;
-                    if (pasteSnapshot && currentAdapter.getText() !== pasteSnapshot.text) {
-                        showToast("Vigils: 输入内容已变化,请重新粘贴安全版本。", "warn");
-                        return;
+                    const safe = toDisplayRedactedText(redactedText);
+                    if (typeof currentAdapter.insertText === "function") {
+                        currentAdapter.insertText(safe);
+                    } else {
+                        insertAtPasteSnapshot(target, currentAdapter, safe, pasteSnapshot);
                     }
-                    insertAtPasteSnapshot(
-                        target,
-                        currentAdapter,
-                        toDisplayRedactedText(redactedText),
-                        pasteSnapshot,
-                    );
+                    if (target instanceof HTMLElement) setInputVigilState(target, "guarded");
                     showToast("Vigils: 已脱敏后写入", "info");
                 });
                 return;
@@ -1577,28 +1727,34 @@
                 typeof resp.redacted_text === "string"
             ) {
                 if (primaryInput) {
-                    const ad = adaptTarget(primaryInput);
-                    const originalText = ad ? ad.getText() : "";
-                    showRiskPrompt(resp, primaryInput, (redactedText) => {
-                        if (primaryInput) {
-                            const currentAdapter = adaptTarget(primaryInput);
-                            if (!currentAdapter) return;
-                            if (currentAdapter.getText() !== originalText) {
-                                showToast(
-                                    "Vigils: 提交内容已变化,请重新触发安全检查。",
-                                    "warn",
-                                );
-                                return;
-                            }
+                    showRiskPrompt(resp, primaryInput, async () => {
+                        // 写回前对**当前**输入框文本重新送检 —— 写回/续发的永远是当前内容
+                        // 的最新裁决(框架 normalize / 用户弹卡期间续写都安全:不用过时脱敏版
+                        // 覆盖新内容,新增的高危也绝不自动续发)。旧实现按「与提交时刻文本
+                        // 严格相等」守门,富文本框架异步 normalize 会让写回恒被拒绝。
+                        const currentAdapter = adaptTarget(primaryInput);
+                        if (!currentAdapter) return;
+                        const currentText = currentAdapter.getText();
+                        if (!currentText) return;
+                        const recheck = await callBackground("submit", currentText);
+                        if (
+                            recheck.action === "confirm_redact" &&
+                            typeof recheck.redacted_text === "string"
+                        ) {
                             writeFieldByExtension(
                                 primaryInput,
                                 currentAdapter,
-                                toDisplayRedactedText(redactedText),
+                                toDisplayRedactedText(recheck.redacted_text),
                             );
                             continueSubmit(form, submitter);
                             showToast("Vigils: 已脱敏后写入", "info");
+                        } else if (recheck.action === "allow") {
+                            continueSubmit(form, submitter);
                         } else {
-                            showToast("Vigils: 无法定位输入框，已阻断", "error");
+                            if (primaryInput instanceof HTMLElement) {
+                                setInputVigilState(primaryInput, "block");
+                            }
+                            showBlockPrompt(recheck, primaryInput);
                         }
                     });
                     return;
@@ -1638,24 +1794,36 @@
                 resp.action === "confirm_redact" &&
                 typeof resp.redacted_text === "string"
             ) {
-                const ad = adaptTarget(target);
-                const originalText = ad ? ad.getText() : "";
-                showRiskPrompt(resp, target, (redactedText) => {
+                showRiskPrompt(resp, target, async () => {
+                    // 同 form 提交路径:写回前对当前文本重查,消除「框架 normalize 导致
+                    // 严格相等失败 → 写回被拒」;新增高危绝不放行。
                     const currentAdapter = adaptTarget(target);
                     if (!currentAdapter) return;
-                    if (currentAdapter.getText() !== originalText) {
-                        showToast("Vigils: 提交内容已变化,请重新触发安全检查。", "warn");
-                        return;
+                    const currentText = currentAdapter.getText();
+                    if (!currentText) return;
+                    const recheck = await callBackground("submit", currentText);
+                    if (
+                        recheck.action === "confirm_redact" &&
+                        typeof recheck.redacted_text === "string"
+                    ) {
+                        writeFieldByExtension(
+                            target,
+                            currentAdapter,
+                            toDisplayRedactedText(recheck.redacted_text),
+                        );
+                        continueContenteditableSubmit(
+                            target,
+                            "Vigils: 已脱敏后写入，请确认内容后手动再次发送。",
+                        );
+                    } else if (recheck.action === "allow") {
+                        continueContenteditableSubmit(
+                            target,
+                            "Vigils: 已允许本次内容，请确认内容后手动再次发送。",
+                        );
+                    } else {
+                        setInputVigilState(target, "block");
+                        showBlockPrompt(recheck, target);
                     }
-                    writeFieldByExtension(
-                        target,
-                        currentAdapter,
-                        toDisplayRedactedText(redactedText),
-                    );
-                    continueContenteditableSubmit(
-                        target,
-                        "Vigils: 已脱敏后写入，请确认内容后手动再次发送。",
-                    );
                 });
                 return;
             }

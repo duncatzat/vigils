@@ -17,9 +17,11 @@ import { normalizeCustomRiskRuleInput } from "./redaction-rules.js";
     const modeHint = document.getElementById("mode-hint");
     const enterpriseSection = document.getElementById("enterprise-section");
     const enterpriseProviderSelect = document.getElementById("enterprise-provider-type");
-    const enterpriseDataPolicySelect = document.getElementById("enterprise-data-policy");
     const enterpriseStatus = document.getElementById("enterprise-status");
     const enterpriseNativeGuide = document.getElementById("enterprise-native-guide");
+    const enterpriseBadge = document.getElementById("enterprise-badge");
+    const enterpriseBadgeText = document.getElementById("enterprise-badge-text");
+    const enterpriseBadgeChips = document.getElementById("enterprise-badge-chips");
     const customRiskForm = document.getElementById("custom-risk-form");
     const customRiskName = document.getElementById("custom-risk-name");
     const customRiskPrefix = document.getElementById("custom-risk-prefix");
@@ -103,22 +105,55 @@ import { normalizeCustomRiskRuleInput } from "./redaction-rules.js";
         });
     }
 
-    /** 按当前后端同步企业区 UI(select 值 / 数据策略展示 / 状态行)。 */
-    function syncEnterpriseUi(backend) {
+    /** 姿态档 → 状态行后缀(tier 字面量 + 效果说明;非闭集值不显示)。 */
+    function postureSuffix(postureTier) {
+        if (postureTier === "strict") return "跟随系统姿态：strict（命中即阻断）。";
+        if (postureTier === "balanced") return "跟随系统姿态：balanced（脱敏后确认）。";
+        return "";
+    }
+
+    /** 状态徽章:未连接(灰)/已连接(绿)+ 能力 chip(引擎档 + 姿态档,均来自本机引擎回报)。 */
+    function renderEnterpriseBadge(active, info) {
+        if (enterpriseBadge) {
+            enterpriseBadge.classList.toggle("ent-badge-ok", active);
+            enterpriseBadge.classList.toggle("ent-badge-idle", !active);
+        }
+        if (enterpriseBadgeText) {
+            enterpriseBadgeText.textContent = active ? "已连接本机引擎" : "未连接本机引擎";
+        }
+        if (!enterpriseBadgeChips) return;
+        enterpriseBadgeChips.replaceChildren();
+        if (!active) return;
+        const chips = [info && info.engine === "hardfp+ml" ? "ML 语义增强" : "硬指纹检测"];
+        if (info && info.posture_tier === "strict") chips.push("严格姿态");
+        else if (info && info.posture_tier === "balanced") chips.push("均衡姿态");
+        for (const label of chips) {
+            const chip = document.createElement("span");
+            chip.className = "ent-chip";
+            chip.textContent = label;
+            enterpriseBadgeChips.appendChild(chip);
+        }
+    }
+
+    /** 按当前后端同步企业区 UI(select 值 / 徽章 / 状态行;info 可带姿态与引擎观测)。 */
+    function syncEnterpriseUi(backend, info) {
         const active = backend === "native_host";
         if (enterpriseProviderSelect) {
             enterpriseProviderSelect.value = active ? "native_host" : "none";
         }
-        if (enterpriseDataPolicySelect) {
-            enterpriseDataPolicySelect.value = active ? "raw_allowed" : "local_only";
+        if (enterpriseSection) {
+            // 连接成功后弱化步骤区(引导已完成);步骤常驻供参考。
+            enterpriseSection.classList.toggle("ent-connected", active);
         }
-        if (!active && enterpriseNativeGuide) {
-            // 指引仅在启用失败时展开;成功/未配置态收起。
-            enterpriseNativeGuide.classList.add("hidden");
+        if (enterpriseNativeGuide) {
+            // 步骤常驻;此处清除失败高亮(失败路径会重新加上)。
+            enterpriseNativeGuide.classList.remove("attention");
         }
+        renderEnterpriseBadge(active, info);
+        const suffix = active ? postureSuffix(info && info.posture_tier) : "";
         setEnterpriseStatus(
             active
-                ? "已启用本机引擎：检查在本机完成，原文不出设备。"
+                ? `已启用本机引擎：检查在本机完成，原文不出设备。${suffix}`
                 : "未配置扫描后端：企业模式当前仍使用普通保护。",
             active ? "ok" : "",
         );
@@ -126,7 +161,7 @@ import { normalizeCustomRiskRuleInput } from "./redaction-rules.js";
 
     async function refreshEnterpriseBackend() {
         const resp = await sendRuntimeMessage({ type: "vigil_get_enterprise_backend" });
-        syncEnterpriseUi(resp && resp.backend === "native_host" ? "native_host" : "none");
+        syncEnterpriseUi(resp && resp.backend === "native_host" ? "native_host" : "none", resp);
     }
 
     async function setEnterpriseBackend(backend) {
@@ -380,10 +415,10 @@ import { normalizeCustomRiskRuleInput } from "./redaction-rules.js";
                 setEnterpriseStatus("正在探测本机引擎…");
                 const probe = await sendRuntimeMessage({ type: "vigil_probe_native_host" });
                 if (!probe || !probe.ok) {
-                    // 探测失败不保存(fail-closed 且不把用户锁进全阻断);展开指引。
+                    // 探测失败不保存(fail-closed 且不把用户锁进全阻断);高亮引导步骤。
                     await setEnterpriseBackend("none");
                     syncEnterpriseUi("none");
-                    if (enterpriseNativeGuide) enterpriseNativeGuide.classList.remove("hidden");
+                    if (enterpriseNativeGuide) enterpriseNativeGuide.classList.add("attention");
                     setEnterpriseStatus(
                         `未连接到本机引擎（${(probe && probe._error) || "未知错误"}）。请按下方指引完成安装与注册后重试。`,
                         "warn",
@@ -392,7 +427,8 @@ import { normalizeCustomRiskRuleInput } from "./redaction-rules.js";
                 }
                 const resp = await setEnterpriseBackend("native_host");
                 if (resp && resp.ok) {
-                    syncEnterpriseUi("native_host");
+                    // probe 响应已带姿态观测 —— 启用瞬间即显示当前姿态档。
+                    syncEnterpriseUi("native_host", probe);
                 } else {
                     syncEnterpriseUi("none");
                     setEnterpriseStatus(`启用失败：${(resp && resp._error) || "未知错误"}`, "warn");

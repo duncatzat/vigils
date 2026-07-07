@@ -147,3 +147,51 @@ test("malformed finding entries are dropped and kinds are length-capped", async 
         "非字符串/空条目丢弃;超长 kind 截断",
     );
 });
+
+// ───────────── Phase 2「策略+观测」:posture_tier / engine 契约字段透传 ─────────────
+
+test("passes through posture_tier and engine when host sends closed-set values", async () => {
+    const fake = fakeChrome();
+    const provider = createNativeHostProvider({ chromeApi: fake.chromeApi });
+    const checking = provider.check(request("plain text"));
+    fake.emit({
+        request_id: "33333333-3333-4333-8333-333333333333",
+        action: "allow",
+        findings: [],
+        posture_tier: "strict",
+        engine: "hardfp+ml",
+    });
+    const result = await checking;
+    assert.equal(result.posture_tier, "strict");
+    assert.equal(result.engine, "hardfp+ml");
+});
+
+test("drops posture_tier and engine outside the closed sets (host drift tolerance)", async () => {
+    const fake = fakeChrome();
+    const provider = createNativeHostProvider({ chromeApi: fake.chromeApi });
+    const checking = provider.check(request("plain text"));
+    fake.emit({
+        request_id: "33333333-3333-4333-8333-333333333333",
+        action: "allow",
+        findings: [],
+        posture_tier: "paranoid",
+        engine: "turbo",
+    });
+    const result = await checking;
+    assert.equal(Object.hasOwn(result, "posture_tier"), false);
+    assert.equal(Object.hasOwn(result, "engine"), false);
+});
+
+test("legacy host response without the new fields keeps prior shape", async () => {
+    const fake = fakeChrome();
+    const provider = createNativeHostProvider({ chromeApi: fake.chromeApi });
+    const checking = provider.check(request("plain text"));
+    fake.emit({
+        request_id: "33333333-3333-4333-8333-333333333333",
+        action: "allow",
+        findings: [],
+    });
+    const result = await checking;
+    assert.equal(Object.hasOwn(result, "posture_tier"), false);
+    assert.equal(Object.hasOwn(result, "engine"), false);
+});

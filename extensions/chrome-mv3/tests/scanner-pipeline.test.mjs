@@ -265,3 +265,117 @@ test("enterprise native host failure fails closed to block with local findings k
     assert.equal(result.error, "enterprise_provider_failed");
     assert.ok(result.findings.some((f) => f.kind === "github_token"), "本地 findings 保留");
 });
+
+// ───────────── Phase 2「策略+观测」:applyPostureTier 姿态跟随(只收紧) ─────────────
+
+import { applyPostureTier } from "../scanner-pipeline.js";
+
+function resultOf(action, extra = {}) {
+    return { request_id: "r", action, findings: [], source: "pipeline", ...extra };
+}
+
+test("applyPostureTier: strict escalates confirm_redact to block and marks it", () => {
+    const out = applyPostureTier(resultOf("confirm_redact"), "strict", "hardfp+ml");
+    assert.equal(out.action, "block");
+    assert.equal(out.posture_escalated, true);
+    assert.equal(out.posture_tier, "strict");
+    assert.equal(out.engine, "hardfp+ml");
+});
+
+test("applyPostureTier: never loosens — allow and block untouched under any tier", () => {
+    for (const tier of ["strict", "balanced", "paranoid", null, undefined]) {
+        assert.equal(applyPostureTier(resultOf("allow"), tier).action, "allow");
+        assert.equal(applyPostureTier(resultOf("block"), tier).action, "block");
+    }
+});
+
+test("applyPostureTier: balanced / invalid / missing tier keep confirm_redact as-is", () => {
+    assert.equal(applyPostureTier(resultOf("confirm_redact"), "balanced").action, "confirm_redact");
+    assert.equal(applyPostureTier(resultOf("confirm_redact"), "paranoid").action, "confirm_redact");
+    assert.equal(applyPostureTier(resultOf("confirm_redact"), null).action, "confirm_redact");
+    // 非闭集值不得附着
+    assert.equal(
+        Object.hasOwn(applyPostureTier(resultOf("confirm_redact"), "paranoid"), "posture_tier"),
+        false,
+    );
+});
+
+test("enterprise pipeline: host posture strict escalates merged confirm_redact to block", async () => {
+    // 本地 consumer 命中 github_token → confirm_redact;enterprise(本机引擎)allow 但携
+    // posture_tier=strict → 姿态独立于「谁更严」生效,最终 block。
+    const enterpriseProvider = {
+        name: "native_host",
+        async check() {
+            return {
+                request_id: "22222222-2222-4222-8222-222222222222",
+                action: "allow",
+                findings: [],
+                source: "native_host",
+                posture_tier: "strict",
+                engine: "hardfp",
+            };
+        },
+    };
+    const result = await checkWithScannerPipeline(
+        request("token ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD"),
+        {
+            mode: "enterprise",
+            enterprise: { provider: enterpriseProvider, dataPolicy: "raw_allowed" },
+        },
+    );
+    assert.equal(result.action, "block");
+    assert.equal(result.posture_escalated, true);
+    assert.equal(result.posture_tier, "strict");
+    assert.deepEqual(result.findings.map((f) => f.kind), ["github_token"]);
+});
+
+test("enterprise pipeline: balanced posture keeps confirm_redact flow", async () => {
+    const enterpriseProvider = {
+        name: "native_host",
+        async check() {
+            return {
+                request_id: "22222222-2222-4222-8222-222222222222",
+                action: "allow",
+                findings: [],
+                source: "native_host",
+                posture_tier: "balanced",
+                engine: "hardfp+ml",
+            };
+        },
+    };
+    const result = await checkWithScannerPipeline(
+        request("token ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD"),
+        {
+            mode: "enterprise",
+            enterprise: { provider: enterpriseProvider, dataPolicy: "raw_allowed" },
+        },
+    );
+    assert.equal(result.action, "confirm_redact");
+    assert.equal(Object.hasOwn(result, "posture_escalated"), false);
+    assert.equal(result.posture_tier, "balanced");
+    assert.equal(result.engine, "hardfp+ml");
+});
+
+test("enterprise pipeline: legacy host without posture_tier behaves exactly as before", async () => {
+    const enterpriseProvider = {
+        name: "native_host",
+        async check() {
+            return {
+                request_id: "22222222-2222-4222-8222-222222222222",
+                action: "allow",
+                findings: [],
+                source: "native_host",
+            };
+        },
+    };
+    const result = await checkWithScannerPipeline(
+        request("token ghp_abcdefghijklmnopqrstuvwxyz1234567890ABCD"),
+        {
+            mode: "enterprise",
+            enterprise: { provider: enterpriseProvider, dataPolicy: "raw_allowed" },
+        },
+    );
+    assert.equal(result.action, "confirm_redact");
+    assert.equal(Object.hasOwn(result, "posture_tier"), false);
+    assert.equal(Object.hasOwn(result, "posture_escalated"), false);
+});

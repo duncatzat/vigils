@@ -169,20 +169,39 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
             li.classList.add("event-row");
 
             const iconClass = actionIconClass(it.action);
-            const iconText = actionIconText(it.action);
             const findingNames = Array.isArray(it.findings) && it.findings.length > 0
                 ? it.findings.map(findingLabel).join("、")
-                : "风险内容";
+                : "敏感内容";
+            // 动作 → 如实文案:阻断 = 已阻断;脱敏 = 建议脱敏;其它风险 = 检测到。
+            // (allow 已在 background 侧不入列,此处不会出现「未见风险」被说成检测到。)
+            const verb =
+                it.action === "block"
+                    ? "已阻断"
+                    : it.action === "confirm_redact" || it.action === "redact"
+                      ? "建议脱敏"
+                      : "检测到";
 
-            li.innerHTML = `
-                <div class="event-row-icon ${iconClass}">${iconText}</div>
-                <div class="event-row-body">
-                    <div class="title">${eventKindLabel(it.event_kind)}检测到 ${findingNames}</div>
-                    <div class="meta">${it.origin || "当前网站"} · ${fmtTs(it.ts)}</div>
-                </div>
-                <div class="event-row-arrow">›</div>
-            `;
+            // **全 DOM + textContent 构建**(不用 innerHTML):origin / finding 名等
+            // 均来自 backend,按「backend 数据一律纯文本插入」安全契约杜绝任何注入。
+            const icon = document.createElement("div");
+            icon.className = `event-row-icon ${iconClass}`;
+            icon.textContent = actionIconText(it.action);
 
+            const body = document.createElement("div");
+            body.className = "event-row-body";
+            const title = document.createElement("div");
+            title.className = "title";
+            title.textContent = `${eventKindLabel(it.event_kind)}${verb} ${findingNames}`;
+            const meta = document.createElement("div");
+            meta.className = "meta";
+            meta.textContent = `${it.origin || "当前网站"} · ${fmtTs(it.ts)}`;
+            body.append(title, meta);
+
+            const arrow = document.createElement("div");
+            arrow.className = "event-row-arrow";
+            arrow.textContent = "›";
+
+            li.append(icon, body, arrow);
             listEl.appendChild(li);
         }
     }
@@ -196,13 +215,19 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
         const resp = await sendRuntimeMessage({ type: "vigil_get_mode" });
         const mode = resp && resp.mode === "enterprise" ? "enterprise" : "consumer";
         if (mode === "enterprise") {
-            // 企业模式:标出实际扫描后端(本机引擎 = 检查在本机 Vigils 进程完成)。
+            // 企业模式:标出实际扫描后端(本机引擎 = 检查在本机 Vigils 进程完成),
+            // 并附观测后缀:ML = 本机 daemon 语义增强参与;严格 = 跟随系统姿态命中即阻断。
             const backendResp = await sendRuntimeMessage({ type: "vigil_get_enterprise_backend" });
             const backend =
                 backendResp && backendResp.backend === "native_host" ? "native_host" : "none";
             if (statusText) {
-                statusText.textContent =
-                    backend === "native_host" ? "企业保护 · 本机引擎" : "企业保护";
+                let label = "企业保护";
+                if (backend === "native_host") {
+                    label = "企业保护 · 本机引擎";
+                    if (backendResp && backendResp.engine === "hardfp+ml") label += " · ML";
+                    if (backendResp && backendResp.posture_tier === "strict") label += " · 严格";
+                }
+                statusText.textContent = label;
             }
             setHeaderStatus("ok");
         }

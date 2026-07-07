@@ -44,6 +44,22 @@ let currentMode = MODE_DEFAULT;
 let currentEnterpriseBackend = ENTERPRISE_BACKEND_DEFAULT;
 /** Native Host provider 单例(port 惰性建立,断连自愈;仅 backend=native_host 时被使用)。 */
 let nativeHostProvider = null;
+// Phase 2「策略+观测」观测缓存:最近一次本机引擎回报的姿态档 / 引擎标识(闭集校验后
+// 缓存;仅展示用 —— options 企业状态行 / popup 企业标注,不参与任何决策路径,决策端
+// 的姿态升级在 scanner-pipeline 逐次用响应自带值完成)。
+/** @type {string|null} */
+let lastPostureTier = null;
+/** @type {string|null} */
+let lastEngine = null;
+function cacheHostObservability(result) {
+    if (!result || typeof result !== "object") return;
+    if (result.posture_tier === "balanced" || result.posture_tier === "strict") {
+        lastPostureTier = result.posture_tier;
+    }
+    if (result.engine === "hardfp" || result.engine === "hardfp+ml") {
+        lastEngine = result.engine;
+    }
+}
 function getNativeHostProvider() {
     if (nativeHostProvider === null) {
         nativeHostProvider = createNativeHostProvider();
@@ -472,15 +488,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     },
                 ))
                     .then((resp) => {
-                        recordFinding({
-                            ts: Date.now(),
-                            origin: msg.origin || "?",
-                            event_kind: msg.event_kind || "?",
-                            action: resp.action,
-                            findings: (resp.findings || []).map((finding) =>
-                                typeof finding === "string" ? finding : finding.label || finding.kind,
-                            ),
-                        });
+                        cacheHostObservability(resp);
+                        // 只把**风险**事件(命中脱敏 / 阻断)记入事件列表。allow(未见风险)
+                        // 不入列 —— 否则简单文本的正常放行会被 popup 显示成「检测到风险内容」
+                        // (用户报告的误报:即使输入简单文本事件中心也报风险)。
+                        if (resp.action !== "allow") {
+                            recordFinding({
+                                ts: Date.now(),
+                                origin: msg.origin || "?",
+                                event_kind: msg.event_kind || "?",
+                                action: resp.action,
+                                findings: (resp.findings || []).map((finding) =>
+                                    typeof finding === "string"
+                                        ? finding
+                                        : finding.label || finding.kind,
+                                ),
+                            });
+                        }
                         sendResponse(resp);
                     });
             })
@@ -584,6 +608,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({
             backend: currentEnterpriseBackend,
             values: ENTERPRISE_BACKEND_VALUES.slice(),
+            // 观测缓存(null = 尚无本机引擎回报):options 状态行 / popup 标注用。
+            posture_tier: lastPostureTier,
+            engine: lastEngine,
         });
         return false;
     }
@@ -610,7 +637,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 event_kind: "paste",
                 text: "vigils native host connection probe",
             })
-            .then((result) => sendResponse({ ok: true, action: result.action }))
+            .then((result) => {
+                // 探测成功即缓存姿态/引擎 —— 启用瞬间 options 就能显示当前姿态档,
+                // 不必等首次真实检查。
+                cacheHostObservability(result);
+                sendResponse({
+                    ok: true,
+                    action: result.action,
+                    posture_tier: lastPostureTier,
+                    engine: lastEngine,
+                });
+            })
             .catch((err) =>
                 sendResponse({
                     ok: false,
