@@ -72,7 +72,10 @@ vigil-hub setup       # 自动探测 Claude Code / Codex / Cursor 并接好守�
 
 在 AI 网站上粘贴/提交前先脱敏密钥与 PII。从 Chrome 应用商店一键安装
 [**Vigils Browser Guard**](https://chromewebstore.google.com/detail/vigils-browser-guard/ffmgaglmcimapacgmoejaobfjdpmopch) ——
-普通模式开箱即用,无需桌面 App。可选:配合桌面 App 的 native host 解锁深度脱敏。
+普通模式开箱即用,无需桌面 App。可选深度脱敏:安装 Vigils CLI,用扩展 ID 注册 native host
+(`vigil-native-host install --extension-id <ID>`,ID 在扩展「选项 → 高级设置」里可复制),
+再到选项页企业模式下选择「本机 Vigils 引擎」——检查将路由到本机引擎(硬指纹 + daemon
+运行时的 ML PII 识别),原文不出设备。
 开发版:`chrome://extensions` → 开 **开发者模式** → **加载已解压的扩展程序** → 选 `extensions/chrome-mv3/`。
 
 ---

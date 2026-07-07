@@ -16,7 +16,7 @@ Vigils Browser Guard 是一个 Chrome MV3 扩展，用来在你把密钥、token
 - **贴近输入框提示**: 风险提示会优先出现在输入框附近，而不是藏在页面角落。
 - **一键保护网站**: Popup 会显示当前页面保护状态，并支持添加自定义 HTTPS 网站。
 - **安全事件记录**: Popup 只展示风险类型、网站和处理结果，不保存原文。
-- **企业接口预留**: 后续可接入 Native Host、localhost agent、企业 HTTPS API 或 Wasm provider。
+- **企业后端（可选）**: 可将检查路由到本机安装的 Vigils 引擎（Native Host）——首个真实落地的企业 provider；localhost agent、企业 HTTPS API、Wasm 仍是预留接口。
 
 ## 适用场景
 
@@ -78,11 +78,14 @@ Vigils 适合经常把代码、配置、日志或环境变量粘贴到 AI 工具
 - 页面提示使用 DOM API 和 `textContent` 渲染，不使用 `innerHTML`
 - 未知或异常的风险决策按 fail-closed 处理，默认阻断
 
-企业模式是预留能力，不是普通用户默认路径。Native Host 只是未来企业 provider 的一种实现方式。
+企业模式可选、默认关闭。首个真实后端是 **本机 Vigils 引擎**（Native Host）：安装 Vigils CLI，
+用扩展 ID 注册 host（`vigil-native-host install --extension-id <ID>`，ID 在「选项 → 高级设置」
+可复制），再到选项页企业区选择「本机 Vigils 引擎」。此后检查在本机进程内完成（硬指纹 +
+daemon 运行时的 ML PII 识别），原文不出设备；host 不可达时阻断而非静默降级。
 
 ## 安装与体验
 
-当前版本适合开发模式加载：
+推荐从 Chrome 应用商店安装（见下文）；开发构建可加载本目录：
 
 1. 打开 Chrome `chrome://extensions/`
 2. 开启 Developer mode
@@ -148,7 +151,7 @@ extensions/chrome-mv3/
 ├── scanner-pipeline.js
 ├── providers/
 │   ├── consumer-js-provider.js
-│   └── enterprise-provider.js
+│   └── native-host-provider.js
 └── tests/
 ```
 
@@ -159,7 +162,7 @@ extensions/chrome-mv3/
 - `custom-sites.js`: 规范化用户添加的 HTTPS 自定义保护域名。
 - `redaction-rules.js`: 浏览器内扫描、脱敏规则和自定义前缀风险类型。
 - `risk-decision.js`: 将扫描结果转为 `allow`、`confirm_redact` 或 `block`。
-- `scanner-pipeline.js`: 普通 provider 与企业 provider 的组合入口。
+- `scanner-pipeline.js`: 普通 provider 与企业 provider（如 Native Host provider）的组合入口。
 
 ## 开发与测试
 
