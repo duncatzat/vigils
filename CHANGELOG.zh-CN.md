@@ -8,6 +8,44 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.5.0-beta.1] — 2026-07-07 — 浏览器防线接入控制平面:本机引擎配对、姿态感知守护、hook 加固
+
+浏览器扩展不再是孤岛:Chrome Web Store 版本(0.3.0)可与本机安装的 Vigils 引擎配对,桌面端与
+CLI 终于能看见浏览器防线,hook 路径新增两项加固。硬地板不动。
+
+### 新增
+
+- **浏览器 ⇄ 引擎连接**(#57)。native messaging host 成为 daemon 的第二个 ML 客户端:浏览器
+  检查获得与 hook 路径一致的本机 ML PII 增强(`engine.json` 门控;daemon 缺席 → fail-closed
+  回落硬指纹地板,绝不 fail-open)。
+- **扩展首个企业后端**(#58)。选项页可将检查路由到本机 Vigils 引擎(native messaging)——
+  权限为可选、仅在显式启用时请求,原文不出设备,host 不可达时阻断而非静默降级。
+- **浏览器事件进控制平面**(#59、#60、#62)。事件中心显示浏览器粘贴/输入/发送介入;防护总览
+  新增浏览器防线卡:注册与引擎状态 + 近 24 小时检查/拦截/脱敏计数。
+- **`setup --status` 浏览器行**(#61)。native host 注册态与 hook、MCP 并列——turnkey 状态
+  自此覆盖三条防线。
+- **姿态下发**(#62、#64)。host 回报 `posture_tier`/`engine`;strict 姿态下扩展将
+  confirm-redact 升级为 block(只收紧,allow/block 恒不动)。
+- **Command Guard 文件写入侧翼**(#63)。Write/Edit 工具向 shell rc、crontab、`.git/hooks`
+  的持久化落点写入,现与等价 shell 命令同样分类。
+
+### 修复
+
+- **真实富文本编辑器上的内联介入**(#64)。content script 提前到 `document_start`,站点
+  capture 监听不再饿死守门;手动输入防抖增加最长等待,框架重渲染心跳无法永久推迟检查;
+  引擎判定有风险后弹卡无条件呈现;写回前对当前文本重新检查而非严格快照等值,连续粘贴在
+  光标处叠加。
+- **事件中心如实化**(#64)。正常放行不再记为「检测到风险」;popup 事件行全部用
+  DOM/textContent 构建,不用 innerHTML。
+- **hook panic 兜底**(#65)。hook 决策+输出整体包进 `catch_unwind`:未预期 panic 收敛为
+  该 CLI 的 Deny 形状(Claude 为 exit 2),而非以 101 退出被 agent 视为 non-blocking
+  fail-open。
+
+### 变更
+
+- **扩展 UX**(#64、#66)。品牌化弹卡(盾徽、风险 chip、信任行、tone 色顶边);企业连接区
+  改为「价值卡 + 状态徽章 + 三步引导」,替代密集表单。manifest 0.3.0 已提交 Chrome Web Store。
+
 ## [v0.4.6] — 2026-07-03 — Command Guard、可独立使用的浏览器扩展、四轮用户级验证
 
 v0.4.6-beta.1 – beta.4 的稳定汇总,外加消费者模式浏览器扩展重构(#32)。两条新防线(hook 路径的
