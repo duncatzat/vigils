@@ -154,6 +154,13 @@ const CO_APPROVAL_WAIT_SECS_CODEX: u64 = 86_000;
 /// shell 命令执行工具(`Bash`=Claude/Codex;`shell`=Cursor 合成名,为未来扩展预留)。
 const EXECUTION_BOUNDARY_TOOLS: &[&str] = &["Bash", "shell"];
 
+/// 文件写入 / 编辑工具名(归一化后的原始 `tool_name`):其 `file_path` 是**写入目标**,交
+/// [`command_guard::classify_file_write`] 做持久化落点检测。**必须门禁到写工具** —— `Read` 也用
+/// `file_path`、`Grep`/`Glob` 用 `path`,那是**读**操作(读 shell rc 是合法调试),绝不能当持久化
+/// 写拦截(hostile 复审 FP-1)。Claude `Write`/`Edit`/`MultiEdit`、Gemini `write_file`/`replace`
+/// 在此列;Codex `apply_patch` / Cursor 文件编辑不触发 PreToolUse(平台限制,走 MCP 网关)。
+const FILE_WRITE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "write_file", "replace"];
+
 /// 注入 lease 绑定的合成 server id(原生工具无 MCP server 概念)。lease 三元组绑定
 /// (session + server + tool)中此维固定,与 mint/resolve 同值即匹配(本进程即用即弃)。
 const HOOK_INJECT_SERVER_ID: &str = "hook-native";
@@ -615,63 +622,30 @@ pub fn run<R: Read>(args: &HookArgs, stdin: &mut R) -> HookOutcome {
         ));
     }
 
-    // Command Guard(危险命令防线):对**原生** shell/Bash 工具的 command 字段分类破坏性/
-    // 持久化/RCE 动作。这是 hook 侧唯一防线 —— 用户开「允许所有命令」时,agent 因意图漂移/
-    // 注入/参数事故跑出的 `rm -rf ~`、`curl … | sh`、写 crontab 等无 secret 无占位符的命令
-    // 会直接放行。MCP 工具不在此评估(is_mcp 排除:走网关自有 destructive 检测,避免双评估)。
-    // 灾难级恒 Deny(硬地板);高危按姿态 Ask/Deny(见 posture 决策表)。
+    // Command Guard(危险命令防线):对**原生**工具分类破坏性/持久化/RCE 动作。hook 侧唯一防线 ——
+    // 用户开「允许所有命令」时,agent 因意图漂移/注入/参数事故跑出的 `rm -rf ~`、`curl … | sh`、
+    // 写 crontab、或**文件写入 `~/.bashrc`/`authorized_keys`/systemd/git-hook** 等无 secret 无
+    // 占位符的动作会直接放行。两条提取路径(shell 命令优先、文件写入兜底):shell 工具走 `command`
+    // 字段([`command_guard::classify`],项目根 = 事件 cwd 用于「项目外删除」判别);**写/编辑工具**
+    // (`FILE_WRITE_TOOLS` 门禁,排除 `Read`/`Grep` 等读工具 —— 读 shell rc 是合法调试,不是持久化写)
+    // 走 `file_path`([`command_guard::classify_file_write`],持久化落点检测,补 shell-only 的旁路)。
+    // 命中后共用 [`decide_command_risk`] 映射到姿态决策(灾难级恒 Deny 硬地板;高危 Ask/Deny)。
+    // MCP 工具排除(is_mcp:走网关自有 destructive 检测,避免双评估)。
     if !is_mcp {
-        if let Some(cmd) = shell_command_of(&input) {
-            // 项目根 = 事件 cwd(用于「项目外删除」判别;缺失则退化为「命中家目录/系统路径」)。
-            let root = input.cwd.as_deref();
-            if let Some(risk) = command_guard::classify(&cmd, root) {
-                let (rc, kind_label) = match risk.tier {
-                    command_guard::GuardTier::Catastrophic => {
-                        (RiskClass::DestructiveCatastrophic, "catastrophic_command")
-                    }
-                    command_guard::GuardTier::Dangerous => {
-                        (RiskClass::DangerousCommand, "dangerous_command")
-                    }
-                };
-                // 灾难级 posture 无关(恒 Deny);高危才需算有效档(base + session risk 升档)。
-                let profile = match risk.tier {
-                    command_guard::GuardTier::Catastrophic => posture::PostureProfile::Low,
-                    command_guard::GuardTier::Dangerous => {
-                        load_effective_posture(args, input.session_id.as_deref())
-                    }
-                };
-                match posture::decide(profile, rc) {
-                    // 两类在决策表里都不产生 Allow;真出现(未来表变动)保守放行不 brick。
-                    PostureAction::Allow => {}
-                    PostureAction::Deny => {
-                        audit_deny(
-                            args,
-                            &input,
-                            kind_label,
-                            Some(risk.category.audit_tag()),
-                            &serialized,
-                        );
-                        return HookOutcome::Deny(format!(
-                            "Vigil blocked tool `{tool}`: {detail}. This is a FINAL security decision \
-                             (posture: {p}) — retrying, rephrasing, or switching tools will be blocked \
-                             the same way. If this action is genuinely intended, the user can run it \
-                             themselves outside the agent, or lower Vigil's command-guard posture.",
-                            tool = tool_display,
-                            detail = risk.detail,
-                            p = profile.as_str(),
-                        ));
-                    }
-                    PostureAction::Ask => {
-                        return co_approve_command(
-                            args,
-                            &input,
-                            &tool_display,
-                            &serialized,
-                            profile,
-                            risk.detail,
-                        );
-                    }
+        let risk = shell_command_of(&input)
+            .and_then(|cmd| command_guard::classify(&cmd, input.cwd.as_deref()))
+            .or_else(|| {
+                if FILE_WRITE_TOOLS.contains(&input.tool_name.as_str()) {
+                    file_path_of(&input).and_then(|fp| command_guard::classify_file_write(&fp))
+                } else {
+                    None
                 }
+            });
+        if let Some(risk) = risk {
+            if let Some(outcome) =
+                decide_command_risk(risk, args, &input, &tool_display, &serialized)
+            {
+                return outcome;
             }
         }
     }
@@ -789,6 +763,73 @@ fn shell_command_of(input: &NormalizedEvent) -> Option<String> {
         }
     }
     None
+}
+
+/// 文件写入/编辑工具的**目标路径**(Command Guard 文件写入侧翼)。Claude `Write`/`Edit`/`MultiEdit`、
+/// Gemini `write_file`/`replace` 均用 `file_path`。**只读 `file_path`,不兜底 `path`** —— `path` 是
+/// `Grep`/`Glob` 等**读**工具的字段,读取合法不应触发持久化写检测(调用方已用 [`FILE_WRITE_TOOLS`]
+/// 门禁,此处双保险)。MCP 工具由调用方 `is_mcp` 排除。见 [`command_guard::classify_file_write`]。
+fn file_path_of(input: &NormalizedEvent) -> Option<String> {
+    input
+        .tool_input
+        .get("file_path")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Command Guard 命中 → 姿态决策 + 审计 + 拦截。shell 命令与文件写入两路共用(DRY)。
+/// `Some(outcome)` = 终态(Deny/Ask);`None` = 决策表放行(灾难/高危两类实际不产生 Allow,
+/// 防御性 fall-through 不 brick)。deny 说明只带固定 `detail`(非命令/路径原文,不回显不可信输入)。
+fn decide_command_risk(
+    risk: command_guard::CommandRisk,
+    args: &HookArgs,
+    input: &NormalizedEvent,
+    tool_display: &str,
+    serialized: &str,
+) -> Option<HookOutcome> {
+    let (rc, kind_label) = match risk.tier {
+        command_guard::GuardTier::Catastrophic => {
+            (RiskClass::DestructiveCatastrophic, "catastrophic_command")
+        }
+        command_guard::GuardTier::Dangerous => (RiskClass::DangerousCommand, "dangerous_command"),
+    };
+    // 灾难级 posture 无关(恒 Deny);高危才需算有效档(base + session risk 升档)。
+    let profile = match risk.tier {
+        command_guard::GuardTier::Catastrophic => posture::PostureProfile::Low,
+        command_guard::GuardTier::Dangerous => {
+            load_effective_posture(args, input.session_id.as_deref())
+        }
+    };
+    match posture::decide(profile, rc) {
+        PostureAction::Allow => None,
+        PostureAction::Deny => {
+            audit_deny(
+                args,
+                input,
+                kind_label,
+                Some(risk.category.audit_tag()),
+                serialized,
+            );
+            Some(HookOutcome::Deny(format!(
+                "Vigil blocked tool `{tool}`: {detail}. This is a FINAL security decision \
+                 (posture: {p}) — retrying, rephrasing, or switching tools will be blocked \
+                 the same way. If this action is genuinely intended, the user can run it \
+                 themselves outside the agent, or lower Vigil's command-guard posture.",
+                tool = tool_display,
+                detail = risk.detail,
+                p = profile.as_str(),
+            )))
+        }
+        PostureAction::Ask => Some(co_approve_command(
+            args,
+            input,
+            tool_display,
+            serialized,
+            profile,
+            risk.detail,
+        )),
+    }
 }
 
 /// 算有效姿态档(磁盘 base 档 + session risk 升档;读失败 fail-closed 维持 base)。
@@ -2827,6 +2868,92 @@ mod tests {
             "tool_input": { "command": "rm -rf ~" }
         }));
         assert_eq!(out, HookOutcome::Allow, "MCP 工具 hook 侧不评估命令守卫");
+    }
+
+    #[test]
+    fn command_guard_file_write_to_bashrc_denied_at_high() {
+        // 文件写入旁路(补 shell-only):Write 到 ~/.bashrc(持久化落点)= Dangerous;High 档 Deny。
+        // content 无 secret,证明拦截来自 file_path 持久化判定(非 secret 扫描)。
+        let out = run_json_posture(
+            json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": { "file_path": "/home/user/.bashrc", "content": "export PATH=/x\n" }
+            }),
+            CliKind::Claude,
+            Some(PostureProfile::High),
+        );
+        assert!(
+            matches!(out, HookOutcome::Deny(_)),
+            "写 ~/.bashrc High 档应 Deny"
+        );
+    }
+
+    #[test]
+    fn command_guard_file_write_to_authkeys_asks_at_default() {
+        // 默认 Low + 无 ledger:文件写入持久化落点走 Ask(「允许所有」下的 backstop)。
+        let out = run_json(json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "/home/user/.ssh/authorized_keys",
+                "content": "ssh-ed25519 AAAA\n"
+            }
+        }));
+        assert!(
+            matches!(out, HookOutcome::Ask(_)),
+            "写 authorized_keys 默认档应 Ask"
+        );
+    }
+
+    #[test]
+    fn command_guard_gemini_write_file_to_systemd_denied_at_high() {
+        // 跨 agent:Gemini `write_file`(同 `file_path` 字段)到 systemd unit → 同样命中。
+        let out = run_json_posture(
+            json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "write_file",
+                "tool_input": {
+                    "file_path": "/etc/systemd/system/evil.service",
+                    "content": "[Service]\n"
+                }
+            }),
+            CliKind::Gemini,
+            Some(PostureProfile::High),
+        );
+        assert!(
+            matches!(out, HookOutcome::Deny(_)),
+            "Gemini write_file 写 systemd 应 Deny"
+        );
+    }
+
+    #[test]
+    fn command_guard_ordinary_file_write_allowed() {
+        // 日常写码 = 普通项目文件,绝不拦(否则每次 Write/Edit 都误报)。
+        let out = run_json(json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/proj/src/main.rs", "content": "fn main() {}" }
+        }));
+        assert_eq!(out, HookOutcome::Allow, "普通项目文件写入应放行");
+    }
+
+    #[test]
+    fn command_guard_read_of_sensitive_path_not_flagged() {
+        // hostile 复审 FP-1:`Read`(也用 file_path)/`Grep`(用 path)读 shell rc 是合法调试,
+        // 绝不能当持久化写拦截 —— FILE_WRITE_TOOLS 门禁 + file_path_of 只读 file_path 双保险。
+        let read = run_json(json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": { "file_path": "/home/user/.bashrc" }
+        }));
+        assert_eq!(read, HookOutcome::Allow, "Read ~/.bashrc 是读操作,不该拦");
+        let grep = run_json(json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Grep",
+            "tool_input": { "path": "/home/user/.zshrc", "pattern": "alias" }
+        }));
+        assert_eq!(grep, HookOutcome::Allow, "Grep ~/.zshrc 是读操作,不该拦");
     }
 
     #[test]
