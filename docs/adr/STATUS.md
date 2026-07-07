@@ -666,6 +666,13 @@ ADR 0012 §3.2-§3.7 全实施(commit `b5419b5`):
 - **审查**:hostile sub-agent SOUND(A-G 全 OK,0 Crit/High/Med;3 LOW 非阻断,其一 JS 限长已当场加固);远端 fmt/clippy(-D warnings)/test 全绿 **1270/0**(+10)
 - **评估依据**:见引入 PR 描述(四断裂分析 + 能力增量矩阵 + 三阶段方案);Phase 2/3 后续推进
 
+### ADR 0009 Phase 2「策略+观测」移植(2026-07-07)
+
+- **交付**:posture 下发(host 每请求现读 posture.json → `posture_to_tier` 闭集映射 → `BrowserCheckResponse.posture_tier` 可选字段;`PostureSource` DI trait 镜像 `MlProbe` 惯例)+ Response `engine` 可选字段(与审计 payload 同源)+ Protection Overview 浏览器防线卡增 24h 守门统计(`Ledger::browser_guard_counts`;注册态沿用 `is_registered` 收口)
+- **扩展消费边界**:0.2.x consumer 形态不消费 posture_tier(固定推荐策略);字段留给 enterprise 后端策略层(后续接线)
+- **新守门**:`BROWSER_GUARD_EVENT_TYPES` ↔ `event_type_for` 双向 SSOT 集合相等;posture_to_tier 输出闭集;协议只加可选字段不 bump(双向兼容)
+- **验证**:远端 fmt/clippy(-D warnings)/test 全绿 **1266/0**(基线 1257,+9);vue-tsc+vite build 绿
+
 ## 维护约定
 
 - **每轮迭代 ACCEPT 后**:作者在表格相应行填 "最终状态 / Codex 审查轮次 / 交付测试数",并在"Codex review 关键修复摘要"追加段落

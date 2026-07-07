@@ -18,6 +18,16 @@ use vigil_browser::{
     FindingKind,
 };
 
+/// 固定姿态源(Phase 2):`None` = 配置目录不可得(响应省略 posture_tier),
+/// `Some(tier)` = 固定建议 tier。集成测试不触真实文件系统。
+struct FixedPosture(Option<&'static str>);
+
+impl vigil_native_host::PostureSource for FixedPosture {
+    fn tier(&self) -> Option<&'static str> {
+        self.0
+    }
+}
+
 /// 编码一条 request frame。
 fn encode_request(req: &BrowserCheckRequest) -> Vec<u8> {
     let body = serde_json::to_vec(req).unwrap();
@@ -56,6 +66,7 @@ fn run_once(req: &BrowserCheckRequest) -> (Ledger, String, serde_json::Value) {
         &ledger,
         &sid,
         &vigil_native_host::DisabledMlProbe,
+        &FixedPosture(None),
     )
     .unwrap();
     let frames = decode_responses(&stdout);
@@ -206,6 +217,7 @@ fn oversized_length_prefix_returns_too_large() {
         &ledger,
         &sid,
         &vigil_native_host::DisabledMlProbe,
+        &FixedPosture(None),
     )
     .unwrap();
     let frames = decode_responses(&stdout);
@@ -231,6 +243,7 @@ fn bad_json_payload_returns_bad_json() {
         &ledger,
         &sid,
         &vigil_native_host::DisabledMlProbe,
+        &FixedPosture(None),
     )
     .unwrap();
     let frames = decode_responses(&stdout);
@@ -265,6 +278,7 @@ fn multi_frame_sequence_roundtrip() {
         &ledger,
         &sid,
         &vigil_native_host::DisabledMlProbe,
+        &FixedPosture(None),
     )
     .unwrap();
     let frames = decode_responses(&stdout);
@@ -275,4 +289,37 @@ fn multi_frame_sequence_roundtrip() {
     assert_eq!(r1.action, BrowserAction::Allow);
     assert_eq!(r2.action, BrowserAction::Redact);
     assert_eq!(r3.action, BrowserAction::Block);
+}
+
+/// Phase 2「策略+观测」:响应附着 `engine` + `posture_tier`(姿态源可得时);
+/// 姿态源不可得(None)→ `posture_tier` 字段**整个省略**(skip_serializing_if,
+/// 旧扩展/JS undefined-tolerant),`engine` 恒在(DisabledMlProbe → "hardfp")。
+#[test]
+fn response_carries_engine_and_posture_tier_when_available() {
+    let ledger = Ledger::open_in_memory().unwrap();
+    let sid = ledger.start_session("h", None).unwrap();
+    let req = make_req("hello plain text", "https://chatgpt.com");
+    let mut stdin = Cursor::new(encode_request(&req));
+    let mut stdout: Vec<u8> = Vec::new();
+    vigil_native_host::run(
+        &mut stdin,
+        &mut stdout,
+        &ledger,
+        &sid,
+        &vigil_native_host::DisabledMlProbe,
+        &FixedPosture(Some("strict")),
+    )
+    .unwrap();
+    let frames = decode_responses(&stdout);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["engine"], "hardfp");
+    assert_eq!(frames[0]["posture_tier"], "strict");
+
+    // 姿态源 None → 字段省略(不是 null)。
+    let (_l, _sid, v) = run_once(&req);
+    assert_eq!(v["engine"], "hardfp");
+    assert!(
+        v.get("posture_tier").is_none(),
+        "posture 源不可得时 posture_tier 应整体省略:{v}"
+    );
 }
