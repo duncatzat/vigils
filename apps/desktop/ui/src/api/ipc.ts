@@ -657,6 +657,12 @@ export interface BrowserGuardStatus {
   registered: boolean;
   manifest_exists: boolean;
   registry_present: boolean | null;
+  /** 最近 24h 浏览器检查总数(paste/input/submit) */
+  checks_24h: number;
+  /** 其中拦截(block) */
+  blocked_24h: number;
+  /** 其中脱敏放行(redact) */
+  redacted_24h: number;
 }
 
 export async function browserGuardStatus(): Promise<BrowserGuardStatus> {

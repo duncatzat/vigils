@@ -640,11 +640,12 @@ async fn verify_chain(state: State<'_, AppState>) -> Result<ChainVerifyReport, S
 // `vigil_desktop::ml_control`)。这些 handler 取 `AppHandle`(Tauri 自动注入)以经 resource_dir /
 // 稳定启动器 / PATH 解析引擎二进制;不触 Ledger / Hub。引擎缺失时只读 handler 优雅回默认值不报错。
 
-/// `invoke('browser_guard_status')` → 只读浏览器防线(native host)注册态。
+/// `invoke('browser_guard_status')` → 只读浏览器防线(native host)注册态 + 24h 守门统计。
 #[tauri::command]
-async fn browser_guard_status() -> Result<vigil_desktop::browser_guard::BrowserGuardStatus, String>
-{
-    vigil_desktop::browser_guard::browser_guard_status()
+async fn browser_guard_status(
+    state: State<'_, AppState>,
+) -> Result<vigil_desktop::browser_guard::BrowserGuardStatus, String> {
+    vigil_desktop::browser_guard::browser_guard_status(state.ledger.as_ref())
 }
 
 /// `invoke('daemon_status')` → 只读 daemon 运行态(running / pii_loaded / engine_present)。

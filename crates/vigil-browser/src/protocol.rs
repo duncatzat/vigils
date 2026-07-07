@@ -137,6 +137,18 @@ pub struct BrowserCheckResponse {
     /// 空(`default`,向后兼容 hardfp-only host 的响应)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ml_labels: Vec<String>,
+    /// 参与本次决策的引擎标识(`"hardfp"` / `"hardfp+ml"`,与审计 payload 的 `engine` 同源;
+    /// Phase 2「策略+观测」)。**仅展示层**:popup 引擎态徽标用,不进 tier / action 决策。
+    /// 可选字段只增不改(协议不 bump):旧扩展忽略未知字段;旧 host 缺省 → `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// 系统安全姿态(posture.json)映射出的**建议 tier**(`"balanced"` / `"strict"`;
+    /// Phase 2「策略+观测」)。映射(low→balanced、medium/high→strict、损坏→strict)在
+    /// host 侧完成 —— posture 词汇闭集与穷举 match 留在 Rust,扩展只见 tier 值。
+    /// 扩展在「跟随系统」模式(无会话级覆盖)下按此取 tier;值非 tier 闭集成员时扩展
+    /// 忽略(fail 到内建默认)。旧 host 缺省 → `None` = 扩展行为等于现状。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posture_tier: Option<String>,
 }
 
 /// Core 层错误码(Host 在 framing 层也会用相同 error schema 返扩展)。

@@ -398,3 +398,42 @@ pub enum FindingKind {
 - 后续:Phase 2(posture→tier 统一 + GUI 观测)、Phase 3(setup 编排 + 文档一致性)。
   Chrome Web Store 消费版扩展(0.2.0,纯 JS consumer 模式)已独立上架;本轮 native host
   ML 能力对应其 enterprise 模式的 provider 接缝,接线属 Phase 2+ 产品决策。
+
+## Revised 2026-07-07(Phase 2「策略+观测」移植:posture 下发 + 浏览器防线统计)
+
+自内部实现轮移植(方案承接上一 Revised 段所引 PR 描述的三阶段计划)。
+
+### P2-1. 决策
+
+1. **posture→tier 下发通道 = Response 可选字段**(否决「新增 host 消息」:会新开协议
+   request 形态、且启动时拉取会陈旧):host 每请求现读 `posture.json`(与 engine.json
+   现读同纪律)→ `BrowserCheckResponse.posture_tier`("balanced"|"strict")。逐次新鲜
+   —— 桌面/CLI 切姿态,下一次 paste 即生效;映射闭集与穷举 match 留在 Rust
+   (`posture_to_tier` 纯函数)。
+2. **映射**:缺失→balanced(Low 默认,`load_posture` 唯一"更松"分支的镜像);
+   low→balanced;medium/high→strict(浏览器 paste 路径无 Ask 通道,medium 收敛更严);
+   损坏/坏版本/未知档位→strict(镜像 SSOT fail-closed 收敛 High;漂移只会更严不会更松)。
+3. **扩展消费(0.2.x consumer/enterprise 形态)**:consumer 模式采用固定推荐策略、
+   无用户档位,不消费 `posture_tier`;该字段的消费点是 enterprise 后端策略层
+   (「本机 Vigils 引擎」启用后按系统姿态收紧,后续接线)。原内部 0.1.x 形态的
+   三档跟随语义随 2026-07-06 内外扩展收敛(公开形态为唯一权威)退役。
+4. **观测面**:Response 增 `engine`(与审计 payload 同源;供扩展未来展示实际引擎)+
+   GUI Protection Overview 浏览器防线卡增最近 24h 守门统计
+   (`vigil_audit::Ledger::browser_guard_counts`,payload 仅 metadata,整数计数;
+   注册态判定沿用 `StatusReport::is_registered` 收口)。
+
+### P2-2. 新增守门
+
+- `BROWSER_GUARD_EVENT_TYPES`(vigil-audit,统计侧字面量)与 `event_type_for` 全变体
+  产出(写入侧)**精确集合相等**,由 native-host `browser_event_ssot_tests` 双向守门
+  (vigil-audit 不依赖 vigil-browser,防字面量漂移静默丢统计)。
+- `posture_to_tier` 输出闭集守门(只允许产出扩展 tier 闭集成员)。
+- 协议只加可选字段不 bump:旧扩展×新 host(忽略未知字段)/新扩展×旧 host
+  (字段缺省 → 行为=现状)双向兼容。
+
+### P2-3. 验证
+
+- 远端 `fmt --all --check` / `clippy --workspace --all-targets -- -D warnings` /
+  `test --workspace` 全绿:**1266 passed / 0 failed**(基线 1257,+9:posture_to_tier 3
+  + SSOT 集合守门 1 + browser_guard_counts 4 + acceptance 响应字段 1);
+  前端 vue-tsc + vite build 绿。

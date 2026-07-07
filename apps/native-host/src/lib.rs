@@ -147,6 +147,59 @@ pub fn engine_allows_ml(raw: Option<&str>) -> bool {
     )
 }
 
+/// posture.json(`{"version":1,"posture":"low"|"medium"|"high"}`,SSOT 见 vigil-hub-cli
+/// `posture.rs`)内容 → 扩展建议 tier 的**纯函数**映射(Phase 2「策略+观测」;`raw` = 文件
+/// 内容,`None` = 文件缺失):
+///
+/// - 缺失 → `"balanced"`(未配置 = Low 默认档语义,与 `load_posture` 的唯一"更松"分支一致);
+/// - `"low"` → `"balanced"`、`"medium"` / `"high"` → `"strict"`(扩展 tier 闭集只有
+///   strict/balanced/recall-first,medium 的"交确认"在浏览器 paste 路径无 Ask 通道,
+///   收敛到更严的 strict —— 只收紧方向);
+/// - 损坏 / 版本不识别 / 未知档位 → `"strict"`(镜像 `load_posture` fail-closed 收敛 High;
+///   本层解析独立于 SSOT 实现,字段漂移时最多退化为更严,绝不更松)。
+pub fn posture_to_tier(raw: Option<&str>) -> &'static str {
+    let Some(raw) = raw else {
+        return "balanced"; // 文件缺失 = 未配置 → Low 默认
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return "strict"; // 损坏 → 收敛最严
+    };
+    if v.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return "strict"; // 版本不识别 → 不按旧语义猜
+    }
+    match v.get("posture").and_then(serde_json::Value::as_str) {
+        Some("low") => "balanced",
+        Some("medium") | Some("high") => "strict",
+        _ => "strict", // 未知档位 → 收敛最严
+    }
+}
+
+/// 姿态源(DI 边界,production-logic-testable):`tier` 返 `None` = 无法定位配置目录
+/// (响应省略 `posture_tier` 字段,扩展 fall 到内建默认),`Some(tier)` = 建议 tier。
+pub trait PostureSource {
+    /// 读取当前系统姿态并映射为扩展建议 tier(`"balanced"` / `"strict"`)。
+    fn tier(&self) -> Option<&'static str>;
+}
+
+/// 生产实现:每请求现读 `<data_local>/Vigil/posture.json`(host 为 Chrome 长驻进程,
+/// 现读避免配置陈旧 —— 与 [`DaemonProbe`] 现读 engine.json 同纪律;文件极小,paste 为
+/// 人手频率,成本可忽略)。
+#[derive(Debug, Default)]
+pub struct FilePostureSource;
+
+impl PostureSource for FilePostureSource {
+    fn tier(&self) -> Option<&'static str> {
+        let path = dirs::data_local_dir().map(|d| d.join("Vigil").join("posture.json"))?;
+        Some(match std::fs::read_to_string(path) {
+            Ok(raw) => posture_to_tier(Some(&raw)),
+            // 缺失 = 未配置 → Low 默认;读失败(权限/是目录等)= 状态不明 → 镜像
+            // load_posture fail-closed 收敛最严。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => posture_to_tier(None),
+            Err(_) => "strict",
+        })
+    }
+}
+
 /// ML 探针(DI 边界,production-logic-testable):`scan` 返 `None` = 本次不可用
 /// (daemon 缺席/超时/协议错/被禁用/冷却中),`Some(findings)` = 扫描成功(可为空 = 无命中)。
 pub trait MlProbe {
@@ -287,11 +340,12 @@ pub fn run<R: Read, W: Write>(
     ledger: &Ledger,
     session_id: &str,
     ml: &dyn MlProbe,
+    posture: &dyn PostureSource,
 ) -> Result<(), std::io::Error> {
     loop {
         match read_frame(stdin) {
             Ok(Some(payload)) => {
-                handle_one(&payload, stdout, ledger, session_id, ml)?;
+                handle_one(&payload, stdout, ledger, session_id, ml, posture)?;
             }
             Ok(None) => return Ok(()), // 扩展断开
             Err(code) => {
@@ -311,6 +365,7 @@ fn handle_one<W: Write>(
     ledger: &Ledger,
     session_id: &str,
     ml: &dyn MlProbe,
+    posture: &dyn PostureSource,
 ) -> Result<(), std::io::Error> {
     // 解析请求
     let req: BrowserCheckRequest = match serde_json::from_slice(payload) {
@@ -328,6 +383,10 @@ fn handle_one<W: Write>(
         ClassifyOutcome::Response(mut resp) => {
             // daemon ML 增强(fail-closed 纯加性;daemon 缺席时本行为恒等于现状)。
             let engine = ml_augment(&req.text, &mut resp, ml);
+            // Phase 2「策略+观测」:响应附着引擎标识(popup 徽标)+ 姿态建议 tier
+            // (扩展「跟随系统」)。均为仅展示/策略提示的可选字段,不改 action 语义。
+            resp.engine = Some(engine.to_string());
+            resp.posture_tier = posture.tier().map(str::to_string);
             // 审计(metadata only)—— 用 `BrowserAuditMeta` 接口边界编码"不得含 raw text"
             let meta = BrowserAuditMeta {
                 origin: &req.origin,
@@ -690,6 +749,105 @@ mod ml_augment_tests {
         assert!(
             !cd.in_cooldown(t0 + Duration::from_secs(61)),
             "窗口过后自动恢复(daemon 复活可自愈)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod posture_tier_tests {
+    use super::posture_to_tier;
+
+    /// 三档映射 + 缺失默认(Phase 2「策略+观测」):low→balanced;medium/high→strict;
+    /// 缺失 = 未配置 → Low 默认 balanced(load_posture 唯一"更松"分支的镜像)。
+    #[test]
+    fn posture_mapping_matrix() {
+        assert_eq!(posture_to_tier(None), "balanced");
+        assert_eq!(
+            posture_to_tier(Some(r#"{"version":1,"posture":"low"}"#)),
+            "balanced"
+        );
+        assert_eq!(
+            posture_to_tier(Some(r#"{"version":1,"posture":"medium"}"#)),
+            "strict"
+        );
+        assert_eq!(
+            posture_to_tier(Some(r#"{"version":1,"posture":"high"}"#)),
+            "strict"
+        );
+    }
+
+    /// fail-closed 收敛(镜像 hub-cli `load_posture`):损坏 / 版本不识别 / 未知档位 /
+    /// 缺字段 → 一律 strict(宁严不松;SSOT 字段漂移时最多退化为更严)。
+    #[test]
+    fn malformed_and_unknown_fail_closed_to_strict() {
+        assert_eq!(posture_to_tier(Some("not json")), "strict");
+        assert_eq!(
+            posture_to_tier(Some(r#"{"version":2,"posture":"low"}"#)),
+            "strict"
+        );
+        assert_eq!(
+            posture_to_tier(Some(r#"{"version":1,"posture":"paranoid"}"#)),
+            "strict"
+        );
+        assert_eq!(posture_to_tier(Some(r#"{"version":1}"#)), "strict");
+        assert_eq!(posture_to_tier(Some(r#"{"posture":"low"}"#)), "strict");
+        assert_eq!(
+            posture_to_tier(Some(r#"{"version":1,"posture":7}"#)),
+            "strict"
+        );
+    }
+
+    /// 输出闭集守门:本函数只允许产出扩展 tier 闭集的成员(strict/balanced)——
+    /// 扩展侧按闭集校验,任何漂移值会被忽略;此测试保证 host 永不发出会被忽略的值。
+    #[test]
+    fn output_is_within_extension_tier_closed_set() {
+        for raw in [
+            None,
+            Some(r#"{"version":1,"posture":"low"}"#),
+            Some(r#"{"version":1,"posture":"medium"}"#),
+            Some(r#"{"version":1,"posture":"high"}"#),
+            Some("garbage"),
+        ] {
+            let t = posture_to_tier(raw);
+            assert!(
+                t == "balanced" || t == "strict",
+                "posture_to_tier 产出 {t},不在扩展 tier 闭集"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod browser_event_ssot_tests {
+    //! SSOT 漂移守门(feedback「SSOT drift guard」):GUI 的 24h 拦截统计
+    //! (`vigil_audit::Ledger::browser_guard_counts`)按 `BROWSER_GUARD_EVENT_TYPES`
+    //! 常量过滤事件;真实写入点是本 crate `handle_one` 经 `event_type_for` 产出的
+    //! 字面量。两个集合必须**精确相等**(双向,非子集/count),否则新增浏览器事件类型
+    //! 会在统计侧静默丢失(或统计声称覆盖不存在的类型)。
+
+    #[test]
+    fn browser_guard_event_types_exactly_match_event_type_for() {
+        use std::collections::BTreeSet;
+        use vigil_browser::{event_type_for, BrowserEventKind};
+
+        // 写入侧:event_type_for 对全部 BrowserEventKind 变体的产出(新增变体时
+        // 此数组由穷举 match 强制更新)。
+        let emitted: BTreeSet<&str> = [
+            BrowserEventKind::Paste,
+            BrowserEventKind::Input,
+            BrowserEventKind::Submit,
+        ]
+        .into_iter()
+        .map(event_type_for)
+        .collect();
+        // 统计侧:vigil-audit 的过滤常量。
+        let counted: BTreeSet<&str> = vigil_audit::BROWSER_GUARD_EVENT_TYPES
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            emitted, counted,
+            "browser 事件字面量与 vigil-audit BROWSER_GUARD_EVENT_TYPES 漂移:两侧必须精确相等"
         );
     }
 }

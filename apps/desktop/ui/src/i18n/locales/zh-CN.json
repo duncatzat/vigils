@@ -83,7 +83,8 @@
     "browser_guard_ml": "浏览器防线：本机引擎已注册 · ML 运行中",
     "browser_guard_hardfp": "浏览器防线：本机引擎已注册（硬指纹）",
     "browser_guard_off": "浏览器防线：未注册本机引擎",
-    "browser_guard_unknown": "浏览器防线：状态未知"
+    "browser_guard_unknown": "浏览器防线：状态未知",
+    "browser_guard_stats": "近 24h：检查 {checks} · 拦截 {blocked} · 脱敏 {redacted}"
   },
   "approval": {
     "page_title": "审批队列",

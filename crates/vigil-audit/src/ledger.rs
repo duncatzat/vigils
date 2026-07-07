@@ -178,6 +178,30 @@ pub struct ProtectionSummary {
     pub recent: Vec<EventHit>,
 }
 
+/// 浏览器防线(native host)写入的审计事件类型全集(Phase 2「策略+观测」)。
+///
+/// 真实写入点 = `vigil-native-host` `handle_one` 经 `vigil_browser::event_type_for` 产出;
+/// 两侧集合由 native-host 的 `browser_guard_event_types_exactly_match_event_type_for`
+/// 测试做**精确相等**守门(vigil-audit 不依赖 vigil-browser,字面量在此复制;新增
+/// `BrowserEventKind` 变体时该测试强制同步本常量)。
+pub const BROWSER_GUARD_EVENT_TYPES: &[&str] = &[
+    "browser.paste_checked",
+    "browser.input_checked",
+    "browser.submit_checked",
+];
+
+/// [`Ledger::browser_guard_counts`] 的窗口统计(桌面 Protection Overview 浏览器防线卡)。
+/// 纯整数计数,不携带任何事件内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BrowserGuardCounts {
+    /// 窗口内检查总数(三类 browser.* 事件行数)。
+    pub checks: u64,
+    /// 其中 action=block(阻断)。
+    pub blocked: u64,
+    /// 其中 action=redact(脱敏放行)。
+    pub redacted: u64,
+}
+
 /// I08 `list_sessions` 返回的 session 摘要投影。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionSummaryRow {
@@ -986,6 +1010,49 @@ impl Ledger {
             chain_intact,
             recent,
         })
+    }
+
+    /// 浏览器防线(native host)审计事件的窗口统计 → [`BrowserGuardCounts`]
+    /// (Phase 2「策略+观测」:桌面 Protection Overview 浏览器防线卡)。
+    ///
+    /// 过滤 [`BROWSER_GUARD_EVENT_TYPES`] 三类事件且 `created_at >= since_epoch_secs`,
+    /// 逐行解析 payload 的 `action` 归类(block / redact / 其它=放行)。**纯读**;payload
+    /// 本身是 metadata-only(vigil-browser §I-9.1/9.2 白名单,不含原文),解析失败的行
+    /// 只计入 `checks` 不计入动作(不 Err —— 统计卡不因单行畸形而整体失败)。
+    /// 事件量 = 人手 paste 频率 × 窗口(默认 24h),全取到内存逐行解析成本可忽略。
+    pub fn browser_guard_counts(&self, since_epoch_secs: i64) -> Result<BrowserGuardCounts> {
+        let guard = self.conn.lock().map_err(|_| AuditError::LockPoisoned)?;
+        let mut stmt = guard.prepare(
+            "SELECT payload_json FROM events WHERE event_type IN (?1, ?2, ?3) AND created_at >= ?4",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![
+                BROWSER_GUARD_EVENT_TYPES[0],
+                BROWSER_GUARD_EVENT_TYPES[1],
+                BROWSER_GUARD_EVENT_TYPES[2],
+                since_epoch_secs
+            ],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut counts = BrowserGuardCounts {
+            checks: 0,
+            blocked: 0,
+            redacted: 0,
+        };
+        for payload in rows {
+            let payload = payload?;
+            counts.checks += 1;
+            match serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|v| v.get("action").and_then(|a| a.as_str().map(String::from)))
+                .as_deref()
+            {
+                Some("block") => counts.blocked += 1,
+                Some("redact") => counts.redacted += 1,
+                _ => {}
+            }
+        }
+        Ok(counts)
     }
 
     /// 主动触发 WAL checkpoint(TRUNCATE 模式:尽量缩短 WAL 文件)。

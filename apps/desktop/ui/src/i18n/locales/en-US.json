@@ -83,7 +83,8 @@
     "browser_guard_ml": "Browser guard: local engine registered · ML running",
     "browser_guard_hardfp": "Browser guard: local engine registered (hard fingerprints)",
     "browser_guard_off": "Browser guard: local engine not registered",
-    "browser_guard_unknown": "Browser guard: status unknown"
+    "browser_guard_unknown": "Browser guard: status unknown",
+    "browser_guard_stats": "Last 24h: {checks} checks · {blocked} blocked · {redacted} redacted"
   },
   "approval": {
     "page_title": "Approval Queue",

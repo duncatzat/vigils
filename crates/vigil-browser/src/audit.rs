@@ -114,6 +114,8 @@ mod tests {
                 _ => None,
             },
             ml_labels: Vec::new(),
+            engine: None,
+            posture_tier: None,
         }
     }
 
@@ -194,6 +196,8 @@ mod tests {
             findings: vec![FindingKind::GithubToken],
             redacted_text: Some("[REDACTED github_token]".into()),
             ml_labels: vec!["private_email".into()],
+            engine: Some("hardfp+ml".into()),
+            posture_tier: Some("balanced".into()),
         };
         let p = build_audit_payload(&meta, &resp);
         let s = serde_json::to_string(&p).unwrap();

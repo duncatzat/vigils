@@ -134,6 +134,15 @@ onMounted(() => loadAll());
 
 // ─────────────────────────── Derived metrics ───────────────────────────
 const blockedAttempts = computed(() => summary.value?.raw_secrets_blocked ?? 0);
+const browserGuardStats = computed(() => {
+  const g = browserGuard.value;
+  if (!g || !g.registered || g.checks_24h === 0) return null;
+  return t("protection.browser_guard_stats", {
+    checks: g.checks_24h,
+    blocked: g.blocked_24h,
+    redacted: g.redacted_24h,
+  });
+});
 const browserGuardLine = computed(() => {
   const g = browserGuard.value;
   if (!g) return t("protection.browser_guard_unknown");
@@ -390,6 +399,9 @@ async function exportSession(sessionId: string): Promise<void> {
             </div>
             <div class="flex justify-between">
               <span class="text-vigils-text-secondary">{{ browserGuardLine }}</span>
+            </div>
+            <div v-if="browserGuardStats" class="flex justify-between">
+              <span class="text-vigils-text-secondary">{{ browserGuardStats }}</span>
             </div>
           </div>
         </div>

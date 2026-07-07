@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 
-/// 浏览器防线(native host)注册状态 DTO。
+/// 浏览器防线(native host)注册状态 + 最近 24h 守门统计 DTO。
 #[derive(Debug, Clone, Serialize)]
 pub struct BrowserGuardStatus {
     /// 综合判定:manifest 在位且(Windows 上)HKCU 注册表键在位。
@@ -15,17 +15,40 @@ pub struct BrowserGuardStatus {
     pub manifest_exists: bool,
     /// Windows HKCU 注册表键是否在位;非 Windows 平台恒 `null`。
     pub registry_present: Option<bool>,
+    /// 最近 24h 浏览器检查总数(paste/input/submit)。
+    pub checks_24h: u64,
+    /// 其中拦截(block)。
+    pub blocked_24h: u64,
+    /// 其中脱敏放行(redact)。
+    pub redacted_24h: u64,
 }
 
-/// 读取本机 native host 注册状态(只读)。
-pub fn browser_guard_status() -> Result<BrowserGuardStatus, String> {
-    let report = vigil_native_host::install::status(None).map_err(|e| e.to_string())?;
+/// 读取本机 native host 注册状态 + 24h 守门统计(均只读)。
+///
+/// 注册态查询失败(home 不可得等)按未注册处理:状态卡宁可保守提示,不报错阻塞整页;
+/// 统计走 ledger 纯读([`vigil_audit::Ledger::browser_guard_counts`],窗口 = now-24h)。
+pub fn browser_guard_status(ledger: &vigil_audit::Ledger) -> Result<BrowserGuardStatus, String> {
+    let (manifest_exists, registry_present) = match vigil_native_host::install::status(None) {
+        Ok(report) => (report.manifest_exists, report.registry_present),
+        Err(_) => (false, None),
+    };
     // 非 Windows 无注册表概念(`registry_present = None`)→ 仅看 manifest。
-    let registered = report.manifest_exists && report.registry_present.unwrap_or(true);
+    let registered = manifest_exists && registry_present.unwrap_or(true);
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        .saturating_sub(24 * 3600);
+    let counts = ledger
+        .browser_guard_counts(since)
+        .map_err(|e| e.to_string())?;
     Ok(BrowserGuardStatus {
         registered,
-        manifest_exists: report.manifest_exists,
-        registry_present: report.registry_present,
+        manifest_exists,
+        registry_present,
+        checks_24h: counts.checks,
+        blocked_24h: counts.blocked,
+        redacted_24h: counts.redacted,
     })
 }
 
@@ -37,9 +60,11 @@ mod tests {
     /// `registered` 蕴含 `manifest_exists`(综合判定不得凭空为真)。
     #[test]
     fn status_is_readonly_and_consistent() {
-        let s = browser_guard_status().expect("status query must not fail");
+        let ledger = vigil_audit::Ledger::open_in_memory().expect("in-memory ledger");
+        let s = browser_guard_status(&ledger).expect("status query must not fail");
         if s.registered {
             assert!(s.manifest_exists, "registered 蕴含 manifest_exists");
         }
+        assert_eq!((s.checks_24h, s.blocked_24h, s.redacted_24h), (0, 0, 0));
     }
 }

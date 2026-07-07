@@ -146,7 +146,10 @@ fn run_stdio_loop() -> ExitCode {
 
     // daemon ML 探针:engine.json 门控 + 失败冷却;daemon 缺席 → 行为恒等纯硬指纹(fail-closed)。
     let ml = vigil_native_host::DaemonProbe::new();
-    match vigil_native_host::run(&mut stdin, &mut stdout, &ledger, &session_id, &ml) {
+    // 姿态源(Phase 2「策略+观测」):每请求现读 posture.json → 响应附着建议 tier,
+    // 扩展「跟随系统」据此取档;读不到配置目录 → 字段省略,扩展 fall 到内建默认。
+    let posture = vigil_native_host::FilePostureSource;
+    match vigil_native_host::run(&mut stdin, &mut stdout, &ledger, &session_id, &ml, &posture) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     }
