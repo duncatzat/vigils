@@ -80,6 +80,67 @@ pub fn classify(command: &str, project_root: Option<&str>) -> Option<CommandRisk
     classify_depth(command, project_root, 0)
 }
 
+/// 文件写入 / 编辑工具的**目标路径**是否命中持久化落点 → [`GuardTier::Dangerous`]。
+///
+/// 这是 [`classify`] 的对称面:hook 只扫 shell command 字符串([`classify`] 走 `command` 字段),
+/// 但**文件写入**(`Write` 的 `{file_path, content}`,无 command 字段)会从旁边绕过。往
+/// shell rc / SSH authorized_keys / cron / systemd / launchd / git-hook 写**任何**内容都是
+/// 可疑持久化(与 shell 侧 `echo >> ~/.bashrc` 判 Dangerous 对称;只看落点不看内容,落点即风险)。
+/// 普通项目文件 → `None`,不误伤日常写码。
+///
+/// # 覆盖边界(external contract,2026-07-06 核实官方文档)
+/// **Claude** `Write`/`Edit` 与 **Gemini** `write_file`/`replace` 均用 `file_path` 字段且触发
+/// PreToolUse —— 本函数覆盖。**Codex** `apply_patch` 当前不可靠触发 PreToolUse(平台限制:
+/// "PreToolUse only supports Bash tool interception")、**Cursor** 只有 shell/MCP hook 无文件
+/// 写入事件 —— 那两家的文件写入防护由 MCP 网关([`vigil_firewall`] `FsWrite`)承担,不在 hook 范围。
+pub fn classify_file_write(file_path: &str) -> Option<CommandRisk> {
+    if is_persistence_write_target(strip_quotes(file_path.trim())) {
+        return Some(CommandRisk {
+            tier: GuardTier::Dangerous,
+            category: GuardCategory::Persistence,
+            detail: "writes to a shell startup file, SSH authorized_keys, a cron/systemd/launchd unit, or a git hook — a persistence foothold that runs code automatically",
+        });
+    }
+    None
+}
+
+/// 写入目标路径是否为持久化落点。**路径锚定**(区别于 shell 侧 [`SENSITIVE_PERSIST_FILE`] 的
+/// 命令子串):rc / 登录 dotfile 按 **basename 精确**匹配 —— 否则 `webpack.profile.json` 这类
+/// 普通文件会被 `.profile` 子串误伤(而 file_path 每次写入都触发,误报面远大于 shell 命令);
+/// 敏感目录 / 文件按足够特异的**路径段**匹配。反斜杠归一为正斜杠 + 小写,兼顾 Windows 与大小写。
+/// 词表与 [`SENSITIVE_PERSIST_FILE`] 对齐(语义不同:那里判「命令里出现」,这里判「路径即写入目标」)。
+fn is_persistence_write_target(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let norm = path.replace('\\', "/").to_ascii_lowercase();
+    let base = norm.rsplit('/').next().unwrap_or(norm.as_str());
+    const RC_FILES: &[&str] = &[
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".zshrc",
+        ".zprofile",
+        ".zshenv",
+        ".profile",
+    ];
+    if RC_FILES.contains(&base) {
+        return true;
+    }
+    const SENSITIVE_PATHS: &[&str] = &[
+        "/.ssh/authorized_keys",
+        "/etc/cron",
+        "/var/spool/cron",
+        "/etc/systemd/system",
+        "/.config/systemd/user",
+        "/library/launchagents",
+        "/library/launchdaemons",
+        "/.git/hooks/",
+        "start menu/programs/startup",
+    ];
+    SENSITIVE_PATHS.iter().any(|s| norm.contains(s))
+}
+
 /// 嵌套 shell(`bash -c "<script>"`)递归深度上限 —— 防病态深嵌套无界递归。
 const MAX_NEST_DEPTH: u8 = 4;
 
@@ -574,7 +635,7 @@ static WRITE_INDICATOR: Lazy<Regex> =
 
 static SENSITIVE_PERSIST_FILE: Lazy<Regex> = Lazy::new(|| {
     re(
-        r"(?i)(\.bashrc|\.bash_profile|\.bash_login|\.zshrc|\.zprofile|\.zshenv|\.profile|/\.ssh/authorized_keys|/etc/cron|/var/spool/cron|/etc/systemd/system|/\.config/systemd/user|/library/launchagents|/library/launchdaemons|start menu\\programs\\startup)",
+        r"(?i)(\.bashrc|\.bash_profile|\.bash_login|\.zshrc|\.zprofile|\.zshenv|\.profile|/\.ssh/authorized_keys|/etc/cron|/var/spool/cron|/etc/systemd/system|/\.config/systemd/user|/library/launchagents|/library/launchdaemons|\.git/hooks/|start menu\\programs\\startup)",
     )
 });
 
@@ -702,6 +763,54 @@ mod tests {
         assert!(classify("cat ~/.bashrc", Some("/proj")).is_none());
         // crontab -l 是列出(读),不拦。
         assert!(classify("crontab -l", Some("/proj")).is_none());
+    }
+
+    #[test]
+    fn file_write_to_persistence_path_is_dangerous() {
+        // 文件写入工具(Write/write_file)的 file_path 命中持久化落点须判 Dangerous ——
+        // 与 shell 侧 `echo >> ~/.bashrc` 对称(hook 只扫 command 字符串会漏掉文件写入形态)。
+        for p in [
+            "/home/user/.bashrc",
+            "~/.zshrc",
+            "/home/user/.ssh/authorized_keys",
+            "/etc/systemd/system/evil.service",
+            "/Users/x/Library/LaunchAgents/eviltask.plist",
+            "/proj/.git/hooks/pre-commit",
+        ] {
+            let r = classify_file_write(p).unwrap_or_else(|| panic!("expected a hit for `{p}`"));
+            assert_eq!(r.tier, GuardTier::Dangerous, "`{p}` 应判高危");
+            assert_eq!(r.category, GuardCategory::Persistence, "`{p}`");
+        }
+    }
+
+    #[test]
+    fn file_write_to_ordinary_project_path_is_allowed() {
+        // 日常写码 = 普通项目文件,绝不拦(否则每次 Write/Edit 都误报)。
+        for p in [
+            "/proj/src/main.rs",
+            "./README.md",
+            "/proj/config.toml",
+            "notes.txt",
+            "/home/user/project/index.js",
+            "",
+            // `.profile` 作为 infix 的普通文件:basename 锚定后不再误伤(hostile 复审 FP-2)。
+            "/proj/webpack.profile.json",
+            "/proj/report.profile",
+            "/proj/build.profile.js",
+        ] {
+            assert!(classify_file_write(p).is_none(), "`{p}` 不应命中");
+        }
+    }
+
+    #[test]
+    fn shell_write_to_git_hook_is_dangerous() {
+        // `.git/hooks/` 进 SENSITIVE_PERSIST_FILE 后,shell 侧写 git hook 也算持久化。
+        let r = cat(
+            "echo 'export EVIL=1' >> .git/hooks/pre-commit",
+            Some("/proj"),
+        );
+        assert_eq!(r.category, GuardCategory::Persistence);
+        assert_eq!(r.tier, GuardTier::Dangerous);
     }
 
     #[test]
