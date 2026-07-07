@@ -16,7 +16,7 @@ In the default consumer mode, it does not require a Native Host, desktop app, or
 - **Contextual page prompt**: Risk prompts appear near the active input instead of being hidden in a page corner.
 - **One-click site protection**: The popup shows the current page status and lets you add custom HTTPS sites.
 - **Safe event history**: The popup shows only risk type, website, and action metadata. It does not store original text.
-- **Enterprise-ready interface**: Future enterprise providers can use Native Host, localhost agent, HTTPS API, or Wasm.
+- **Enterprise backend (optional)**: route checks to the locally installed Vigils engine over Native Host — the first shipped enterprise provider. Localhost agent, HTTPS API, and Wasm remain planned interfaces.
 
 ## Use Cases
 
@@ -78,11 +78,16 @@ Consumer mode follows these rules:
 - Page prompts are rendered with DOM APIs and `textContent`, not `innerHTML`
 - Unknown or invalid decisions fail closed and are blocked by default
 
-Enterprise mode is a reserved capability, not the default path for everyday users. Native Host is only one possible future enterprise provider implementation.
+Enterprise mode is optional and off by default. Its first shipped backend is the **local Vigils
+engine** over Native Host: install the Vigils CLI, register the host with your extension ID
+(`vigil-native-host install --extension-id <ID>` — the ID is shown under Options → Advanced),
+then pick "Local Vigils engine" in the enterprise section of Options. Checks then run in a local
+process (hard fingerprints, plus ML PII when the daemon runs); raw text never leaves the device,
+and an unreachable host blocks instead of silently downgrading.
 
 ## Install and Try
 
-The current version is intended for development-mode loading:
+Install from the Chrome Web Store (see below), or load the directory as a development build:
 
 1. Open Chrome `chrome://extensions/`
 2. Enable Developer mode
@@ -150,7 +155,7 @@ extensions/chrome-mv3/
 ├── scanner-pipeline.js
 ├── providers/
 │   ├── consumer-js-provider.js
-│   └── enterprise-provider.js
+│   └── native-host-provider.js
 └── tests/
 ```
 
@@ -161,7 +166,7 @@ Core layers:
 - `custom-sites.js`: Normalizes user-provided HTTPS domains for optional protection.
 - `redaction-rules.js`: Browser-local detection, redaction, and custom prefix-based risk rules.
 - `risk-decision.js`: Converts scan results into `allow`, `confirm_redact`, or `block`.
-- `scanner-pipeline.js`: Combines the consumer provider and future enterprise providers.
+- `scanner-pipeline.js`: Combines the consumer provider and enterprise providers (e.g. the Native Host provider).
 
 ## Development and Tests
 
