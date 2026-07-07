@@ -56,42 +56,72 @@
     <details id="advanced-settings" class="advanced-settings">
       <summary>高级设置</summary>
 
-      <div class="advanced-block">
-        <h3>扩展 ID</h3>
-        <p class="desc">用于排查问题或后续企业 provider 对接时识别当前扩展实例。</p>
-        <div class="id-row">
-          <code id="extension-id" class="id-value">—</code>
-          <button id="copy-id-btn" type="button">复制</button>
-        </div>
-        <p id="extension-id-hint" class="hint"></p>
-      </div>
+      <div id="enterprise-section" class="advanced-block enterprise-guide">
+        <h3>企业连接 · 本机引擎</h3>
 
-      <div id="enterprise-section" class="advanced-block">
-        <h3>企业连接</h3>
-        <p class="desc">企业模式可将检查路由到更强的扫描后端；未配置时仍使用普通保护。</p>
-        <label for="enterprise-provider-type">扫描后端</label>
-        <select id="enterprise-provider-type">
-          <option value="none">尚未配置（普通保护）</option>
-          <option value="native_host">本机 Vigils 引擎</option>
-          <option value="localhost" disabled>Localhost Agent（规划中）</option>
-          <option value="https_api" disabled>企业 HTTPS API（规划中）</option>
-          <option value="wasm" disabled>浏览器内 Wasm（规划中）</option>
-        </select>
-        <p id="enterprise-status" class="hint"></p>
-        <div id="enterprise-native-guide" class="hidden">
-          <p class="desc">启用本机引擎需要先安装 Vigils CLI（或桌面版）并完成本机引擎注册——
-            步骤见用户文档「Browser extension」一节；注册时会用到上方「扩展 ID」。完成后回到
-            此页重新选择「本机 Vigils 引擎」。</p>
-          <p class="desc">本机引擎：原文仅送本机进程内存、不出设备；含硬指纹检测，本机 ML
-            引擎运行时自动叠加语义识别（邮箱 / 人名 / 电话等）。</p>
+        <div class="ent-value">
+          <div class="ent-value-head">
+            <svg class="ent-shield" width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 2.5l6.4 2.8v5.3c0 4.2-2.7 7.9-6.4 9.4-3.7-1.5-6.4-5.2-6.4-9.4V5.3L12 2.5z"
+                fill="currentColor" fill-opacity="0.14" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" />
+              <path d="M9 12.2l2.1 2.1L15 10.4" stroke="currentColor" stroke-width="1.7"
+                stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <div>
+              <strong>把检查升级到本机 Vigils 引擎</strong>
+              <p>企业模式下，更强的扫描后端在你本机运行；普通用户无需配置。</p>
+            </div>
+          </div>
+          <ul class="ent-benefits">
+            <li><span class="ent-benefit-ic" aria-hidden="true">🔒</span><span>原文仅在本机进程内存处理，<strong>不出设备</strong></span></li>
+            <li><span class="ent-benefit-ic" aria-hidden="true">🎯</span><span>硬指纹检测 + 本机 ML 语义识别（邮箱 / 人名 / 电话）</span></li>
+            <li><span class="ent-benefit-ic" aria-hidden="true">⚙️</span><span>跟随系统安全姿态，strict 命中<strong>即阻断</strong></span></li>
+          </ul>
         </div>
 
-        <label for="enterprise-data-policy">数据策略</label>
-        <select id="enterprise-data-policy" disabled>
-          <option value="local_only">local_only：不发送原文</option>
-          <option value="metadata_only">metadata_only：只发送元数据</option>
-          <option value="raw_allowed">本机引擎：原文仅送本机进程（不出设备）</option>
-        </select>
+        <div id="enterprise-badge" class="ent-badge ent-badge-idle">
+          <span class="ent-badge-dot" aria-hidden="true"></span>
+          <span id="enterprise-badge-text" class="ent-badge-text">未连接本机引擎</span>
+          <span id="enterprise-badge-chips" class="ent-badge-chips"></span>
+        </div>
+
+        <ol id="enterprise-native-guide" class="ent-steps">
+          <li class="ent-step">
+            <span class="ent-step-n" aria-hidden="true">1</span>
+            <div class="ent-step-body">
+              <strong>安装 Vigils CLI 或桌面版</strong>
+              <p>参见用户文档「Browser extension」一节；已安装可跳过此步。</p>
+            </div>
+          </li>
+          <li class="ent-step">
+            <span class="ent-step-n" aria-hidden="true">2</span>
+            <div class="ent-step-body">
+              <strong>用扩展 ID 注册本机引擎</strong>
+              <p>注册时需要下面这串扩展 ID，用于识别当前扩展实例。</p>
+              <div class="id-row">
+                <code id="extension-id" class="id-value">—</code>
+                <button id="copy-id-btn" type="button">复制 ID</button>
+              </div>
+              <p id="extension-id-hint" class="hint"></p>
+            </div>
+          </li>
+          <li class="ent-step">
+            <span class="ent-step-n" aria-hidden="true">3</span>
+            <div class="ent-step-body">
+              <strong>开启「本机 Vigils 引擎」</strong>
+              <p>安装并注册完成后在此选择本机引擎；扩展会先探测连通再启用。</p>
+              <label for="enterprise-provider-type">扫描后端</label>
+              <select id="enterprise-provider-type">
+                <option value="none">尚未配置（普通保护）</option>
+                <option value="native_host">本机 Vigils 引擎</option>
+                <option value="localhost" disabled>Localhost Agent（规划中）</option>
+                <option value="https_api" disabled>企业 HTTPS API（规划中）</option>
+                <option value="wasm" disabled>浏览器内 Wasm（规划中）</option>
+              </select>
+              <p id="enterprise-status" class="hint"></p>
+            </div>
+          </li>
+        </ol>
       </div>
 
       <div class="advanced-block">

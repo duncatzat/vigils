@@ -104,6 +104,21 @@ test("popup renders safety events in plain language", () => {
     assert.doesNotMatch(js, /toUpperCase\(\)/);
 });
 
+// 防回归:事件列表只记**风险**事件,allow(未见风险)不入列 —— 否则简单文本的
+// 正常放行会被显示成「检测到风险」(用户报告的误报)。且 popup 事件行**不得**用
+// innerHTML 拼接 backend 数据(纯文本 textContent,杜绝注入)。
+test("only risk events are recorded; simple/allow input is not shown as a risk", () => {
+    const background = read("extensions/chrome-mv3/background.js");
+    // recordFinding 必须在 `resp.action !== "allow"` 守卫内
+    assert.match(background, /resp\.action\s*!==\s*"allow"[\s\S]{0,120}recordFinding\(/);
+});
+
+test("popup event rows are built with DOM/textContent, never innerHTML", () => {
+    const js = read("extensions/chrome-mv3/popup.js");
+    assert.doesNotMatch(js, /\.innerHTML\s*=/);
+    assert.match(js, /\.textContent\s*=/);
+});
+
 test("options defaults to consumer settings and hides enterprise diagnostics as advanced", () => {
     const html = read("extensions/chrome-mv3/options.html");
     assert.match(html, /推荐保护/);
@@ -129,4 +144,29 @@ test("options exposes custom risk types only inside advanced settings", () => {
     assert.match(source, /vigil_add_custom_risk_rule/);
     assert.match(source, /vigil_remove_custom_risk_rule/);
     assert.doesNotMatch(html, /正则表达式/);
+});
+
+// 防回归:企业引导是「价值卡 + 状态徽章 + 三步引导」,而非密集表单;且不得再出现
+// 那个只读、纯摆设的「数据策略」下拉(disabled select 徒增困惑)。徽章的能力 chip 必须
+// 由 renderEnterpriseBadge 依据本机引擎真实回报的 engine/posture_tier 渲染。
+test("enterprise guide is a value+steps+status onboarding, not a dense form", () => {
+    const html = read("extensions/chrome-mv3/options.html");
+    const js = read("extensions/chrome-mv3/options.js");
+    // 价值卡 + 三步引导 + 状态徽章的结构标记
+    assert.match(html, /class="[^"]*enterprise-guide/);
+    assert.match(html, /class="ent-benefits"/);
+    assert.match(html, /<ol[^>]*id="enterprise-native-guide"[^>]*class="ent-steps"/);
+    assert.match(html, /class="ent-step-n"/);
+    assert.match(html, /id="enterprise-badge"/);
+    // 三步的关键文案(顺序即引导路径)
+    assert.match(html, /安装 Vigils CLI 或桌面版/);
+    assert.match(html, /用扩展 ID 注册本机引擎/);
+    assert.match(html, /开启「本机 Vigils 引擎」/);
+    // 摆设的只读数据策略下拉已移除
+    assert.doesNotMatch(html, /enterprise-data-policy/);
+    assert.doesNotMatch(html, /metadata_only/);
+    // 徽章 chip 走真实观测字段(engine / posture_tier),非硬编码
+    assert.match(js, /function renderEnterpriseBadge/);
+    assert.match(js, /info\.engine === "hardfp\+ml"/);
+    assert.match(js, /info\.posture_tier === "strict"/);
 });

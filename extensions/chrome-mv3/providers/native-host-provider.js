@@ -103,6 +103,15 @@ export function createNativeHostProvider(options = {}) {
         if (typeof resp.redacted_text === "string") {
             result.redacted_text = resp.redacted_text;
         }
+        // Phase 2「策略+观测」契约字段(host 每响应携带,闭集校验后透传;非闭集值丢弃
+        // =旧 host / 漂移容错):posture_tier = 系统姿态(posture.json)映射的建议档,
+        // pipeline 据此做只收紧的姿态升级;engine = 本次参与引擎(观测标注)。
+        if (resp.posture_tier === "balanced" || resp.posture_tier === "strict") {
+            result.posture_tier = resp.posture_tier;
+        }
+        if (resp.engine === "hardfp" || resp.engine === "hardfp+ml") {
+            result.engine = resp.engine;
+        }
         return result;
     }
 

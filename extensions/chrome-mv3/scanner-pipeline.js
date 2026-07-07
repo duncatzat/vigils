@@ -56,6 +56,34 @@ export function mergeScanResults(requestId, results) {
     };
 }
 
+/**
+ * 姿态跟随(Phase 2「策略+观测」):把 enterprise provider(本机引擎)带回的系统姿态
+ * 建议档应用到**合并后的最终决策**上。纯函数,只收紧:
+ *
+ *   - `postureTier === "strict"` 且最终 action 为 confirm_redact → 升级 block
+ *     (系统姿态严格 = 命中即阻断,不走用户确认;posture.json medium/high 由 host 侧
+ *     映射为 strict);
+ *   - allow(无命中)与 block(已最严)在任何姿态下都**不动**——姿态绝不放宽;
+ *   - `postureTier` 非闭集成员(null / 旧 host 缺省 / 漂移值)→ 原样返回 = 现状行为。
+ *
+ * 同时把 posture_tier / engine 附着到结果上(观测:popup 企业标注 / options 状态行),
+ * 无论是否发生升级 —— 附着基于 provider 实际回报,不基于本函数是否收紧。
+ */
+export function applyPostureTier(result, postureTier, engine) {
+    if (!result || typeof result !== "object") return result;
+    const annotated = { ...result };
+    if (postureTier === "balanced" || postureTier === "strict") {
+        annotated.posture_tier = postureTier;
+    }
+    if (engine === "hardfp" || engine === "hardfp+ml") {
+        annotated.engine = engine;
+    }
+    if (annotated.posture_tier === "strict" && annotated.action === "confirm_redact") {
+        return { ...annotated, action: "block", posture_escalated: true };
+    }
+    return annotated;
+}
+
 function lengthBucket(text) {
     const length = typeof text === "string" ? text.length : 0;
     if (length <= 100) return "0-100";
@@ -103,10 +131,17 @@ export async function checkWithScannerPipeline(request, options = {}) {
             dataPolicy,
             localResult,
         });
-        return mergeScanResults(request && request.request_id ? request.request_id : "", [
+        const merged = mergeScanResults(request && request.request_id ? request.request_id : "", [
             localResult,
             enterpriseResult,
         ]);
+        // 姿态跟随:从 enterprise 结果**独立**取姿态档再应用到合并结果 —— 不依赖
+        // enterprise 恰好是 merge 的最严者(本地更严时姿态升级依然要生效)。
+        return applyPostureTier(
+            merged,
+            enterpriseResult && enterpriseResult.posture_tier,
+            enterpriseResult && enterpriseResult.engine,
+        );
     } catch {
         return {
             request_id: request && request.request_id ? request.request_id : "",

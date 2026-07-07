@@ -69,7 +69,7 @@
         "https://spark.xfyun.cn/*"
       ],
       "js": ["content-script.js"],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "all_frames": true
     }
   ],
