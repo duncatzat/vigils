@@ -473,6 +473,34 @@ pub fn respond(outcome: &HookOutcome, cli: CliKind) -> HookResponse {
     }
 }
 
+/// hook 进程退出码的 **panic 兜底**(纵深防御,VIGIL 全用户面审核 P1):跑决策+输出闭包,
+/// 任何未预期 panic(逻辑 bug、`println!` 撞 broken pipe 等)一律收敛为该 CLI 的 **Deny**
+/// 形状退出码,绝不让 unwind 逃逸成 Rust panic 退出(码 101)—— Claude 把非 2 的退出视为
+/// non-blocking fail-open,即"hook 崩溃 = 放行",违背 [`run`] 声明的 fail-closed 契约。
+///
+/// 兜底分支用**不 panic 的 write**(`writeln!` 忽略错误)输出 deny 决策:stdout 可能已断
+/// (broken pipe 正是可达的 panic 源),此时 Claude 靠 exit 2 仍硬拦截;JSON 型 CLI
+/// (Codex/Gemini/Cursor)尽力而为输出 deny JSON。正常路径零行为变化。
+///
+/// `AssertUnwindSafe`:闭包内全是 one-shot hook 进程的局部状态(stdin lock / 配置快照),
+/// panic 后本进程随即退出,无跨 unwind 状态复用,断言成立。
+pub fn exit_code_guarded(cli: CliKind, f: impl FnOnce() -> u8) -> u8 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        use std::io::Write;
+        let resp = respond(
+            &HookOutcome::Deny("Vigil hook: internal error (blocked fail-closed).".into()),
+            cli,
+        );
+        if let Some(out) = &resp.stdout {
+            let _ = writeln!(std::io::stdout(), "{out}");
+        }
+        if let Some(err) = &resp.stderr {
+            let _ = writeln!(std::io::stderr(), "{err}");
+        }
+        resp.exit_code
+    })
+}
+
 /// Claude 的 α2 注入响应:`hookSpecificOutput` 携带重写后的 `tool_input`(`updatedInput`)。
 /// `permissionDecision=allow` 表示按重写输入放行。`updated_input` 含真值,但仅作为给宿主
 /// 执行的载体输出(模型可见 transcript 仍是原占位符);`note`(reason)**不含真值**。
@@ -2451,6 +2479,34 @@ fn safe_tool_name(name: &str) -> String {
 mod tests {
     use super::*;
     use crate::posture::PostureProfile;
+
+    // ── exit_code_guarded:panic 兜底安全命门(审核 P1 HOOK-PANIC)──────────────────
+
+    /// panic → Claude 收敛为 deny 的 exit 2(绝不 unwind 成 101 fail-open)。
+    #[test]
+    fn exit_code_guarded_panic_converges_to_claude_deny_exit2() {
+        let code = exit_code_guarded(CliKind::Claude, || panic!("boom"));
+        assert_eq!(code, 2);
+    }
+
+    /// panic → JSON 型 CLI(Codex/Gemini/Cursor)收敛为各自 deny 形状的 exit 0
+    /// (deny 决策经 stdout JSON 尽力而为;exit code 与 respond 的 Deny 分支一致)。
+    #[test]
+    fn exit_code_guarded_panic_converges_to_json_cli_deny_exit0() {
+        for cli in [CliKind::Codex, CliKind::Gemini, CliKind::Cursor] {
+            let code = exit_code_guarded(cli, || panic!("boom"));
+            let expect = respond(&HookOutcome::Deny("x".into()), cli).exit_code;
+            assert_eq!(code, expect, "{cli:?} panic 兜底应与 Deny 形状同 exit code");
+            assert_eq!(code, 0);
+        }
+    }
+
+    /// 无 panic 时守卫透明:闭包返回什么就是什么(正常路径零行为变化)。
+    #[test]
+    fn exit_code_guarded_passthrough_without_panic() {
+        assert_eq!(exit_code_guarded(CliKind::Claude, || 0), 0);
+        assert_eq!(exit_code_guarded(CliKind::Claude, || 2), 2);
+    }
 
     // ── ADR 0024 hook-ML PII 增强(wire 应用原语单测已随函数移至 vigil-daemon-ipc::wire)──
 
