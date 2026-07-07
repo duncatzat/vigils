@@ -8,6 +8,50 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.5.0-beta.1] — 2026-07-07 — the browser line joins the control plane: local-engine pairing, posture-aware guard, hook hardening
+
+The browser extension stops being an island: the Chrome Web Store build (0.3.0) can pair with the
+locally installed Vigils engine, the desktop app and CLI can finally see the browser line, and the
+hook path gains two hardening features. Hard floors are untouched.
+
+### Added
+
+- **Browser ⇄ engine link** (#57). The native messaging host joins the daemon as its second ML
+  client: browser checks get the same local ML PII augmentation as the hook path (`engine.json`
+  gated; daemon absent → fail-closed to the hard-fingerprint floor, never fail-open).
+- **First enterprise backend in the extension** (#58). Options can route checks to the local
+  Vigils engine over native messaging — the permission is optional and only requested on explicit
+  enable, raw text stays on the device, and an unreachable host blocks instead of silently
+  downgrading.
+- **Browser events in the control plane** (#59, #60, #62). Activity Feed shows browser
+  paste/input/submit interventions; Protection Overview gains a browser-guard card with
+  registration + engine state and 24-hour check/block/redact counts.
+- **`setup --status` browser line** (#61). Native-host registration state next to the hook and
+  MCP lines — the turnkey status now covers all three defense lines.
+- **Posture propagation** (#62, #64). The host reports `posture_tier`/`engine`; under a strict
+  posture the extension escalates confirm-redact to block (tighten-only, allow/block never move).
+- **Command Guard file-write flank** (#63). Write/Edit tools that persist into shell rc files,
+  crontabs, or `.git/hooks` are now classified like their shell-command equivalents.
+
+### Fixed
+
+- **Inline interventions on real rich-text editors** (#64). The content script runs at
+  `document_start` so site capture listeners can no longer starve the guard; the manual-input
+  debounce gains a max-wait so framework re-render heartbeats cannot postpone the check forever;
+  the prompt is presented unconditionally once the engine reports risk; write-back rechecks the
+  current text instead of strict snapshot equality, and repeated pastes accumulate at the caret.
+- **Activity feed honesty** (#64). Normal allows are no longer recorded as "risk detected", and
+  popup event rows are built with DOM/textContent, never innerHTML.
+- **Hook panic guard** (#65). The hook decision+output path is wrapped in `catch_unwind`: an
+  unexpected panic converges to the CLI's Deny shape (Claude: exit 2) instead of exiting 101,
+  which agents treat as non-blocking fail-open.
+
+### Changed
+
+- **Extension UX** (#64, #66). Branded prompt card (shield icon, finding chips, trust line,
+  tone-colored top edge); the enterprise section is a value card + status badge + 3-step
+  onboarding instead of a dense form. Manifest 0.3.0 submitted to the Chrome Web Store.
+
 ## [v0.4.6] — 2026-07-03 — Command Guard, a standalone browser extension, and four user-level verification passes
 
 The stable roll-up of v0.4.6-beta.1 – beta.4, plus the consumer-mode browser-extension rework
