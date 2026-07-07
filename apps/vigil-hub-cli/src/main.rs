@@ -538,33 +538,43 @@ fn main() -> std::process::ExitCode {
             // engine.json(GUI 控制平面写的全局偏好)决定 hook 是否经常驻 daemon 走 ML PII 增强
             // (ADR 0024)。持久化 = standing 偏好 → best-effort(daemon 缺则降级硬指纹;D8)。hook 由
             // agent 以固定注册参数调起,无 `--engine` flag → 仅读 engine.json(显式覆盖留 serve/wrap)。
-            let loaded_engine =
-                engine_config::default_engine_path().map(|p| engine_config::load_engine(&p));
-            if let Some(w) = loaded_engine.as_ref().and_then(|l| l.warning.as_deref()) {
-                eprintln!("vigil-hook: {w}");
-            }
-            let engine = loaded_engine.and_then(|l| l.mode);
-            let injection =
-                build_injection_config(args.inject, args.secrets.as_deref(), args.inject_ttl_secs);
-            let hook_args = HookArgs {
-                ledger_path: args.ledger,
-                cli: args.cli,
-                injection,
-                redact_results: args.redact_results,
-                engine,
-                ..HookArgs::default()
-            };
-            let stdin = std::io::stdin();
-            let mut reader = stdin.lock();
-            let outcome = hook::run(&hook_args, &mut reader);
-            let resp = hook::respond(&outcome, args.cli);
-            if let Some(out) = &resp.stdout {
-                println!("{out}");
-            }
-            if let Some(err) = &resp.stderr {
-                eprintln!("{err}");
-            }
-            std::process::ExitCode::from(resp.exit_code)
+            // 纵深兜底(审核 P1):决策 + 输出整体经 exit_code_guarded —— 任何未预期 panic
+            // (含 broken-pipe 下 println! panic)收敛为本 CLI 的 Deny 形状(Claude=exit 2),
+            // 绝不 unwind 成 exit 101(Claude 视非 2 退出为 non-blocking fail-open)。
+            let cli = args.cli;
+            let code = hook::exit_code_guarded(cli, || {
+                let loaded_engine =
+                    engine_config::default_engine_path().map(|p| engine_config::load_engine(&p));
+                if let Some(w) = loaded_engine.as_ref().and_then(|l| l.warning.as_deref()) {
+                    eprintln!("vigil-hook: {w}");
+                }
+                let engine = loaded_engine.and_then(|l| l.mode);
+                let injection = build_injection_config(
+                    args.inject,
+                    args.secrets.as_deref(),
+                    args.inject_ttl_secs,
+                );
+                let hook_args = HookArgs {
+                    ledger_path: args.ledger,
+                    cli,
+                    injection,
+                    redact_results: args.redact_results,
+                    engine,
+                    ..HookArgs::default()
+                };
+                let stdin = std::io::stdin();
+                let mut reader = stdin.lock();
+                let outcome = hook::run(&hook_args, &mut reader);
+                let resp = hook::respond(&outcome, cli);
+                if let Some(out) = &resp.stdout {
+                    println!("{out}");
+                }
+                if let Some(err) = &resp.stderr {
+                    eprintln!("{err}");
+                }
+                resp.exit_code
+            });
+            std::process::ExitCode::from(code)
         }
         Some(Command::Setup(args)) => {
             if args.all {
