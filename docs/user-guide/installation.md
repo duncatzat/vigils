@@ -136,7 +136,7 @@ vigil-native-host install --extension-id <EXTENSION_ID>
 
 ```powershell
 # Windows
-.\vigil-hub.exe --version      # 应打印 vigil-hub 版本号(如 vigil-hub 0.4.6)
+.\vigil-hub.exe --version      # 应打印所装 release 的版本号(与下载的 tag 一致)
 .\vigil-native-host.exe status # 应打印 installed: true + manifest 路径
 ```
 
