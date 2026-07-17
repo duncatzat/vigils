@@ -8,6 +8,26 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.6.0] — 2026-07-18 — 八个 agent、Aegis 桌面与 Intel mac
+
+v0.6.0-beta.1 → beta.4 的稳定汇总,已在三平台真机对已发布产物完成端到端验收
+(ML turnkey 安装、daemon 生命周期、功能矩阵 —— 全绿)。
+
+**要点**
+
+- **MCP 网关新增三个接入面 —— Kimi CLI、ZCode、pi** —— turnkey 覆盖达 8 个 agent
+  (hook:Claude Code / Codex / Gemini CLI / Cursor;MCP wrap:+ Windsurf / Kimi CLI /
+  ZCode / pi),并对接入层系统性加固(CODEX_HOME 分裂修复、托管条目 grammar 统一、
+  单一 agent registry + 命名空间门禁、根形状严格校验、status 三态诚实化)。
+- **Aegis 指挥舱桌面 UI 落地公开构建** —— 盾徽 hero + 八徽记防御环、逐页重做、常驻守护
+  (关窗收托盘、单实例)、一键部署守卫、引擎安全自动下载、引擎/姿态切换、daemon 生命周期
+  与 ML 模型安装。
+- **macOS Intel(x86_64)构建** —— 桌面 dmg + CLI,交叉编译并走独立 OTA 线(更新器归档带
+  架构后缀,两条 mac 线不可能相撞)。ML 变体仍仅 Apple Silicon(上游 onnxruntime 停发
+  x86_64 macOS)。
+
+完整细节见下方各 beta 条目。
+
 ## [v0.6.0-beta.4] — 2026-07-17 — macOS Intel(x86_64)构建
 
 ### 新增
