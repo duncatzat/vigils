@@ -708,10 +708,17 @@ mod tests {
             "X=1 dd if=/dev/zero of=/dev/sda",
         ] {
             let r = cat(cmd, Some("/proj"));
-            assert_eq!(r.tier, GuardTier::Catastrophic, "`{cmd}` 应灾难级(前导赋值不绕过)");
+            assert_eq!(
+                r.tier,
+                GuardTier::Catastrophic,
+                "`{cmd}` 应灾难级(前导赋值不绕过)"
+            );
         }
         // 真正的赋值语句(无危险命令)不被误判为命令。
-        assert!(classify("FOO=bar", Some("/proj")).is_none(), "纯赋值不应命中");
+        assert!(
+            classify("FOO=bar", Some("/proj")).is_none(),
+            "纯赋值不应命中"
+        );
         // `--flag=x`(非环境赋值)不被误吞:含破坏性动词的正常命令仍按其真实 bin 分类。
         assert!(
             classify("grep --color=auto pattern file", Some("/proj")).is_none(),
@@ -731,7 +738,10 @@ mod tests {
             "printf '%s' café",
             "ls 目录",
         ] {
-            assert!(classify(cmd, Some("/proj")).is_none(), "`{cmd}` 良性,不应命中(且不 panic)");
+            assert!(
+                classify(cmd, Some("/proj")).is_none(),
+                "`{cmd}` 良性,不应命中(且不 panic)"
+            );
         }
         // 非 ASCII 与危险命令共存时,分隔符切段仍正确工作(灾难命令照拦)。
         assert_eq!(
