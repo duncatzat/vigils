@@ -8,7 +8,7 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
-## [Unreleased]
+## [v0.6.0-beta.1] — 2026-07-17 — 三个新 agent 接入面(Kimi CLI / ZCode / pi)与接入面系统性加固
 
 ### 新增
 
