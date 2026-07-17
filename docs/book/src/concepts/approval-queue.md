@@ -5,7 +5,7 @@ Human-in-the-loop gating for risky effects (driven by `FirewallOutcome::Approval
 ```
 firewall::evaluate → ApprovalRequired(req)
   → ApprovalBroker (SQLite, persistent)
-  → Desktop UI "Approval Queue" tab
+  → Desktop UI "Approval Queue" page
   → user: Approve / Reject / Delegate / Defer
   → ledger event
   → vigil-runner spawn (only if approved)

@@ -15,7 +15,9 @@ client startup
 ```
 
 The update endpoint and signing key are operated by the project; release bundles are signed
-in CI.
+in CI. macOS is served as two independent lines — `darwin-aarch64` (Apple Silicon) and
+`darwin-x86_64` (Intel) — each with its own manifest and arch-suffixed updater archive, so an
+update can never deliver the wrong architecture.
 
 ## Building a signed bundle
 
