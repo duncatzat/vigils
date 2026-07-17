@@ -8,7 +8,12 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
-## [v0.6.0-beta.2] — 2026-07-17 — the Aegis command-deck desktop UI lands in the public build
+## [v0.6.0-beta.3] — 2026-07-17 — the Aegis command-deck desktop UI lands in the public build
+
+> Supersedes v0.6.0-beta.2, whose desktop bundle jobs failed on all three platforms
+> (tauri-cli's manifest parser ignores `autobins = false` and mistook an internal-only
+> `src/main.rs` for a crate-named binary); that tag/release was removed before any
+> desktop asset shipped.
 
 ### Changed
 
