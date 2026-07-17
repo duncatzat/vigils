@@ -230,10 +230,19 @@ jobs:
       - name: GUI smoke over CDP
         shell: bash
         run: |
-          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9222 --remote-allow-origins=*" "$VIGILS_EXE" >gui.log 2>&1 &
+          # --user-data-dir into a fresh dir is REQUIRED to open the WebView2/Edge remote-debugging
+          # port on current runner-image Edge builds. Without it the port silently never opens
+          # (regressed the whole desktop-smoke gate between v0.5.0 and v0.6.0-beta.1 as GitHub's
+          # windows-latest Edge auto-updated). A pre-existing profile blocks the debug port; a
+          # dedicated empty profile restores it. Harmless on older Edge (verified real-machine).
+          UDD="$(mktemp -d)/wv2"
+          WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=9222 --remote-allow-origins=* --user-data-dir=$UDD" "$VIGILS_EXE" >gui.log 2>&1 &
           node tests/acceptance/gui-smoke.mjs 9222 gui-shots | tee gsmoke.out
           RC=${PIPESTATUS[0]}
           taskkill //F //IM vigils.exe >/dev/null 2>&1 || true
+          # On failure, surface the app's own stdout/stderr so a future break is diagnosable
+          # (launch crash vs. debug-port-not-open are very different fixes).
+          if [ "$RC" != 0 ]; then echo "----- gui.log (app output) -----"; cat gui.log || true; fi
           exit "$RC"
       - name: Job summary
         if: always()

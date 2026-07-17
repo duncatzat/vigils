@@ -7,8 +7,10 @@
 //   G4 全程零未捕获异常 / console error
 //
 // 前置:vigils.exe 以
-//   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=<port> --remote-allow-origins=*"
-// 启动。用法: node gui-smoke.mjs <port> <out-dir>
+//   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=<port> --remote-allow-origins=* --user-data-dir=<fresh-empty-dir>"
+// 启动。**`--user-data-dir` 指向一个新建空目录是必需的**:当前版本 Edge/WebView2 在存在既有
+// 用户配置时不再开放远程调试端口(端口静默不开,连不上 CDP)——专用空 profile 才恢复。缺它会让
+// desktop-smoke 门在 runner Edge 自升级后整体失效。用法: node gui-smoke.mjs <port> <out-dir>
 import { writeFileSync, mkdirSync } from "node:fs";
 
 const PORT = process.argv[2] || "9222";
