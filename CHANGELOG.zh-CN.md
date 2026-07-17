@@ -8,6 +8,17 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [Unreleased]
+
+### 新增
+
+- **macOS Intel(x86_64)构建。** 发布管线现从 arm64 runner 交叉编译并发布:桌面
+  `Vigils_<ver>_x64.dmg`(+ OTA 更新器资产与 `latest-darwin-x86_64.json`)与 CLI
+  `vigils-cli-macos-x64.tar.gz`。mac 更新器归档现带架构后缀
+  (`Vigils-darwin-<arch>.app.tar.gz`),两条 macOS 线不再会在 release 里互相覆盖。
+- 已知限制:**ML 引擎变体不支持 Intel mac** —— 上游 onnxruntime 已停发 x86_64 macOS
+  wheel(1.24.x 仅 arm64),无 dylib 可捆。Intel mac 使用默认硬指纹引擎;其余防护层完全一致。
+
 ## [v0.6.0-beta.3] — 2026-07-17 — Aegis 指挥舱桌面 UI 落地公开构建
 
 > 取代 v0.6.0-beta.2:其桌面 bundle 三平台全部失败(tauri-cli 的 manifest 解析不识别

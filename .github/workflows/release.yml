@@ -194,6 +194,8 @@ jobs:
           #   cargo build。bindir:zigbuild 带 --target 时产物落 target/<triple>/release(native build 落 target/release)。
           - { os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu,  plat: linux-x64,   suffix: "",     archive: tar.gz, bindir: "target/x86_64-unknown-linux-gnu/release" }
           - { os: macos-latest,   target: aarch64-apple-darwin,      plat: macos-arm64, suffix: "",     archive: tar.gz, bindir: "target/release" }
+          # Intel mac:在 arm64 runner 交叉(--target),SDK 同机自带;bindir 随 target 走。
+          - { os: macos-latest,   target: x86_64-apple-darwin,       plat: macos-x64,   suffix: "",     archive: tar.gz, bindir: "target/x86_64-apple-darwin/release", cross: true }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,    plat: windows-x64, suffix: ".exe", archive: zip,    bindir: "target/release" }
     runs-on: ${{ matrix.os }}
     steps:
@@ -202,7 +204,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # CI 卫生:key 含 OS 镜像版本,防 ubuntu-22.04/24.04 共享 target/(见 v0.4.0 gtk GLIBC 事故)。
-          prefix-key: "v0-rust-${{ matrix.os }}"
+          prefix-key: "v0-rust-${{ matrix.os }}-${{ matrix.plat }}"
 
       - name: Install Linux deps (keyring / secret-service)
         # robust:按 runner OS 判定而非钉死版本字符串(改 runner 版本不漏装 = 不静默断 keyring 链)。
@@ -225,8 +227,15 @@ jobs:
         run: cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.17 --bin vigil-hub -p vigil-hub-cli --bin vigil-native-host -p vigil-native-host
 
       - name: Build CLI binaries (macOS / Windows — native)
-        if: runner.os != 'Linux'
+        if: runner.os != 'Linux' && !matrix.cross
         run: cargo build --release --bin vigil-hub -p vigil-hub-cli --bin vigil-native-host -p vigil-native-host
+
+      # Intel mac 交叉:arm64 runner + --target x86_64-apple-darwin(Apple SDK 双架构自带,纯 Rust 无 C 交叉障碍)。
+      - name: Build CLI binaries (macOS Intel — cross)
+        if: matrix.cross
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin --bin vigil-hub -p vigil-hub-cli --bin vigil-native-host -p vigil-native-host
 
       # D21 守门:zigbuild 若失灵(地板未下沉),objdump 断言 fail 整 leg,杜绝静默发回高 glibc 二进制。
       # sort -V 把 max 符号与 GLIBC_2.17 比较:并入后版本升序排,若 tail(最大)仍是 2.17 则 max≤2.17 通过。
@@ -322,7 +331,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # CI 卫生:key 含 OS 镜像版本,防 ubuntu-22.04/24.04 共享 target/(见 v0.4.0 gtk GLIBC 事故)。
-          prefix-key: "v0-rust-${{ matrix.os }}"
+          prefix-key: "v0-rust-${{ matrix.os }}-${{ matrix.plat }}"
 
       - name: Install Linux deps (keyring / secret-service)
         if: runner.os == 'Linux'
@@ -439,9 +448,11 @@ jobs:
           # Desktop GUI built on ubuntu-22.04 (glibc 2.35) not ubuntu-latest (24.04 / glibc 2.39)
           # to lower the runtime floor: covers Ubuntu 22.04+, Debian 12+. The GUI links system
           # webkit2gtk so it can't use the CLI's zig glibc-2.17 trick; 22.04 has webkit2gtk-4.1.
-          - { os: ubuntu-22.04,   plat: linux-x86_64 }
-          - { os: macos-latest,   plat: darwin-aarch64 }
-          - { os: windows-latest, plat: windows-x86_64 }
+          - { os: ubuntu-22.04,   plat: linux-x86_64,   bundle_root: target/release/bundle }
+          - { os: macos-latest,   plat: darwin-aarch64, bundle_root: target/release/bundle }
+          # Intel mac:arm64 runner 交叉(--target);bundle 落 target/<triple>/release/bundle。
+          - { os: macos-latest,   plat: darwin-x86_64,  bundle_root: target/x86_64-apple-darwin/release/bundle, cargo_target: x86_64-apple-darwin }
+          - { os: windows-latest, plat: windows-x86_64, bundle_root: target/release/bundle }
     runs-on: ${{ matrix.os }}
     # OTA updater signing — set repo secret TAURI_SIGNING_PRIVATE_KEY (content of the
     # Tauri minisign private key) to produce signed updater artifacts + per-platform
@@ -460,8 +471,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # CI 卫生:key 含 OS 镜像版本,防 ubuntu-22.04/24.04 共享 target/(见 v0.4.0 gtk GLIBC 事故)。
-          prefix-key: "v0-rust-${{ matrix.os }}"
+          # CI 卫生:key 含 OS 镜像版本 + plat,防 ubuntu-22.04/24.04 共享 target/(v0.4.0 gtk GLIBC
+          # 事故)与 macos 同机 native/cross 双 leg 串味。
+          prefix-key: "v0-rust-${{ matrix.os }}-${{ matrix.plat }}"
 
       - name: Install Linux Tauri system deps
         if: matrix.os == 'ubuntu-22.04'
@@ -481,6 +493,10 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.0" --locked
 
+      - name: Add cross target (Intel mac)
+        if: matrix.cargo_target != ''
+        run: rustup target add ${{ matrix.cargo_target }}
+
       # createUpdaterArtifacts is enabled ONLY when the signing key is present (otherwise
       # the build would fail demanding a key). Two guarded steps keep no-secret releases
       # working unchanged. shell: bash for uniform --config JSON quoting across OSes.
@@ -497,7 +513,7 @@ jobs:
           if [[ "$RUNNER_OS" == "Windows" && "$REL_TAG" == *-* ]]; then
             extra=',"targets":["nsis"]'
           fi
-          cargo tauri build --features gui --config "{\"bundle\":{\"createUpdaterArtifacts\":true${extra}}}"
+          cargo tauri build --features gui${{ matrix.cargo_target != '' && format(' --target {0}', matrix.cargo_target) || '' }} --config "{\"bundle\":{\"createUpdaterArtifacts\":true${extra}}}"
 
       - name: Build desktop bundles (no signing key — plain installers)
         if: env.TAURI_SIGNING_PRIVATE_KEY == ''
@@ -509,7 +525,20 @@ jobs:
           if [[ "$RUNNER_OS" == "Windows" && "$REL_TAG" == *-* ]]; then
             extra=" --bundles nsis"
           fi
-          cargo tauri build --features gui$extra
+          cargo tauri build --features gui${{ matrix.cargo_target != '' && format(' --target {0}', matrix.cargo_target) || '' }}$extra
+
+      # mac updater 资产名消歧:Tauri 固定产 `Vigils.app.tar.gz`(无架构后缀),双 mac leg
+      # (aarch64 / x86_64)上传会在 release 里同名相覆 → OTA 把错误架构推给用户。按 plat 改名;
+      # latest-<plat>.json 由后续 manifest 步骤从改名后的文件生成,URL 恒指对的架构。
+      - name: Disambiguate mac updater artifact names (per-arch)
+        if: startsWith(matrix.plat, 'darwin-')
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for f in "${{ matrix.bundle_root }}"/macos/Vigils.app.tar.gz "${{ matrix.bundle_root }}"/macos/Vigils.app.tar.gz.sig; do
+            [ -f "$f" ] || continue
+            mv -v "$f" "${f/Vigils.app.tar.gz/Vigils-${{ matrix.plat }}.app.tar.gz}"
+          done
 
       # always(): 单个 bundle target(如某平台 rpm)失败不应拖垮整步,
       # 让已成功产出的其他安装包仍能上传(matrix 已 fail-fast: false)。
@@ -520,18 +549,18 @@ jobs:
           tag_name: ${{ needs.create-release.outputs.tag }}
           draft: true # ISS-005: stay draft until `finalize` publishes after all builds pass
           files: |
-            target/release/bundle/**/*-setup.exe
-            target/release/bundle/**/*-setup.exe.sig
-            target/release/bundle/**/*.msi
-            target/release/bundle/**/*.dmg
-            target/release/bundle/**/*.app.tar.gz
-            target/release/bundle/**/*.app.tar.gz.sig
-            target/release/bundle/**/*.deb
-            target/release/bundle/**/*.rpm
-            target/release/bundle/**/*.AppImage
-            target/release/bundle/**/*.AppImage.sig
-            target/release/bundle/**/*.AppImage.tar.gz
-            target/release/bundle/**/*.AppImage.tar.gz.sig
+            ${{ matrix.bundle_root }}/**/*-setup.exe
+            ${{ matrix.bundle_root }}/**/*-setup.exe.sig
+            ${{ matrix.bundle_root }}/**/*.msi
+            ${{ matrix.bundle_root }}/**/*.dmg
+            ${{ matrix.bundle_root }}/**/*.app.tar.gz
+            ${{ matrix.bundle_root }}/**/*.app.tar.gz.sig
+            ${{ matrix.bundle_root }}/**/*.deb
+            ${{ matrix.bundle_root }}/**/*.rpm
+            ${{ matrix.bundle_root }}/**/*.AppImage
+            ${{ matrix.bundle_root }}/**/*.AppImage.sig
+            ${{ matrix.bundle_root }}/**/*.AppImage.tar.gz
+            ${{ matrix.bundle_root }}/**/*.AppImage.tar.gz.sig
 
       # D25:为本平台的桌面安装包生成 build provenance(.exe/.msi/.dmg/.deb/.rpm/.AppImage;
       # 不含 .sig 更新器签名——那是签名非构建产物)。continue-on-error:provenance 是增值,
@@ -542,12 +571,12 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            target/release/bundle/**/*-setup.exe
-            target/release/bundle/**/*.msi
-            target/release/bundle/**/*.dmg
-            target/release/bundle/**/*.deb
-            target/release/bundle/**/*.rpm
-            target/release/bundle/**/*.AppImage
+            ${{ matrix.bundle_root }}/**/*-setup.exe
+            ${{ matrix.bundle_root }}/**/*.msi
+            ${{ matrix.bundle_root }}/**/*.dmg
+            ${{ matrix.bundle_root }}/**/*.deb
+            ${{ matrix.bundle_root }}/**/*.rpm
+            ${{ matrix.bundle_root }}/**/*.AppImage
 
       # OTA: generate this platform's updater manifest (latest-<plat>.json) pointing at the
       # signed artifact's GitHub release URL, then upload it as a release asset. The
@@ -555,7 +584,7 @@ jobs:
       - name: Generate OTA updater manifest
         if: env.TAURI_SIGNING_PRIVATE_KEY != ''
         shell: bash
-        run: node scripts/gen-updater-manifest.mjs "${{ needs.create-release.outputs.tag }}" "${{ matrix.plat }}" target/release/bundle "${{ github.repository }}" "Vigils ${{ needs.create-release.outputs.tag }}"
+        run: node scripts/gen-updater-manifest.mjs "${{ needs.create-release.outputs.tag }}" "${{ matrix.plat }}" "${{ matrix.bundle_root }}" "${{ github.repository }}" "Vigils ${{ needs.create-release.outputs.tag }}"
 
       - name: Upload OTA updater manifest
         if: env.TAURI_SIGNING_PRIVATE_KEY != ''

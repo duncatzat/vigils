@@ -8,6 +8,20 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **macOS Intel (x86_64) builds.** The release pipeline now cross-compiles from the arm64
+  runner and ships: desktop `Vigils_<ver>_x64.dmg` (+ OTA updater artifact and
+  `latest-darwin-x86_64.json`) and CLI `vigils-cli-macos-x64.tar.gz`. Mac updater archives
+  are now arch-suffixed (`Vigils-darwin-<arch>.app.tar.gz`) so the two macOS lines can no
+  longer overwrite each other in a release.
+- Known limitation: the **ML engine variant is not available for Intel macs** — upstream
+  onnxruntime stopped publishing x86_64 macOS wheels (1.24.x is arm64-only), so there is no
+  dylib source to bundle. Intel macs run the default hard-fingerprint engine; every other
+  protection layer is identical.
+
 ## [v0.6.0-beta.3] — 2026-07-17 — the Aegis command-deck desktop UI lands in the public build
 
 > Supersedes v0.6.0-beta.2, whose desktop bundle jobs failed on all three platforms
