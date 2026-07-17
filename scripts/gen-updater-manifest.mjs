@@ -26,6 +26,7 @@ const version = tag.replace(/^v/, "");
 const SIG_SUFFIXES = {
   "windows-x86_64": ["-setup.exe.sig"],
   "darwin-aarch64": [".app.tar.gz.sig"],
+  "darwin-x86_64": [".app.tar.gz.sig"],
   "linux-x86_64": [".AppImage.tar.gz.sig", ".AppImage.sig"],
 };
 const suffixes = SIG_SUFFIXES[plat];
