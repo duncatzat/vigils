@@ -51,8 +51,8 @@ use std::sync::Arc;
 
 use tauri::{Emitter, Manager, State};
 use vigil_audit::{
-    CheckpointLog, EventHit, Ledger, ProtectionSummary, ServerOnboardingData,
-    StoredServerProfile, ToolApprovalCard,
+    CheckpointLog, EventHit, Ledger, ProtectionSummary, ServerOnboardingData, StoredServerProfile,
+    ToolApprovalCard,
 };
 use vigil_desktop::dispatch;
 use vigil_mcp::Hub;
