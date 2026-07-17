@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use crate::i18n::Lang;
-use crate::setup_mcp::{self, JsonMcpAgent, McpServerClass};
+use crate::setup_mcp::{self, McpServerClass};
 
 /// 单 agent 的 MCP server 分类计数。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -145,8 +145,9 @@ pub fn run(home: &Path, exe: &str, lang: Lang) -> i32 {
         Err(e) => println!("{}", could_not_read(lang, "Claude Code", e)),
     }
 
-    // Codex(`~/.codex/config.toml`)。
-    match setup_mcp::run_codex_preview(home, exe, monitor) {
+    // Codex(`$CODEX_HOME/config.toml`)。生产 env 快照只在此入口读一次(库函数注入式)。
+    let agent_env = setup_mcp::AgentEnv::from_process_env();
+    match setup_mcp::run_codex_preview(home, agent_env.codex_home.as_deref(), exe, monitor) {
         Ok(r) => {
             let c = count_servers(&r.servers);
             println!("{}", agent_line(lang, "Codex", c.total() > 0, c));
@@ -155,8 +156,18 @@ pub fn run(home: &Path, exe: &str, lang: Lang) -> i32 {
         Err(e) => println!("{}", could_not_read(lang, "Codex", e)),
     }
 
-    // Cursor + Windsurf(JSON `mcpServers` 形态)。
-    for agent in [JsonMcpAgent::cursor(home), JsonMcpAgent::windsurf(home)] {
+    // ZCode(`~/.zcode/cli/config.json` 嵌套 `mcp.servers` 专线)。
+    match setup_mcp::run_zcode_preview(home, exe, monitor) {
+        Ok(r) => {
+            let c = count_servers(&r.servers);
+            println!("{}", agent_line(lang, "ZCode", c.total() > 0, c));
+            total_unprotected += c.unprotected;
+        }
+        Err(e) => println!("{}", could_not_read(lang, "ZCode", e)),
+    }
+
+    // 全部 JSON `mcpServers` 形态 agent(registry SSOT:Cursor / Windsurf / Kimi / pi)。
+    for agent in setup_mcp::all_json_mcp_agents(home, &agent_env) {
         match setup_mcp::run_json_agent_preview(&agent, exe, monitor) {
             Ok(r) => {
                 let c = count_servers(&r.servers);

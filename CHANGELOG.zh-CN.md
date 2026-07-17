@@ -8,6 +8,46 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [Unreleased]
+
+### 新增
+
+- **MCP 网关新增三个 agent 接入面:Kimi CLI / ZCode / pi。** `setup --mcp` / `setup --all`
+  (及 `--doctor`、`--status`、`quickstart`)现可自动探测并保护:
+  - **Kimi CLI**(Moonshot)—— `~/.kimi/mcp.json`(标准顶层 `mcpServers`),server-id 命名空间
+    `kimi-`。Kimi 的 hook 面**刻意不注册**:该功能为 Beta 且官方 fail-open(hook 崩溃/超时 =
+    放行),不满足 Vigils 的强保护语义;GA 后重评。
+  - **ZCode**(Z.ai)—— `~/.zcode/cli/config.json` 内嵌套的 `mcp.servers` 键,独立专线
+    (契约取证自 vendor 实际发布的应用代码,非第三方资料)。`enabled` 等 GUI 附加字段逐字
+    保留;`--apply` 前请关闭 ZCode。命名空间 `zcode-`。工作区级 `.zcode/config.json`(项目内
+    文件)与共享 `~/.agents/mcp.json` fallback 刻意不碰。
+  - **pi**(badlogic)—— `$PI_AGENT_DIR/mcp.json`(默认 `~/.pi/agent/`,支持
+    `PI_CODING_AGENT_DIR`/`PI_AGENT_DIR`),即 pi-mcp-adapter 约定文件;pi 本体无内置 MCP。
+    文件不存在即如实报告"无可保护项",绝不代为创建。命名空间 `pi-`。
+
+### 修复
+
+- **agent 接入面系统性加固**(双线对抗性代码评审产出):
+  - `CODEX_HOME` 分裂:MCP wrap 面此前硬编码 `~/.codex/config.toml`,而 hook 面尊重
+    `$CODEX_HOME` —— 自定义目录的 Codex 安装其 MCP server 全部静默漏保护且
+    `--status`/`--doctor` 不可见。现两面共用同一路径解析(带守门测试)。
+  - 托管条目 grammar 统一:分类(`AlreadyWrapped`)与还原(`unwrap`)现接受完全一致的 wrap
+    grammar(sentinel 必须紧邻 `--`),堵住"计为已保护却无法卸载"的假托管态,以及伪造
+    sentinel 逃逸包裹的口子。
+  - 受支持 agent 清单 SSOT:清单此前散落 4 处调用点(status 计数 / doctor / apply 编排 /
+    quickstart),新增 agent 可能静默漏一处。现收敛为 `all_json_mcp_agents()` 单一 registry +
+    受校验前缀构造器(字符集 + `user`/`local`/`codex` 保留命名空间)+ registry 驱动的
+    invariant 测试。
+  - 根形状严格化:`mcpServers`(JSON)/ `mcp_servers`(TOML)**存在但类型错**此前被静默当作
+    "没有 server"(配置在场却完全不受保护、无任何信号)。现按不支持形状 abort;Codex 内联表
+    形态顺带获得支持;`--doctor` 输出 `ConfigError` 行。
+  - `--status` 诚实化:逐 agent MCP 计数不再把"配置存在但读不了/解析失败"折叠成 `0`,
+    改为独立的配置错误状态。
+  - preview 与 apply 的 server-id 同源:预览此前手拼 `<prefix>-<name>`,apply 则做
+    slug + 哈希规约;现共用同一派生函数。
+  - apply 前 PATH 预警(底层程序不可解析)扩展到全部接入面(Claude user+local / Codex /
+    ZCode / JSON-agent registry),并按接入面标注。
+
 ## [v0.5.0] — 2026-07-08 — 浏览器防线接入控制平面:商店版配对、姿态感知守护、hook 加固
 
 v0.5.0-beta.1 的稳定汇总。浏览器扩展不再是孤岛:Chrome Web Store 版本

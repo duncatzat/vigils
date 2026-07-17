@@ -7,7 +7,8 @@ Put **Vigils** in front of your AI agent's tools, so every tool call your agent 
 PII), and — when risky — sent to **approval**. Everything runs locally; nothing leaves your
 machine.
 
-Works with any MCP-capable agent: **Claude Code**, **Codex**, **Cursor**, **Zed**, OpenCode,
+Works with any MCP-capable agent: **Claude Code**, **Codex**, **Cursor**, **Zed**, **Kimi CLI**,
+**ZCode**, **pi**, OpenCode,
 Continue, and more.
 
 ## How it works
@@ -70,7 +71,29 @@ vigil-hub verify                  # after using your agent: confirm the tamper-e
 vigil-hub setup --all --uninstall # remove everything (config restored byte-for-byte)
 ```
 
-Restart Claude Code and you're protected. The rest of this guide is the **manual path** — use it
+Restart Claude Code and you're protected.
+
+**What `setup` auto-detects** (2026-07):
+
+| Agent | Hook (native-tool gate) | MCP wrap (server gateway) | Config touched |
+|---|---|---|---|
+| Claude Code | ✅ | ✅ (user + local scope) | `~/.claude/settings.json` + `~/.claude.json` |
+| Codex CLI | ✅ | ✅ (honors `$CODEX_HOME`) | `$CODEX_HOME/hooks.json` + `config.toml` |
+| Gemini CLI | ✅ | — (MCP lives inside the shared `settings.json`; later increment) | `~/.gemini/settings.json` |
+| Cursor | ✅ | ✅ | `~/.cursor/hooks.json` + `mcp.json` |
+| Windsurf | — | ✅ | `~/.codeium/windsurf/mcp_config.json` |
+| Kimi CLI | — (hooks are Beta and officially fail-open; deferred until GA) | ✅ | `~/.kimi/mcp.json` |
+| ZCode | — (plugin-only hook surface) | ✅ (close ZCode before `--apply`) | `mcp.servers` inside `~/.zcode/cli/config.json` |
+| pi | — (no hook mechanism) | ✅ (via the [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) convention file — pi ships no built-in MCP) | `$PI_AGENT_DIR/mcp.json` (default `~/.pi/agent/`) |
+
+> ZCode notes: the workspace-level `<project>/.zcode/config.json` is an in-repo file (may be
+> committed) and is deliberately left alone; the shared `~/.agents/mcp.json` fallback is not
+> rewritten either (multi-host file, identity ownership unsettled). Users who configure MCP in
+> ZCode's settings panel (which always writes back to the user-level `.zcode` config) get full
+> protection. For pi, a missing `mcp.json` simply means "nothing to protect" — the file is never
+> created for you.
+
+The rest of this guide is the **manual path** — use it
 for non-Claude agents (Codex / Cursor / Zed / …) or when you want explicit control over the
 `serve` gateway and its `upstreams.json`.
 

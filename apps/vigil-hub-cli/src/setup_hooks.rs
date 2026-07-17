@@ -118,8 +118,13 @@ pub struct AgentHookSpec {
     versioned_root: bool,
 }
 
-/// 解析 `$CODEX_HOME`:env 非空白 → 该值(`~`/`~/...` 展开到 home);否则默认 `~/.codex`。
-fn resolve_codex_home(home: &Path, env_val: Option<&str>) -> PathBuf {
+/// 通用 agent 配置目录解析:env 非空白 → 该值(`~`/`~/...` 展开到 home);否则 `default()`。
+/// Codex(`CODEX_HOME`)与 pi(`PI_AGENT_DIR`)共用同一展开语义(SSOT,注入式可测)。
+pub(crate) fn resolve_agent_dir(
+    home: &Path,
+    env_val: Option<&str>,
+    default: impl FnOnce() -> PathBuf,
+) -> PathBuf {
     match env_val.map(str::trim).filter(|s| !s.is_empty()) {
         Some("~") => home.to_path_buf(),
         Some(s) => {
@@ -129,8 +134,16 @@ fn resolve_codex_home(home: &Path, env_val: Option<&str>) -> PathBuf {
                 PathBuf::from(s)
             }
         }
-        None => home.join(".codex"),
+        None => default(),
     }
+}
+
+/// 解析 `$CODEX_HOME`:env 非空白 → 该值(`~`/`~/...` 展开到 home);否则默认 `~/.codex`。
+/// `pub(crate)`:MCP 接入面([`crate::setup_mcp::codex_config_path`])与 hook 注册面共用**同一**
+/// 解析(SSOT)—— 此前 MCP 面固定 `~/.codex`,自定义 `CODEX_HOME` 的用户其 MCP server 全部
+/// 漏保护且 status/doctor 不可见(agent-surface review 2026-07-17 HIGH-1)。
+pub(crate) fn resolve_codex_home(home: &Path, env_val: Option<&str>) -> PathBuf {
+    resolve_agent_dir(home, env_val, || home.join(".codex"))
 }
 
 /// Codex CLI 注册面规格。`codex_home_env` = `CODEX_HOME` 环境变量值(生产由 [`all_agent_specs`] 读)。

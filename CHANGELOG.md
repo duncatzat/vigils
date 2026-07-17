@@ -8,6 +8,53 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Three new MCP gateway surfaces: Kimi CLI, ZCode, pi.** `setup --mcp` / `setup --all` (and
+  `--doctor`, `--status`, `quickstart`) now auto-detect and protect:
+  - **Kimi CLI** (Moonshot) — `~/.kimi/mcp.json` (standard top-level `mcpServers`), server-id
+    namespace `kimi-`. Kimi's hook surface is deliberately **not** registered: it is Beta and
+    officially fail-open (a crashed or timed-out hook allows the action), which does not meet
+    Vigils' enforcement semantics; re-evaluated at GA.
+  - **ZCode** (Z.ai) — the nested `mcp.servers` key inside `~/.zcode/cli/config.json`, via a
+    dedicated pipeline (contract evidenced from the vendor's shipped application code, not
+    third-party writeups). Extra GUI fields such as `enabled` are preserved verbatim; close ZCode
+    before `--apply`. Namespace `zcode-`. The workspace-level `.zcode/config.json` (in-repo) and
+    the shared `~/.agents/mcp.json` fallback are deliberately untouched.
+  - **pi** (badlogic) — `$PI_AGENT_DIR/mcp.json` (default `~/.pi/agent/`, honors
+    `PI_CODING_AGENT_DIR`/`PI_AGENT_DIR`), the pi-mcp-adapter convention file; pi itself ships no
+    built-in MCP. A missing file is honestly reported as "nothing to protect" and never created.
+    Namespace `pi-`.
+
+### Fixed
+
+- **Agent-surface hardening** (from a two-track adversarial code review of the integration
+  surface):
+  - `CODEX_HOME` split: the MCP wrap surface previously hard-coded `~/.codex/config.toml` while
+    the hook surface honored `$CODEX_HOME` — MCP servers of custom-home Codex installs were
+    silently unprotected and invisible to `--status`/`--doctor`. Both now resolve through the
+    same path (with guard tests).
+  - Managed-entry grammar unified: classification (`AlreadyWrapped`) and restore (`unwrap`) now
+    accept exactly the same wrap grammar (sentinel must sit immediately before `--`), closing a
+    state where an entry counted as protected but could not be uninstalled, and a spoofed
+    sentinel could dodge wrapping.
+  - Supported-agent registry SSOT: the agent list previously lived in 4 call sites
+    (status counts / doctor / apply orchestration / quickstart); adding an agent could silently
+    miss one. Now a single `all_json_mcp_agents()` registry with a validated-prefix constructor
+    (charset + reserved `user`/`local`/`codex` namespaces) and registry-driven invariant tests.
+  - Root-shape strictness: a present-but-wrong-typed `mcpServers` (JSON) / `mcp_servers` (TOML)
+    was silently treated as "no servers" (config present yet fully unprotected, no signal). Now
+    aborts as an unsupported shape; Codex inline-table form gains support; `--doctor` reports a
+    `ConfigError` row.
+  - `--status` honesty: per-agent MCP counts no longer collapse "config exists but unreadable /
+    unparsable" into `0` — a distinct config-error state is shown instead.
+  - Preview/apply server-id parity: the preview used to hand-concatenate `<prefix>-<name>` while
+    apply slugs + hashes names; both now derive through the same function.
+  - The pre-apply PATH warning (underlying program not resolvable) now covers every surface
+    (Claude user+local / Codex / ZCode / JSON-agent registry), labeled per surface.
+
 ## [v0.5.0] — 2026-07-08 — the browser line joins the control plane: store pairing, posture-aware guard, hook hardening
 
 The stable roll-up of v0.5.0-beta.1. The browser extension stops being an island: the Chrome Web

@@ -6,7 +6,8 @@
 **防火墙**（默认拒绝）、**审计**（防篡改哈希链）、**脱敏**（密钥 / PII），高危调用还会进入
 **人工审批**。全部本地运行，数据不外传。
 
-支持任何兼容 MCP 的 agent：**Claude Code**、**Codex**、**Cursor**、**Zed**、OpenCode、Continue 等。
+支持任何兼容 MCP 的 agent：**Claude Code**、**Codex**、**Cursor**、**Zed**、**Kimi CLI**、
+**ZCode**、**pi**、OpenCode、Continue 等。
 
 ## 工作原理
 
@@ -64,7 +65,27 @@ vigil-hub verify                  # 用过 agent 后:确认防篡改审计链完
 vigil-hub setup --all --uninstall # 移除全部(配置逐字节还原)
 ```
 
-重启 Claude Code 即受保护。本指南余下部分是**手动路径** —— 用于非 Claude agent(Codex / Cursor /
+重启 Claude Code 即受保护。
+
+**`setup` 自动探测覆盖面**（2026-07）：
+
+| Agent | Hook（原生工具守门） | MCP wrap（server 网关） | 涉及配置 |
+|---|---|---|---|
+| Claude Code | ✅ | ✅（user + local scope） | `~/.claude/settings.json` + `~/.claude.json` |
+| Codex CLI | ✅ | ✅（尊重 `$CODEX_HOME`） | `$CODEX_HOME/hooks.json` + `config.toml` |
+| Gemini CLI | ✅ | —（MCP 嵌在共享 `settings.json`，留后续增量） | `~/.gemini/settings.json` |
+| Cursor | ✅ | ✅ | `~/.cursor/hooks.json` + `mcp.json` |
+| Windsurf | — | ✅ | `~/.codeium/windsurf/mcp_config.json` |
+| Kimi CLI | —（hooks 为 Beta 且官方 fail-open，等 GA 再评） | ✅ | `~/.kimi/mcp.json` |
+| ZCode | —（仅 plugin 形态 hook） | ✅（`--apply` 前请先关闭 ZCode） | `~/.zcode/cli/config.json` 的 `mcp.servers` |
+| pi | —（无 hook 机制） | ✅（经 [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) 约定文件 —— pi 本体无内置 MCP） | `$PI_AGENT_DIR/mcp.json`（默认 `~/.pi/agent/`） |
+
+> ZCode 说明：工作区级 `<项目>/.zcode/config.json` 是项目内文件（可能被提交），刻意不碰；共享
+> `~/.agents/mcp.json` fallback 亦不改写（多宿主文件，身份归属未定）。用 ZCode 设置面板配置
+> MCP（默认写回用户级 `.zcode` 配置）的用户获得完整保护。pi 的 `mcp.json` 不存在即"无可保护
+> 项"——绝不会替你创建。
+
+本指南余下部分是**手动路径** —— 用于非 Claude agent(Codex / Cursor /
 Zed / …)或你想显式控制 `serve` 网关及其 `upstreams.json` 时。
 
 ## 第 1 步 —— 冒烟测试 `vigil-hub`（30 秒，不用 agent）
