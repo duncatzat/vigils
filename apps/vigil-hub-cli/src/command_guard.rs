@@ -224,33 +224,31 @@ fn classify_depth(command: &str, project_root: Option<&str>, depth: u8) -> Optio
                     consider(risk);
                 }
             }
-            "dd" => {
-                if argv.iter().any(|a| {
-                    a.strip_prefix("of=")
-                        .map(|t| t.starts_with("/dev/"))
-                        .unwrap_or(false)
-                }) {
-                    consider(CommandRisk {
-                        tier: GuardTier::Catastrophic,
-                        category: GuardCategory::DeviceOrDiskWrite,
-                        detail: "dd writes directly to a block device (of=/dev/…) — overwrites a disk/partition",
-                    });
-                }
+            // guard-arm 形式(clippy 1.95 collapsible_match):guard 不满足 → **落穿**后续 arm——
+            // 当前 dd/shred 落穿只会被 `_ => {}` 接住;新增前缀 guard arm 时注意落穿语义。
+            "dd" if argv.iter().any(|a| {
+                a.strip_prefix("of=")
+                    .map(|t| t.starts_with("/dev/"))
+                    .unwrap_or(false)
+            }) =>
+            {
+                consider(CommandRisk {
+                    tier: GuardTier::Catastrophic,
+                    category: GuardCategory::DeviceOrDiskWrite,
+                    detail: "dd writes directly to a block device (of=/dev/…) — overwrites a disk/partition",
+                });
             }
             b if b.starts_with("mkfs") => consider(CommandRisk {
                 tier: GuardTier::Catastrophic,
                 category: GuardCategory::DeviceOrDiskWrite,
                 detail: "mkfs formats a filesystem — destroys all data on the target device",
             }),
-            "shred" => {
-                if argv.iter().skip(1).any(|a| a.starts_with("/dev/")) {
-                    consider(CommandRisk {
-                        tier: GuardTier::Catastrophic,
-                        category: GuardCategory::DeviceOrDiskWrite,
-                        detail:
-                            "shred targets a block device (/dev/…) — irrecoverably wipes a disk",
-                    });
-                }
+            "shred" if argv.iter().skip(1).any(|a| a.starts_with("/dev/")) => {
+                consider(CommandRisk {
+                    tier: GuardTier::Catastrophic,
+                    category: GuardCategory::DeviceOrDiskWrite,
+                    detail: "shred targets a block device (/dev/…) — irrecoverably wipes a disk",
+                });
             }
             "chmod" | "chown" => {
                 let recursive = argv

@@ -10,7 +10,11 @@
 //!   身份运行)。注意:macOS 为 **euid-only,不作 pid 绑定**,故不主张 pid-reuse 保护——cross-user
 //!   由用户私有目录权限排除,同用户冒充由 token + 单实例 bind 兜底;且**永不 fail-open**(硬指纹
 //!   底座在 hook 内先跑,冒充/缺失至多抑制 ML recall)。取不到 / 不符 → fail-closed → 硬指纹。
-//! - **R6**(socket 权限硬化,后续):Unix 0600 / Windows pipe DACL。
+//! - **R1'(服务端 accept 门,unix)**:accept 后、占 handler 坑前核**对端 client euid == 本用户**
+//!   (取不到/不符 → fail-closed 丢弃)。Linux 抽象 NS 无文件系统权限 → 这是结构性跨用户屏障
+//!   (token 只挡请求,挡不住握手前静默占坑);macOS 上是 0700 目录/0600 节点之外的纵深。
+//!   见 [`peer_is_current_user`](服务端消费在 vigil-hub-cli `daemon::server::serve`)。
+//! - **R6**(socket 权限硬化,后续):Windows pipe 显式 DACL(当前依赖默认安全描述符挡跨用户)。
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -28,7 +32,9 @@ use crate::protocol::{Request, Response};
 
 /// 默认 daemon socket 标识。
 ///
-/// - **Linux**:`GenericNamespaced` → 抽象 UDS(`\0` 前缀,内核在进程死亡时自动回收,无 stale)。
+/// - **Linux**:`GenericNamespaced` → 抽象 UDS(`\0` 前缀,内核在进程死亡时自动回收,无 stale);
+///   名含本用户 euid(抽象 NS 跨用户共享,固定名多用户互撞 —— 见 [`platform_default_socket_name`]
+///   内注释)。
 /// - **Windows**:`GenericNamespaced` → `\\.\pipe\vigil-daemon.sock`(named pipe,句柄关即清)。
 /// - **macOS**:**无抽象命名空间** —— namespaced 会落到世界可读的 `/tmp` 文件 socket、非干净
 ///   退出不回收(EADDRINUSE 永久卡死重启)、且 `peer_creds().pid()` 恒 None(R1 失效)。故改用
@@ -68,7 +74,16 @@ fn platform_default_socket_name() -> String {
                     .into_owned()
             })
     }
-    #[cfg(not(target_os = "macos"))]
+    // Linux:抽象命名空间跨用户共享且无属主 —— 固定名下多用户互撞(后 bind 者 daemon 起不来,
+    // ML 降级硬指纹)。per-euid 名消除**意外**互撞;恶意 squat(抽象名无属主,无法根绝)由客户端
+    // R1 + 服务端 euid 门 fail-closed 兜底(至多可用性损失,绝不 fail-open)。
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        format!("vigil-daemon-{}.sock", rustix::process::geteuid().as_raw())
+    }
+    // Windows:保持既有 named pipe 名。跨用户 duplex 连接被默认 pipe 安全描述符挡住
+    // (Everyone 仅读,连接需读+写);显式 DACL 与多席互撞处理 = R6 后续。
+    #[cfg(windows)]
     {
         "vigil-daemon.sock".to_string()
     }
@@ -193,10 +208,13 @@ fn connect_and_verify(socket_name: &str, expected_pid: u32) -> Option<LocalStrea
     Some(stream)
 }
 
-/// macOS R1:对端(server)euid == 本进程 euid(都是当前用户)。取不到 → fail-closed。
-/// `rustix::process::geteuid` 安全封装(本 crate 仍 `forbid(unsafe_code)`)。
-#[cfg(target_os = "macos")]
-fn peer_is_current_user(stream: &LocalStream) -> bool {
+/// 对端 euid == 本进程 euid(同一用户)。取不到 → `false`(fail-closed)。**双向复用**:
+/// macOS 客户端 R1(核 server 身份,见 [`connect_and_verify`])+ **全 unix 服务端 accept 门**
+/// (核 client 身份 —— Linux 抽象命名空间 UDS 无文件系统权限,任意本机用户可连;token 只挡请求,
+/// 挡不住握手前静默占坑,此门是结构性跨用户屏障)。`SO_PEERCRED`/`LOCAL_PEERCRED` 两端对称,
+/// 同一 API 双向可用。`rustix::process::geteuid` 安全封装(本 crate 仍 `forbid(unsafe_code)`)。
+#[cfg(unix)]
+pub fn peer_is_current_user(stream: &LocalStream) -> bool {
     match stream.peer_creds().ok().and_then(|c| c.euid()) {
         Some(peer_euid) => peer_euid == rustix::process::geteuid().as_raw(),
         None => false,
@@ -255,6 +273,17 @@ mod tests {
             platform_default_socket_name()
         );
         assert_eq!(resolve_socket_name(None), platform_default_socket_name());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn linux_default_socket_name_is_per_euid() {
+        // 抽象 NS 跨用户共享:固定名多用户互撞 → 默认名必须含本用户 euid(消除意外互撞)。
+        let name = platform_default_socket_name();
+        assert!(
+            name.contains(&rustix::process::geteuid().as_raw().to_string()),
+            "Linux 默认 socket 名应含本用户 euid,got {name}"
+        );
     }
 
     #[cfg(target_os = "macos")]

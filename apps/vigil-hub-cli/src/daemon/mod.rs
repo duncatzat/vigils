@@ -21,7 +21,9 @@
 //! ledger;dispatch 出真 findings / 软信号 risk bump)、`daemon start|stop|status` 子命令、hook 接
 //! `query_daemon`(PostToolUse PII 再脱敏 + 注入 fire-forget,fail-closed)、**F2** 并发上限门
 //! (conn 64 / classify 8;超限丢弃 —— 连接侧客户端 fail-closed 降级硬指纹,classify 侧软信号
-//! 丢弃,线程不随负载无界累积;见 `server::serve` 诚实边界注释)。后续:R6 socket 权限硬化。
+//! 丢弃,线程不随负载无界累积;见 `server::serve` 诚实边界注释)、**R1'** 服务端 accept 门
+//! (unix:对端 client euid 必须为本用户,Linux 抽象 NS 的结构性跨用户屏障)+ Linux per-euid
+//! 默认 socket 名(消除多用户固定名 bind 互撞)。后续:R6 Windows pipe 显式 DACL。
 //!
 //! # 不变量(ADR 0024 Revised,实施前必决 R1–R6 已落决策)
 //!
