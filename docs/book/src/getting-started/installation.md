@@ -26,8 +26,10 @@ Pick your OS, download, run. First launch shows a one-time "unknown developer" p
 2. If a blue **"Windows protected your PC"** box appears → **More info → Run anyway**.
 3. Done. *(The warning fades on its own as more people install.)*
 
-### macOS (Apple Silicon)
-1. Download **`Vigils_<version>_aarch64.dmg`** → open it → drag **Vigils** to **Applications**.
+### macOS
+1. Download the dmg for your chip — **Apple Silicon**: `Vigils_<version>_aarch64.dmg`;
+   **Intel**: `Vigils_<version>_x64.dmg` *(not sure? Apple menu → About This Mac — "Apple M…" means
+   Apple Silicon)* → open it → drag **Vigils** to **Applications**.
 2. First launch is blocked ("Apple could not verify…"). To allow it **once**:
    **  System Settings → Privacy & Security → scroll down → "Open Anyway" → confirm with Touch ID / password.**
 3. Done — it won't ask again.
@@ -68,7 +70,8 @@ block is recorded in a tamper-evident local ledger. Kick the tires with **`vigil
 
 > **ML variant** (optional, semantic PII + prompt-injection detection): download
 > `vigils-cli-ml-<os>` instead and run `vigil-hub serve --engine ml`. Floors: Linux glibc ≥ 2.28,
-> macOS ≥ 14. See [Privacy Filter](../concepts/privacy-filter.md).
+> macOS ≥ 14, Apple Silicon only (upstream onnxruntime dropped x86_64 macOS; Intel macs use the
+> default hard-fingerprint engine). See [Privacy Filter](../concepts/privacy-filter.md).
 
 ---
 

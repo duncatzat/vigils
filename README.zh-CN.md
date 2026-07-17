@@ -19,7 +19,7 @@
 
 ---
 
-AI Agent(Claude Code、Cursor、Zed、MCP 客户端、浏览器助手)会代你调用工具、读文件、请求
+AI Agent(Claude Code、Codex、Cursor、Zed、Kimi CLI、ZCode、pi、浏览器助手)会代你调用工具、读文件、请求
 API、往网页里粘贴。这种能力很有用 —— 也有风险。**Vigils 位于你的 Agent 与它们所触及的
 工具/数据之间**,且是 *本地优先* 的:你的 prompt、密钥与审计记录永不离开本机。
 
@@ -56,8 +56,11 @@ API、往网页里粘贴。这种能力很有用 —— 也有风险。**Vigils 
 - **🔌 MCP 网关** —— 位于 MCP server 之前,支持 **stdio 与 HTTP**;descriptor pinning + 漂移
   检测(工具定义变化时告警);裸命令 stdio upstream(`npx`/`node`/`python`)在沙箱化前经
   宿主 PATH 解析。
-- **🖥️ 桌面应用**(Tauri 2 + Vue 3)—— 审批队列、活动流、服务器注册、会话回放、隐私发现;
-  键盘快捷键、浅色/深色/跟随系统主题、实时更新、中英双语 UI。
+- **🖥️ 桌面应用**(Tauri 2 + Vue 3)—— **Aegis 指挥舱**:盾徽 hero + 八徽记防御环,保护成效
+  概览、审批队列、活动流、服务器注册、会话回放、隐私发现与设置统一在深色优先的设计语言下。
+  以**常驻守护**运行(关窗收托盘、单实例),一键**部署守卫**、缺失引擎检测 + 安全自动下载、
+  引擎模式/姿态切换、daemon 生命周期与 ML 模型安装 —— GUI 与 CLI 驱动同一个 `vigil-hub`
+  引擎。中英双语、实时更新。
 - **🌐 浏览器扩展**(Chrome MV3)—— 在 AI 站点(ChatGPT、Claude、Gemini、Perplexity)粘贴或
   提交*之前*脱敏密钥/PII。
 
@@ -87,7 +90,7 @@ Vigils 是一个由聚焦单一职责的 crate 组成的 Rust workspace,外加�
 | 二进制 | Crate | 它是什么 |
 |---|---|---|
 | `vigil-hub` | `vigil-hub-cli` | CLI MCP 网关:`vigil-hub serve --stdio`、`add-remote-mcp`、`inspect`、… |
-| `gui` | `apps/desktop` | Tauri 2 桌面应用(内嵌 Vue 3 UI + 进程内 Hub) |
+| `vigils` | `apps/desktop` | Tauri 2 桌面应用(内嵌 Vue 3 UI + 进程内 Hub) |
 | `vigil-native-host` | `apps/native-host` | Chrome 扩展的 native-messaging 桥 |
 | — | `extensions/chrome-mv3` | Chrome MV3 扩展(纯 vanilla JS,零 npm 依赖) |
 
@@ -111,7 +114,8 @@ Linux** 的预构建安装包与二进制:
 | 平台 | 桌面应用 | CLI |
 |---|---|---|
 | **Windows** | `.exe`(NSIS)/ `.msi` | `vigil-hub.exe`(在 `vigils-cli-windows-x64.zip` 内) |
-| **macOS** | `.dmg` | `vigil-hub`(在 `vigils-cli-macos-arm64.tar.gz` 内) |
+| **macOS**(Apple Silicon) | `Vigils_<版本>_aarch64.dmg` | `vigil-hub`(在 `vigils-cli-macos-arm64.tar.gz` 内) |
+| **macOS**(Intel) | `Vigils_<版本>_x64.dmg` | `vigil-hub`(在 `vigils-cli-macos-x64.tar.gz` 内) |
 | **Linux** | `.AppImage` / `.deb` / `.rpm` | `vigil-hub`(在 `vigils-cli-linux-x64.tar.gz` 内) |
 
 ### 两种脱敏引擎:硬指纹(默认)或 ML
@@ -131,7 +135,7 @@ vigil-hub serve --engine ml       # 严格 ML:首跑下载模型,不可用则 fa
 vigil-hub serve --engine auto     # 仅当模型已缓存且 dylib 就位才启用 ML;否则降级硬指纹,绝不下载
 ```
 
-模型从 Hugging Face(主源)拉取,带 [vigils.ai](https://vigils.ai) 镜像 fallback,逐文件 SHA-256 校验(fail-closed)。ML 构建把 [ONNX Runtime](https://onnxruntime.ai) 1.24 捆在 `vigil-hub` 同目录。**ML** 构建的平台地板:**Linux glibc ≥ 2.28**、**macOS ≥ 14** —— 默认硬指纹构建则没有。_(ML 构建自 v0.4.0 起随每个 release 发布 —— 认准 `vigils-cli-ml-*` 资产。)_
+模型从 Hugging Face(主源)拉取,带 [vigils.ai](https://vigils.ai) 镜像 fallback,逐文件 SHA-256 校验(fail-closed)。ML 构建把 [ONNX Runtime](https://onnxruntime.ai) 1.24 捆在 `vigil-hub` 同目录。**ML** 构建的平台地板:**Linux glibc ≥ 2.28**、**macOS ≥ 14(仅 Apple Silicon** —— 上游 onnxruntime 已停发 x86_64 macOS 构建,Intel mac 使用默认硬指纹引擎**)** —— 默认硬指纹构建则没有。_(ML 构建自 v0.4.0 起随每个 release 发布 —— 认准 `vigils-cli-ml-*` 资产。)_
 
 > 早期版本未签名;首次运行时系统可能弹出 Gatekeeper / SmartScreen 提示。
 
@@ -157,7 +161,7 @@ irm https://vigils.ai/install.ps1 | iex              # Windows(PowerShell)
 什么,你始终掌控。解压前会对 release 发布的 SHA-256 校验(fail-closed)。想先读再 pipe?脚本在
 [`install.sh`](./install.sh) / [`install.ps1`](./install.ps1)。想手动下载?见[安装](#安装)。
 
-### 一键保护 Claude Code(turnkey)
+### 一键保护你的 agent(turnkey)
 
 下载 release 后,只跑**一条命令**即全面受保护。无需手动改配置——你既有的设置会被备份,只新增 Vigils
 自己的条目(完全可逆):
@@ -168,12 +172,14 @@ vigil-hub setup --all       # 一步全保护
 
 `setup --all` 同时接入**两层**保护:
 
-1. **原生工具输入侧守门** —— Claude Code `PreToolUse` hook,于是**每一次工具调用**(Bash、Edit、
-   Write、Read、MCP 工具……)在执行前都先被检查:真实凭据流*入*工具会被 **fail-closed 拦截**,记入
-   防篡改审计账本。
-2. **MCP 网关** —— 把你每个 stdio MCP server 经 Vigils 路由,工具**结果**里的 secret 在模型看到之前
+1. **原生工具输入侧守门** —— 为 **Claude Code、Codex CLI、Gemini CLI、Cursor** 注册
+   pre-tool-use hook,于是**每一次工具调用**(Bash、Edit、Write、Read、MCP 工具……)在执行前都先被
+   检查:真实凭据流*入*工具会被 **fail-closed 拦截**,记入防篡改审计账本。
+2. **MCP 网关** —— 把每个被探测到的 agent(**Claude Code、Codex、Cursor、Windsurf、Kimi CLI、
+   ZCode、pi**)的 stdio MCP server 改写为经 Vigils 运行,工具**结果**里的 secret 在模型看到之前
    被脱敏,每次调用都被审计。默认 **monitor** 姿态 —— 你的 server 保持完全可用,同时所有硬保护照常
    生效(裸 secret 拦截、结果脱敏、防篡改审计)。加 `--enforce` 升级为 default-deny 硬拦。
+   逐 agent 覆盖矩阵见 [Agent 接入指南](https://duncatzat.github.io/vigils/getting-started/agent-integration.zh-CN.html)。
 
 ```bash
 vigil-hub setup --mcp --doctor    # 接入前预检:每个被包裹的 MCP server 真能启动吗?(PATH 检查,只读)
@@ -237,8 +243,11 @@ vigil-hub inspect --db-path ./vigil.db activity --limit 20
 
 ### 桌面应用
 
-启动桌面应用,实时观察与控制 agent:**审批队列**(批准 / 拒绝 / 批量)、**活动流**(实时审计
-流)、**服务器注册**、**会话回放**、**隐私发现**。
+启动桌面应用,从 **Aegis 指挥舱**实时观察与控制 agent:**保护成效概览**(盾徽 hero + 八徽记
+防御环 + 一键**部署守卫**)、**审批队列**(批准 / 拒绝 / 批量)、**活动流**(实时审计流)、
+**服务器注册**、**会话回放**、**隐私发现**与**设置**(引擎模式、姿态、常驻 daemon、ML 模型
+安装、审计检查点锚定)。关闭窗口即收起到系统托盘 —— Vigils 在后台继续守护(托盘菜单可重新
+打开 / 退出;再次启动只会唤起既有实例)。
 
 ## 从源码构建
 
@@ -256,7 +265,7 @@ cargo build --release -p vigil-hub-cli --bin vigil-hub
 
 # 桌面 UI + 应用(`gui` feature 内嵌已构建的 UI)
 cd apps/desktop/ui && npm ci && npm run build && cd -
-cargo build --release -p vigil-desktop --features gui --bin gui
+cargo build --release -p vigil-desktop --features gui --bin vigils
 ```
 
 > crate 名沿用历史 `vigil-*` 前缀;产品与项目名为 **Vigils**。
@@ -277,10 +286,10 @@ cargo build --release -p vigil-desktop --features gui --bin gui
 ## 项目结构
 
 ```
-crates/          # 15 个库 crate(audit、policy、firewall、mcp、redaction、runner、
+crates/          # 16 个库 crate(audit、policy、firewall、mcp、redaction、runner、daemon-ipc、
                  #   lease、sandbox-linux、http-auth/transport、ui-protocol、browser、sdk、types)
 apps/
-  desktop/       # Tauri 2 + Vue 3 桌面应用(bin: gui)
+  desktop/       # Tauri 2 + Vue 3 桌面应用(bin: vigils)
   native-host/   # Chrome native-messaging 桥(bin: vigil-native-host)
   vigil-hub-cli/ # CLI MCP 网关(bin: vigil-hub)
 extensions/

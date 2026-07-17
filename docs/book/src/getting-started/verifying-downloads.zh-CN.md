@@ -21,7 +21,7 @@ gh attestation verify <下载的文件> --repo duncatzat/vigils
 每个可下载产物都附带一份 [SLSA](https://slsa.dev) 构建溯源证明，由 GitHub 背后的
 Sigstore 基础设施签发（你无需自管密钥，除 GitHub 与公开源码外无需信任其他方）：
 
-- CLI 压缩包——`vigils-cli-linux-x64.tar.gz`、`vigils-cli-macos-arm64.tar.gz`、`vigils-cli-windows-x64.zip`
+- CLI 压缩包——`vigils-cli-linux-x64.tar.gz`、`vigils-cli-macos-arm64.tar.gz`、`vigils-cli-macos-x64.tar.gz`、`vigils-cli-windows-x64.zip`
 - 桌面安装包——`.exe`、`.msi`、`.dmg`、`.deb`、`.rpm`、`.AppImage`
 - 浏览器扩展——`vigils-chrome-extension.zip`
 
