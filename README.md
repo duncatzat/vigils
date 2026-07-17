@@ -273,7 +273,8 @@ vigil-hub inspect protection
 vigil-hub inspect --db-path ./vigil.db activity --limit 20
 ```
 
-Point your agent (Claude Code / Cursor / Zed) at `vigil-hub` instead of the raw MCP server. See
+Point any MCP-capable agent (Claude Code / Codex / Cursor / Zed / Kimi CLI / …) at `vigil-hub`
+instead of the raw MCP server. See
 the **[Agent Integration & Test guide](https://duncatzat.github.io/vigils/getting-started/agent-integration.html)**
 for per-agent config and how to verify it's gating.
 

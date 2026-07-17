@@ -239,7 +239,7 @@ vigil-hub add-remote-mcp https://mcp.example.com/
 vigil-hub inspect --db-path ./vigil.db activity --limit 20
 ```
 
-把你的 agent(Claude Code / Cursor / Zed)指向 `vigil-hub` 而非原始 MCP server 即可。各 agent 配置
+把任何兼容 MCP 的 agent(Claude Code / Codex / Cursor / Zed / Kimi CLI / …)指向 `vigil-hub` 而非原始 MCP server 即可。各 agent 配置
 与"如何验证它在管控"见 **[Agent 接入与测试指南](https://duncatzat.github.io/vigils/getting-started/agent-integration.zh-CN.html)**。
 
 ### 桌面应用 —— 不需要终端
