@@ -8,6 +8,29 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.6.0] — 2026-07-18 — eight agents, the Aegis desktop, and Intel macs
+
+The stable roll-up of v0.6.0-beta.1 → beta.4, verified end-to-end on real machines across
+all three platforms (published-artifact acceptance: ML turnkey install, daemon lifecycle,
+functional sweep — all green).
+
+**Highlights**
+
+- **Three new MCP gateway surfaces — Kimi CLI, ZCode, pi** — bringing turnkey coverage to
+  8 agents (hooks: Claude Code / Codex / Gemini CLI / Cursor; MCP wrap: + Windsurf /
+  Kimi CLI / ZCode / pi), on a systematically hardened integration layer
+  (CODEX_HOME split fix, unified managed-entry grammar, single agent registry with
+  namespace guards, strict root-shape validation, three-state status honesty).
+- **The Aegis command-deck desktop UI lands in the public build** — shield hero +
+  eight-emblem defense ring, per-page rework, resident guardian (close-to-tray,
+  single-instance), one-click Deploy Guardian, secure engine auto-download, engine/posture
+  switches, daemon lifecycle and ML model install from Settings.
+- **macOS Intel (x86_64) builds** — desktop dmg + CLI, cross-compiled and served on its own
+  OTA line (arch-suffixed updater archives so the two mac lines can never collide).
+  ML variant remains Apple-Silicon-only (upstream onnxruntime dropped x86_64 macOS).
+
+See the beta entries below for the full detail.
+
 ## [v0.6.0-beta.4] — 2026-07-17 — macOS Intel (x86_64) builds
 
 ### Added

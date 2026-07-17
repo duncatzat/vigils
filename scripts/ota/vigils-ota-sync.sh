@@ -11,13 +11,22 @@ set -euo pipefail
 
 REPO="${VIGILS_REPO:-duncatzat/vigils}"
 DOCROOT="${VIGILS_OTA_DOCROOT:-/var/www/vigils.ai/desktop-updates}"
-PLATFORMS=(windows-x86_64 darwin-aarch64 linux-x86_64)
+PLATFORMS=(windows-x86_64 darwin-aarch64 darwin-x86_64 linux-x86_64)
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 log() { echo "[ota-sync] $*"; }
 
 TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | jq -r '.tag_name // empty')"
 [ -z "$TAG" ] && { log "no latest release tag — nothing to do"; exit 0; }
 log "latest release: $TAG"
+
+# Metric hygiene: the timer fires every 15 min, but asset downloads count toward the
+# release's public download stats — unconditional pulls drowned real-user numbers
+# (~260 machine downloads/day). Only re-download when the latest tag actually changed;
+# the API call above is not an asset download and costs nothing.
+STAMP="$DOCROOT/.last-synced-tag"
+if [ -f "$STAMP" ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$TAG" ]; then
+  log "already synced $TAG — nothing to do"; exit 0
+fi
 
 changed=0
 for PLAT in "${PLATFORMS[@]}"; do
@@ -44,4 +53,7 @@ if [ "$changed" = 1 ]; then
   chmod -R a+rX "$DOCROOT"
   log "permissions refreshed"
 fi
+# Record the synced tag even when nothing changed content-wise (e.g. re-run after a
+# partial first pass) so the early-exit above holds until the next real release.
+mkdir -p "$DOCROOT" && printf '%s' "$TAG" > "$STAMP" 2>/dev/null || true
 log "done"
