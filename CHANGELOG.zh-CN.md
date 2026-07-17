@@ -8,7 +8,11 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
-## [v0.6.0-beta.2] — 2026-07-17 — Aegis 指挥舱桌面 UI 落地公开构建
+## [v0.6.0-beta.3] — 2026-07-17 — Aegis 指挥舱桌面 UI 落地公开构建
+
+> 取代 v0.6.0-beta.2:其桌面 bundle 三平台全部失败(tauri-cli 的 manifest 解析不识别
+> `autobins = false`,把仅内部保留的 `src/main.rs` 误判为 crate 名二进制);该 tag/release
+> 已在任何桌面资产发出前移除。
 
 ### 变更
 
