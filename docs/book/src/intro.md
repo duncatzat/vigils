@@ -12,6 +12,17 @@
 Vigils sits between AI agents and the effectful tools / APIs they touch, gating each action
 through redaction + policy + audit + approval — and everything stays on your machine.
 
+## Two ways in
+
+- **Desktop app — a few clicks.** Open the Aegis command deck and click **Deploy Guardian**:
+  Vigils detects every installed agent, backs up its config, wires hook + MCP-gateway
+  protection into all of them and shows per-agent status. Missing engine? One click downloads
+  it (signed manifest + SHA-pin, fail-closed). Close the window — it keeps guarding from the
+  tray. See the [Desktop Quickstart](./getting-started/desktop-quickstart.md).
+- **CLI — one command.** `vigil-hub setup --all` does the same from a terminal, and
+  `vigil-hub demo` shows the whole protection story in 30 seconds with zero setup. See
+  [Agent Integration](./getting-started/agent-integration.md).
+
 ## What it protects against — and what it doesn't
 
 Vigils is **defense in depth**, not an airtight barrier. Being honest about the boundary lets you rely on it correctly.
@@ -44,7 +55,7 @@ An **egress proxy** that mediates *all* outbound data is the full answer — it 
 - **Desktop installers** — Linux deb / rpm / AppImage + macOS dmg + Windows nsis / msi (Ed25519-signed, auto-update).
 - **Rust SDK** — `cargo add vigil-sdk` ([crates.io](https://crates.io/crates/vigil-sdk) / [docs.rs](https://docs.rs/vigil-sdk)).
 - **Browser extension** — Chrome MV3 (redacts before paste / submit on AI sites).
-- **CLI agent gateway** — `vigil-hub serve --stdio` (Claude Code / Codex / Cursor / Zed).
+- **CLI agent gateway** — `vigil-hub serve --stdio`; turnkey `setup --all` covers Claude Code / Codex / Gemini CLI / Cursor hooks and MCP wrapping for Claude Code / Codex / Cursor / Windsurf / Kimi CLI / ZCode / pi.
 
 ## License
 
@@ -53,5 +64,7 @@ Apache-2.0 © Vigils Project Contributors
 ## Quick links
 
 - [Installation](./getting-started/installation.md)
+- [Quickstart — Desktop App](./getting-started/desktop-quickstart.md)
+- [Agent Integration & Test](./getting-started/agent-integration.md)
 - [Quickstart — Embedding the SDK](./getting-started/sdk-quickstart.md)
 - [Architecture Overview](./concepts/architecture.md)

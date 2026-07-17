@@ -58,13 +58,14 @@ Four guarantees, enforced locally:
 - **🔌 MCP gateway** — sits in front of MCP servers over **stdio and HTTP**; descriptor
   pinning with drift detection (alerts when a tool's definition changes); bare-command stdio
   upstreams (`npx`/`node`/`python`) resolve via host PATH before sandboxing.
-- **🖥️ Desktop app** (Tauri 2 + Vue 3) — the **Aegis command deck**: shield hero with an
-  eight-emblem defense ring, Protection Overview, Approval Queue, Activity Feed, Server
-  Registry, Session Replay, Privacy Findings and Settings on one dark-first design language.
-  Runs as a **resident guardian** (close-to-tray, single-instance) with one-click **Deploy
-  Guardian**, missing-engine detect + secure auto-download, engine-mode / posture switches,
-  daemon lifecycle and ML model install — all driving the same `vigil-hub` engine as the CLI.
-  Bilingual (zh / en), real-time updates.
+- **🖥️ Desktop app — protection in a few clicks** (Tauri 2 + Vue 3). Open the **Aegis
+  command deck** and click **Deploy Guardian**: Vigils finds every AI agent on the machine,
+  backs up their configs, wires hook + MCP-gateway protection into all of them, and lights up
+  per-agent status — no terminal, no hand-edited files, fully reversible. Engine missing?
+  One more click downloads it securely (signed manifest + SHA-pin, fail-closed). Close the
+  window and it keeps guarding from the tray (single-instance). Engine mode / posture /
+  resident daemon / ML install are switches on the Settings page — the GUI drives the same
+  `vigil-hub` engine as the CLI. Bilingual (zh / en), real-time.
 - **🌐 Browser extension** (Chrome MV3) — redacts secrets/PII *before* paste or submit on AI
   sites (ChatGPT, Claude, Gemini, Perplexity).
 
@@ -276,15 +277,26 @@ Point your agent (Claude Code / Cursor / Zed) at `vigil-hub` instead of the raw 
 the **[Agent Integration & Test guide](https://duncatzat.github.io/vigils/getting-started/agent-integration.html)**
 for per-agent config and how to verify it's gating.
 
-### Desktop app
+### Desktop app — no terminal needed
 
-Launch the desktop app to watch and control agents in real time from the **Aegis command
-deck**: **Protection Overview** (shield hero + eight-emblem defense ring + one-click **Deploy
-Guardian**), **Approval Queue** (approve / deny / bulk), **Activity Feed** (live audit stream),
-**Server Registry**, **Session Replay**, **Privacy Findings**, and **Settings** (engine mode,
-posture, resident daemon, ML model install, audit checkpoint anchor). Closing the window hides
-to the system tray — Vigils keeps guarding in the background (tray menu to reopen / quit; a
-second launch focuses the existing instance).
+Prefer clicking to typing? The desktop app gets you to the same protection in three clicks:
+
+1. **Open Vigils** — the Protection Overview shows an honest status: which agents are
+   protected, which aren't.
+2. *(first run)* Click **Download engine** if prompted — the `vigil-hub` engine is fetched
+   over HTTPS, pinned to the release's signed manifest, and run-verified before use
+   (fail-closed).
+3. Click **Deploy Guardian** — Vigils detects your installed agents, backs up their configs,
+   registers the hooks, rewrites their MCP servers through the gateway, and lights up
+   per-agent status. Same effect as `setup --all`, zero typing.
+
+From then on it's a **resident guardian**: closing the window hides to the system tray and
+protection keeps running (a second launch just focuses the existing window). Watch and
+control everything live — **Approval Queue** (approve / deny / bulk), **Activity Feed**
+(live audit stream), **Server Registry**, **Session Replay**, **Privacy Findings**, and
+**Settings** (engine mode, posture, resident daemon, ML model install, audit checkpoint
+anchor). Changed your mind? One click (or `vigil-hub setup --all --uninstall`) restores
+every config faithfully.
 
 ## Build from source
 

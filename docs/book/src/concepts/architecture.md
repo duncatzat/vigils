@@ -27,6 +27,7 @@ T0 — Types + Schemas (vigil-types)
 
 - `vigil-runner` concrete (wasmtime + sandbox-linux + vigil-redaction deps)
 - `vigil-sandbox-linux` (Linux-only, target-gated)
+- `vigil-daemon-ipc` (daemon wire protocol + thin client, shared by hook / native-host)
 - `vigil-http-auth` / `vigil-http-transport` / `vigil-browser`
 - `apps/desktop` / `apps/native-host` / `apps/vigil-hub-cli`
 

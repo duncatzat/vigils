@@ -56,11 +56,12 @@ API、往网页里粘贴。这种能力很有用 —— 也有风险。**Vigils 
 - **🔌 MCP 网关** —— 位于 MCP server 之前,支持 **stdio 与 HTTP**;descriptor pinning + 漂移
   检测(工具定义变化时告警);裸命令 stdio upstream(`npx`/`node`/`python`)在沙箱化前经
   宿主 PATH 解析。
-- **🖥️ 桌面应用**(Tauri 2 + Vue 3)—— **Aegis 指挥舱**:盾徽 hero + 八徽记防御环,保护成效
-  概览、审批队列、活动流、服务器注册、会话回放、隐私发现与设置统一在深色优先的设计语言下。
-  以**常驻守护**运行(关窗收托盘、单实例),一键**部署守卫**、缺失引擎检测 + 安全自动下载、
-  引擎模式/姿态切换、daemon 生命周期与 ML 模型安装 —— GUI 与 CLI 驱动同一个 `vigil-hub`
-  引擎。中英双语、实时更新。
+- **🖥️ 桌面应用 —— 点几下就全护上**(Tauri 2 + Vue 3)。打开 **Aegis 指挥舱**,点一下
+  **部署守卫**:Vigils 自动找到本机每个 AI agent,备份其配置,把 hook + MCP 网关保护一次性
+  接进去,并逐 agent 亮起状态 —— 不用终端、不用手改文件、完全可逆。缺引擎?再点一下即安全
+  下载(签名清单 + SHA-pin,fail-closed)。关窗后从托盘继续守护(单实例)。引擎模式/姿态/
+  常驻 daemon/ML 安装都是设置页里的开关 —— GUI 与 CLI 驱动同一个 `vigil-hub` 引擎。
+  中英双语、实时更新。
 - **🌐 浏览器扩展**(Chrome MV3)—— 在 AI 站点(ChatGPT、Claude、Gemini、Perplexity)粘贴或
   提交*之前*脱敏密钥/PII。
 
@@ -241,13 +242,21 @@ vigil-hub inspect --db-path ./vigil.db activity --limit 20
 把你的 agent(Claude Code / Cursor / Zed)指向 `vigil-hub` 而非原始 MCP server 即可。各 agent 配置
 与"如何验证它在管控"见 **[Agent 接入与测试指南](https://duncatzat.github.io/vigils/getting-started/agent-integration.zh-CN.html)**。
 
-### 桌面应用
+### 桌面应用 —— 不需要终端
 
-启动桌面应用,从 **Aegis 指挥舱**实时观察与控制 agent:**保护成效概览**(盾徽 hero + 八徽记
-防御环 + 一键**部署守卫**)、**审批队列**(批准 / 拒绝 / 批量)、**活动流**(实时审计流)、
-**服务器注册**、**会话回放**、**隐私发现**与**设置**(引擎模式、姿态、常驻 daemon、ML 模型
-安装、审计检查点锚定)。关闭窗口即收起到系统托盘 —— Vigils 在后台继续守护(托盘菜单可重新
-打开 / 退出;再次启动只会唤起既有实例)。
+更喜欢点鼠标而不是敲命令?桌面应用三下点击就到位:
+
+1. **打开 Vigils** —— 保护成效概览如实显示:哪些 agent 已受保护、哪些还没有。
+2. *(首次运行)*按提示点 **下载引擎** —— `vigil-hub` 引擎经 HTTPS 拉取、按 release 签名
+   清单 SHA-pin 校验、运行核验后才启用(fail-closed)。
+3. 点 **部署守卫** —— Vigils 自动探测本机已装的 agent,备份配置、注册 hook、把它们的
+   MCP server 改写为经网关运行,并逐 agent 亮起状态。效果等同 `setup --all`,零打字。
+
+此后它就是**常驻守护**:关窗收进系统托盘,保护持续运行(再次启动只会唤起既有窗口)。一切
+尽在实时掌控 —— **审批队列**(批准 / 拒绝 / 批量)、**活动流**(实时审计流)、**服务器
+注册**、**会话回放**、**隐私发现**与**设置**(引擎模式、姿态、常驻 daemon、ML 模型安装、
+审计检查点锚定)。改主意了?点一下(或 `vigil-hub setup --all --uninstall`)即可把所有
+配置逐一如实还原。
 
 ## 从源码构建
 
