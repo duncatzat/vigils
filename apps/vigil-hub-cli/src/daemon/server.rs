@@ -187,6 +187,13 @@ fn serve_with_limit(listener: interprocess::local_socket::Listener, caps: Daemon
             Ok(s) => s,
             Err(_) => continue,
         };
+        // **R1'(服务端,unix)**:占坑前核对端 client euid == 本用户;取不到/不符 → fail-closed
+        // 丢弃。Linux 抽象 NS 无文件系统权限 → 此门是结构性跨用户屏障(token 挡不住握手前占坑)。
+        // Windows 由默认 pipe 安全描述符挡跨用户 duplex 连接(显式 DACL = R6 后续)。
+        #[cfg(unix)]
+        if !crate::daemon::transport::peer_is_current_user(&stream) {
+            continue;
+        }
         if !acquire_slot(&active, max) {
             continue; // 满员:drop(stream) → 客户端 EOF → fail-closed 降级硬指纹
         }
