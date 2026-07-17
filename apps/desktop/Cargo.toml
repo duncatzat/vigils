@@ -1,12 +1,10 @@
 [package]
 name = "vigil-desktop"
 publish = false  # 非 SDK publish set(app / wasmtime / http / sandbox)— 不上 crates.io;cargo-deny path-dep wildcard 守门
-# autobins = false + 单 [[bin]] gui:desktop crate 只产 GUI 二进制,杜绝双 bin 歧义。
-# 双 bin(CLI vigil-desktop + GUI gui)会让 `cargo tauri build` 误把 CLI 打成 GUI 包
-# (v0.1.2 灾难;default-run / bin-name 都不足以纠正 —— 公开仓最终靠删 CLI bin 根治,
-# 见 [[feedback_tauri_single_bin]])。autobins=false 阻止 src/main.rs 被自动发现为 bin;
-# CLI 源文件保留(可逆),仅不参与构建。CLI 能力已归入 vigil-hub inspect 等。
-autobins = false
+# 单 [[bin]] vigils:desktop crate 只产 GUI 二进制,杜绝双 bin 歧义(v0.1.2 灾难教训)。
+# 公开树**不保留** src/main.rs(内部用 autobins=false 排除它,但 tauri-cli 自实现的
+# manifest 解析不理解 autobins,会按 cargo 自动发现规则把 src/main.rs 当 crate 名 bin →
+# bundler 找 target/release/vigil-desktop 不存在,三平台 bundle 全挂 —— v0.6.0-beta.2 实证)。
 default-run = "vigils"  # tauri build 靠此认主二进制(单 bin 下无歧义;bin 名品牌一致 = vigils.exe)
 version.workspace = true
 edition.workspace = true
@@ -17,8 +15,8 @@ repository.workspace = true
 [lints]
 workspace = true
 
-# GUI bin(Tauri;feature 门控,默认关闭 —— `cargo test --workspace` 不编)
-# desktop crate 仅此一个 bin(autobins=false 阻止 src/main.rs CLI 自动成 bin)。
+# GUI bin(Tauri;feature 门控,默认关闭 —— `cargo test --workspace` 不编)。
+# desktop crate 仅此一个 bin(无 src/main.rs,无自动发现歧义)。
 # v0.11 ISS-102/103/104:bin name 对齐 path basename,Tauri v2 bundle 默认查
 # `target/release/<path-basename>` 复制 binary;name == path basename == mainBinaryName
 # 三者一致(均 `vigils`)让 bundle 找得到。raw build 用 `--bin vigils --features gui`。
