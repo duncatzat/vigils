@@ -403,29 +403,26 @@ fn classify_persistence(command: &str) -> Option<CommandRisk> {
 /// 按顶层 shell 分隔符切段(供逐命令 argv 分析)。朴素切分,**不**严格尊重引号 ——
 /// 对 denylist 而言宁可过度切分(仍能命中各段),不做完整 shell 解析(ADR 0003 §D2)。
 fn segments(command: &str) -> Vec<String> {
+    // **字符安全**:分隔符全是 ASCII,但命令可含多字节 UTF-8(如 `git commit -m "café"`
+    // / `echo 日本語`)。旧实现用字节游标 `&command[i..i+2]` 切片会在多字节字符边界内 panic
+    // → 经 hook 的 catch_unwind 收敛为 Deny = **对所有含非 ASCII 的合法命令误拒**(会逼用户
+    // 卸载),且 fail-closed 全靠兜底。改为 char 迭代:多字节字符整体入 `cur`,分隔符按字符判定。
     let mut out = Vec::new();
     let mut cur = String::new();
-    let bytes = command.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        let two = if i + 1 < bytes.len() {
-            &command[i..i + 2]
-        } else {
-            ""
-        };
-        if two == "&&" || two == "||" {
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        // 两字符逻辑连接 `&&` / `||`(先于单字符判定,消费两个 token)。
+        if (c == '&' || c == '|') && chars.peek() == Some(&c) {
+            chars.next();
             out.push(std::mem::take(&mut cur));
-            i += 2;
             continue;
         }
+        // 单字符分隔符。
         if c == '|' || c == ';' || c == '\n' || c == '&' {
             out.push(std::mem::take(&mut cur));
-            i += 1;
             continue;
         }
         cur.push(c);
-        i += 1;
     }
     if !cur.trim().is_empty() {
         out.push(cur);
@@ -461,11 +458,35 @@ fn eval_flag_script(argv: &[String]) -> Option<&str> {
     None
 }
 
-/// 剥掉前缀 wrapper(及其选项 / `KEY=VAL` / 时长参数),返回真正命令的 argv 切片。
-/// `sudo -E env FOO=1 rm -rf /` → `["rm","-rf","/"]`。防 wrapper 绕过(issue #15 同源关切)。
+/// 一个 token 是否是 shell 变量赋值 `NAME=VALUE`(NAME 须为 `[A-Za-z_][A-Za-z0-9_]*`)。
+/// 用于识别命令**前导**的裸环境赋值(`FOO=1 rm ...` 等价 `env FOO=1 rm ...`)。严格 identifier
+/// 校验避免误吞 `--flag=x`(NAME 以 `-` 开头,不合法)/ 含 `=` 的路径参数。
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+/// 剥掉前缀 wrapper(及其选项 / `KEY=VAL` / 时长参数)与**前导裸环境赋值**,返回真正命令的
+/// argv 切片。`sudo -E env FOO=1 rm -rf /` → `["rm","-rf","/"]`;`FOO=1 rm -rf /` → `["rm","-rf","/"]`。
+/// 防 wrapper 绕过(issue #15 同源关切)。**前导裸赋值必须剥离**:否则 `FOO=1` 的 basename
+/// `foo=1` 不匹配任何 wrapper → break → 整条按 `foo=1` 分类,rm/dd/mkfs 等 argv 级灾难命令检测
+/// 被静默绕过(实证 `FOO=1 rm -rf /` 放行,而 `env FOO=1 rm -rf /` / `rm -rf /` 均被拦 = fail-open)。
 fn unwrap_argv(argv: &[String]) -> &[String] {
     let mut i = 0;
     'outer: while i < argv.len() {
+        // 先吞掉前导裸环境赋值(可多个:`FOO=1 BAR=2 rm ...`)。
+        while i < argv.len() && is_env_assignment(&argv[i]) {
+            i += 1;
+        }
+        if i >= argv.len() {
+            break;
+        }
         let b = basename(&argv[i]).to_ascii_lowercase();
         let b = b.strip_suffix(".exe").unwrap_or(&b);
         if !CMD_WRAPPERS.contains(&b) {
@@ -672,6 +693,52 @@ mod tests {
             let r = cat(cmd, Some("/proj"));
             assert_eq!(r.tier, GuardTier::Catastrophic, "`{cmd}` 应灾难级");
         }
+    }
+
+    #[test]
+    fn bare_env_assignment_prefix_does_not_bypass_argv_detection() {
+        // 回归(robustness 2026-07-18 HIGH,实证 fail-open):前导裸环境赋值 `FOO=1` 不得让
+        // argv 级灾难命令检测失效。`env FOO=1 rm -rf /` / `rm -rf /` 一直被拦,但 `FOO=1 rm -rf /`
+        // 曾放行(basename `foo=1` 不匹配 rm)。三形态现须一致灾难级。
+        for cmd in [
+            "FOO=1 rm -rf /",
+            "FOO=1 BAR=2 rm -rf /",
+            "HOME=/ rm -rf ~",
+            "A=b sudo rm -rf /usr",
+            "X=1 dd if=/dev/zero of=/dev/sda",
+        ] {
+            let r = cat(cmd, Some("/proj"));
+            assert_eq!(r.tier, GuardTier::Catastrophic, "`{cmd}` 应灾难级(前导赋值不绕过)");
+        }
+        // 真正的赋值语句(无危险命令)不被误判为命令。
+        assert!(classify("FOO=bar", Some("/proj")).is_none(), "纯赋值不应命中");
+        // `--flag=x`(非环境赋值)不被误吞:含破坏性动词的正常命令仍按其真实 bin 分类。
+        assert!(
+            classify("grep --color=auto pattern file", Some("/proj")).is_none(),
+            "--flag=x 不是环境赋值,不应误命中"
+        );
+    }
+
+    #[test]
+    fn non_ascii_command_does_not_panic_or_misfire() {
+        // 回归(robustness 2026-07-18 HIGH,实证 panic→误拒):含多字节 UTF-8 的**合法**命令
+        // 曾使 `segments()` 字节切片 panic → hook 兜底 Deny(对所有非 ASCII 命令 DoS)。
+        // 现须既不 panic 也不误命中良性命令。
+        for cmd in [
+            "git commit -m \"café\"",
+            "git commit -m \"修复bug\"",
+            "echo 日本語",
+            "printf '%s' café",
+            "ls 目录",
+        ] {
+            assert!(classify(cmd, Some("/proj")).is_none(), "`{cmd}` 良性,不应命中(且不 panic)");
+        }
+        // 非 ASCII 与危险命令共存时,分隔符切段仍正确工作(灾难命令照拦)。
+        assert_eq!(
+            cat("echo café && rm -rf /", Some("/proj")).tier,
+            GuardTier::Catastrophic,
+            "非 ASCII 段后的 rm -rf / 仍应被拦"
+        );
     }
 
     #[test]
