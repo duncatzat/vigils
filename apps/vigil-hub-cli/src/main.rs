@@ -602,7 +602,12 @@ fn main() -> std::process::ExitCode {
                         // `--mcp` turnkey 用户未保护)。逐 agent 统计(F-6:只报 Claude 会让
                         // setup --all 保护的 Codex/Cursor 覆盖面在 status 里不可见)。
                         let mcp_counts = dirs::home_dir()
-                            .map(|h| setup_mcp::wrapped_server_counts_all_agents(&h))
+                            .map(|h| {
+                                setup_mcp::wrapped_server_counts_all_agents(
+                                    &h,
+                                    &setup_mcp::AgentEnv::from_process_env(),
+                                )
+                            })
                             .unwrap_or_default();
                         let code = print_setup_report(lang, &setup_args, &report, &mcp_counts);
                         // 其余 agent 的 hook 注册面(Codex/Gemini/Cursor):检测到才注册,逐面诚实
@@ -859,6 +864,8 @@ fn setup_mcp_dispatch(
         .map_err(|_| setup::SetupError::MissingCurrentExe)?
         .to_string_lossy()
         .to_string();
+    // 生产 env 快照(CODEX_HOME / PI_AGENT_DIR):只在此入口读一次,库函数全注入式。
+    let agent_env = setup_mcp::AgentEnv::from_process_env();
     // wrap 网关姿态:默认 monitor(观察放行+脱敏+审计+裸 secret 拦截);`--enforce` 升级为 default-deny
     // 硬拦。第三方 server 工具名不在 effect 词表 → enforce 一律 default-deny = server 全不可用,故默认 monitor
     // 让 turnkey 接入即可用且仍守全部硬地板(详见 CliSetupArgs::enforce doc)。
@@ -871,32 +878,39 @@ fn setup_mcp_dispatch(
             // 开始 spawn)在 stderr 明确告警,而非仅 help 文案 / 事后表头。
             match lang {
                 Lang::En => eprintln!(
-                    "[vigil-hub] --probe will briefly START each configured MCP server (Claude / Codex / \
-                     Cursor / Windsurf) — running its startup code — to test a real MCP handshake, then \
+                    "[vigil-hub] --probe will briefly START each configured MCP server (across every \
+                     supported agent) — running its startup code — to test a real MCP handshake, then \
                      stop it. Ctrl-C to abort."
                 ),
                 Lang::Zh => eprintln!(
-                    "[vigil-hub] --probe 会短暂启动每个已配置的 MCP 服务器(Claude / Codex / Cursor / \
-                     Windsurf)—— 执行其启动代码 —— 以测试真实 MCP 握手,随后停止它。Ctrl-C 可中止。"
+                    "[vigil-hub] --probe 会短暂启动每个已配置的 MCP 服务器(覆盖全部受支持 agent)\
+                     —— 执行其启动代码 —— 以测试真实 MCP 握手,随后停止它。Ctrl-C 可中止。"
                 ),
             }
             Some(setup_mcp::DOCTOR_PROBE_TIMEOUT)
         } else {
             None
         };
-        let rows = setup_mcp::run_doctor(&home, probe_timeout)?;
+        let rows = setup_mcp::run_doctor(&home, &agent_env, probe_timeout)?;
         Ok(print_mcp_doctor(lang, &rows))
     } else if args.uninstall {
-        // 所有 agent 接入面都还原:Claude + Codex + Cursor + Windsurf(各独立文件,逐一诚实报告)。
+        // 所有 agent 接入面都还原:Claude + Codex + 全部 JSON-agent registry(各独立文件,逐一诚实报告)。
         let rep = setup_mcp::run_uninstall(&home, args.dry_run)?;
         let mut code = print_mcp_apply(lang, &rep, "uninstall");
         code = run_codex_leg(
             lang,
-            setup_mcp::run_codex_uninstall(&home, args.dry_run),
+            setup_mcp::run_codex_uninstall(&home, agent_env.codex_home.as_deref(), args.dry_run),
             "uninstall",
             code,
         );
-        for agent in json_mcp_agents(&home) {
+        code = run_json_agent_leg(
+            lang,
+            setup_mcp::run_zcode_uninstall(&home, args.dry_run),
+            "ZCode",
+            "uninstall",
+            code,
+        );
+        for agent in setup_mcp::all_json_mcp_agents(&home, &agent_env) {
             code = run_json_agent_leg(
                 lang,
                 setup_mcp::run_json_agent_uninstall(&agent, args.dry_run),
@@ -908,31 +922,46 @@ fn setup_mcp_dispatch(
         Ok(code)
     } else if args.apply {
         // 所有面都保护(turnkey:一条命令覆盖用户全部 agent 接入面)。
-        // #16:apply 前先查底层程序在 PATH 是否可解析(apply 后条目变 AlreadyWrapped 不再可查)。
-        let unresolvable = setup_mcp::unresolvable_wrappables(&home);
+        // #16:apply 前先查**全部接入面**底层程序在 PATH 是否可解析(apply 后条目变 AlreadyWrapped
+        // 不再可查;此前只查 Claude user scope,其余面无同款即时预警 —— review 2026-07-17 LOW-1)。
+        let unresolvable = setup_mcp::unresolvable_wrappables(&home, &agent_env);
         let rep = setup_mcp::run_apply(&home, &exe, args.dry_run, args.user_scope_only, monitor)?;
         let mut code = print_mcp_apply(lang, &rep, "apply");
         // #16:非阻塞 WARN —— 底层程序找不到的 server 仍被 wrap(配置正确),但会在 agent 启动时静默
         // 失败,故诚实告知(避免"Protected"虚假安全感)。
-        for (name, prog) in &unresolvable {
+        for (agent_label, name, prog) in &unresolvable {
             match lang {
                 Lang::En => eprintln!(
-                    "  WARNING: MCP server '{name}' command '{prog}' not found on PATH; once wrapped it \
-                     will fail when the agent starts it (install it or fix the path in your config)"
+                    "  WARNING: [{agent_label}] MCP server '{name}' command '{prog}' not found on PATH; \
+                     once wrapped it will fail when the agent starts it (install it or fix the path in \
+                     your config)"
                 ),
                 Lang::Zh => eprintln!(
-                    "  警告:MCP 服务器 '{name}' 的命令 '{prog}' 不在 PATH 中;一旦被 wrap,agent 启动它时 \
-                     会失败(请安装它,或在配置里修好路径)"
+                    "  警告:[{agent_label}] MCP 服务器 '{name}' 的命令 '{prog}' 不在 PATH 中;一旦被 \
+                     wrap,agent 启动它时会失败(请安装它,或在配置里修好路径)"
                 ),
             }
         }
         code = run_codex_leg(
             lang,
-            setup_mcp::run_codex_apply(&home, &exe, args.dry_run, monitor),
+            setup_mcp::run_codex_apply(
+                &home,
+                agent_env.codex_home.as_deref(),
+                &exe,
+                args.dry_run,
+                monitor,
+            ),
             "apply",
             code,
         );
-        for agent in json_mcp_agents(&home) {
+        code = run_json_agent_leg(
+            lang,
+            setup_mcp::run_zcode_apply(&home, &exe, args.dry_run, monitor),
+            "ZCode",
+            "apply",
+            code,
+        );
+        for agent in setup_mcp::all_json_mcp_agents(&home, &agent_env) {
             code = run_json_agent_leg(
                 lang,
                 setup_mcp::run_json_agent_apply(&agent, &exe, args.dry_run, monitor),
@@ -946,14 +975,14 @@ fn setup_mcp_dispatch(
         let rep = setup_mcp::run_preview(&home, &exe, monitor)?;
         let code = print_mcp_preview(lang, &rep);
         // 预览只读:某 agent 配置 malformed 不硬 abort(什么都没写),优雅降级为一行提示而非突兀报错。
-        match setup_mcp::run_codex_preview(&home, &exe, monitor) {
+        match setup_mcp::run_codex_preview(&home, agent_env.codex_home.as_deref(), &exe, monitor) {
             Ok(codex) => print_codex_preview(lang, &codex),
             Err(e) => {
                 println!();
                 println!(
                     "  {}{}",
                     tr(lang, "Codex CLI config: ", "Codex CLI 配置:"),
-                    setup_mcp::codex_config_path(&home).display()
+                    setup_mcp::codex_config_path(&home, agent_env.codex_home.as_deref()).display()
                 );
                 match lang {
                     Lang::En => println!(
@@ -965,7 +994,27 @@ fn setup_mcp_dispatch(
                 }
             }
         }
-        for agent in json_mcp_agents(&home) {
+        // ZCode(嵌套键专线;报告结构与 JSON-agent 同款,渲染复用)。
+        match setup_mcp::run_zcode_preview(&home, &exe, monitor) {
+            Ok(r) => print_json_agent_preview(lang, &r),
+            Err(e) => {
+                println!();
+                println!(
+                    "  {}{}",
+                    tr(lang, "ZCode config: ", "ZCode 配置:"),
+                    setup_mcp::zcode_config_path(&home).display()
+                );
+                match lang {
+                    Lang::En => println!(
+                        "  (could not read it: {e} -- fix the file to preview/protect ZCode MCP servers)"
+                    ),
+                    Lang::Zh => println!(
+                        "  (无法读取:{e} —— 修好该文件以预览 / 保护 ZCode 的 MCP 服务器)"
+                    ),
+                }
+            }
+        }
+        for agent in setup_mcp::all_json_mcp_agents(&home, &agent_env) {
             match setup_mcp::run_json_agent_preview(&agent, &exe, monitor) {
                 Ok(r) => print_json_agent_preview(lang, &r),
                 Err(e) => {
@@ -995,14 +1044,6 @@ fn setup_mcp_dispatch(
         }
         Ok(code)
     }
-}
-
-/// turnkey 覆盖的"JSON `mcpServers` 形态"agent 列表(Cursor + Windsurf)。新增同形态 agent 只在此扩列。
-fn json_mcp_agents(home: &std::path::Path) -> [setup_mcp::JsonMcpAgent; 2] {
-    [
-        setup_mcp::JsonMcpAgent::cursor(home),
-        setup_mcp::JsonMcpAgent::windsurf(home),
-    ]
 }
 
 /// 运行 Codex 接入面的一步(apply/uninstall)并**诚实处理半应用状态**(Codex review #7 MEDIUM):
@@ -1355,14 +1396,27 @@ fn run_setup_all(
             // `run_*_leg` **诚实半应用报告**(不回滚已应用面 —— 各面独立、各自可逆)。op 在 dry-run 时为
             // "preview";各步只认 apply/uninstall(dry 措辞由报告里 dry_run 决定)。
             let exe_str = exe.to_string_lossy().to_string();
+            let agent_env = setup_mcp::AgentEnv::from_process_env();
             let mcp_op = if args.uninstall { "uninstall" } else { "apply" };
             let codex_res = if args.uninstall {
-                setup_mcp::run_codex_uninstall(&home, args.dry_run)
+                setup_mcp::run_codex_uninstall(&home, agent_env.codex_home.as_deref(), args.dry_run)
             } else {
-                setup_mcp::run_codex_apply(&home, &exe_str, args.dry_run, monitor)
+                setup_mcp::run_codex_apply(
+                    &home,
+                    agent_env.codex_home.as_deref(),
+                    &exe_str,
+                    args.dry_run,
+                    monitor,
+                )
             };
             code = run_codex_leg(lang, codex_res, mcp_op, code);
-            for agent in json_mcp_agents(&home) {
+            let zcode_res = if args.uninstall {
+                setup_mcp::run_zcode_uninstall(&home, args.dry_run)
+            } else {
+                setup_mcp::run_zcode_apply(&home, &exe_str, args.dry_run, monitor)
+            };
+            code = run_json_agent_leg(lang, zcode_res, "ZCode", mcp_op, code);
+            for agent in setup_mcp::all_json_mcp_agents(&home, &agent_env) {
                 let res = if args.uninstall {
                     setup_mcp::run_json_agent_uninstall(&agent, args.dry_run)
                 } else {
@@ -1715,21 +1769,34 @@ fn print_mcp_doctor(lang: Lang, rows: &[setup_mcp::McpDoctorRow]) -> std::proces
             "  {}",
             tr(
                 lang,
-                "No MCP servers found across Claude / Codex / Cursor / Windsurf (nothing to check).",
-                "Claude / Codex / Cursor / Windsurf 均未找到 MCP 服务器(无需检查)。",
+                "No MCP servers found across any supported agent (nothing to check).",
+                "所有受支持 agent 均未找到 MCP 服务器(无需检查)。",
             )
         );
         return std::process::ExitCode::SUCCESS;
     }
+    // agent 显示名集合(registry + Codex;本程序固定字面量,非用户输入):doctor 行的 scope 若命中
+    // 即"某 agent 面",否则是 Claude 的 user/项目路径。此前硬编码三家,新增 agent 的行会被误判成
+    // Claude local 项目渲染为 `local:<agent>`(review 2026-07-17 MED-2)。路径参数只为取名,传空即可。
+    let agent_labels: Vec<&'static str> = ["Codex", "ZCode"]
+        .into_iter()
+        .chain(
+            setup_mcp::all_json_mcp_agents(
+                std::path::Path::new(""),
+                &setup_mcp::AgentEnv::default(),
+            )
+            .iter()
+            .map(|a| a.display_name),
+        )
+        .collect();
     let mut failed = 0usize;
     for r in rows {
-        // scope 标注:Claude user / Claude 项目路径(local) / 其它 agent(Codex/Cursor/Windsurf)。
-        // 三个 agent 名是本程序固定字面量(非用户输入),据此与 Claude 的 user/local-path 区分。wrapped
-        // 标注是否已受 Vigil 保护。全部过 scrub。
+        // scope 标注:Claude user / Claude 项目路径(local) / 其它 agent 面。wrapped 标注是否已受
+        // Vigil 保护。全部过 scrub。
         let name = scrub(&r.name);
         let scope = match r.scope.as_str() {
             "user" => "user".to_string(),
-            "Codex" | "Cursor" | "Windsurf" => r.scope.clone(),
+            s if agent_labels.contains(&s) => r.scope.clone(),
             other => format!("local:{}", scrub(other)),
         };
         let guard = if r.wrapped { " [vigil-wrapped]" } else { "" };
@@ -2355,10 +2422,17 @@ fn print_json_agent_preview(lang: Lang, r: &setup_mcp::JsonAgentPreviewReport) {
             r.wrappable_count()
         ),
     }
-    // server-id 派生须与 apply 一致(`<prefix>-<name>`)。prefix 是 &'static str,闭包捕获。
+    // server-id 派生与 apply 同源(json_agent_server_id SSOT)—— 此前手拼 `{prefix}-{name}`,
+    // 名含大写/空格时与 apply 的 slug+hash 规约不一致(review 2026-07-17 MED-6)。
     let prefix = r.id_prefix;
     for s in &r.servers {
-        print_mcp_server_preview(lang, &r.exe, |n| format!("{prefix}-{n}"), s, r.monitor);
+        print_mcp_server_preview(
+            lang,
+            &r.exe,
+            |n| setup_mcp::json_agent_server_id(prefix, n),
+            s,
+            r.monitor,
+        );
     }
 }
 
@@ -2435,10 +2509,17 @@ fn print_setup_report(
     lang: Lang,
     args: &SetupArgs,
     r: &setup::SetupReport,
-    mcp_counts: &[(&'static str, usize)],
+    mcp_counts: &[(&'static str, setup_mcp::AgentWrapStatus)],
 ) -> std::process::ExitCode {
     use setup::ProtectionState;
-    let mcp_wrapped: usize = mcp_counts.iter().map(|(_, n)| n).sum();
+    use setup_mcp::AgentWrapStatus;
+    let mcp_wrapped: usize = mcp_counts
+        .iter()
+        .map(|(_, st)| match st {
+            AgentWrapStatus::Wrapped(n) => *n,
+            AgentWrapStatus::ConfigError => 0,
+        })
+        .sum();
     if args.status {
         let self_test = setup::doctor_self_test();
         println!("{}", tr(lang, "Vigil status", "Vigil 状态"));
@@ -2493,17 +2574,29 @@ fn print_setup_report(
                 ProtectionState::NotInstalled => tr(lang, "not installed", "未安装"),
             }
         );
+        // 逐 agent 明细(非零项 + ConfigError 项):用户能一眼确认 setup --all 的全局覆盖面。
+        // ConfigError(配置在但读/解析失败)**必须**出现在明细里 —— 此前被折叠成 0,配置损坏的
+        // agent 与"未配置"不可区分,status 呈现虚假"全部正常"(review 2026-07-17 MED-4)。
+        let mut detail: Vec<String> = Vec::new();
+        let mut config_errors = 0usize;
+        for (name, st) in mcp_counts {
+            match st {
+                AgentWrapStatus::Wrapped(n) if *n > 0 => detail.push(format!("{name} {n}")),
+                AgentWrapStatus::Wrapped(_) => {}
+                AgentWrapStatus::ConfigError => {
+                    config_errors += 1;
+                    detail.push(format!(
+                        "{name} {}",
+                        tr(lang, "CONFIG ERROR", "配置读取失败")
+                    ));
+                }
+            }
+        }
         println!(
             "  {}{}",
             tr(lang, "MCP gateway:   ", "MCP 网关:     "),
-            if mcp_wrapped > 0 {
-                // 逐 agent 明细(只列非零项):用户能一眼确认 setup --all 的全局覆盖面。
-                let detail = mcp_counts
-                    .iter()
-                    .filter(|(_, n)| *n > 0)
-                    .map(|(name, n)| format!("{name} {n}"))
-                    .collect::<Vec<_>>()
-                    .join(" / ");
+            if mcp_wrapped > 0 || config_errors > 0 {
+                let detail = detail.join(" / ");
                 match lang {
                     Lang::En => format!("{mcp_wrapped} server(s) wrapped ({detail})"),
                     Lang::Zh => format!("已防护 {mcp_wrapped} 个服务器({detail})"),
@@ -2512,6 +2605,16 @@ fn print_setup_report(
                 tr(lang, "no servers wrapped", "尚未防护任何服务器").to_string()
             }
         );
+        if config_errors > 0 {
+            println!(
+                "  {}",
+                tr(
+                    lang,
+                    "                (a config exists but could not be checked -- run `vigil-hub setup --mcp --doctor` for details)",
+                    "                (有配置存在但无法检查 —— 运行 `vigil-hub setup --mcp --doctor` 查看详情)",
+                )
+            );
+        }
         // 浏览器防线(可选层):native host 注册态。直调 install::status(纯文件/注册表
         // 只读,与桌面 Protection Overview 卡同源判定 is_registered,防重实现漂移)。
         println!(

@@ -56,6 +56,32 @@ const MAX_CLAUDE_JSON_BYTES: u64 = 256 * 1024 * 1024;
 /// `--vigil-managed-mcp` clap flag 一致;也是 `wrap` 子命令忽略的托管标记。
 pub const VIGIL_MANAGED_MCP_MARKER: &str = "--vigil-managed-mcp";
 
+/// arg 是否 sentinel token(精确 `--vigil-managed-mcp` 或 `--vigil-managed-mcp=...` 形态)。
+fn is_sentinel_token(a: &str) -> bool {
+    a == VIGIL_MANAGED_MCP_MARKER || a.starts_with(&format!("{VIGIL_MANAGED_MCP_MARKER}="))
+}
+
+/// sentinel 在 `args` 中的位置(首个命中;无 → `None`)。
+fn sentinel_pos(args: &[Value]) -> Option<usize> {
+    args.iter()
+        .position(|a| a.as_str().map(is_sentinel_token).unwrap_or(false))
+}
+
+/// Vigil 标准托管 wrap 条目的**唯一** grammar 判定(classify 与 unwrap 共用,SSOT):
+/// `args[0]=="wrap"` ∧ sentinel 存在 ∧ sentinel **紧邻** `--`([`wrapped_argv`] 恒产出该形态,
+/// Vigil 从未写出过其它形态)。此前 classify 只要求 sentinel **在任意位置**:手改出的
+/// `args[0]=="wrap"` + sentinel 不邻 `--` 条目被分类 AlreadyWrapped(status 计入已保护),
+/// [`unwrap_entry`] 却反解不出(None)→ **不可逆的假托管态**(review 2026-07-17 HIGH-2)。
+/// 统一后这类条目按普通条目处理:command 含 vigil-hub 的落 #15 wrapper-前缀 Skipped(不动),
+/// 纯第三方伪标记条目则被当普通 server 正常保护(不再因自带 sentinel 逃逸 wrap = 收窄 fail-open)。
+fn is_managed_wrap_args(args: &[Value]) -> bool {
+    let args0_wrap = args.first().and_then(Value::as_str) == Some("wrap");
+    args0_wrap
+        && sentinel_pos(args)
+            .map(|i| args.get(i + 1).and_then(Value::as_str) == Some("--"))
+            .unwrap_or(false)
+}
+
 /// 一个枚举到的 MCP server 条目分类。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpServerClass {
@@ -119,8 +145,47 @@ pub fn read_claude_json(path: &Path) -> Result<Option<Value>, SetupError> {
     }
 }
 
+/// 校验已解析 JSON 配置的 **MCP 根形状**(读层之后、分类之前的统一守门):根必须是 object;
+/// `mcpServers` **存在则必须**是 object;`projects`(Claude 专有)存在则必须是 object,其每个
+/// 项目的 `mcpServers` 同。键**不存在** = 合法"未配置"(绝大多数用户),不报错。
+///
+/// **为什么必须 abort 而不是静默空**:此前"存在但类型错"(如 `"mcpServers": []` / 字符串)被
+/// `as_object()` 折叠成"无 server" → preview/apply 假成功、status 报 0、doctor 无行 —— 配置
+/// 在场却完全不受保护,用户得不到任何"Vigil 读不懂它"的信号(fail-open;review 2026-07-17
+/// MED-1)。与 hook 注册面 [`crate::setup_hooks`] 的 `ensure_agent_shape` 同纪律:绝不臆测。
+pub fn ensure_mcp_root_shape(cfg: &Value, path: &Path) -> Result<(), SetupError> {
+    let bad = |field: &'static str| {
+        Err(SetupError::UnsupportedConfigShape {
+            path: path.to_path_buf(),
+            field,
+        })
+    };
+    if !cfg.is_object() {
+        return bad("<root>");
+    }
+    if let Some(v) = cfg.get("mcpServers") {
+        if !v.is_object() {
+            return bad("mcpServers");
+        }
+    }
+    if let Some(projects) = cfg.get("projects") {
+        let Some(po) = projects.as_object() else {
+            return bad("projects");
+        };
+        for proj in po.values() {
+            if let Some(v) = proj.get("mcpServers") {
+                if !v.is_object() {
+                    return bad("projects.*.mcpServers");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// 从已解析的 `~/.claude.json` 枚举 **user scope**(顶层 `mcpServers`)的 server 并分类。
-/// 纯函数 —— 不碰文件系统,fixture 直接可测。无 `mcpServers` / 形状不符 → 空 Vec(无可保护项)。
+/// 纯函数 —— 不碰文件系统,fixture 直接可测。无 `mcpServers` / 形状不符 → 空 Vec(无可保护项;
+/// "存在但类型错"的根形状由调用方先经 [`ensure_mcp_root_shape`] 拦截)。
 pub fn classify_user_scope_servers(claude_cfg: &Value) -> Vec<McpServerClass> {
     let Some(servers) = claude_cfg.get("mcpServers").and_then(Value::as_object) else {
         return Vec::new();
@@ -148,17 +213,15 @@ fn classify_one(name: &str, entry: &Value) -> McpServerClass {
             .map(|s| s.eq_ignore_ascii_case("vigil-hub") || s.eq_ignore_ascii_case("vigil-hub.exe"))
             .unwrap_or(false);
         let args0 = args.first().and_then(Value::as_str);
-        let has_sentinel = args.iter().filter_map(Value::as_str).any(|a| {
-            a == VIGIL_MANAGED_MCP_MARKER || a.starts_with(&format!("{VIGIL_MANAGED_MCP_MARKER}="))
-        });
+        let has_sentinel = args.iter().filter_map(Value::as_str).any(is_sentinel_token);
 
-        // ① 已托管:`args[0]=="wrap"` + sentinel 即足够。
-        //    **DEF-002 trigger B 修复**:不再要求 command basename==vigil-hub —— 否则从改名 / 带版本号
+        // ① 已托管:与 [`unwrap_entry`] **同一** grammar([`is_managed_wrap_args`]:args[0]=="wrap"
+        //    + sentinel 紧邻 `--`)—— 分类说"已托管"的,反解必然能还原(可逆性闭环)。
+        //    **DEF-002 trigger B 修复**:不要求 command basename==vigil-hub —— 否则从改名 / 带版本号
         //    的二进制(如 `vigil-hub-0.1.4`、符号链接 `vh`)再跑 setup 时,已 wrap 的条目认不出 → 被
-        //    二次 wrap。sentinel 是 Vigil 自有标记、args[0]=="wrap" 锚定为本网关 shim,二者合取后第三方
-        //    server 不可能误命中(其 args[0] 不会是 "wrap";仅自带 `--vigil-managed-mcp` 参数也因 args[0]
-        //    ≠ "wrap" 被排除,原 Codex review 关切的 fail-open 仍被堵)。
-        if args0 == Some("wrap") && has_sentinel {
+        //    二次 wrap。sentinel + args[0]=="wrap" + 紧邻 `--` 的合取后第三方 server 不可能误命中
+        //    (其 args[0] 不会是 "wrap";仅自带 `--vigil-managed-mcp` 参数也被排除,fail-open 仍被堵)。
+        if is_managed_wrap_args(args) {
             return McpServerClass::AlreadyWrapped { name: name.into() };
         }
 
@@ -455,40 +518,97 @@ pub fn wrapped_server_count(home: &Path) -> usize {
     user + local
 }
 
-/// `setup --status` 的逐 agent MCP 网关覆盖统计:`(agent 显示名, 已 wrap 数)`,恒含四个 agent
-/// (0 也返回,渲染层自行取舍)。此前 status 只报 Claude Code 的计数 —— `setup --all` 保护了
-/// Codex/Cursor 的二十余个 server 后,用户无从确认全局覆盖面。best-effort 只读:配置缺失 /
-/// 解析失败按 0 计,状态报告不因单个 agent 配置损坏而失败(与 [`wrapped_server_count`] 同口径)。
-pub fn wrapped_server_counts_all_agents(home: &Path) -> Vec<(&'static str, usize)> {
+/// `setup --status` 单 agent 的 MCP 网关覆盖状态。此前返回裸 usize,读/解析失败被折叠成 0 ——
+/// 配置存在却损坏/不可读的 agent 与"未配置"不可区分,status 呈现虚假的"全部正常"视图
+/// (review 2026-07-17 MED-4)。`ConfigError` 态让渲染层能诚实提示"配置在但查不了,去跑 doctor"。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentWrapStatus {
+    /// 配置可读(或不存在 = 0):已被 Vigil wrap 的 server 数。
+    Wrapped(usize),
+    /// 配置**存在但读取/解析/根形状失败** —— server 可能存在但对 status 不可见,绝不谎报 0。
+    ConfigError,
+}
+
+/// `setup --status` 的逐 agent MCP 网关覆盖统计:`(agent 显示名, 状态)`,恒含全部接入面
+/// (Claude + Codex + 全部 [`all_json_mcp_agents`] registry;0 也返回,渲染层自行取舍)。
+/// best-effort 只读(单 agent 配置损坏不使整个 status 失败),但**不再**把读失败折叠成 0
+/// (诚实三态,见 [`AgentWrapStatus`])。`env` 注入式(测试 `AgentEnv::default()`)。
+pub fn wrapped_server_counts_all_agents(
+    home: &Path,
+    env: &AgentEnv,
+) -> Vec<(&'static str, AgentWrapStatus)> {
+    use AgentWrapStatus::{ConfigError, Wrapped};
     let wrapped_in = |cfg: &Value| {
         classify_user_scope_servers(cfg)
             .iter()
             .filter(|c| matches!(c, McpServerClass::AlreadyWrapped { .. }))
             .count()
     };
-    let json_agent = |a: &JsonMcpAgent| {
-        read_claude_json(&a.config_path)
-            .ok()
-            .flatten()
-            .map(|cfg| wrapped_in(&cfg))
-            .unwrap_or(0)
+    // Claude:user scope + local scope 合计(与 [`wrapped_server_count`] 同口径,但读失败诚实报错)。
+    let claude_path = claude_json_path(home);
+    let claude = match read_claude_json(&claude_path) {
+        Ok(Some(cfg)) => match ensure_mcp_root_shape(&cfg, &claude_path) {
+            Ok(()) => Wrapped(
+                wrapped_in(&cfg)
+                    + classify_local_scope_servers(&cfg)
+                        .iter()
+                        .filter(|(_, c)| matches!(c, McpServerClass::AlreadyWrapped { .. }))
+                        .count(),
+            ),
+            Err(_) => ConfigError,
+        },
+        Ok(None) => Wrapped(0),
+        Err(_) => ConfigError,
     };
-    let codex = read_codex_config(&codex_config_path(home))
-        .ok()
-        .flatten()
-        .map(|doc| {
-            classify_codex_servers(&doc)
-                .iter()
-                .filter(|c| matches!(c, McpServerClass::AlreadyWrapped { .. }))
-                .count()
-        })
-        .unwrap_or(0);
-    vec![
-        ("Claude Code", wrapped_server_count(home)),
-        ("Codex", codex),
-        ("Cursor", json_agent(&JsonMcpAgent::cursor(home))),
-        ("Windsurf", json_agent(&JsonMcpAgent::windsurf(home))),
-    ]
+    let codex_path = codex_config_path(home, env.codex_home.as_deref());
+    let codex = match read_codex_config(&codex_path) {
+        Ok(Some(doc)) => match ensure_codex_root_shape(&doc, &codex_path) {
+            Ok(()) => Wrapped(
+                classify_codex_servers(&doc)
+                    .iter()
+                    .filter(|c| matches!(c, McpServerClass::AlreadyWrapped { .. }))
+                    .count(),
+            ),
+            Err(_) => ConfigError,
+        },
+        Ok(None) => Wrapped(0),
+        Err(_) => ConfigError,
+    };
+    let zcode_path = zcode_config_path(home);
+    let zcode = match read_claude_json(&zcode_path) {
+        Ok(Some(cfg)) => match ensure_zcode_root_shape(&cfg, &zcode_path) {
+            Ok(()) => Wrapped(
+                zcode_servers_obj(&cfg)
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(name, entry)| {
+                                matches!(
+                                    classify_one(name, entry),
+                                    McpServerClass::AlreadyWrapped { .. }
+                                )
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0),
+            ),
+            Err(_) => ConfigError,
+        },
+        Ok(None) => Wrapped(0),
+        Err(_) => ConfigError,
+    };
+    let mut out = vec![("Claude Code", claude), ("Codex", codex), ("ZCode", zcode)];
+    for agent in all_json_mcp_agents(home, env) {
+        let st = match read_claude_json(&agent.config_path) {
+            Ok(Some(cfg)) => match ensure_mcp_root_shape(&cfg, &agent.config_path) {
+                Ok(()) => Wrapped(wrapped_in(&cfg)),
+                Err(_) => ConfigError,
+            },
+            Ok(None) => Wrapped(0),
+            Err(_) => ConfigError,
+        };
+        out.push((agent.display_name, st));
+    }
+    out
 }
 
 /// `setup --mcp`(只读)的预览报告 —— 供 CLI 层渲染。
@@ -534,11 +654,14 @@ pub fn run_preview(home: &Path, exe: &str, monitor: bool) -> Result<McpPreviewRe
     let path = claude_json_path(home);
     let cfg = read_claude_json(&path)?;
     let (exists, servers, local_servers) = match cfg {
-        Some(v) => (
-            true,
-            classify_user_scope_servers(&v),
-            classify_local_scope_servers(&v),
-        ),
+        Some(v) => {
+            ensure_mcp_root_shape(&v, &path)?; // 存在但类型错的 mcpServers 绝不静默当"无 server"
+            (
+                true,
+                classify_user_scope_servers(&v),
+                classify_local_scope_servers(&v),
+            )
+        }
         None => (false, Vec::new(), Vec::new()),
     };
     Ok(McpPreviewReport {
@@ -566,6 +689,9 @@ pub fn run(monitor: bool) -> Result<McpPreviewReport, SetupError> {
 //
 // **自描述可逆**:wrap 条目保留原 `env`/`type`/未知字段**逐字**,只改 `command`+`args`;`--` 之后
 // 即原始 argv → uninstall 从 wrap 条目**自还原**,无需独立 snapshot 文件(reversal 信息随条目走)。
+// **可逆边界(诚实声明,review 2026-07-17 MED-3)**:还原目标是**语义等价的可运行形态**,非字节级
+// 快照 —— classify 的刻意归一化(#14 单串 command 拆分、首尾空白 trim、缺失 `args` 还原后成 `[]`)
+// 不可逆转回原病态形态;整个文件也经 pretty-print 重写(键序/未知字段保留,空白/缩进可能变)。
 // 写盘经 `setup::atomic_write_with_backup`(原子 temp+rename + 备份 + preserve_order 保留用户键序)。
 // **仅 user scope**(顶层 mcpServers);local scope(`projects.<path>.mcpServers`)有未保护 server 时
 // **fail-closed 拒绝**(Codex setup_mcp review guardrail:漏 scope=fail-open),除非 `--user-scope-only`。
@@ -602,24 +728,15 @@ fn wrap_entry(
 fn unwrap_entry(wrapped: &Value) -> Option<Value> {
     let obj = wrapped.as_object()?;
     let args = obj.get("args")?.as_array()?;
-    let args0_wrap = args.first().and_then(Value::as_str) == Some("wrap");
-    // **sentinel-anchored 分隔符**:`wrapped_argv` 里 sentinel **紧跟** `--`,故 separator = sentinel_idx+1。
-    // **不**用 `position("--")` 找第一个 `--` —— 若 server 名 / env-key 字面恰是 `--`(病态但可能)会撞
-    // 错分隔符导致还原失败/错乱。锚定 sentinel 后取其紧邻 `--` 才鲁棒(name/env-key 在 sentinel 之前)。
-    let sent = args.iter().position(|a| {
-        a.as_str()
-            .map(|s| {
-                s == VIGIL_MANAGED_MCP_MARKER
-                    || s.starts_with(&format!("{VIGIL_MANAGED_MCP_MARKER}="))
-            })
-            .unwrap_or(false)
-    })?;
-    if args.get(sent + 1).and_then(Value::as_str) != Some("--") {
-        return None; // sentinel 后必紧跟 `--`;否则非 Vigil 标准 wrap 形态,不动(fail-safe)
+    // 与 classify 的 AlreadyWrapped **同一** grammar([`is_managed_wrap_args`],SSOT):
+    // args[0]=="wrap" + sentinel 存在 + sentinel **紧邻** `--`。
+    // **sentinel-anchored 分隔符**:**不**用 `position("--")` 找第一个 `--` —— 若 server 名 /
+    // env-key 字面恰是 `--`(病态但可能)会撞错分隔符导致还原失败/错乱。锚定 sentinel 后取其
+    // 紧邻 `--` 才鲁棒(name/env-key 在 sentinel 之前)。
+    if !is_managed_wrap_args(args) {
+        return None; // 非 Vigil 标准 wrap 形态,不动(fail-safe)
     }
-    if !args0_wrap {
-        return None;
-    }
+    let sent = sentinel_pos(args)?;
     // sentinel 之后第 2 元素起即原始 argv(逐字还原)。
     let orig = &args[sent + 2..];
     let orig_cmd = orig.first()?.as_str()?;
@@ -775,20 +892,46 @@ impl McpApplyReport {
     }
 }
 
-/// #16:列出 user scope 配置里 Wrappable server 中底层程序在宿主 PATH **不可解析**的 `(name, program)`。
-/// 供 `setup --mcp --apply` 后**非阻塞 WARN** —— 避免给"Protected"虚假安全感(底层程序坏/未装时
-/// server 在 agent 启动才静默失败,无 Vigil 关联提示)。必须在 apply **之前**对原始配置调用(apply 后
-/// 条目变 AlreadyWrapped 不再 Wrappable)。复用网关同款 `resolve_program`(SSOT)。
-pub fn unresolvable_wrappables(home: &Path) -> Vec<(String, String)> {
-    let path = claude_json_path(home);
-    let Ok(Some(cfg)) = read_claude_json(&path) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for class in classify_user_scope_servers(&cfg) {
+/// #16:列出**全部接入面**(Claude user+local / Codex / JSON-agent registry)Wrappable server 中
+/// 底层程序在宿主 PATH **不可解析**的 `(接入面标签, server 名, program)`。供 `setup --mcp --apply`
+/// 后**非阻塞 WARN** —— 避免给"Protected"虚假安全感(底层程序坏/未装时 server 在 agent 启动才
+/// 静默失败,无 Vigil 关联提示)。此前只查 Claude user scope,其余面 wrap 后没有同款即时预警
+/// (review 2026-07-17 LOW-1)。必须在 apply **之前**对原始配置调用(apply 后条目变 AlreadyWrapped
+/// 不再 Wrappable)。复用网关同款 `resolve_program`(SSOT)。best-effort 只读:读失败按无警告处理
+/// (apply 自身会对该面诚实报错,此处不重复)。
+pub fn unresolvable_wrappables(home: &Path, env: &AgentEnv) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut push_unresolvable = |label: &str, class: McpServerClass| {
         if let McpServerClass::Wrappable { name, command, .. } = class {
             if vigil_mcp::stdio::resolve_program(&command).is_err() {
-                out.push((name, command));
+                out.push((label.to_string(), name, command));
+            }
+        }
+    };
+    if let Ok(Some(cfg)) = read_claude_json(&claude_json_path(home)) {
+        for class in classify_user_scope_servers(&cfg) {
+            push_unresolvable("Claude Code", class);
+        }
+        for (_proj, class) in classify_local_scope_servers(&cfg) {
+            push_unresolvable("Claude Code (project)", class);
+        }
+    }
+    if let Ok(Some(doc)) = read_codex_config(&codex_config_path(home, env.codex_home.as_deref())) {
+        for class in classify_codex_servers(&doc) {
+            push_unresolvable("Codex", class);
+        }
+    }
+    if let Ok(Some(cfg)) = read_claude_json(&zcode_config_path(home)) {
+        if let Some(servers) = zcode_servers_obj(&cfg) {
+            for (name, entry) in servers {
+                push_unresolvable("ZCode", classify_one(name, entry));
+            }
+        }
+    }
+    for agent in all_json_mcp_agents(home, env) {
+        if let Ok(Some(cfg)) = read_claude_json(&agent.config_path) {
+            for class in classify_user_scope_servers(&cfg) {
+                push_unresolvable(agent.display_name, class);
             }
         }
     }
@@ -807,7 +950,10 @@ pub fn run_apply(
 ) -> Result<McpApplyReport, SetupError> {
     let path = claude_json_path(home);
     let cfg = match read_claude_json(&path)? {
-        Some(v) => v,
+        Some(v) => {
+            ensure_mcp_root_shape(&v, &path)?; // 类型错的根形状绝不改写(abort-on-unexpected)
+            v
+        }
         None => {
             return Ok(McpApplyReport {
                 claude_json: path,
@@ -850,7 +996,10 @@ pub fn run_apply(
 pub fn run_uninstall(home: &Path, dry_run: bool) -> Result<McpApplyReport, SetupError> {
     let path = claude_json_path(home);
     let cfg = match read_claude_json(&path)? {
-        Some(v) => v,
+        Some(v) => {
+            ensure_mcp_root_shape(&v, &path)?; // 读不懂的形状绝不声称"还原了 0 个"
+            v
+        }
         None => {
             return Ok(McpApplyReport {
                 claude_json: path,
@@ -898,9 +1047,15 @@ pub fn run_uninstall(home: &Path, dry_run: bool) -> Result<McpApplyReport, Setup
 // **server-id 命名空间**:Codex 条目派生 `codex-<name>`,与 user scope 的 `user-` / local scope 的
 // `local-` **可证不相交**(共享账本里跨 agent 同名 server 身份不塌缩)。
 
-/// Codex CLI 的 MCP 配置文件路径(`~/.codex/config.toml`)。
-pub fn codex_config_path(home: &Path) -> PathBuf {
-    home.join(".codex").join("config.toml")
+/// Codex CLI 的 MCP 配置文件路径:`$CODEX_HOME/config.toml`(默认 `~/.codex/config.toml`)。
+///
+/// `codex_home_env` = `CODEX_HOME` 环境变量值,**注入式**(生产经 [`codex_home_env`] 读;测试传
+/// `None`/fixture 值,绝不受开发机真实 env 污染)。解析复用 hook 注册面的
+/// [`crate::setup_hooks::resolve_codex_home`](SSOT)—— 此前本面固定 `~/.codex`,与 hook 面分裂:
+/// 自定义 `CODEX_HOME` 的用户 hook 写进真实 Codex 目录、MCP wrap 却读写不存在的 `~/.codex`,
+/// 其全部 server 漏保护且 status/doctor/quickstart 不可见(review 2026-07-17 HIGH-1)。
+pub fn codex_config_path(home: &Path, codex_home_env: Option<&str>) -> PathBuf {
+    crate::setup_hooks::resolve_codex_home(home, codex_home_env).join("config.toml")
 }
 
 /// 为 Codex `[mcp_servers.<name>]` 条目派生 server-id:`codex-<组件>`。
@@ -941,12 +1096,30 @@ pub fn read_codex_config(path: &Path) -> Result<Option<DocumentMut>, SetupError>
     }
 }
 
-/// 取 `[mcp_servers]` 表(标准 sub-table 形态;`mcp_servers = {..}` 内联 / 缺省 → `None` = 无可保护项)。
-fn codex_servers_table(doc: &DocumentMut) -> Option<&toml_edit::Table> {
-    doc.get("mcp_servers").and_then(|i| i.as_table())
+/// 校验 Codex `config.toml` 的 MCP 根形状:`mcp_servers` **存在则必须**是 table-like
+/// (`[mcp_servers.x]` 标准 sub-table 或 `mcp_servers = {..}` 内联表都合法)。缺省 = 未配置,合法。
+/// 存在但是标量/数组等 → abort —— 此前与"缺失"合并成 `None` 静默当 0 项(fail-open;
+/// review 2026-07-17 MED-1 Codex 侧),与 JSON 面 [`ensure_mcp_root_shape`] 同纪律。
+pub fn ensure_codex_root_shape(doc: &DocumentMut, path: &Path) -> Result<(), SetupError> {
+    match doc.get("mcp_servers") {
+        None => Ok(()),
+        Some(i) if i.as_table_like().is_some() => Ok(()),
+        Some(_) => Err(SetupError::UnsupportedConfigShape {
+            path: path.to_path_buf(),
+            field: "mcp_servers",
+        }),
+    }
 }
-fn codex_servers_table_mut(doc: &mut DocumentMut) -> Option<&mut toml_edit::Table> {
-    doc.get_mut("mcp_servers").and_then(|i| i.as_table_mut())
+
+/// 取 `[mcp_servers]` 表。`as_table_like`:标准 sub-table 与 `mcp_servers = {..}` 内联表**都**
+/// 支持(此前只认 `as_table()`,内联形态被静默当 0 项 = 漏保护;形状异常由
+/// [`ensure_codex_root_shape`] 在调用方先拦)。缺省 → `None` = 无可保护项。
+fn codex_servers_table(doc: &DocumentMut) -> Option<&dyn toml_edit::TableLike> {
+    doc.get("mcp_servers").and_then(|i| i.as_table_like())
+}
+fn codex_servers_table_mut(doc: &mut DocumentMut) -> Option<&mut dyn toml_edit::TableLike> {
+    doc.get_mut("mcp_servers")
+        .and_then(|i| i.as_table_like_mut())
 }
 
 /// 把一个 `toml_edit` 条目桥接成 `serde_json::Value`,喂给共享的 [`classify_one`]。
@@ -1148,17 +1321,21 @@ pub struct CodexApplyReport {
     pub backup: Option<PathBuf>,
 }
 
-/// 读真实 `~/.codex/config.toml`(IO 边界)→ 枚举 + 分类,产出只读预览。**不写任何东西**。
-/// `home` / `exe` 注入 → 测试走 fixture 而**绝不**碰真实用户配置。
+/// 读真实 `$CODEX_HOME/config.toml`(IO 边界)→ 枚举 + 分类,产出只读预览。**不写任何东西**。
+/// `home` / `codex_home_env` / `exe` 全注入 → 测试走 fixture 而**绝不**碰真实用户配置。
 pub fn run_codex_preview(
     home: &Path,
+    codex_home_env: Option<&str>,
     exe: &str,
     monitor: bool,
 ) -> Result<CodexPreviewReport, SetupError> {
-    let path = codex_config_path(home);
+    let path = codex_config_path(home, codex_home_env);
     let doc = read_codex_config(&path)?;
     let (exists, servers) = match doc {
-        Some(d) => (true, classify_codex_servers(&d)),
+        Some(d) => {
+            ensure_codex_root_shape(&d, &path)?; // 存在但非 table-like 绝不静默当 0 项
+            (true, classify_codex_servers(&d))
+        }
         None => (false, Vec::new()),
     };
     Ok(CodexPreviewReport {
@@ -1173,13 +1350,17 @@ pub fn run_codex_preview(
 /// `setup --mcp --apply`(Codex 面):读 → wrap 全部 Wrappable → 格式保留原子写。`dry_run` 只算不写。
 pub fn run_codex_apply(
     home: &Path,
+    codex_home_env: Option<&str>,
     exe: &str,
     dry_run: bool,
     monitor: bool,
 ) -> Result<CodexApplyReport, SetupError> {
-    let path = codex_config_path(home);
+    let path = codex_config_path(home, codex_home_env);
     let mut doc = match read_codex_config(&path)? {
-        Some(d) => d,
+        Some(d) => {
+            ensure_codex_root_shape(&d, &path)?; // 类型错的根形状绝不改写
+            d
+        }
         None => {
             return Ok(CodexApplyReport {
                 codex_config: path,
@@ -1209,10 +1390,17 @@ pub fn run_codex_apply(
 }
 
 /// `setup --mcp --uninstall`(Codex 面):读 → 还原所有 Vigil 托管条目 → 格式保留原子写。`dry_run` 只算不写。
-pub fn run_codex_uninstall(home: &Path, dry_run: bool) -> Result<CodexApplyReport, SetupError> {
-    let path = codex_config_path(home);
+pub fn run_codex_uninstall(
+    home: &Path,
+    codex_home_env: Option<&str>,
+    dry_run: bool,
+) -> Result<CodexApplyReport, SetupError> {
+    let path = codex_config_path(home, codex_home_env);
     let mut doc = match read_codex_config(&path)? {
-        Some(d) => d,
+        Some(d) => {
+            ensure_codex_root_shape(&d, &path)?; // 读不懂的形状绝不声称"还原了 0 个"
+            d
+        }
         None => {
             return Ok(CodexApplyReport {
                 codex_config: path,
@@ -1240,56 +1428,137 @@ pub fn run_codex_uninstall(home: &Path, dry_run: bool) -> Result<CodexApplyRepor
     })
 }
 
-// ============================ JSON `mcpServers` agent 接入面(Cursor / Windsurf) ============================
+// ============================ JSON `mcpServers` agent 接入面(Cursor / Windsurf / Kimi / pi) ============================
 //
-// Cursor(`~/.cursor/mcp.json`)与 Windsurf(`~/.codeium/windsurf/mcp_config.json`)的 MCP 配置**形态与
+// Cursor(`~/.cursor/mcp.json`)、Windsurf(`~/.codeium/windsurf/mcp_config.json`)、Kimi CLI
+// (`~/.kimi/mcp.json`)与 pi(`$PI_AGENT_DIR/mcp.json`,经 pi-mcp-adapter)的 MCP 配置**形态与
 // Claude user scope 完全一致**:专用 JSON 文件、顶层 `mcpServers` 对象、条目 `command`/`args`/`env`、
 // 远程用 `url`(Windsurf 另用 `serverUrl`,已并入 `classify_one` 远程检测)。故**直接复用 Claude 路径的
 // read/classify/wrap/unwrap/atomic-write 机制**,仅 config 路径与 server-id 前缀不同;无 `projects.*` 嵌套
-// (那是 Claude 专有),只处理顶层 scope。server-id 用 `<prefix>-<name>`(`cursor-`/`windsurf-`,与
-// `user-`/`local-`/`codex-` 命名空间不相交)。
+// (那是 Claude 专有),只处理顶层 scope。server-id 用 `<prefix>-<name>`(与 `user-`/`local-`/`codex-`
+// 命名空间不相交,前缀合法性由 [`JsonMcpAgent::new`] 门禁)。实例清单唯一来源 = [`all_json_mcp_agents`]。
 //
-// **范围**:Cursor + Windsurf —— 均为专用、安全可重写文件、零形态差异。Cline(globalStorage 路径随
+// **范围**:上述四家 —— 均为专用、安全可重写文件、零形态差异。Cline(globalStorage 路径随
 // VS Code 版本/fork 漂移 + 有删配置数据丢失史)、Zed(`context_servers` 键且嵌入共享 settings.json/JSONC)、
-// VS Code(`servers` 键 + 显式 `type`)形态/风险不同,留后续专门增量。
+// VS Code(`servers` 键 + 显式 `type`)形态/风险不同,留后续专门增量。ZCode(嵌套 `mcp.servers`
+// 键,GUI 管理的共享 `~/.zcode/cli/config.json`)**不走本通用管道** —— 已由下文独立专线覆盖
+// (契约 = 解包 vendor app.asar 实锤,见"ZCode 接入面"段)。Kimi 的 hook 面(`~/.kimi/config.toml`
+// `[[hooks]]`)**刻意不做**:Beta + 官方 fail-open(hook 超时/崩溃=放行),不满足 Vigil 强保护
+// 语义,等 GA 后独立评估。
 
-/// 一个"JSON `mcpServers` 形态"的 agent 接入面描述符(Cursor / Windsurf)。
+/// 生产环境变量快照(**注入式**):库函数绝不直接读 env —— 否则 fixture 测试会被开发机真实
+/// `CODEX_HOME`/`PI_AGENT_DIR` 污染,apply 类测试甚至可能误写真实配置。main/quickstart 生产
+/// 入口取一次后传引用;测试用 `AgentEnv::default()`(全 None = 全默认路径)或注入 fixture 值。
+#[derive(Debug, Clone, Default)]
+pub struct AgentEnv {
+    /// `CODEX_HOME`(Codex 配置根;`None` = 默认 `~/.codex`)。
+    pub codex_home: Option<String>,
+    /// pi 的 agent 配置目录(`None` = 默认 `~/.pi/agent`)。取自 `PI_CODING_AGENT_DIR`
+    /// (pi-mcp-adapter 文档对 mcp.json 点名的变量)或 `PI_AGENT_DIR`(pi 本体文档),前者优先。
+    pub pi_agent_dir: Option<String>,
+}
+
+impl AgentEnv {
+    /// 读真实进程环境(**仅生产调用点**;库/测试路径绝不调用)。
+    pub fn from_process_env() -> Self {
+        AgentEnv {
+            codex_home: std::env::var("CODEX_HOME").ok(),
+            pi_agent_dir: std::env::var("PI_CODING_AGENT_DIR")
+                .ok()
+                .or_else(|| std::env::var("PI_AGENT_DIR").ok()),
+        }
+    }
+}
+
+/// 一个"JSON `mcpServers` 形态"的 agent 接入面描述符(Cursor / Windsurf / Kimi / pi)。
 #[derive(Debug, Clone)]
 pub struct JsonMcpAgent {
     /// 人类可读名(报告/预览用)。
     pub display_name: &'static str,
     /// 配置文件绝对路径(已注入 home → 测试可指向 fixture,绝不碰真实用户配置)。
     pub config_path: PathBuf,
-    /// server-id 前缀(`cursor` / `windsurf`)。
+    /// server-id 前缀(`cursor` / `windsurf` / `kimi` / `pi`)。
     pub id_prefix: &'static str,
 }
 
 impl JsonMcpAgent {
+    /// 受校验构造器(所有预置构造器的唯一落点):`id_prefix` 必须非空、全 `[a-z0-9]`
+    /// (禁 `-`/`_`:防与 [`server_id_component`] 的 `-` 分隔产生歧义,并保持与既有前缀同形),
+    /// 且不得撞 `user`/`local`/`codex` 保留命名空间 —— 撞了 = 共享账本跨 agent 身份塌缩,
+    /// descriptor pin 与审批串号(review 2026-07-17 HIGH-3)。前缀是编译期字面量,违规属编程
+    /// bug → fail-fast panic;registry invariant 测试再兜跨实例唯一性(单实例校验查不了重复)。
+    fn new(display_name: &'static str, config_path: PathBuf, id_prefix: &'static str) -> Self {
+        assert!(
+            !id_prefix.is_empty()
+                && id_prefix
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "JsonMcpAgent id_prefix must be non-empty [a-z0-9]+: {id_prefix:?}"
+        );
+        assert!(
+            !matches!(id_prefix, "user" | "local" | "codex"),
+            "JsonMcpAgent id_prefix collides with a reserved namespace: {id_prefix:?}"
+        );
+        JsonMcpAgent {
+            display_name,
+            config_path,
+            id_prefix,
+        }
+    }
     /// Cursor:`~/.cursor/mcp.json`(user scope;项目级 `<repo>/.cursor/mcp.json` 是独立提交文件,不碰)。
     pub fn cursor(home: &Path) -> Self {
-        JsonMcpAgent {
-            display_name: "Cursor",
-            config_path: home.join(".cursor").join("mcp.json"),
-            id_prefix: "cursor",
-        }
+        Self::new("Cursor", home.join(".cursor").join("mcp.json"), "cursor")
     }
     /// Windsurf:`~/.codeium/windsurf/mcp_config.json`(唯一 scope —— Windsurf 无项目级 MCP 配置)。
     pub fn windsurf(home: &Path) -> Self {
-        JsonMcpAgent {
-            display_name: "Windsurf",
-            config_path: home
-                .join(".codeium")
+        Self::new(
+            "Windsurf",
+            home.join(".codeium")
                 .join("windsurf")
                 .join("mcp_config.json"),
-            id_prefix: "windsurf",
-        }
+            "windsurf",
+        )
     }
-    /// 派生 server-id:`<prefix>-<name>`(与 `user-`/`local-`/`codex-` 命名空间不相交)。
-    /// 名经 [`server_id_component`] 规约(合法名原样;非法字符 slug + 哈希),前缀全在
-    /// `^[a-z0-9_-]+$` 字符集内,拼接后必合法。
-    fn server_id(&self, name: &str) -> String {
-        format!("{}-{}", self.id_prefix, server_id_component(name))
+    /// Kimi CLI(Moonshot):`~/.kimi/mcp.json`(官方文档核实 2026-07;标准顶层 `mcpServers`,
+    /// stdio `command`/`args`/`env` + 远程 `url`/`headers` —— 远程条目由 classify 诚实 Skip)。
+    pub fn kimi(home: &Path) -> Self {
+        Self::new("Kimi CLI", home.join(".kimi").join("mcp.json"), "kimi")
     }
+    /// pi(badlogic/pi-mono)**经 pi-mcp-adapter**:`$PI_AGENT_DIR/mcp.json`(默认 `~/.pi/agent/`)。
+    /// pi 本体**设计上无内置 MCP**;该文件是官方 MCP extension 示例与 pi-mcp-adapter 共同的
+    /// Pi-global 约定(标准顶层 `mcpServers`)。文件不存在 = 没装 adapter / 没配 MCP → 诚实
+    /// `exists:false`,绝不创建。产品文案点名 pi-mcp-adapter,不宣传"pi 原生 MCP"。自定义
+    /// agent dir 不并入 server-id(与 `CODEX_HOME` 自定义时 `codex-` 前缀不变的既有决策一致)。
+    pub fn pi(home: &Path, pi_agent_dir_env: Option<&str>) -> Self {
+        let dir = crate::setup_hooks::resolve_agent_dir(home, pi_agent_dir_env, || {
+            home.join(".pi").join("agent")
+        });
+        Self::new("pi", dir.join("mcp.json"), "pi")
+    }
+    /// 派生 server-id(经 [`json_agent_server_id`],preview 渲染与 apply 落盘同源)。
+    pub fn server_id(&self, name: &str) -> String {
+        json_agent_server_id(self.id_prefix, name)
+    }
+}
+
+/// JSON-agent 面 server-id 派生 SSOT:`<prefix>-<组件>`。preview 渲染与 apply 落盘**必须**同走
+/// 本函数 —— 此前 main.rs 预览手拼 `{prefix}-{name}`,名含大写/空格时与 apply 的 slug+hash 规约
+/// 不一致,预览展示错误甚至非法 id(review 2026-07-17 MED-6,F-4 的漏网点)。
+pub fn json_agent_server_id(prefix: &str, name: &str) -> String {
+    format!("{prefix}-{}", server_id_component(name))
+}
+
+/// 全部"JSON `mcpServers` 形态" agent 的**唯一清单**(SSOT)。status / doctor / preview / apply /
+/// uninstall / quickstart 一律遍历本函数 —— 此前 Cursor/Windsurf 在 4 处各自硬编码,新增 agent
+/// 漏一处即该功能的覆盖缺口(review 2026-07-17 MED-2)。**新增同形态 agent 只改这里**
+/// (registry invariant 测试自动覆盖新条目)。`env` 注入式(生产 [`AgentEnv::from_process_env`])。
+pub fn all_json_mcp_agents(home: &Path, env: &AgentEnv) -> Vec<JsonMcpAgent> {
+    vec![
+        JsonMcpAgent::cursor(home),
+        JsonMcpAgent::windsurf(home),
+        JsonMcpAgent::kimi(home),
+        JsonMcpAgent::pi(home, env.pi_agent_dir.as_deref()),
+    ]
 }
 
 /// JSON-agent 接入面的只读预览报告。
@@ -1344,7 +1613,10 @@ pub fn run_json_agent_preview(
 ) -> Result<JsonAgentPreviewReport, SetupError> {
     let cfg = read_claude_json(&agent.config_path)?;
     let (exists, servers) = match cfg {
-        Some(v) => (true, classify_user_scope_servers(&v)),
+        Some(v) => {
+            ensure_mcp_root_shape(&v, &agent.config_path)?; // 类型错绝不静默当"无 server"
+            (true, classify_user_scope_servers(&v))
+        }
         None => (false, Vec::new()),
     };
     Ok(JsonAgentPreviewReport {
@@ -1367,7 +1639,10 @@ pub fn run_json_agent_apply(
     monitor: bool,
 ) -> Result<JsonAgentApplyReport, SetupError> {
     let cfg = match read_claude_json(&agent.config_path)? {
-        Some(v) => v,
+        Some(v) => {
+            ensure_mcp_root_shape(&v, &agent.config_path)?; // 类型错的根形状绝不改写
+            v
+        }
         None => {
             return Ok(JsonAgentApplyReport {
                 display_name: agent.display_name,
@@ -1408,7 +1683,10 @@ pub fn run_json_agent_uninstall(
     dry_run: bool,
 ) -> Result<JsonAgentApplyReport, SetupError> {
     let cfg = match read_claude_json(&agent.config_path)? {
-        Some(v) => v,
+        Some(v) => {
+            ensure_mcp_root_shape(&v, &agent.config_path)?; // 读不懂的形状绝不声称"还原了 0 个"
+            v
+        }
         None => {
             return Ok(JsonAgentApplyReport {
                 display_name: agent.display_name,
@@ -1436,6 +1714,202 @@ pub fn run_json_agent_uninstall(
     Ok(JsonAgentApplyReport {
         display_name: agent.display_name,
         config_path: agent.config_path.clone(),
+        changed,
+        dry_run,
+        backup,
+    })
+}
+
+// ============================ ZCode 接入面(`~/.zcode/cli/config.json`,嵌套 `mcp.servers`) ============================
+//
+// ZCode(Z.ai 的 GLM 桌面 Agentic IDE)把 **用户级** MCP server 存在共享设置文件
+// `~/.zcode/cli/config.json` 的 **`mcp.servers`** 嵌套键下(非顶层 `mcpServers`,故不走
+// [`JsonMcpAgent`] 通用管道,单独一条与 Codex-TOML 并列的专线)。**契约来源 = vendor shipped
+// code**(2026-07-17 对 ZCode 3.3.6 安装包解包 app.asar 核实,非仅第三方博客):
+// - 路径:`resolveUserHomeDir()`(HOME→USERPROFILE→homedir)+ `[".zcode","cli"]/config.json`;
+//   GUI 的新增/编辑**始终写回** `.zcode`(workspace 级 `<ws>/.zcode/config.json` 是项目内文件,
+//   与 Cursor 项目级同决策 —— 不碰;`~/.agents/mcp.json` 兼容层是共享标准文件,defer,见下)。
+// - 读:`readServerMapFromJson`:`cfg.mcp.servers`,非 object 静默 `{}`(ZCode 自身容错;Vigil 侧
+//   仍按 abort-on-unexpected 纪律,存在但类型错 → 拒绝,绝不静默当 0)。
+// - 写:`saveMcpToUserDirectory` 是 **read-modify-write**(每次先重读文件再改单个 server),
+//   故 Vigil wrap 后 ZCode 保存**其它** server 不会覆掉 wrap;运行中编辑**同一** server 才会
+//   (用户显式行为)。风险模型与 Claude Code 并发写 claude.json 同构 → 同款缓解:用户须关闭
+//   ZCode 再 `--apply`(TOCTOU stamp + 备份兜底)。
+// - 条目:map value 原样存储,禁用时**附加** `enabled: false` 键(启用时删除该键)——
+//   [`classify_one`] 的 clone-保留-未知字段纪律天然兼容,`enabled:false` 条目照常 wrap
+//   (ZCode 仍视其为禁用;wrap 不改变 enabled 语义)。
+// - **已知边界(诚实声明)**:ZCode 在 `.zcode` 无任何条目时 fallback 读 `~/.agents/mcp.json`
+//   (共享标准文件,多宿主消费)。wrap 共享文件有跨宿主身份塌缩问题(单一 `zcode-` 前缀对
+//   非 ZCode 宿主是错误身份)→ 本增量不碰它;只用 `.zcode` 配置的用户(GUI 用户的默认形态)
+//   获得完整保护。
+//
+// 复用与 Claude/Codex/JSON-agent 完全相同的安全机制:[`classify_one`](全部护栏)、
+// [`wrapped_argv`]/[`unwrap_entry`](wrap/反解 SSOT)、[`wrap_servers_object`]/
+// [`unwrap_servers_object`](批量改写,仅 server-id 派生器不同)、
+// `atomic_write_with_backup`(原子写 + 备份 + preserve_order)。ZCode 专属的只有
+// "嵌套键取放"这一层。server-id 前缀 `zcode-`(与 `user-`/`local-`/`codex-` 及
+// JSON-agent registry 各前缀可证不相交,见 registry invariant 测试)。
+
+/// ZCode 用户级 MCP 配置路径(`~/.zcode/cli/config.json`)。
+pub fn zcode_config_path(home: &Path) -> PathBuf {
+    home.join(".zcode").join("cli").join("config.json")
+}
+
+/// 为 ZCode 条目派生 server-id:`zcode-<组件>`(命名空间与其它面不相交)。
+pub fn zcode_scope_server_id(name: &str) -> String {
+    format!("zcode-{}", server_id_component(name))
+}
+
+/// 校验 ZCode 配置的 MCP 根形状:根 object;`mcp` **存在则必须** object;`mcp.servers`
+/// **存在则必须** object。键不存在 = 未配置(合法)。类型错 → abort(与
+/// [`ensure_mcp_root_shape`] 同纪律 —— ZCode 自身对类型错静默 `{}`,Vigil 绝不效仿:
+/// 静默 = 配置在场却完全不受保护且无信号)。
+pub fn ensure_zcode_root_shape(cfg: &Value, path: &Path) -> Result<(), SetupError> {
+    let bad = |field: &'static str| {
+        Err(SetupError::UnsupportedConfigShape {
+            path: path.to_path_buf(),
+            field,
+        })
+    };
+    if !cfg.is_object() {
+        return bad("<root>");
+    }
+    match cfg.get("mcp") {
+        None => Ok(()),
+        Some(mcp) => {
+            let Some(mcp_obj) = mcp.as_object() else {
+                return bad("mcp");
+            };
+            match mcp_obj.get("servers") {
+                None => Ok(()),
+                Some(v) if v.is_object() => Ok(()),
+                Some(_) => bad("mcp.servers"),
+            }
+        }
+    }
+}
+
+/// 取 `mcp.servers` 嵌套 map(只读)。缺省 → `None` = 无可保护项(形状异常由
+/// [`ensure_zcode_root_shape`] 在调用方先拦)。
+fn zcode_servers_obj(cfg: &Value) -> Option<&serde_json::Map<String, Value>> {
+    cfg.get("mcp")?.get("servers")?.as_object()
+}
+fn zcode_servers_obj_mut(cfg: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    cfg.get_mut("mcp")?.get_mut("servers")?.as_object_mut()
+}
+
+/// 读真实 ZCode 配置(IO 边界)→ 枚举 + 分类,产出只读预览(复用 [`JsonAgentPreviewReport`]
+/// 结构;`id_prefix = "zcode"` 供渲染层派生与 apply 一致的 server-id)。**不写任何东西**。
+pub fn run_zcode_preview(
+    home: &Path,
+    exe: &str,
+    monitor: bool,
+) -> Result<JsonAgentPreviewReport, SetupError> {
+    let path = zcode_config_path(home);
+    let cfg = read_claude_json(&path)?; // 同款"读 + 解析 JSON"管道(大小上限/损坏 abort)
+    let (exists, servers) = match cfg {
+        Some(v) => {
+            ensure_zcode_root_shape(&v, &path)?;
+            let servers = zcode_servers_obj(&v)
+                .map(|m| {
+                    m.iter()
+                        .map(|(name, entry)| classify_one(name, entry))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (true, servers)
+        }
+        None => (false, Vec::new()),
+    };
+    Ok(JsonAgentPreviewReport {
+        display_name: "ZCode",
+        config_path: path,
+        exists,
+        exe: exe.to_string(),
+        servers,
+        monitor,
+        id_prefix: "zcode",
+    })
+}
+
+/// `setup --mcp --apply`(ZCode 面):读 → wrap `mcp.servers` 全部 Wrappable → 原子写。
+/// `dry_run` 只算不写。**用户须关闭 ZCode 后再 apply**(见模块 doc 的并发风险声明)。
+pub fn run_zcode_apply(
+    home: &Path,
+    exe: &str,
+    dry_run: bool,
+    monitor: bool,
+) -> Result<JsonAgentApplyReport, SetupError> {
+    let path = zcode_config_path(home);
+    let cfg = match read_claude_json(&path)? {
+        Some(v) => {
+            ensure_zcode_root_shape(&v, &path)?;
+            v
+        }
+        None => {
+            return Ok(JsonAgentApplyReport {
+                display_name: "ZCode",
+                config_path: path,
+                changed: 0,
+                dry_run,
+                backup: None,
+            })
+        }
+    };
+    let stamp = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let mut new_cfg = cfg.clone();
+    let changed = zcode_servers_obj_mut(&mut new_cfg)
+        .map(|servers| wrap_servers_object(servers, exe, monitor, zcode_scope_server_id))
+        .unwrap_or(0);
+    let backup = if !dry_run && changed > 0 {
+        crate::setup::atomic_write_with_backup(&path, &new_cfg, stamp)?
+    } else {
+        None
+    };
+    Ok(JsonAgentApplyReport {
+        display_name: "ZCode",
+        config_path: path,
+        changed,
+        dry_run,
+        backup,
+    })
+}
+
+/// `setup --mcp --uninstall`(ZCode 面):读 → self-describing 还原全部 Vigil 托管条目 → 原子写。
+pub fn run_zcode_uninstall(home: &Path, dry_run: bool) -> Result<JsonAgentApplyReport, SetupError> {
+    let path = zcode_config_path(home);
+    let cfg = match read_claude_json(&path)? {
+        Some(v) => {
+            ensure_zcode_root_shape(&v, &path)?;
+            v
+        }
+        None => {
+            return Ok(JsonAgentApplyReport {
+                display_name: "ZCode",
+                config_path: path,
+                changed: 0,
+                dry_run,
+                backup: None,
+            })
+        }
+    };
+    let stamp = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let mut new_cfg = cfg.clone();
+    let changed = zcode_servers_obj_mut(&mut new_cfg)
+        .map(unwrap_servers_object)
+        .unwrap_or(0);
+    let backup = if !dry_run && changed > 0 {
+        crate::setup::atomic_write_with_backup(&path, &new_cfg, stamp)?
+    } else {
+        None
+    };
+    Ok(JsonAgentApplyReport {
+        display_name: "ZCode",
+        config_path: path,
         changed,
         dry_run,
         backup,
@@ -1655,14 +2129,18 @@ fn config_error_doctor_row(agent_label: &str, path: &Path, err: &SetupError) -> 
     }
 }
 
-/// 把一个 JSON-`mcpServers` agent(Cursor/Windsurf)顶层 server 逐个产出 doctor 行,追加到 `rows`。
-/// 配置不存在 → 无行(用户未用该 agent);读失败 → 一条 `ConfigError` 行(不 abort,计入失败)。`scope`=agent 名。
+/// 把一个 JSON-`mcpServers` agent(registry 内任一家)顶层 server 逐个产出 doctor 行,追加到 `rows`。
+/// 配置不存在 → 无行(用户未用该 agent);读失败**或根形状异常** → 一条 `ConfigError` 行
+/// (不 abort,计入失败 —— 形状异常同样意味着"server 可能在但 doctor 看不见")。`scope`=agent 名。
 fn append_json_agent_doctor_rows(
     agent: &JsonMcpAgent,
     probe_timeout: Option<Duration>,
     rows: &mut Vec<McpDoctorRow>,
 ) {
-    match read_claude_json(&agent.config_path) {
+    match read_claude_json(&agent.config_path).and_then(|cfg| match cfg {
+        Some(v) => ensure_mcp_root_shape(&v, &agent.config_path).map(|()| Some(v)),
+        None => Ok(None),
+    }) {
         Ok(Some(cfg)) => {
             if let Some(servers) = cfg.get("mcpServers").and_then(Value::as_object) {
                 for (name, entry) in servers {
@@ -1679,14 +2157,43 @@ fn append_json_agent_doctor_rows(
     }
 }
 
-/// Codex(TOML)doctor 行:每个 `mcp_servers` 条目桥接成 JSON(`item_to_json`)后复用 `doctor_row`。
-fn append_codex_doctor_rows(
+/// ZCode(嵌套 `mcp.servers`)doctor 行:逐条复用 `doctor_row`。读失败**或根形状异常** →
+/// `ConfigError` 行(不 abort,计入失败)。`scope`="ZCode"。
+fn append_zcode_doctor_rows(
     home: &Path,
     probe_timeout: Option<Duration>,
     rows: &mut Vec<McpDoctorRow>,
 ) {
-    let path = codex_config_path(home);
-    match read_codex_config(&path) {
+    let path = zcode_config_path(home);
+    match read_claude_json(&path).and_then(|cfg| match cfg {
+        Some(v) => ensure_zcode_root_shape(&v, &path).map(|()| Some(v)),
+        None => Ok(None),
+    }) {
+        Ok(Some(cfg)) => {
+            if let Some(servers) = zcode_servers_obj(&cfg) {
+                for (name, entry) in servers {
+                    rows.push(doctor_row(name, "ZCode", entry, probe_timeout));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => rows.push(config_error_doctor_row("ZCode", &path, &e)),
+    }
+}
+
+/// Codex(TOML)doctor 行:每个 `mcp_servers` 条目桥接成 JSON(`item_to_json`)后复用 `doctor_row`。
+/// 读失败**或根形状异常**(存在但非 table-like)→ `ConfigError` 行(不 abort,计入失败)。
+fn append_codex_doctor_rows(
+    home: &Path,
+    codex_home_env: Option<&str>,
+    probe_timeout: Option<Duration>,
+    rows: &mut Vec<McpDoctorRow>,
+) {
+    let path = codex_config_path(home, codex_home_env);
+    match read_codex_config(&path).and_then(|doc| match doc {
+        Some(d) => ensure_codex_root_shape(&d, &path).map(|()| Some(d)),
+        None => Ok(None),
+    }) {
         Ok(Some(doc)) => {
             if let Some(servers) = codex_servers_table(&doc) {
                 for (name, item) in servers.iter() {
@@ -1704,8 +2211,9 @@ fn append_codex_doctor_rows(
     }
 }
 
-/// `setup --mcp --doctor`:对**所有** agent 接入面(Claude user+local / Codex / Cursor / Windsurf)的
-/// 每个 MCP server 做启动预检 —— 兑现"turnkey wrap 之后,所有 agent 的 server 是否还能起"。
+/// `setup --mcp --doctor`:对**所有** agent 接入面(Claude user+local / Codex / 全部
+/// [`all_json_mcp_agents`] registry)的每个 MCP server 做启动预检 —— 兑现"turnkey wrap 之后,
+/// 所有 agent 的 server 是否还能起"。
 ///
 /// `probe_timeout`:
 /// - `None`(默认 `--doctor`):**纯静态**(只验 `resolve_program` PATH 可解析,不 spawn,无副作用/无延迟)。
@@ -1718,11 +2226,15 @@ fn append_codex_doctor_rows(
 /// 一条诚实 Skipped 行,不 abort(读-only 健康检查应能跨 agent 看全,不因一个坏配置全瞎)。
 pub fn run_doctor(
     home: &Path,
+    env: &AgentEnv,
     probe_timeout: Option<Duration>,
 ) -> Result<Vec<McpDoctorRow>, SetupError> {
     let mut rows = Vec::new();
-    // Claude(~/.claude.json):user + local scope。malformed → abort(既有契约)。缺失 → 跳过(仍查其它 agent)。
-    if let Some(cfg) = read_claude_json(&claude_json_path(home))? {
+    // Claude(~/.claude.json):user + local scope。malformed / 根形状异常 → abort(既有契约)。
+    // 缺失 → 跳过(仍查其它 agent)。
+    let claude_path = claude_json_path(home);
+    if let Some(cfg) = read_claude_json(&claude_path)? {
+        ensure_mcp_root_shape(&cfg, &claude_path)?;
         if let Some(servers) = cfg.get("mcpServers").and_then(Value::as_object) {
             for (name, entry) in servers {
                 rows.push(doctor_row(name, "user", entry, probe_timeout));
@@ -1738,9 +2250,11 @@ pub fn run_doctor(
             }
         }
     }
-    // 其余 agent 面(best-effort,各自独立文件):Codex(TOML)+ Cursor + Windsurf(JSON)。
-    append_codex_doctor_rows(home, probe_timeout, &mut rows);
-    for agent in [JsonMcpAgent::cursor(home), JsonMcpAgent::windsurf(home)] {
+    // 其余 agent 面(best-effort,各自独立文件):Codex(TOML)+ ZCode(嵌套键)+ 全部
+    // JSON-agent registry。
+    append_codex_doctor_rows(home, env.codex_home.as_deref(), probe_timeout, &mut rows);
+    append_zcode_doctor_rows(home, probe_timeout, &mut rows);
+    for agent in all_json_mcp_agents(home, env) {
         append_json_agent_doctor_rows(&agent, probe_timeout, &mut rows);
     }
     Ok(rows)
@@ -1983,10 +2497,11 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let u = unresolvable_wrappables(home);
+        let u = unresolvable_wrappables(home, &AgentEnv::default());
         assert!(
-            u.iter().any(|(n, _)| n == "badprog"),
-            "missing program must be flagged, got {:?}",
+            u.iter()
+                .any(|(label, n, _)| label == "Claude Code" && n == "badprog"),
+            "missing program must be flagged with its agent label, got {:?}",
             u
         );
     }
@@ -2080,8 +2595,478 @@ mod tests {
     fn no_mcp_servers_yields_empty() {
         assert!(classify_user_scope_servers(&json!({})).is_empty());
         assert!(classify_user_scope_servers(&json!({"mcpServers": {}})).is_empty());
-        // mcpServers 形状异常(数组而非对象)→ 容错空,不 panic
+        // mcpServers 形状异常(数组而非对象):classify 纯函数层容错空、不 panic ——
+        // 但 IO 入口(run_preview/apply/uninstall 等)已先经 ensure_mcp_root_shape **abort**,
+        // 生产路径绝不把类型错静默当"无 server"(见 mcp_root_shape_type_error_aborts)。
         assert!(classify_user_scope_servers(&json!({"mcpServers": []})).is_empty());
+    }
+
+    #[test]
+    fn mcp_root_shape_type_error_aborts() {
+        // review 2026-07-17 MED-1:`mcpServers` **存在但类型错** → 所有 IO 入口 abort
+        // (UnsupportedConfigShape),绝不静默当"没有 server"(fail-open)。键不存在仍是合法未配置。
+        let p = Path::new("/x/.claude.json");
+        assert!(ensure_mcp_root_shape(&json!({}), p).is_ok());
+        assert!(ensure_mcp_root_shape(&json!({"mcpServers": {}}), p).is_ok());
+        for bad in [
+            json!({"mcpServers": []}),
+            json!({"mcpServers": "oops"}),
+            json!({"mcpServers": 3}),
+            json!([1, 2]),
+            json!({"projects": "oops"}),
+            json!({"projects": {"/p": {"mcpServers": []}}}),
+        ] {
+            assert!(
+                matches!(
+                    ensure_mcp_root_shape(&bad, p),
+                    Err(SetupError::UnsupportedConfigShape { .. })
+                ),
+                "type-broken root shape must abort, got Ok for {bad}"
+            );
+        }
+        // IO 入口真接线(fixture):preview / apply / uninstall 全部 abort,文件一字不动。
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        let raw = json!({"mcpServers": []}).to_string();
+        std::fs::write(home.join(".claude.json"), &raw).unwrap();
+        assert!(run_preview(home, "vigil-hub", true).is_err());
+        assert!(run_apply(home, "vigil-hub", false, false, true).is_err());
+        assert!(run_uninstall(home, false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(home.join(".claude.json")).unwrap(),
+            raw,
+            "aborted run must leave the file byte-identical"
+        );
+        // JSON-agent 面同纪律。
+        std::fs::create_dir_all(home.join(".cursor")).unwrap();
+        std::fs::write(home.join(".cursor").join("mcp.json"), &raw).unwrap();
+        let agent = JsonMcpAgent::cursor(home);
+        assert!(run_json_agent_preview(&agent, "vigil-hub", true).is_err());
+        assert!(run_json_agent_apply(&agent, "vigil-hub", false, true).is_err());
+        assert!(run_json_agent_uninstall(&agent, false).is_err());
+    }
+
+    #[test]
+    fn codex_root_shape_type_error_aborts_and_inline_table_is_supported() {
+        // review 2026-07-17 MED-1(Codex 侧):`mcp_servers` 存在但非 table-like → abort;
+        // 内联表 `mcp_servers = {..}` 是合法 TOML,**必须**被枚举(此前被静默当 0 项 = 漏保护)。
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        let p = home.join(".codex").join("config.toml");
+        // 非 table-like → abort。
+        std::fs::write(&p, "mcp_servers = 3\n").unwrap();
+        assert!(run_codex_preview(home, None, "vigil-hub", true).is_err());
+        assert!(run_codex_apply(home, None, "vigil-hub", false, true).is_err());
+        // 内联表 → 正常枚举 + wrap。
+        std::fs::write(
+            &p,
+            "mcp_servers = { fs = { command = \"npx\", args = [\"-y\", \"srv\"] } }\n",
+        )
+        .unwrap();
+        let prev = run_codex_preview(home, None, "vigil-hub", true).unwrap();
+        assert_eq!(prev.wrappable_count(), 1, "inline table must be enumerated");
+        let rep = run_codex_apply(home, None, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 1, "inline-table entry must be wrappable");
+        let after = std::fs::read_to_string(&p).unwrap();
+        assert!(after.contains("--vigil-managed-mcp"), "wrapped: {after}");
+    }
+
+    #[test]
+    fn managed_wrap_grammar_is_symmetric_between_classify_and_unwrap() {
+        // review 2026-07-17 HIGH-2:classify 说 AlreadyWrapped ⟺ unwrap 能反解(同一 grammar)。
+        // 反例 1:sentinel 不紧邻 `--`(手改插参)→ 不是 AlreadyWrapped,unwrap 也是 None
+        //(此前 classify 认、unwrap 不认 → status 报已保护而 uninstall 还原不了 = 假托管态)。
+        let drifted = json!({"command": "vigil-hub",
+            "args": ["wrap", "--server-id", "x", "--vigil-managed-mcp", "EXTRA", "--", "npx", "y"]});
+        assert!(
+            !matches!(
+                classify_one("d", &drifted),
+                McpServerClass::AlreadyWrapped { .. }
+            ),
+            "sentinel not adjacent to `--` must NOT classify as AlreadyWrapped"
+        );
+        assert!(unwrap_entry(&drifted).is_none());
+        // 反例 2:第三方条目伪造 sentinel(command 非 vigil-hub、args[0]=="wrap"、sentinel 不邻 --)
+        // → 当普通 server 正常保护(不再因自带标记逃逸 wrap)。
+        let forged = json!({"command": "third-party-tool",
+            "args": ["wrap", "--vigil-managed-mcp", "X", "--", "npx", "srv"]});
+        assert!(
+            matches!(classify_one("f", &forged), McpServerClass::Wrappable { .. }),
+            "forged marker with drifted grammar must stay Wrappable, got {:?}",
+            classify_one("f", &forged)
+        );
+        // 正例:Vigil 真实产出的 wrap(sentinel 恒紧邻 --)→ 两边都认,往返成立。
+        let argv = wrapped_argv("vigil-hub", "user-x", "npx", &["y".into()], &[], true);
+        let real = json!({"command": argv[0],
+            "args": argv[1..].iter().map(|s| json!(s)).collect::<Vec<_>>()});
+        assert!(matches!(
+            classify_one("r", &real),
+            McpServerClass::AlreadyWrapped { .. }
+        ));
+        let restored = unwrap_entry(&real).expect("real wrap must unwrap");
+        assert_eq!(restored.get("command").unwrap(), "npx");
+    }
+
+    #[test]
+    fn wrap_status_reports_config_error_not_zero() {
+        // review 2026-07-17 MED-4:配置存在但损坏 → status 三态里是 ConfigError,绝不折叠成 0。
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        std::fs::create_dir_all(home.join(".cursor")).unwrap();
+        std::fs::write(home.join(".cursor").join("mcp.json"), "{not json").unwrap();
+        let counts = wrapped_server_counts_all_agents(home, &AgentEnv::default());
+        let cursor = counts
+            .iter()
+            .find(|(n, _)| *n == "Cursor")
+            .expect("Cursor row");
+        assert_eq!(
+            cursor.1,
+            AgentWrapStatus::ConfigError,
+            "broken config must be ConfigError, not Wrapped(0)"
+        );
+        // 类型错的根形状同样 ConfigError(shape 校验一致过门)。
+        std::fs::create_dir_all(home.join(".kimi")).unwrap();
+        std::fs::write(
+            home.join(".kimi").join("mcp.json"),
+            json!({"mcpServers": []}).to_string(),
+        )
+        .unwrap();
+        let counts = wrapped_server_counts_all_agents(home, &AgentEnv::default());
+        let kimi = counts
+            .iter()
+            .find(|(n, _)| *n == "Kimi CLI")
+            .expect("Kimi row");
+        assert_eq!(kimi.1, AgentWrapStatus::ConfigError);
+        // 未配置(无文件)仍是 Wrapped(0):与"配置坏了"可区分。
+        let pi = counts.iter().find(|(n, _)| *n == "pi").expect("pi row");
+        assert_eq!(pi.1, AgentWrapStatus::Wrapped(0));
+    }
+
+    #[test]
+    fn json_agent_registry_invariants() {
+        // review 2026-07-17 HIGH-3 + MED-2:registry 是唯一清单 —— 前缀/显示名/路径必须两两不同,
+        // 前缀必须过构造器门禁(字符集 + 非保留)。**动态遍历** registry,新增 agent 自动被覆盖。
+        let home = Path::new("/h");
+        let env = AgentEnv {
+            codex_home: None,
+            pi_agent_dir: None,
+        };
+        let agents = all_json_mcp_agents(home, &env);
+        assert!(agents.len() >= 4, "cursor/windsurf/kimi/pi expected");
+        for a in &agents {
+            assert!(
+                !a.id_prefix.is_empty()
+                    && a.id_prefix
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "prefix charset: {}",
+                a.id_prefix
+            );
+            assert!(
+                !matches!(a.id_prefix, "user" | "local" | "codex"),
+                "reserved namespace: {}",
+                a.id_prefix
+            );
+        }
+        for i in 0..agents.len() {
+            for j in (i + 1)..agents.len() {
+                assert_ne!(agents[i].id_prefix, agents[j].id_prefix, "prefix dup");
+                assert_ne!(
+                    agents[i].display_name, agents[j].display_name,
+                    "display dup"
+                );
+                assert_ne!(
+                    agents[i].config_path, agents[j].config_path,
+                    "config path dup"
+                );
+            }
+        }
+        // 关键成员在场(专项守门:漏加 = 该 agent 全链路无保护)。
+        let prefixes: Vec<&str> = agents.iter().map(|a| a.id_prefix).collect();
+        for want in ["cursor", "windsurf", "kimi", "pi"] {
+            assert!(prefixes.contains(&want), "registry must contain {want}");
+        }
+    }
+
+    #[test]
+    fn preview_and_apply_server_id_agree_for_awkward_names() {
+        // review 2026-07-17 MED-6:非法字符名(大写/空格)时 preview 与 apply 的 id 派生必须同源。
+        let agent = JsonMcpAgent::cursor(Path::new("/h"));
+        for name in ["Playwright", "My Server", "纯中文"] {
+            assert_eq!(
+                agent.server_id(name),
+                json_agent_server_id("cursor", name),
+                "preview(json_agent_server_id) and apply(JsonMcpAgent::server_id) must agree"
+            );
+        }
+        // 合法名逐字保留(向后兼容既有账本身份)。
+        assert_eq!(agent.server_id("fs"), "cursor-fs");
+    }
+
+    #[test]
+    fn kimi_and_pi_paths_and_env_override() {
+        // C1/C2 接入契约:kimi 固定 ~/.kimi/mcp.json;pi 默认 ~/.pi/agent/mcp.json,
+        // 自定义 agent dir(PI_CODING_AGENT_DIR/PI_AGENT_DIR 注入)重定向,`~/` 展开到 home。
+        let home = Path::new("/h");
+        assert_eq!(
+            JsonMcpAgent::kimi(home).config_path,
+            home.join(".kimi").join("mcp.json")
+        );
+        assert_eq!(
+            JsonMcpAgent::pi(home, None).config_path,
+            home.join(".pi").join("agent").join("mcp.json")
+        );
+        assert_eq!(
+            JsonMcpAgent::pi(home, Some("/custom/pi")).config_path,
+            Path::new("/custom/pi").join("mcp.json")
+        );
+        assert_eq!(
+            JsonMcpAgent::pi(home, Some("~/mypi")).config_path,
+            home.join("mypi").join("mcp.json")
+        );
+        assert_eq!(
+            JsonMcpAgent::pi(home, Some("   ")).config_path,
+            home.join(".pi").join("agent").join("mcp.json"),
+            "blank env value falls back to default"
+        );
+    }
+
+    #[test]
+    fn kimi_wrap_roundtrip_and_pi_absent_is_honest_skip() {
+        // Kimi:官方文档形状 fixture(stdio + 远程混合)→ wrap 只动 stdio、远程 Skip;uninstall 还原。
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        std::fs::create_dir_all(home.join(".kimi")).unwrap();
+        let orig = json!({"mcpServers": {
+            "chrome-devtools": {"command": "npx", "args": ["chrome-devtools-mcp@latest"],
+                                 "env": {"SOME_VAR": "value"}},
+            "context7": {"url": "https://mcp.context7.com/mcp",
+                          "headers": {"CONTEXT7_API_KEY": "k"}}
+        }});
+        std::fs::write(home.join(".kimi").join("mcp.json"), orig.to_string()).unwrap();
+        let kimi = JsonMcpAgent::kimi(home);
+        let prev = run_json_agent_preview(&kimi, "vigil-hub", true).unwrap();
+        assert_eq!(prev.wrappable_count(), 1, "stdio wrappable, remote skipped");
+        let rep = run_json_agent_apply(&kimi, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 1);
+        let wrapped: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".kimi").join("mcp.json")).unwrap(),
+        )
+        .unwrap();
+        let entry = &wrapped["mcpServers"]["chrome-devtools"];
+        assert_eq!(entry["command"], "vigil-hub");
+        assert_eq!(entry["args"][2], "kimi-chrome-devtools", "kimi- namespace");
+        assert_eq!(
+            entry["env"]["SOME_VAR"], "value",
+            "env preserved verbatim on the entry"
+        );
+        assert_eq!(
+            wrapped["mcpServers"]["context7"]["url"], "https://mcp.context7.com/mcp",
+            "remote entry untouched"
+        );
+        // uninstall:self-describing 还原(语义等价)。
+        let rep2 = run_json_agent_uninstall(&kimi, false).unwrap();
+        assert_eq!(rep2.changed, 1);
+        let restored: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".kimi").join("mcp.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored["mcpServers"]["chrome-devtools"]["command"], "npx");
+        assert_eq!(
+            restored["mcpServers"]["chrome-devtools"]["args"][0],
+            "chrome-devtools-mcp@latest"
+        );
+        // pi:文件不存在 → exists:false + 0 改动 + **绝不创建**文件/目录。
+        let pi = JsonMcpAgent::pi(home, None);
+        let prev = run_json_agent_preview(&pi, "vigil-hub", true).unwrap();
+        assert!(!prev.exists);
+        let rep = run_json_agent_apply(&pi, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 0);
+        assert!(
+            !home.join(".pi").exists(),
+            "absent pi config must never be created"
+        );
+    }
+
+    #[test]
+    fn zcode_nested_key_wrap_roundtrip_preserves_enabled_and_other_settings() {
+        // ZCode 契约(2026-07-17 解包 3.3.6 app.asar 核实):`~/.zcode/cli/config.json` 是共享
+        // 设置文件,MCP 在 `mcp.servers` 嵌套键;禁用条目带 `enabled:false` 附加键。wrap 必须:
+        // 只动 `mcp.servers` 内条目的 command/args;enabled 与文件内其它设置逐字保留;可逆。
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        std::fs::create_dir_all(home.join(".zcode").join("cli")).unwrap();
+        let orig = json!({
+            "theme": "dark",
+            "mcp": {
+                "servers": {
+                    "memory": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"]},
+                    "disabled-one": {"command": "npx", "args": ["srv"], "enabled": false},
+                    "remote": {"url": "https://example.com/mcp"}
+                },
+                "otherMcpSetting": 42
+            }
+        });
+        let p = zcode_config_path(home);
+        std::fs::write(&p, orig.to_string()).unwrap();
+
+        let prev = run_zcode_preview(home, "vigil-hub", true).unwrap();
+        assert!(prev.exists);
+        assert_eq!(prev.id_prefix, "zcode");
+        assert_eq!(
+            prev.wrappable_count(),
+            2,
+            "stdio(含 disabled)可保护,remote Skip"
+        );
+
+        let rep = run_zcode_apply(home, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 2);
+        let wrapped: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(wrapped["theme"], "dark", "非 MCP 设置逐字保留");
+        assert_eq!(wrapped["mcp"]["otherMcpSetting"], 42, "mcp 下其它键保留");
+        let mem = &wrapped["mcp"]["servers"]["memory"];
+        assert_eq!(mem["command"], "vigil-hub");
+        assert_eq!(mem["args"][2], "zcode-memory", "zcode- namespace");
+        assert_eq!(
+            wrapped["mcp"]["servers"]["disabled-one"]["enabled"], false,
+            "enabled:false 附加键逐字保留(wrap 不改变禁用语义)"
+        );
+        assert_eq!(
+            wrapped["mcp"]["servers"]["remote"]["url"], "https://example.com/mcp",
+            "远程条目不动"
+        );
+        // 幂等:再 apply 不二次 wrap。
+        let rep_again = run_zcode_apply(home, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep_again.changed, 0, "already wrapped must be idempotent");
+        // uninstall 还原。
+        let rep2 = run_zcode_uninstall(home, false).unwrap();
+        assert_eq!(rep2.changed, 2);
+        let restored: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(restored["mcp"]["servers"]["memory"]["command"], "npx");
+        assert_eq!(
+            restored["mcp"]["servers"]["disabled-one"]["enabled"], false,
+            "还原后 enabled 仍在"
+        );
+        assert_eq!(restored["theme"], "dark");
+    }
+
+    #[test]
+    fn zcode_shape_errors_abort_and_missing_is_honest_skip() {
+        // `mcp` / `mcp.servers` 存在但类型错 → abort(ZCode 自身静默 {},Vigil 绝不效仿);
+        // 文件不存在 → exists:false,绝不创建。
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        // 不存在:诚实跳过 + 不创建。
+        let prev = run_zcode_preview(home, "vigil-hub", true).unwrap();
+        assert!(!prev.exists);
+        assert_eq!(
+            run_zcode_apply(home, "vigil-hub", false, true)
+                .unwrap()
+                .changed,
+            0
+        );
+        assert!(
+            !home.join(".zcode").exists(),
+            "must never create the config"
+        );
+        // 类型错:abort 且文件一字不动。
+        std::fs::create_dir_all(home.join(".zcode").join("cli")).unwrap();
+        let p = zcode_config_path(home);
+        for bad in [
+            json!({"mcp": "oops"}).to_string(),
+            json!({"mcp": {"servers": []}}).to_string(),
+            json!({"mcp": {"servers": "x"}}).to_string(),
+        ] {
+            std::fs::write(&p, &bad).unwrap();
+            assert!(run_zcode_preview(home, "vigil-hub", true).is_err());
+            assert!(run_zcode_apply(home, "vigil-hub", false, true).is_err());
+            assert!(run_zcode_uninstall(home, false).is_err());
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), bad, "file untouched");
+        }
+        // `mcp` 键缺省 = 未配置,合法(0 项,不报错)。
+        std::fs::write(&p, json!({"theme": "dark"}).to_string()).unwrap();
+        let prev = run_zcode_preview(home, "vigil-hub", true).unwrap();
+        assert!(prev.exists);
+        assert_eq!(prev.servers.len(), 0);
+        // doctor / counts 覆盖 ZCode 面。
+        std::fs::write(
+            &p,
+            json!({"mcp": {"servers": {"zz": {"command": "npx", "args": []}}}}).to_string(),
+        )
+        .unwrap();
+        let rows = run_doctor(home, &AgentEnv::default(), None).unwrap();
+        assert!(
+            rows.iter().any(|r| r.scope == "ZCode" && r.name == "zz"),
+            "doctor must cover the ZCode surface"
+        );
+        let counts = wrapped_server_counts_all_agents(home, &AgentEnv::default());
+        assert!(
+            counts.iter().any(|(n, _)| *n == "ZCode"),
+            "status must include the ZCode row"
+        );
+        // zcode- 前缀与 registry 各前缀 + 保留命名空间不相交(身份塌缩守门)。
+        let env = AgentEnv::default();
+        for a in all_json_mcp_agents(Path::new("/h"), &env) {
+            assert_ne!(
+                a.id_prefix, "zcode",
+                "zcode prefix reserved for the ZCode lane"
+            );
+        }
+        assert_eq!(
+            zcode_scope_server_id("My Srv"),
+            json_agent_server_id("zcode", "My Srv"),
+            "zcode id derivation must share the same component normalization"
+        );
+    }
+
+    #[test]
+    fn codex_home_env_redirects_all_codex_surfaces() {
+        // review 2026-07-17 HIGH-1 守门:自定义 CODEX_HOME 时,MCP 面(preview/apply/doctor/counts)
+        // 与 hook 面读写**同一**目录 —— 此前 MCP 面固定 ~/.codex,自定义用户全部 server 漏保护。
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        let custom = home.join("custom-codex-home");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            custom.join("config.toml"),
+            "[mcp_servers.fs]\ncommand = \"npx\"\nargs = [\"-y\", \"srv\"]\n",
+        )
+        .unwrap();
+        let env_val = custom.to_string_lossy().to_string();
+        // 路径解析一致(hook 面 SSOT)。
+        assert_eq!(
+            codex_config_path(home, Some(&env_val)),
+            custom.join("config.toml")
+        );
+        // 默认 home 下没有配置:不带 env → 未配置;带 env → 找到并可保护。
+        assert!(
+            !run_codex_preview(home, None, "vigil-hub", true)
+                .unwrap()
+                .exists
+        );
+        let prev = run_codex_preview(home, Some(&env_val), "vigil-hub", true).unwrap();
+        assert!(prev.exists);
+        assert_eq!(prev.wrappable_count(), 1);
+        let rep = run_codex_apply(home, Some(&env_val), "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 1);
+        // doctor / counts 同样读自定义目录。
+        let env = AgentEnv {
+            codex_home: Some(env_val.clone()),
+            pi_agent_dir: None,
+        };
+        let rows = run_doctor(home, &env, None).unwrap();
+        assert!(
+            rows.iter().any(|r| r.scope == "Codex" && r.name == "fs"),
+            "doctor must see the custom CODEX_HOME server"
+        );
+        let counts = wrapped_server_counts_all_agents(home, &env);
+        assert!(
+            counts
+                .iter()
+                .any(|(n, st)| *n == "Codex" && *st == AgentWrapStatus::Wrapped(1)),
+            "status must count the wrapped server under custom CODEX_HOME, got {counts:?}"
+        );
     }
 
     #[test]
@@ -2691,7 +3676,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = run_doctor(home, None).unwrap();
+        let rows = run_doctor(home, &AgentEnv::default(), None).unwrap();
         let by = |n: &str| &rows.iter().find(|r| r.name == n).unwrap().status;
         assert!(
             matches!(by("good"), DoctorStatus::Launchable { .. }),
@@ -2728,7 +3713,7 @@ mod tests {
             json!({ "mcpServers": { "fs": wrapped } }).to_string(),
         )
         .unwrap();
-        let rows = run_doctor(home, None).unwrap();
+        let rows = run_doctor(home, &AgentEnv::default(), None).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].wrapped, "应识别为 Vigil 托管");
         assert!(
@@ -2740,7 +3725,9 @@ mod tests {
     #[test]
     fn run_doctor_empty_when_no_config() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(run_doctor(dir.path(), None).unwrap().is_empty());
+        assert!(run_doctor(dir.path(), &AgentEnv::default(), None)
+            .unwrap()
+            .is_empty());
     }
 
     // ──────────────── D18 --probe:可 spawn argv+env 提取(纯函数,无 spawn) ────────────────
@@ -3061,7 +4048,7 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
         fs::write(&cfg, original).unwrap();
 
         // apply(monitor 姿态)
-        let rep = run_codex_apply(home, "vigil-hub", false, true).unwrap();
+        let rep = run_codex_apply(home, None, "vigil-hub", false, true).unwrap();
         assert_eq!(rep.changed, 1);
         assert!(rep.backup.is_some(), "写盘应留备份");
         let wrapped = fs::read_to_string(&cfg).unwrap();
@@ -3092,7 +4079,7 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
         assert!(fargs.iter().any(|a| a == "codex-filesystem"));
 
         // uninstall → 逐字还原
-        let rep2 = run_codex_uninstall(home, false).unwrap();
+        let rep2 = run_codex_uninstall(home, None, false).unwrap();
         assert_eq!(rep2.changed, 1);
         let restored = fs::read_to_string(&cfg).unwrap();
         let rdoc = restored.parse::<DocumentMut>().unwrap();
@@ -3128,13 +4115,13 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
         .unwrap();
 
         assert_eq!(
-            run_codex_apply(home, "vigil-hub", false, true)
+            run_codex_apply(home, None, "vigil-hub", false, true)
                 .unwrap()
                 .changed,
             1
         );
         assert_eq!(
-            run_codex_apply(home, "vigil-hub", false, true)
+            run_codex_apply(home, None, "vigil-hub", false, true)
                 .unwrap()
                 .changed,
             0,
@@ -3154,7 +4141,7 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
         let before = fs::read_to_string(&cfg).unwrap();
 
         assert!(matches!(
-            run_codex_apply(home, "vigil-hub", false, true),
+            run_codex_apply(home, None, "vigil-hub", false, true),
             Err(SetupError::MalformedConfig { .. })
         ));
         assert_eq!(
@@ -3169,10 +4156,14 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
     fn codex_no_config_is_noop() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        let rep = run_codex_apply(home, "vigil-hub", false, true).unwrap();
+        let rep = run_codex_apply(home, None, "vigil-hub", false, true).unwrap();
         assert_eq!(rep.changed, 0);
         assert!(rep.backup.is_none());
-        assert!(!run_codex_preview(home, "vigil-hub", true).unwrap().exists);
+        assert!(
+            !run_codex_preview(home, None, "vigil-hub", true)
+                .unwrap()
+                .exists
+        );
     }
 
     /// 非法 server 名(含大写 / 点)→ Wrappable(F-4 修订:id 经 slug 化派生,不再要求用户改名)。
@@ -3428,7 +4419,7 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
     /// doctor 现在覆盖全部 4 个 agent 面:Claude / Codex / Cursor / Windsurf 的 server 都进 doctor 行,
     /// 各带正确 scope 标签;底层程序存在 → 全 Launchable。
     #[test]
-    fn doctor_covers_all_four_agents() {
+    fn doctor_covers_all_agents() {
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
@@ -3465,13 +4456,29 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
             json!({"mcpServers": {"ws": {"command": real_str, "args": []}}}).to_string(),
         )
         .unwrap();
+        // Kimi CLI(JSON)
+        fs::create_dir_all(home.join(".kimi")).unwrap();
+        fs::write(
+            home.join(".kimi").join("mcp.json"),
+            json!({"mcpServers": {"km": {"command": real_str, "args": []}}}).to_string(),
+        )
+        .unwrap();
+        // pi(JSON,pi-mcp-adapter 约定路径)
+        fs::create_dir_all(home.join(".pi").join("agent")).unwrap();
+        fs::write(
+            home.join(".pi").join("agent").join("mcp.json"),
+            json!({"mcpServers": {"pp": {"command": real_str, "args": []}}}).to_string(),
+        )
+        .unwrap();
 
-        let rows = run_doctor(home, None).unwrap();
+        let rows = run_doctor(home, &AgentEnv::default(), None).unwrap();
         let scope_of = |n: &str| rows.iter().find(|r| r.name == n).map(|r| r.scope.as_str());
         assert_eq!(scope_of("cl"), Some("user"), "Claude user scope");
         assert_eq!(scope_of("cx"), Some("Codex"));
         assert_eq!(scope_of("cu"), Some("Cursor"));
         assert_eq!(scope_of("ws"), Some("Windsurf"));
+        assert_eq!(scope_of("km"), Some("Kimi CLI"));
+        assert_eq!(scope_of("pp"), Some("pi"));
         assert!(
             rows.iter()
                 .all(|r| matches!(r.status, DoctorStatus::Launchable { .. })),
@@ -3493,7 +4500,7 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
              args = [\"wrap\", \"--server-id\", \"codex-cx\", \"--vigil-managed-mcp\", \"--\", \"definitely-not-a-real-prog-xyz789\", \"x\"]\n",
         )
         .unwrap();
-        let rows = run_doctor(home, None).unwrap();
+        let rows = run_doctor(home, &AgentEnv::default(), None).unwrap();
         let cx = rows.iter().find(|r| r.name == "cx").unwrap();
         assert_eq!(cx.scope, "Codex");
         assert!(cx.wrapped, "应识别为 Vigil 托管");
@@ -3522,7 +4529,7 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
         fs::create_dir_all(home.join(".cursor")).unwrap();
         fs::write(home.join(".cursor").join("mcp.json"), "}{ not json").unwrap();
 
-        let rows = run_doctor(home, None).unwrap(); // 不 abort
+        let rows = run_doctor(home, &AgentEnv::default(), None).unwrap(); // 不 abort
         assert!(
             rows.iter().any(|r| r.name == "cl" && r.scope == "user"),
             "Claude 行仍在"
@@ -3551,7 +4558,7 @@ args = ["wrap", "--server-id", "codex-already", "--vigil-managed-mcp", "--", "np
         let home = dir.path();
         fs::write(home.join(".claude.json"), "}{ broken").unwrap();
         assert!(matches!(
-            run_doctor(home, None),
+            run_doctor(home, &AgentEnv::default(), None),
             Err(SetupError::MalformedConfig { .. })
         ));
     }
