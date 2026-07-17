@@ -9,6 +9,7 @@
 //! **立即 ack**,真 classify + risk bump 在后台线程(**R4** 非阻塞;ort 暖载分类器时生效,否则 no-op)。
 
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use vigil_audit::Ledger;
@@ -138,17 +139,63 @@ pub fn handle_connection<S: Read + Write>(stream: &mut S, caps: &DaemonCaps) {
     }
 }
 
-/// server accept 循环:每连接 spawn [`handle_connection`](thread-per-conn,简化;bounded 后续)。
+/// **F2**:并发连接上限。合法客户端均为毫秒级 one-shot(hook 瘦客户端/native-host probe/status),
+/// 64 远超真实并发;超限连接**立即丢弃** → 客户端读 EOF → fail-closed 降级硬指纹(绝不 fail-open,
+/// 也绝不阻塞 agent)。上限的意义:卡死/僵持连接(如半开 socket)至多占满上限,不再无界耗线程。
+const MAX_ACTIVE_CONNECTIONS: usize = 64;
+
+/// **F2**:并发注入 classify 推理上限。fire-and-forget 软信号(dispatch 已先 ack),满员**丢弃**
+/// —— 软信号缺位不破 fail-safe(hook 正则元指令兜底),但推理线程不再随请求速率无界累积。
+#[cfg(feature = "ort")]
+const MAX_ACTIVE_CLASSIFIES: usize = 8;
+
+/// 占坑守门:`fetch_add` 抢坑(返回旧值),满员则退坑返 `false`。抽纯函数进默认测试矩阵
+/// (真并发路径由下方真 socket e2e 覆盖)。非热路径 → 取最强 `SeqCst` 免推理内存序。
+fn acquire_slot(counter: &AtomicUsize, max: usize) -> bool {
+    if counter.fetch_add(1, Ordering::SeqCst) >= max {
+        counter.fetch_sub(1, Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+
+/// server accept 循环:每连接 spawn [`handle_connection`](thread-per-conn + **F2 上限门**)。
 /// 原居 transport 层;随 transport 抽至 `vigil-daemon-ipc`(纯客户端)后归位服务端本模块。
+///
+/// 坑位回收主路径 = **EOF**(one-shot 客户端进程退出 → OS 关 socket → `read_frame` 得 EOF →
+/// handler 返回 → 退坑)。诚实边界:同用户进程连上后保持静默可占坑至上限(彼时新连接全降级
+/// 硬指纹底座)—— 同用户恶意在威胁模型外(其本可直接 kill daemon),上限管的是**意外**无界增长。
 pub fn serve(listener: interprocess::local_socket::Listener, caps: DaemonCaps) {
+    serve_with_limit(listener, caps, MAX_ACTIVE_CONNECTIONS)
+}
+
+/// [`serve`] 的可注入上限版(供真 socket e2e 用小上限验证满员丢弃 + EOF 回收)。
+fn serve_with_limit(listener: interprocess::local_socket::Listener, caps: DaemonCaps, max: usize) {
     use interprocess::local_socket::prelude::*;
+
+    // RAII 退坑:handler 即便 panic(设计上不会,均以 return 收尾)也不漏坑。
+    struct SlotGuard(Arc<AtomicUsize>);
+    impl Drop for SlotGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let mut stream = match conn {
             Ok(s) => s,
             Err(_) => continue,
         };
+        if !acquire_slot(&active, max) {
+            continue; // 满员:drop(stream) → 客户端 EOF → fail-closed 降级硬指纹
+        }
+        let guard = SlotGuard(Arc::clone(&active));
         let caps = caps.clone();
-        std::thread::spawn(move || handle_connection(&mut stream, &caps));
+        std::thread::spawn(move || {
+            let _guard = guard;
+            handle_connection(&mut stream, &caps);
+        });
     }
 }
 
@@ -197,20 +244,33 @@ fn dispatch(req: &Request, caps: &DaemonCaps) -> Response {
 
 /// `ClassifyInjection` 的真处理(**R4 非阻塞**):spawn 后台线程做 ort classify → [`maybe_bump_injection`]。
 /// dispatch 已先 ack,故 hook 不等 classify(~数十 ms 推理不阻塞工具调用)。无分类器/无 ledger → 跳过。
+/// **F2**:并发推理坑位满([`MAX_ACTIVE_CLASSIFIES`])→ 丢弃本次(软信号缺位不破 fail-safe),
+/// 推理线程不随请求速率无界累积。
 #[cfg(feature = "ort")]
 fn spawn_classify_injection(caps: &DaemonCaps, session_id: &str, text: &str) {
     let (Some(inj), Some(ledger)) = (caps.injection.as_ref(), caps.ledger.as_ref()) else {
         return; // 无分类器或无 ledger → 无法出/落信号(软信号缺位不破 fail-safe)
     };
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    if !acquire_slot(&ACTIVE, MAX_ACTIVE_CLASSIFIES) {
+        return; // 满员丢弃:软信号损失,绝不累积推理线程
+    }
     let inj = Arc::clone(inj);
     let ledger = Arc::clone(ledger);
     let sid = session_id.to_string();
     let text = text.to_string();
     std::thread::spawn(move || {
+        // RAII 退坑(classify panic 也不漏坑;推理失败 = 无信号,hook 正则元指令仍兜底)。
+        struct ClassifyGuard;
+        impl Drop for ClassifyGuard {
+            fn drop(&mut self) {
+                ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _guard = ClassifyGuard;
         if let Ok(score) = inj.classify(&text) {
             maybe_bump_injection(&ledger, &sid, score);
         }
-        // 推理失败 = 无信号(软信号缺位不破 fail-safe;hook 正则元指令仍兜底)。
     });
 }
 
@@ -236,7 +296,9 @@ mod tests {
     use super::super::protocol::{
         read_frame, write_frame, Hello, Request, Response, ScanKind, PROTOCOL_VERSION,
     };
-    use super::{handle_connection, maybe_bump_injection, DaemonCaps, INJECTION_RISK_DELTA};
+    use super::{
+        acquire_slot, handle_connection, maybe_bump_injection, DaemonCaps, INJECTION_RISK_DELTA,
+    };
     use std::io::{Cursor, Read, Write};
     use std::sync::Arc;
     use vigil_audit::Ledger;
@@ -574,5 +636,80 @@ mod tests {
                 .is_none(),
             "错 token → 服务端 Error → None"
         );
+    }
+
+    // ── F2 并发上限门 ──
+
+    #[test]
+    fn acquire_slot_gates_at_max_and_recovers_on_release() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = AtomicUsize::new(0);
+        assert!(acquire_slot(&counter, 2), "空坑 → 抢到");
+        assert!(acquire_slot(&counter, 2), "第 2 坑 → 抢到");
+        assert!(!acquire_slot(&counter, 2), "满员 → 拒");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "拒后计数退坑还原(不虚占)"
+        );
+        counter.fetch_sub(1, Ordering::SeqCst); // 模拟一个 handler 结束退坑
+        assert!(acquire_slot(&counter, 2), "释放后 → 又能抢到");
+    }
+
+    /// 裸连接(不握手不发帧):占住一个 handler 坑位,模拟卡死/僵持客户端。
+    fn raw_connect(sock: &str) -> interprocess::local_socket::Stream {
+        use interprocess::local_socket::prelude::*;
+        #[cfg(target_os = "macos")]
+        let name = sock
+            .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+            .unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let name = sock
+            .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
+            .unwrap();
+        interprocess::local_socket::Stream::connect(name).unwrap()
+    }
+
+    #[test]
+    fn connection_cap_drops_overflow_then_recovers_on_eof() {
+        // F2 真 socket e2e:上限 2 → 两个静默连接占满 → 第 3 连接被丢弃(客户端 fail-closed
+        // None,非挂起)→ 释放一个静默连接(EOF 回收)→ 查询恢复成功。
+        let sock = unique_sock("cap");
+        let caps = DaemonCaps {
+            token: "cap-token".to_string(),
+            scanner: None,
+            ledger: None,
+            #[cfg(feature = "ort")]
+            injection: None,
+            pii_loaded: false,
+            inj_loaded: false,
+            started: std::time::Instant::now(),
+        };
+        let listener = crate::daemon::transport::bind(&sock).unwrap();
+        std::thread::spawn(move || super::serve_with_limit(listener, caps, 2));
+
+        // 占满两坑(accept 顺序 = 连接顺序,坑位在 accept 循环内即被占,先于第 3 连接被接受)。
+        let idle_a = raw_connect(&sock);
+        let idle_b = raw_connect(&sock);
+
+        let info = info_for(&sock, "cap-token");
+        assert!(
+            crate::daemon::transport::query_with(&info, &Request::Status).is_none(),
+            "满员 → 第 3 连接被立即丢弃 → fail-closed None(绝不 fail-open / 挂起)"
+        );
+
+        drop(idle_a); // EOF → handler 返回 → 退坑
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let recovered = loop {
+            if crate::daemon::transport::query_with(&info, &Request::Status).is_some() {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(recovered, "EOF 释放坑位后查询应恢复成功");
+        drop(idle_b);
     }
 }
