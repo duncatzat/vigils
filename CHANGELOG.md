@@ -8,7 +8,7 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
-## [Unreleased]
+## [v0.6.0-beta.4] — 2026-07-17 — macOS Intel (x86_64) builds
 
 ### Added
 
