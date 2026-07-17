@@ -1496,7 +1496,9 @@ impl JsonMcpAgent {
             "JsonMcpAgent id_prefix must be non-empty [a-z0-9]+: {id_prefix:?}"
         );
         assert!(
-            !matches!(id_prefix, "user" | "local" | "codex"),
+            // `zcode` 由嵌套键专线用 [`zcode_scope_server_id`] 派生,与 JsonMcpAgent 同属共享账本
+            // 命名空间 —— 一并保留,防未来 JsonMcpAgent::new(_, _, "zcode") 与 ZCode 面 server-id 塌缩。
+            !matches!(id_prefix, "user" | "local" | "codex" | "zcode"),
             "JsonMcpAgent id_prefix collides with a reserved namespace: {id_prefix:?}"
         );
         JsonMcpAgent {
