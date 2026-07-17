@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-guardian-status"
+description = "Enables the guardian_status command without any pre-configured scope."
+commands.allow = ["guardian_status"]
+
+[[permission]]
+identifier = "deny-guardian-status"
+description = "Denies the guardian_status command without any pre-configured scope."
+commands.deny = ["guardian_status"]

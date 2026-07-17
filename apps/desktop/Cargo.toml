@@ -1,23 +1,24 @@
 [package]
 name = "vigil-desktop"
+publish = false  # 非 SDK publish set(app / wasmtime / http / sandbox)— 不上 crates.io;cargo-deny path-dep wildcard 守门
+# autobins = false + 单 [[bin]] gui:desktop crate 只产 GUI 二进制,杜绝双 bin 歧义。
+# 双 bin(CLI vigil-desktop + GUI gui)会让 `cargo tauri build` 误把 CLI 打成 GUI 包
+# (v0.1.2 灾难;default-run / bin-name 都不足以纠正 —— 公开仓最终靠删 CLI bin 根治,
+# 见 [[feedback_tauri_single_bin]])。autobins=false 阻止 src/main.rs 被自动发现为 bin;
+# CLI 源文件保留(可逆),仅不参与构建。CLI 能力已归入 vigil-hub inspect 等。
+autobins = false
+default-run = "vigils"  # tauri build 靠此认主二进制(单 bin 下无歧义;bin 名品牌一致 = vigils.exe)
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-# 包内唯一 bin 是 vigils;default-run 让裸 `cargo run` 指向它,明确"主二进制 = vigils"。
-# (v0.1.1 曾用此修 WiX ICE30 多-bin 重复组件;v0.1.2 移除 CLI bin 后包内仅 1 bin,保留更清晰。)
-# v0.1.5:bin 由 `gui` 改名 `vigils` —— 安装后可执行文件/进程名从不知所云的 `gui.exe`
-# 变为品牌一致的 `vigils.exe`(productName 仍 "Vigils";macOS 仍 Vigils.app)。
-default-run = "vigils"
 
 [lints]
 workspace = true
 
-# 包内唯一 bin = GUI(Tauri;feature `gui` 门控,默认关闭 —— `cargo test --workspace` 不编)。
-# v0.1.2:原 `vigil-desktop` CLI bin(src/main.rs)已移除,"命令行查账本"能力整合进
-# `vigil-hub inspect`。原因:desktop 包含第二个 bin 时,`cargo tauri build`(内部
-# `cargo build --bins`)会把它误打进安装包替换真正的 GUI(v0.1.0/v0.1.1 桌面包损坏根因)。
+# GUI bin(Tauri;feature 门控,默认关闭 —— `cargo test --workspace` 不编)
+# desktop crate 仅此一个 bin(autobins=false 阻止 src/main.rs CLI 自动成 bin)。
 # v0.11 ISS-102/103/104:bin name 对齐 path basename,Tauri v2 bundle 默认查
 # `target/release/<path-basename>` 复制 binary;name == path basename == mainBinaryName
 # 三者一致(均 `vigils`)让 bundle 找得到。raw build 用 `--bin vigils --features gui`。
@@ -30,8 +31,8 @@ required-features = ["gui"]
 name = "vigil_desktop"
 path = "src/lib.rs"
 
-# feature matrix:
-# - 默认(无 feature):仅 lib(CLI dispatch/render 消费层),零 Tauri 依赖,cargo test --workspace 零 regression
+# I08b feature matrix:
+# - 默认(无 feature):纯 CLI,零 Tauri 依赖,cargo test --workspace 零 regression
 # - `gui`:启用 Tauri 2 GUI binary(拉 ~200 transitive crates,仅 `cargo tauri dev` 或
 #   `cargo build --features gui` 时触发);v0.5 P1 ADR 0014 α1 起额外拉 vigil-mcp /
 #   vigil-firewall / vigil-policy(embed Hub 骨架)。三者全部 optional + dep:* 门控,
@@ -41,6 +42,7 @@ default = []
 gui = [
     "dep:tauri",
     "dep:tauri-build",
+    "dep:tauri-plugin-single-instance",
     "dep:tokio",
     "dep:dirs",
     "dep:vigil-mcp",
@@ -58,9 +60,10 @@ gui = [
 vigil-types = { path = "../../crates/vigil-types" }
 vigil-ui-protocol = { path = "../../crates/vigil-ui-protocol" }
 vigil-audit = { path = "../../crates/vigil-audit" }
-# 浏览器防线卡(Protection Overview):直调 native host 注册状态(install::status,只读)。
-vigil-native-host = { path = "../native-host" }
 vigil-runner = { path = "../../crates/vigil-runner", default-features = false }
+# 扩展体系 Phase 2「策略+观测」:Protection Overview 浏览器防线卡直调 install::status
+# (注册态,纯文件/注册表只读)—— 复用 host 自身的路径推导,不 shell、不解析人类文本。
+vigil-native-host = { path = "../native-host" }
 # v0.5 P1 ADR 0014 α1:GUI bin embed Hub 骨架(默认关闭;features = ["gui"] 拉)。
 # `vigil-firewall.default-features = false`:防默认拉 ort feature(ISS-008 P2 模型路径,
 # 启动 ~7s cold-start;GUI α1 无需 PiiScanner=ort,Firewall::new 走 NoopEngine)。
@@ -77,16 +80,24 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 
 # I08b(feature `gui`):Tauri 2 GUI 栈,optional 避免默认拉
-tauri = { version = "2", optional = true, default-features = false, features = ["wry"] }
+tauri = { version = "2", optional = true, default-features = false, features = ["wry", "tray-icon"] }
+# 单实例守卫(多开根治):再次启动唤起首实例主窗口而非起新进程。optional,仅 gui feature 拉。
+tauri-plugin-single-instance = { version = "2", optional = true }
 tokio = { workspace = true, optional = true }
 # β5:用户数据目录解析(跨平台);仅 gui feature 需要,运行时定位 ledger 持久化路径
 dirs = { version = "6", optional = true }
-# ML 引擎变体安装(gui):下载(ureq/rustls)+ 解包(flate2/tar/zip 按魔数嗅探)+ 签名引擎清单验签
-# (minisign-verify + base64 解 Tauri 包装的 .sig)。全纯 Rust,无 C 依赖;仅 gui feature 拉。
+# ③ 引擎自动下载(gui):缺 vigil-hub 时从发布镜像拉取。轻量 blocking HTTP(rustls)。
 ureq = { version = "2", optional = true, default-features = false, features = ["tls"] }
+# ③.5 ML 引擎变体安装(gui):解包发布的 `vigil-cli-ml-*.tar.gz`(--features ort 的 vigil-hub +
+# 同目录 ONNX Runtime dylib)。flate2 已在 workspace lock(纯 Rust miniz_oxide 后端,无 C 工具链);
+# tar 纯 Rust。仅 gui feature 拉,默认硬指纹分发零痕迹。
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
+# 真公开 Windows ML 资产是 .zip(Unix 是 .tar.gz)→ 解包器按魔数嗅探两种格式。
+# default-features=false + deflate(flate2/miniz,纯 Rust)→ 不拉 bzip2/zstd 等 C 依赖。
 zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
+# 签名引擎清单验签:复用 Tauri 更新器同款 minisign key 验发版期签名的 engine-manifest.json(SHA 信任锚)。
+# minisign-verify 纯 Rust 仅验签;base64 解 Tauri 包装的 .sig(其内容 = base64(标准 minisign 文本))。
 minisign-verify = { version = "0.2", optional = true }
 base64 = { version = "0.22", optional = true }
 
@@ -97,6 +108,6 @@ tauri-build = { version = "2", optional = true, default-features = false , featu
 tempfile = { workspace = true }
 vigil-lease = { path = "../../crates/vigil-lease" }
 rusqlite = { workspace = true }
-# 仅测试:测试内现造 minisign 风格预哈希签名,hermetic 验 verify_minisign(无外部工具/网络)。
+# 仅测试:在测试内现造 minisign 风格预哈希签名,hermetic 验证 verify_minisign(无外部工具/网络)。
 ed25519-dalek = "2"
 blake2 = "0.10"

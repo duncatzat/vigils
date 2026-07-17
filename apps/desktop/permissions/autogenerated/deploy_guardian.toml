@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-deploy-guardian"
+description = "Enables the deploy_guardian command without any pre-configured scope."
+commands.allow = ["deploy_guardian"]
+
+[[permission]]
+identifier = "deny-deploy-guardian"
+description = "Denies the deploy_guardian command without any pre-configured scope."
+commands.deny = ["deploy_guardian"]

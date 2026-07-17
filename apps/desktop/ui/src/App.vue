@@ -1,228 +1,289 @@
 <script setup lang="ts">
 /**
- * Vigils Desktop — App shell (原型图风格)。
+ * App shell — 指挥舱侧栏 + router-view。
  *
- * - 左侧图标 + 文字导航
- * - 顶栏: Logo / 页面标题 / 状态 pill / 语言选择
- * - 主题/语言详情进 Settings 页
+ * 安全契约(AGENTS.md + ADR 0008):
+ * - NConfigProvider 深色优先(darkTheme + 品牌 themeOverrides),对齐官网 vigils.ai 视觉
+ * - NDialogProvider + NMessageProvider 供子组件 useDialog / useMessage
+ * - 禁 v-html / innerHTML(ESLint rule 守门;<img> 为静态模板标记)
+ *
+ * UI 全改(2026-06 R2):官方品牌资产(logo + 22 徽记)替手画 SVG;IA 三层分组
+ * (Protection 家 / 监控 / 进阶);深色优先(撤 v0.14 三态 toggle,根治 theme bug)。
  */
 import {
   NConfigProvider,
+  NLayout,
+  NLayoutSider,
+  NMenu,
   NDialogProvider,
   NMessageProvider,
+  NButton,
   darkTheme,
-  lightTheme,
   zhCN,
   dateZhCN,
-  NSelect,
+  type GlobalThemeOverrides,
 } from "naive-ui";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
-import { computed, ref, onMounted, onUnmounted, type Component } from "vue";
+import { computed, h, ref, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
-import { useSettingsStore } from "@/stores/settings";
 import { useGlobalShortcuts } from "@/composables/useGlobalShortcuts";
 import ShortcutHelpModal from "@/components/ShortcutHelpModal.vue";
-
-const router = useRouter();
-
-import IconProtection from "@/components/icons/IconProtection.vue";
-import IconApprovals from "@/components/icons/IconApprovals.vue";
-import IconActivity from "@/components/icons/IconActivity.vue";
-import IconSessions from "@/components/icons/IconSessions.vue";
-import IconServers from "@/components/icons/IconServers.vue";
-import IconPrivacy from "@/components/icons/IconPrivacy.vue";
-import IconSandbox from "@/components/icons/IconSandbox.vue";
-import IconSettings from "@/components/icons/IconSettings.vue";
+import { LOGO, navEmblemIcon } from "@/brand";
+import { setLocale, SUPPORTED_LOCALES, type SupportedLocale } from "@/i18n";
 
 const route = useRoute();
-const { t } = useI18n();
-const settings = useSettingsStore();
+const router = useRouter();
+const { t, locale } = useI18n();
 
 // Naive UI 内建文案随 app locale(空表 "No Data"、分页等;null = 默认英文)。
-const naiveLocale = computed(() => (settings.locale === "zh-CN" ? zhCN : null));
-const naiveDateLocale = computed(() => (settings.locale === "zh-CN" ? dateZhCN : null));
-const helpOpen = ref(false);
-useGlobalShortcuts({ router, helpOpen });
+const naiveLocale = computed(() => (locale.value === "zh-CN" ? zhCN : null));
+const naiveDateLocale = computed(() => (locale.value === "zh-CN" ? dateZhCN : null));
 
-// Naive UI 主题跟随 settings.effectiveTheme(dark/light/system)
-const activeTheme = computed(() => (settings.effectiveTheme === "light" ? lightTheme : darkTheme));
+// 语言切换(zh-CN ↔ en-US 二态循环)
+function cycleLocale(): void {
+  const idx = SUPPORTED_LOCALES.findIndex((l) => l.code === locale.value);
+  const next = SUPPORTED_LOCALES[(idx + 1) % SUPPORTED_LOCALES.length];
+  setLocale(next.code as SupportedLocale);
+}
+const currentLocaleShort = computed(() => {
+  const entry = SUPPORTED_LOCALES.find((l) => l.code === locale.value);
+  return entry?.short ?? "EN";
+});
+const currentLocaleLabel = computed(() => {
+  const entry = SUPPORTED_LOCALES.find((l) => l.code === locale.value);
+  return entry?.label ?? "English";
+});
 
-const themeOverrides = computed(() => ({
+// 全局快捷键(g-chord 导航 / `/` 搜索 / `?` 帮助)
+const shortcutHelpOpen = ref(false);
+useGlobalShortcuts({ router, helpOpen: shortcutHelpOpen });
+
+// ─────────────── 深色优先:固定 darkTheme + 品牌 themeOverrides ───────────────
+const themeOverrides: GlobalThemeOverrides = {
   common: {
-    primaryColor: "#05D9E8",
-    primaryColorHover: "#67E8F9",
-    primaryColorPressed: "#04B6C2",
-    primaryColorSuppl: "#05D9E8",
-    infoColor: "#05D9E8",
-    infoColorHover: "#67E8F9",
-    successColor: "#00FF9D",
-    successColorHover: "#33FFB1",
-    warningColor: "#FACC15",
-    errorColor: "#FF2A6D",
-    errorColorHover: "#FF5589",
-    bodyColor: settings.isLight ? "#ffffff" : "#0B0B0F",
-    cardColor: settings.isLight ? "#f8fafc" : "#13131A",
-    modalColor: settings.isLight ? "#ffffff" : "#13131A",
-    popoverColor: settings.isLight ? "#ffffff" : "#13131A",
-    tableColor: settings.isLight ? "#ffffff" : "#13131A",
-    tableHeaderColor: settings.isLight ? "#f1f5f9" : "#1A1A24",
-    tagColor: settings.isLight ? "#e2e8f0" : "#1A1A24",
-    textColorBase: settings.isLight ? "#0f172a" : "#E2E8F0",
-    textColor1: settings.isLight ? "#0f172a" : "#E2E8F0",
-    textColor2: settings.isLight ? "#334155" : "#94a3b8",
-    textColor3: settings.isLight ? "#64748b" : "#64748B",
-    borderColor: settings.isLight ? "#e2e8f0" : "#1E1E28",
-    dividerColor: settings.isLight ? "#e2e8f0" : "#1E1E28",
+    primaryColor: "#05d9e8",
+    primaryColorHover: "#67e8f9",
+    primaryColorPressed: "#04b4c4",
+    primaryColorSuppl: "#05d9e8",
+    infoColor: "#05d9e8",
+    successColor: "#00ff9d",
+    warningColor: "#facc15",
+    errorColor: "#ff2a6d",
+    bodyColor: "#0a0a0f",
+    cardColor: "#111118",
+    modalColor: "#13131b",
+    popoverColor: "#1a1f2e",
+    tableHeaderColor: "#13131b",
+    inputColor: "rgba(255, 255, 255, 0.03)",
+    borderColor: "#232837",
+    dividerColor: "#232837",
+    textColorBase: "#e2e8f0",
+    textColor1: "#e2e8f0",
+    textColor2: "#cbd5e1",
+    textColor3: "#64748b",
+    borderRadius: "10px",
+    borderRadiusSmall: "8px",
+    fontFamily:
+      '"Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif',
+    fontFamilyMono:
+      'ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code", Consolas, monospace',
   },
-}));
-
-// system 模式下监听系统主题变化,实时切换
-let mediaQueryList: MediaQueryList | null = null;
-const onSystemThemeChange = (): void => {
-  if (settings.themeMode === "system") {
-    settings.applyTheme();
-  }
+  Menu: {
+    itemColorActive: "rgba(5, 217, 232, 0.10)",
+    itemColorActiveHover: "rgba(5, 217, 232, 0.16)",
+    itemColorActiveCollapsed: "rgba(5, 217, 232, 0.10)",
+    itemTextColorActive: "#05d9e8",
+    itemTextColorActiveHover: "#67e8f9",
+    itemTextColorHover: "#e2e8f0",
+    itemHeight: "42px",
+    borderRadius: "10px",
+  },
+  Layout: {
+    color: "transparent",
+    siderColor: "rgba(13, 16, 24, 0.62)",
+  },
 };
+
+// 菜单:Protection(家)+ 监控组 + 进阶组。icon = 官方徽记(每模块色辉光)。
+const menuOptions = computed(() => [
+  {
+    label: () => h(RouterLink, { to: "/protection" }, () => t("nav.protection")),
+    key: "protection",
+    icon: navEmblemIcon("protection"),
+  },
+  {
+    type: "group" as const,
+    key: "g-monitor",
+    label: t("nav.group_monitor"),
+    children: [
+      {
+        label: () => h(RouterLink, { to: "/approvals" }, () => t("nav.approvals")),
+        key: "approvals",
+        icon: navEmblemIcon("approvals"),
+      },
+      {
+        label: () => h(RouterLink, { to: "/activity" }, () => t("nav.activity")),
+        key: "activity",
+        icon: navEmblemIcon("activity"),
+      },
+      {
+        label: () => h(RouterLink, { to: "/privacy" }, () => t("nav.privacy")),
+        key: "privacy",
+        icon: navEmblemIcon("privacy"),
+      },
+    ],
+  },
+  {
+    type: "group" as const,
+    key: "g-advanced",
+    label: t("nav.group_advanced"),
+    children: [
+      {
+        label: () => h(RouterLink, { to: "/servers" }, () => t("nav.servers")),
+        key: "servers",
+        icon: navEmblemIcon("servers"),
+      },
+      {
+        label: () => h(RouterLink, { to: "/sessions" }, () => t("nav.sessions")),
+        key: "sessions",
+        icon: navEmblemIcon("sessions"),
+      },
+    ],
+  },
+  {
+    type: "group" as const,
+    key: "g-system",
+    label: t("nav.group_system"),
+    children: [
+      {
+        label: () => h(RouterLink, { to: "/settings" }, () => t("nav.settings")),
+        key: "settings",
+        icon: navEmblemIcon("settings"),
+      },
+    ],
+  },
+]);
+
+const selectedKey = computed(() => {
+  const name = (route.name as string | undefined) ?? "protection";
+  return name;
+});
+
 onMounted(() => {
-  if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
-    mediaQueryList = window.matchMedia("(prefers-color-scheme: dark)");
-    mediaQueryList.addEventListener("change", onSystemThemeChange);
-  }
+  document.documentElement.dataset.theme = "dark";
 });
-onUnmounted(() => {
-  if (mediaQueryList) {
-    mediaQueryList.removeEventListener("change", onSystemThemeChange);
-    mediaQueryList = null;
-  }
-});
-
-// 顶栏主题下拉选项
-const themeOptions = computed(() => [
-  { label: t("theme.dark"), value: "dark" },
-  { label: t("theme.light"), value: "light" },
-  { label: t("theme.system"), value: "system" },
-]);
-
-interface NavItem {
-  key: string;
-  name: string;
-  label: string;
-  icon: Component;
-}
-
-const navItems = computed<NavItem[]>(() => [
-  { key: "protection", name: "protection", label: t("nav.protection"), icon: IconProtection },
-  { key: "approvals", name: "approvals", label: t("nav.approvals"), icon: IconApprovals },
-  { key: "activity", name: "activity", label: t("nav.activity"), icon: IconActivity },
-  { key: "sessions", name: "sessions", label: t("nav.sessions"), icon: IconSessions },
-  { key: "servers", name: "servers", label: t("nav.servers"), icon: IconServers },
-  { key: "privacy", name: "privacy", label: t("nav.privacy"), icon: IconPrivacy },
-  { key: "sandbox", name: "sandbox", label: t("nav.sandbox"), icon: IconSandbox },
-  { key: "settings", name: "settings", label: t("nav.settings"), icon: IconSettings },
-]);
-
-const activeNav = computed(() => (route.name as string | undefined) ?? "protection");
-
-const pageTitle = computed(() => {
-  const metaTitle = route.meta.title as string | undefined;
-  return metaTitle ? t(metaTitle) : "Vigils";
-});
-
-const languageOptions = [
-  { label: "English", value: "en-US" },
-  { label: "中文", value: "zh-CN" },
-];
-
-function navClass(name: string): string {
-  const base =
-    "flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors duration-200";
-  if (activeNav.value === name) {
-    return `${base} bg-vigils-cyan/10 text-vigils-cyan border-l-2 border-vigils-cyan`;
-  }
-  return `${base} text-vigils-text-secondary hover:bg-vigils-bg-tertiary hover:text-vigils-text-primary`;
-}
 </script>
 
 <template>
   <NConfigProvider
-    :theme="activeTheme"
+    :theme="darkTheme"
     :theme-overrides="themeOverrides"
     :locale="naiveLocale"
     :date-locale="naiveDateLocale"
   >
     <NMessageProvider>
       <NDialogProvider>
-        <div class="flex h-screen bg-vigils-bg-page text-vigils-text-primary overflow-hidden">
-          <!-- Sidebar -->
-          <aside class="w-56 flex-shrink-0 flex flex-col bg-vigils-bg-deep border-r border-vigils-border">
-            <div class="h-14 flex items-center gap-3 px-5 border-b border-vigils-border">
-              <img src="/logo.png" alt="Vigils" class="h-8 w-8 rounded-lg object-contain" />
-              <span class="text-sm font-bold tracking-widest text-vigils-text-primary">VIGILS</span>
-            </div>
-
-            <nav class="flex-1 overflow-y-auto p-3 space-y-1">
-              <RouterLink
-                v-for="item in navItems"
-                :key="item.key"
-                :to="{ name: item.name }"
-                :class="navClass(item.name)"
-              >
-                <span class="flex items-center justify-center w-5 h-5">
-                  <component :is="item.icon" />
-                </span>
-                <span>{{ item.label }}</span>
-              </RouterLink>
-            </nav>
-          </aside>
-
-          <!-- Main -->
-          <main class="flex-1 flex flex-col min-w-0 bg-vigils-bg-page">
-            <header
-              class="h-14 flex items-center justify-between px-6 border-b border-vigils-border bg-vigils-bg-deep/50 backdrop-blur"
-            >
-              <h1 class="text-base font-semibold text-vigils-text-primary">{{ pageTitle }}</h1>
-
-              <div class="flex items-center gap-4">
-                <!-- Status pill -->
-                <div
-                  class="flex items-center gap-2 px-3 py-1 rounded-full border border-vigils-border bg-vigils-bg-panel text-xs font-medium text-vigils-cyan"
-                >
-                  <span class="w-1.5 h-1.5 rounded-full bg-vigils-cyan animate-pulse" />
-                  <span class="uppercase tracking-wider">{{ t(`settings.posture_${settings.defaultPosture}_label`) }}</span>
-                </div>
-
-                <!-- Theme selector -->
-                <NSelect
-                  :value="settings.themeMode"
-                  :options="themeOptions"
-                  size="small"
-                  style="width: 90px;"
-                  @update:value="settings.setTheme"
-                />
-
-                <!-- Language selector -->
-                <NSelect
-                  :value="settings.locale"
-                  :options="languageOptions"
-                  size="small"
-                  style="width: 100px;"
-                  @update:value="settings.setLocaleCode"
-                />
+        <NLayout has-sider class="h-screen">
+          <NLayoutSider bordered :width="212" class="vigil-sider">
+            <!-- 品牌头:官方 logo 徽记 + VIGILS 字标 -->
+            <div class="brand">
+              <img class="brand-logo" :src="LOGO" alt="Vigils" />
+              <div class="brand-text">
+                <div class="brand-name">VIGILS</div>
+                <div class="brand-sub">{{ t("sidebar.app_subtitle") }}</div>
               </div>
-            </header>
-
-            <div class="flex-1 overflow-auto p-6">
-              <RouterView />
             </div>
-          </main>
-        </div>
 
-        <ShortcutHelpModal v-model:show="helpOpen" />
+            <NMenu
+              :options="menuOptions"
+              :value="selectedKey"
+              :indent="18"
+              class="vigil-menu"
+            />
+
+            <!-- 底部:快捷键 + 语言 -->
+            <div class="sidebar-footer">
+              <NButton
+                size="small"
+                quaternary
+                block
+                data-testid="shortcut-help-toggle"
+                title="Keyboard shortcuts (press ?)"
+                @click="shortcutHelpOpen = true"
+              >
+                <span class="footer-btn">⌘ {{ t("sidebar.shortcuts_button") }}</span>
+              </NButton>
+              <NButton
+                size="small"
+                quaternary
+                block
+                data-testid="locale-toggle"
+                :title="t('sidebar.language_tooltip', { label: currentLocaleLabel })"
+                @click="cycleLocale"
+              >
+                <span class="footer-btn">🌐 {{ currentLocaleShort }}</span>
+              </NButton>
+            </div>
+          </NLayoutSider>
+
+          <NLayout class="vigil-main">
+            <RouterView />
+          </NLayout>
+        </NLayout>
+
+        <ShortcutHelpModal v-model:show="shortcutHelpOpen" />
       </NDialogProvider>
     </NMessageProvider>
   </NConfigProvider>
 </template>
 
 <style scoped>
-/* RouterLink 下划线由全局 tailwind.css 统一去除 */
+.vigil-sider {
+  position: relative;
+  backdrop-filter: blur(8px);
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 16px 16px 14px;
+  border-bottom: 1px solid var(--vigil-border);
+}
+.brand-logo {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  filter: drop-shadow(0 0 6px rgba(5, 217, 232, 0.55));
+}
+.brand-name {
+  font-family: var(--vigil-mono);
+  font-weight: 700;
+  letter-spacing: 3.5px;
+  font-size: 15px;
+  line-height: 1.1;
+  color: var(--vigil-text);
+}
+.brand-sub {
+  margin-top: 3px;
+  font-size: 10.5px;
+  letter-spacing: 0.3px;
+  color: var(--vigil-text-secondary);
+}
+.vigil-menu {
+  padding: 8px 8px;
+}
+.sidebar-footer {
+  position: absolute;
+  bottom: 10px;
+  left: 8px;
+  right: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.footer-btn {
+  font-family: var(--vigil-mono);
+  font-size: 11px;
+  letter-spacing: 0.4px;
+}
 </style>

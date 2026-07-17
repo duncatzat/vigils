@@ -694,6 +694,9 @@ fn ledger_upsert_rejects_env_inherit_true_even_bypass_dispatcher() {
 /// Codex R2 BLOCKER:老 schema 升级后 drift API 可用。
 /// 模拟"I07 时代的 server_profiles 缺 pending_command_json 列",手工 CREATE 老结构,
 /// 然后 Ledger::open 应 ALTER TABLE ADD COLUMN,随后 drift 流程可正常写读。
+///
+/// V1.1 扩展:该老库同样缺 `resolved_program_path` / `pending_resolved_program_path` 两列;
+/// 升级后这两列也须可用,且 legacy 行(NULL 基线)首次 spawn 建立基线不 block(spike §3.2 护栏)。
 #[test]
 fn legacy_schema_upgrades_to_add_pending_command_json() {
     let tmp = tempfile::tempdir().unwrap();
@@ -738,6 +741,23 @@ fn legacy_schema_upgrades_to_add_pending_command_json() {
     l.approve_server_command_drift("legacy-fs").unwrap();
     let data = l.get_onboarding_data("legacy-fs").unwrap().unwrap();
     assert_eq!(data.command.as_ref(), Some(&new_argv));
+
+    // V1.1:老库升级后两新列可用 —— legacy 行 NULL 基线,首次 spawn 建立基线(不 block),
+    // 随后异路径触发 resolved-program drift(第二独立维度)。
+    let pinned = l
+        .check_server_resolved_program_drift("legacy-fs", "/usr/bin/mock")
+        .unwrap();
+    assert!(
+        matches!(pinned, vigil_audit::ResolvedProgramOutcome::Pinned { .. }),
+        "legacy NULL 基线首次 spawn 必须 Pinned(不 block),got {pinned:?}"
+    );
+    let drifted = l
+        .check_server_resolved_program_drift("legacy-fs", "/tmp/evil/mock")
+        .unwrap();
+    assert!(
+        matches!(drifted, vigil_audit::ResolvedProgramOutcome::Drifted(_)),
+        "升级后 resolved-program drift 须正常触发,got {drifted:?}"
+    );
 }
 
 /// D6 变种:env_inherit=true 拒绝(保险网)

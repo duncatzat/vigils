@@ -1,65 +1,49 @@
 <script setup lang="ts">
 /**
- * Privacy Findings 页面 — 匹配原型 06_privacy.png。
+ * ISS-017 — Privacy Findings 聚合面板(R2 Aegis 指挥舱)。
  *
- * 布局:
- *   1) 顶部:4 个统计卡片(Total Findings / Github Tokens / OpenAI Keys / Blocked Leaks)
- *   2) 下方:左右分栏
- *      - 左侧:Findings 表格(TIME / LABEL / SOURCE / SESSION)
- *      - 右侧:Finding Detail 面板
+ * 视图布局:
+ *   1) 顶部:全局 label × count 标签徽章("一眼看到今天拦了哪些 PII")
+ *   2) 下方:最近 N 条 scans 表格(ts / source / scan_id 缩短 / fingerprint 缩短 / finding 数)
+ *      - 行点击预留(phase 2 加溯源 drawer)
  *
- * 数据适配说明:
- *   - 后端 `listPrivacyFindings` 返回 scan 级摘要,不含单条 finding 的 label/tool。
- *   - LABEL 列展示 scan 的 source 类型(唯一可用的分类字段),SOURCE 列因无具体工具名展示 "—"。
- *   - Detail 中的 Redacted snippet 同理以 "—" 占位。
- *   - Blocked Leaks 统计取全部 finding 总数(所有命中均视为已拦截)。
+ * **绝不展原文**:DTO 仅含 metadata 类字段。fingerprint 显示 8 字符前缀(可识别但
+ * 不可逆),session_id / scan_id 缩短到首 8 字符 + 末 4 字符。
  *
- * 安全契约(延续 ISS-017):
- *   - 不展示原文;fingerprint 仅展示前 8 位。
- *   - session_id / scan_id 缩短显示。
- *   - 所有字符串 `{{ }}` 插值,无 v-html。
+ * 安全契约(延续 ApprovalDetailDrawer α3):
+ *   - 所有字符串 `{{ }}` 插值,Vue 默认转义,XSS 安全
+ *   - 不引入 v-html / innerHTML
+ *   - 后端 ipc.listPrivacyFindings 失败 → 显示 error 提示,不崩页
  */
-import { computed, h, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
-  NAlert,
   NDataTable,
-  NEmpty,
-  NSpin,
   NTag,
+  NSpin,
   type DataTableColumns,
 } from "naive-ui";
+import { h } from "vue";
 import { useI18n } from "vue-i18n";
 import {
   listPrivacyFindings,
+  type PrivacyFindingDto,
   type PrivacyFindingsDto,
   type RedactionScanSummaryDto,
 } from "@/api/ipc";
-import StatCard from "@/components/StatCard.vue";
-import PanelCard from "@/components/PanelCard.vue";
+import WindowCard from "@/components/WindowCard.vue";
+import StatusPill from "@/components/StatusPill.vue";
+import { EMBLEM } from "@/brand";
 
 const { t } = useI18n();
-
 const data = ref<PrivacyFindingsDto | null>(null);
 const loading = ref(true);
 const errorMsg = ref<string | null>(null);
-const selectedScanId = ref<string | null>(null);
 
-async function refresh(): Promise<void> {
+async function refresh() {
   loading.value = true;
   errorMsg.value = null;
   try {
     data.value = await listPrivacyFindings({ limit_recent_scans: 100 });
-    // 若当前选中的 scan 已被刷新掉,清空选中态
-    if (
-      selectedScanId.value &&
-      !data.value.recent_scans.some((s) => s.scan_id === selectedScanId.value)
-    ) {
-      selectedScanId.value = null;
-    }
-    // 默认选中第一条
-    if (!selectedScanId.value && data.value.recent_scans.length > 0) {
-      selectedScanId.value = data.value.recent_scans[0].scan_id;
-    }
   } catch (e) {
     errorMsg.value = String(e);
   } finally {
@@ -69,265 +53,353 @@ async function refresh(): Promise<void> {
 
 onMounted(refresh);
 
-// 30s 自动刷新
+// 30s 自动刷新(轻量轮询;UI 长时间打开仍跟踪新 scan)。
 const refreshTimer = setInterval(refresh, 30_000);
 onUnmounted(() => clearInterval(refreshTimer));
 
-// ─────────────────────────── 统计卡片 ───────────────────────────
-
-const totalFindings = computed<number>(() =>
-  data.value?.by_label_total.reduce((sum, item) => sum + item.count, 0) ?? 0,
-);
-
-function countByLabel(label: string): number {
-  return (
-    data.value?.by_label_total.find((item) => item.label === label)?.count ?? 0
-  );
+/** Label 徽章颜色映射 — 与 ApprovalDetailDrawer.privacyTagType 同源(ISS-014)。
+ *  字面量与 vigil_redaction::PrivacyLabel::as_str() 对齐(无 `private_` 前缀)。 */
+function privacyTagType(
+  label: string,
+): "default" | "warning" | "success" | "error" | "info" {
+  switch (label) {
+    case "secret":
+    case "account_number":
+      return "error";
+    case "email":
+    case "phone":
+    case "person":
+    case "address":
+    case "url":
+    case "date":
+      return "warning";
+    default:
+      return "default";
+  }
 }
 
-const githubTokenCount = computed<number>(() => countByLabel("github_token"));
-const openaiKeyCount = computed<number>(() => countByLabel("openai_key"));
-
-// 所有命中均视为已拦截的泄漏
-const blockedLeaksCount = computed<number>(() => totalFindings.value);
-
-// ─────────────────────────── 格式化 ───────────────────────────
-
-/** Unix 秒 → HH:MM:SS */
-function formatTime(ts: number): string {
-  if (!ts || ts <= 0) return "—";
-  return new Date(ts * 1000).toLocaleTimeString("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
+/** Source 标签:tool_arg(firewall preflight) / paste(扩展粘贴) / tool_output(回吐) / export */
+function sourceTagType(
+  source: string,
+): "default" | "warning" | "success" | "error" | "info" {
+  switch (source) {
+    case "tool_arg":
+      return "info";
+    case "paste":
+      return "default";
+    case "tool_output":
+      return "warning";
+    case "export":
+      return "success";
+    default:
+      return "default";
+  }
 }
 
-/** Unix 秒 → 本地日期时间字符串 */
-function formatDateTime(ts: number): string {
-  if (!ts || ts <= 0) return "—";
-  return new Date(ts * 1000).toLocaleString("zh-CN");
-}
-
-/** UUID/Hex 缩短:首 8 + … + 末 4 */
+/** UUID/Hex 缩短显示:首 8 + … + 末 4(总 14 字符,适合表格列宽)。 */
 function shortId(id: string): string {
   if (id.length <= 14) return id;
   return `${id.slice(0, 8)}…${id.slice(-4)}`;
 }
 
-// ─────────────────────────── 表格 ───────────────────────────
-
-const selectedScan = computed<RedactionScanSummaryDto | null>(() => {
-  if (!selectedScanId.value || !data.value) return null;
-  return (
-    data.value.recent_scans.find((s) => s.scan_id === selectedScanId.value) ??
-    null
-  );
-});
-
-function onRowClick(row: RedactionScanSummaryDto): void {
-  selectedScanId.value = row.scan_id;
+/** Unix 秒 → 本地时间字符串 */
+function formatTs(ts: number): string {
+  if (!ts || ts <= 0) return "—";
+  return new Date(ts * 1000).toLocaleString("zh-CN");
 }
 
 const columns = computed<DataTableColumns<RedactionScanSummaryDto>>(() => [
   {
     title: t("privacy.col_time"),
     key: "ts",
-    width: 100,
-    render: (row) =>
-      h("span", { class: "text-vigils-text-primary" }, formatTime(row.ts)),
-  },
-  {
-    title: t("privacy.col_label"),
-    key: "label",
-    width: 160,
-    render: (row) =>
-      h(
-        NTag,
-        { size: "small", type: "error", bordered: false },
-        { default: () => row.source },
-      ),
+    width: 170,
+    render: (row) => formatTs(row.ts),
   },
   {
     title: t("privacy.col_source"),
     key: "source",
+    width: 110,
+    render: (row) =>
+      h(
+        NTag,
+        { size: "small", type: sourceTagType(row.source), bordered: false },
+        () => row.source,
+      ),
+  },
+  {
+    title: t("privacy.col_findings"),
+    key: "finding_count",
+    width: 100,
+    render: (row) => `${row.finding_count}`,
+  },
+  {
+    title: t("privacy.col_scan_id"),
+    key: "scan_id",
     width: 160,
-    render: () => h("span", { class: "text-vigils-text-secondary" }, "—"),
+    render: (row) =>
+      h(
+        "code",
+        { class: "text-xs", title: row.scan_id },
+        shortId(row.scan_id),
+      ),
   },
   {
     title: t("privacy.col_session"),
     key: "session_id",
+    width: 160,
     render: (row) =>
       h(
         "code",
-        {
-          class:
-            "text-xs font-mono text-vigils-cyan cursor-pointer hover:underline",
-          title: row.session_id,
-        },
+        { class: "text-xs opacity-70", title: row.session_id },
         shortId(row.session_id),
       ),
   },
+  {
+    title: t("privacy.col_fingerprint"),
+    key: "fingerprint",
+    render: (row) =>
+      h(
+        "code",
+        { class: "text-xs opacity-50", title: row.fingerprint },
+        row.fingerprint.slice(0, 8),
+      ),
+  },
 ]);
-
-const tableData = computed<RedactionScanSummaryDto[]>(
-  () => data.value?.recent_scans ?? [],
-);
-
-const rowKey = (row: RedactionScanSummaryDto): string => row.scan_id;
-
-const rowProps = (row: RedactionScanSummaryDto) => ({
-  style: { cursor: "pointer" },
-  onClick: () => onRowClick(row),
-  class:
-    selectedScanId.value === row.scan_id
-      ? "bg-vigils-bg-surface/60"
-      : undefined,
-});
 </script>
 
 <template>
-  <div class="p-6 h-full overflow-auto">
-    <NAlert
-      v-if="errorMsg"
-      type="error"
-      class="mb-4"
-      :title="t('common.ipc_error')"
-      closable
-      @close="errorMsg = null"
-    >
-      {{ errorMsg }}
-    </NAlert>
+  <div class="privacy">
+    <!-- 顶部细条:页名 + 元数据契约徽 + 刷新 -->
+    <div class="phead">
+      <span class="ptitle">{{ t("privacy.page_title") }}</span>
+      <span class="pright">
+        <StatusPill tone="cyan">{{ t("privacy.page_subtitle_strong") }}</StatusPill>
+      </span>
+    </div>
+
+    <!-- 人话标题:盾徽 + 短标题 + 小副标(精简,不再把整段描述塞进 h1)-->
+    <div class="headline">
+      <h1>
+        <img class="emblem" :src="EMBLEM('lock')" alt="" />
+        {{ t("privacy.hero_title") }}
+      </h1>
+      <p>{{ t("privacy.hero_subtitle") }}</p>
+    </div>
+
+    <!-- 错误态(设计化,不裸露 TypeError 当首屏)-->
+    <div v-if="errorMsg" class="errcard" data-testid="privacy-load-failed">
+      <span class="ei">!</span>
+      <div class="ec">
+        <div class="et">{{ t("privacy.load_error", { msg: errorMsg }) }}</div>
+      </div>
+    </div>
 
     <NSpin :show="loading">
-      <!-- 顶部统计卡片 -->
-      <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard
-          :label="t('privacy.stat_total_findings')"
-          :value="totalFindings"
-          color="red"
-          data-testid="privacy-stat-total"
-        />
-        <StatCard
-          :label="t('privacy.stat_github_tokens')"
-          :value="githubTokenCount"
-          color="yellow"
-          data-testid="privacy-stat-github"
-        />
-        <StatCard
-          :label="t('privacy.stat_openai_keys')"
-          :value="openaiKeyCount"
-          color="yellow"
-          data-testid="privacy-stat-openai"
-        />
-        <StatCard
-          :label="t('privacy.stat_blocked_leaks')"
-          :value="blockedLeaksCount"
-          color="green"
-          data-testid="privacy-stat-blocked"
-        />
-      </div>
+      <!-- 顶部:全局 label 聚合(彩色计数胶囊)-->
+      <WindowCard
+        title="findings · by label"
+        class="block"
+        data-testid="privacy-findings-by-label"
+      >
+        <div class="card-head">
+          <span class="ch-title">{{ t("privacy.by_label_title") }}</span>
+        </div>
+        <div
+          v-if="!data || data.by_label_total.length === 0"
+          class="empty"
+        >
+          {{ t("privacy.by_label_empty") }}
+        </div>
+        <div v-else class="chips">
+          <StatusPill
+            v-for="f in (data.by_label_total as PrivacyFindingDto[])"
+            :key="f.label"
+            :tone="
+              privacyTagType(f.label) === 'error'
+                ? 'red'
+                : privacyTagType(f.label) === 'warning'
+                  ? 'yellow'
+                  : privacyTagType(f.label) === 'success'
+                    ? 'green'
+                    : 'cyan'
+            "
+            :data-testid="`privacy-by-label-${f.label}`"
+          >
+            {{ f.label }} <span class="x">×</span> {{ f.count }}
+          </StatusPill>
+        </div>
+      </WindowCard>
 
-      <!-- 下方左右分栏 -->
-      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <!-- 左侧:Findings 表格 -->
-        <PanelCard class="lg:col-span-2">
-          <template #header>
-            <h2 class="text-base font-semibold text-vigils-text-primary">
-              {{ t("privacy.findings") }}
-            </h2>
-          </template>
-
+      <!-- 下方:最近 N 条 scans(品牌化表格)-->
+      <WindowCard
+        title="findings · recent scans"
+        class="block"
+        data-testid="privacy-findings-recent-scans"
+      >
+        <div class="card-head">
+          <span class="ch-title">{{ t("privacy.recent_scans_title") }}</span>
+        </div>
+        <div class="ndt-brand">
           <NDataTable
             :columns="columns"
-            :data="tableData"
-            :row-key="rowKey"
-            :row-props="rowProps"
+            :data="data?.recent_scans ?? []"
             :bordered="false"
             size="small"
-            :max-height="640"
+            :max-height="600"
             virtual-scroll
-            data-testid="privacy-findings-table"
-          >
-            <template #empty>
-              <NEmpty :description="t('privacy.empty')" data-testid="privacy-empty" />
-            </template>
-          </NDataTable>
-        </PanelCard>
-
-        <!-- 右侧:Finding Detail -->
-        <PanelCard>
-          <template #header>
-            <h2 class="text-base font-semibold text-vigils-text-primary">
-              {{ t("privacy.finding_detail") }}
-            </h2>
-          </template>
-
-          <div
-            v-if="!selectedScan"
-            class="text-sm text-vigils-text-secondary py-8 text-center"
-          >
-            {{ t("privacy.empty") }}
-          </div>
-
-          <div v-else class="space-y-5">
-            <div>
-              <div class="text-xs text-vigils-text-secondary mb-1">
-                {{ t("privacy.label") }}
-              </div>
-              <NTag size="small" type="error" :bordered="false">
-                {{ selectedScan.source }}
-              </NTag>
-            </div>
-
-            <div>
-              <div class="text-xs text-vigils-text-secondary mb-1">
-                {{ t("privacy.source_tool") }}
-              </div>
-              <div class="text-sm text-vigils-text-secondary">—</div>
-            </div>
-
-            <div>
-              <div class="text-xs text-vigils-text-secondary mb-1">
-                {{ t("privacy.count") }}
-              </div>
-              <div class="text-sm text-vigils-text-primary">
-                {{ selectedScan.finding_count }}
-              </div>
-            </div>
-
-            <div>
-              <div class="text-xs text-vigils-text-secondary mb-1">
-                {{ t("privacy.first_seen") }}
-              </div>
-              <div class="text-sm text-vigils-text-primary">
-                {{ formatDateTime(selectedScan.ts) }}
-              </div>
-            </div>
-
-            <div>
-              <div class="text-xs text-vigils-text-secondary mb-1">
-                {{ t("privacy.redacted_snippet") }}
-              </div>
-              <div
-                class="text-sm font-mono text-vigils-text-primary break-all bg-vigils-bg-deep px-3 py-2 rounded border border-vigils-border"
-              >
-                —
-              </div>
-            </div>
-
-            <div>
-              <div class="text-xs text-vigils-text-secondary mb-1">
-                {{ t("privacy.fingerprint") }}
-              </div>
-              <div class="text-sm font-mono text-vigils-text-primary break-all">
-                {{ selectedScan.fingerprint.slice(0, 8) }}
-              </div>
-            </div>
-          </div>
-        </PanelCard>
-      </div>
+          />
+        </div>
+      </WindowCard>
     </NSpin>
   </div>
 </template>
+
+<style scoped>
+.privacy {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 18px 28px 40px;
+}
+
+/* 顶部细条 */
+.phead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 2px;
+}
+.ptitle {
+  font-family: var(--vigil-mono);
+  font-size: 13px;
+  letter-spacing: 1px;
+  color: var(--vigil-text-secondary);
+}
+.pright {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* 人话标题 */
+.headline {
+  text-align: center;
+  margin: 8px 0 20px;
+}
+.headline h1 {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--vigil-text);
+  margin: 0;
+}
+.headline p {
+  margin: 6px 0 0;
+  font-family: var(--vigil-mono);
+  font-size: 12.5px;
+  color: var(--vigil-text-secondary);
+}
+.headline .emblem {
+  width: 30px;
+  height: 30px;
+  display: block;
+  filter: drop-shadow(0 0 6px rgba(244, 114, 182, 0.55));
+}
+
+.block {
+  margin-top: 14px;
+}
+
+/* 卡内标题条 */
+.card-head {
+  display: flex;
+  align-items: center;
+  margin-bottom: 14px;
+}
+.ch-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--vigil-text);
+}
+
+/* by-label 彩色计数胶囊 */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.chips .x {
+  opacity: 0.5;
+  margin: 0 0.1em;
+}
+
+/* 空态 */
+.empty {
+  padding: 10px 2px;
+  font-family: var(--vigil-mono);
+  font-size: 12.5px;
+  color: var(--vigil-text-secondary);
+}
+
+/* 错误态卡 */
+.errcard {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 16px;
+  border: 1px solid rgba(255, 42, 109, 0.3);
+  border-radius: 12px;
+  background: rgba(255, 42, 109, 0.05);
+}
+.errcard .ei {
+  font-family: var(--vigil-mono);
+  font-weight: 800;
+  font-size: 16px;
+  color: var(--vigil-red);
+}
+.errcard .ec {
+  flex: 1;
+}
+.errcard .et {
+  font-size: 13px;
+  color: var(--vigil-text);
+  word-break: break-all;
+}
+
+/* NDataTable 品牌化:深色面板 + 等宽 ID/fingerprint + 收敛分隔线 */
+.ndt-brand :deep(.n-data-table) {
+  --n-th-color: transparent;
+  --n-td-color: transparent;
+  --n-merged-th-color: transparent;
+  --n-merged-td-color: transparent;
+  background: transparent;
+  font-size: 12.5px;
+}
+.ndt-brand :deep(.n-data-table-th) {
+  background: rgba(13, 15, 22, 0.6);
+  color: var(--vigil-text-secondary);
+  font-family: var(--vigil-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--vigil-border);
+}
+.ndt-brand :deep(.n-data-table-td) {
+  background: transparent;
+  color: var(--vigil-text);
+  border-bottom: 1px solid rgba(35, 40, 55, 0.6);
+}
+.ndt-brand :deep(.n-data-table-tr:hover .n-data-table-td) {
+  background: rgba(5, 217, 232, 0.05);
+}
+/* scan_id / session_id / fingerprint 等宽 + 青调,呼应 protection logline */
+.ndt-brand :deep(code) {
+  font-family: var(--vigil-mono);
+  color: var(--vigil-accent-light);
+  font-size: 11.5px;
+  letter-spacing: 0.3px;
+}
+</style>

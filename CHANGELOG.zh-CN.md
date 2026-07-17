@@ -8,6 +8,23 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [Unreleased]
+
+### 变更
+
+- **桌面端:Aegis 指挥舱 UI 落地公开构建。** 桌面 UI 整体替换为此前仅内部构建搭载的当前设计线:
+  盾徽 hero + 八徽记防御环(双态),活动流 / 审批队列 / 服务器注册 / 会话回放 / 隐私发现逐页重做,
+  统一设计语言(窗钮卡片、括号状态胶囊、官方徽记页头、等宽语义上色日志流),官方品牌资产
+  (`/brand`),深色优先。
+- **桌面端成为常驻守护。** 关闭窗口收起到系统托盘(托盘菜单:打开 / 退出);再次启动只唤起既有
+  实例而不再多开进程(单实例插件);Windows release 构建不再闪控制台黑窗。
+- **GUI 内置 Deploy Guardian 与引擎控制。** 一键部署防护(逐 agent 状态)、缺失引擎检测 + 安全
+  自动下载(HTTPS + SHA-pin + 运行核验,fail-closed)、引擎模式(hardfp/ml/auto)与姿态
+  (low/medium/high)切换、常驻 daemon 生命周期与 ML 模型安装 —— GUI 现在驱动与 CLI 同一个
+  `vigil-hub` 引擎。
+- 审计**检查点锚定**保留:公开版既有的 `Settings → checkpoint` 锚定重新落位到新设置页
+  (同一 `anchor_checkpoint` 命令,Aegis 风格卡片)。
+
 ## [v0.6.0-beta.1] — 2026-07-17 — 三个新 agent 接入面(Kimi CLI / ZCode / pi)与接入面系统性加固
 
 ### 新增

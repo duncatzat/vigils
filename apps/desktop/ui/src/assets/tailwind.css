@@ -2,83 +2,94 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Vigils Desktop — 设计 token(CSS 变量)。
-   默认深色(原型图)；.light 类覆盖为浅色主题。 */
-:root {
-  --vigils-cyan: #05d9e8;
-  --vigils-cyan-light: #67e8f9;
-  --vigils-green: #00ff9d;
-  --vigils-purple: #a855f7;
-  --vigils-red: #ff2a6d;
-  --vigils-yellow: #facc15;
-  --vigils-bg-deep: #0b0b0f;
-  --vigils-bg-page: #0b0b0f;
-  --vigils-bg-panel: #13131a;
-  --vigils-bg-tertiary: #1a1a24;
-  --vigils-bg-surface: #252532;
-  --vigils-border: #1e1e28;
-  --vigils-input: #0a0a0f;
-  --vigils-text-primary: #e2e8f0;
-  --vigils-text-secondary: #64748b;
-  --vigils-text-muted: #475569;
+/* ───────────────────────── Vigils 品牌设计 token(单一真源)─────────────────────────
+   对齐官网 vigils.ai 的"指挥舱"深色视觉。所有 vigil-* utility 由 tailwind.config.js
+   映射到这些 CSS 变量;主题就绪 —— 当前深色优先,日后加 :root[data-theme="light"]
+   覆盖块即可,无需改任何页面(UI 全改 2026-06,根治原 dark/light 双系统冲突)。 */
+:root,
+:root[data-theme="dark"] {
+  /* 底色分层(deep → surface,越上层越亮) */
+  --vigil-bg: #0a0a0f;
+  --vigil-panel: #111118;
+  --vigil-tertiary: #1a1f2e;
+  --vigil-surface: #232837;
+  --vigil-border: #232837;
+
+  /* 主色 + 语义色(官网 :root 实测值) */
+  --vigil-accent: #05d9e8; /* cyan — 主色(原 orange 退役) */
+  --vigil-accent-light: #67e8f9;
+  --vigil-green: #00ff9d; /* 通过 / 活跃 / 已保护 */
+  --vigil-red: #ff2a6d; /* 拦截 / 拒绝 */
+  --vigil-yellow: #facc15; /* 注意 / 待处理 */
+  --vigil-purple: #a855f7; /* beta / lease */
+
+  /* 文字层级 */
+  --vigil-text: #e2e8f0;
+  --vigil-text-secondary: #64748b;
+  --vigil-text-muted: #475569;
+
+  /* 等宽字体栈(标签 / 日志 / ID / 版本 pill / 数字)*/
+  --vigil-mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code",
+    Consolas, "Liberation Mono", monospace;
 }
 
-html.light {
-  --vigils-bg-deep: #f8fafc;
-  --vigils-bg-page: #f1f5f9;
-  --vigils-bg-panel: #ffffff;
-  --vigils-bg-tertiary: #e2e8f0;
-  --vigils-bg-surface: #cbd5e1;
-  --vigils-border: #e2e8f0;
-  --vigils-input: #ffffff;
-  --vigils-text-primary: #0f172a;
-  --vigils-text-secondary: #475569;
-  --vigils-text-muted: #94a3b8;
+html {
+  background: var(--vigil-bg);
 }
 
 html,
 body {
   margin: 0;
   padding: 0;
-  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    "PingFang SC", "Microsoft YaHei", sans-serif;
   height: 100vh;
-  background-color: var(--vigils-bg-deep);
-  color: var(--vigils-text-primary);
+  color: var(--vigil-text);
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
-/* 去除链接默认下划线(RouterLink 等) */
-a,
-a:hover,
-a:focus {
-  text-decoration: none;
+/* 指挥舱氛围背景:顶部青色辉光 + 右上紫晕,纯 CSS 零开销、固定不滚动 */
+body {
+  background-color: var(--vigil-bg);
+  background-image: radial-gradient(
+      1200px 620px at 50% -12%,
+      rgba(5, 217, 232, 0.1),
+      transparent 60%
+    ),
+    radial-gradient(
+      900px 520px at 100% 0%,
+      rgba(168, 85, 247, 0.06),
+      transparent 55%
+    );
+  background-attachment: fixed;
 }
 
 #app {
   height: 100vh;
 }
 
-/* 统一代码/终端字体 */
-code,
-pre,
-kbd,
-.font-mono {
-  font-family: "JetBrains Mono", SFMono-Regular, Menlo, Consolas,
-    "Liberation Mono", "Courier New", monospace;
+/* 滚动条 — 收敛到品牌深色 */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--vigil-surface);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #2f3647;
+  background-clip: content-box;
 }
 
-/* 自定义滚动条(暗色控制台风格) */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-::-webkit-scrollbar-track {
-  background: var(--vigils-bg-deep);
-}
-::-webkit-scrollbar-thumb {
-  background: var(--vigils-bg-surface);
-  border-radius: 4px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: var(--vigils-text-muted);
+/* 选区高亮 */
+::selection {
+  background: rgba(5, 217, 232, 0.28);
+  color: #ffffff;
 }

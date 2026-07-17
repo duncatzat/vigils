@@ -13,8 +13,6 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
-/// 浏览器防线卡(Protection Overview):native host 注册态(只读,详见模块内注释)。
-pub mod browser_guard;
 /// I08b-β1 Tauri `#[tauri::command]` 真白名单 SSOT(与 build.rs 通过 `include!` 共用)。
 ///
 /// 详见 `commands.rs` 顶部注释(因 include! 约束采用 `//` 而非 `//!`)。
@@ -34,11 +32,10 @@ pub mod render;
 #[cfg(feature = "gui")]
 pub mod embed;
 
-/// ADR 0024 — 「ML 控制平面」GUI 驱动 vigil-hub CLI 的常驻 daemon 生命周期 + ML 模型安装
-/// (gui-feature-gated;shell-out 调度,不把 ort 拉进 GUI)。
+/// P1.3 — 「部署守卫」GUI 驱动 vigil-hub CLI 引擎的控制层(gui-feature-gated)。
 ///
-/// 详见 `ml_control.rs` 顶部注释。
+/// 详见 `guardian.rs` 顶部注释。
 #[cfg(feature = "gui")]
-pub mod ml_control;
+pub mod guardian;
 
 pub use dispatcher::dispatch;

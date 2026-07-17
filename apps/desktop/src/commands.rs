@@ -22,9 +22,9 @@
 
 /// Tauri `#[tauri::command]` 真白名单 —— 构建期与运行期 ACL 的 SSOT。
 ///
-/// **顺序不重要**(内部按 slugified 生成 permission);共 **29** 条
-/// (α1=1 + α2=3 + α3=3 + α4=10 + α5=2 + ISS-017=1 + ISS-018=1 + D19=1 + checkpoint=1
-/// + ML 控制平面=5[daemon_status/start/stop + model_status/install] + ML 引擎变体安装=1[download_ml_engine])。
+/// **顺序不重要**(内部按 slugified 生成 permission);共 **36** 条
+/// (α1=1 + α2=3 + α3=3 + α4=10 + α5=2 + ISS-017=1 + ISS-018=1 + D19=1 + P1.3=2 + ③引擎=2 + R3 Settings=3
+/// + R3 Phase2 daemon=3 + R3 Phase2 model=2 + R3 Phase2.5 ml-engine=1 + ext-Phase2 browser-guard=1)。
 pub const INVOKE_COMMANDS: &[&str] = &[
     // α1(Sessions smoke)
     "list_sessions",
@@ -56,18 +56,29 @@ pub const INVOKE_COMMANDS: &[&str] = &[
     "export_session_replay",
     // D19(Protection Overview —— 1 read)
     "protection_summary",
-    // Settings: 手动锚定审计检查点
-    "anchor_checkpoint",
-    // ML 控制平面(ADR 0024):daemon 生命周期(3 write)+ 模型安装(2:1 read + 1 write)
+    // P1.3(Deploy Guardian —— 1 read + 1 write)
+    "guardian_status",
+    "deploy_guardian",
+    // ③ 缺失引擎检测 + 安全自动下载(1 read + 1 write)
+    "engine_present",
+    "download_engine",
+    // R3 Phase 1(Settings:引擎模式 + 姿态 —— 1 read + 2 write)
+    "settings_get",
+    "set_posture",
+    "set_engine_mode",
+    // R3 Phase 2(常驻 daemon 生命周期 —— 1 read + 2 write)
     "daemon_status",
     "daemon_start",
     "daemon_stop",
+    // R3 Phase 2(ML 模型安装 —— 1 read + 1 write)
     "model_status",
     "model_install",
-    // ML 引擎变体安装(让 GUI 用户的 ML 真正可用)
+    // R3 Phase 2.5(ML 引擎变体安装 —— 1 write;让 GUI 用户的 ML 真正可用)
     "download_ml_engine",
-    // 浏览器防线卡(Protection Overview —— native host 注册态,1 read)
+    // 扩展体系 Phase 2「策略+观测」(Protection Overview 浏览器防线卡 —— 1 read)
     "browser_guard_status",
+    // Settings:手动锚定审计检查点(公开版既有功能 —— 1 write)
+    "anchor_checkpoint",
 ];
 
 #[cfg(test)]
@@ -83,7 +94,7 @@ mod tests {
     fn invoke_commands_count_in_sync() {
         assert_eq!(
             INVOKE_COMMANDS.len(),
-            30,
+            37,
             "INVOKE_COMMANDS 漂移 —— 新增/删除 handler 时必须同步:\n\
              1) 本文件 `apps/desktop/src/commands.rs`\n\
              2) `apps/desktop/src/bin/vigils.rs` 的 `tauri::generate_handler!` 列表\n\
