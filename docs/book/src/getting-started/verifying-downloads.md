@@ -24,7 +24,7 @@ Every downloadable artifact ships with a [SLSA](https://slsa.dev) build-provenan
 attestation, signed through GitHub's Sigstore-backed infrastructure (no key for you to
 manage, nothing to trust besides GitHub and the public source):
 
-- CLI archives — `vigils-cli-linux-x64.tar.gz`, `vigils-cli-macos-arm64.tar.gz`, `vigils-cli-windows-x64.zip`
+- CLI archives — `vigils-cli-linux-x64.tar.gz`, `vigils-cli-macos-arm64.tar.gz`, `vigils-cli-macos-x64.tar.gz`, `vigils-cli-windows-x64.zip`
 - Desktop installers — `.exe`, `.msi`, `.dmg`, `.deb`, `.rpm`, `.AppImage`
 - Browser extension — `vigils-chrome-extension.zip`
 

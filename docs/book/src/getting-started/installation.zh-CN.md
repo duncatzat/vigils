@@ -25,8 +25,10 @@
 2. 若弹出蓝色 **"Windows 已保护你的电脑"** → **更多信息 → 仍要运行**。
 3. 完成。*(随着安装量增加,该警告会自行消退。)*
 
-### macOS(Apple 芯片)
-1. 下载 **`Vigils_<version>_aarch64.dmg`** → 打开 → 把 **Vigils** 拖进 **应用程序**。
+### macOS
+1. 按芯片下载 dmg —— **Apple Silicon**:`Vigils_<version>_aarch64.dmg`;**Intel**:
+   `Vigils_<version>_x64.dmg`(不确定?苹果菜单 → 关于本机 —— 显示"Apple M…"即 Apple
+   Silicon)→ 打开 → 把 **Vigils** 拖进 **应用程序**。
 2. 首次启动会被拦("Apple 无法验证…")。**一次性**放行:
    **  系统设置 → 隐私与安全性 → 下拉到底 → 点"仍要打开" → 用 Touch ID / 密码确认。**
 3. 完成 —— 之后不再询问。
@@ -64,7 +66,8 @@ vigil-hub setup       # 自动探测 Claude Code / Codex / Cursor 并接好守�
 想先试试就跑 **`vigil-hub demo`**(零设置)。各 agent 细节见 [Agent 集成](./agent-integration.zh-CN.md)。
 
 > **ML 变体**(可选,语义 PII + 提示注入检测):改下载 `vigils-cli-ml-<os>`,跑 `vigil-hub serve --engine ml`。
-> 底线:Linux glibc ≥ 2.28、macOS ≥ 14。见 [隐私过滤器](../concepts/privacy-filter.md)。
+> 底线:Linux glibc ≥ 2.28、macOS ≥ 14(仅 Apple Silicon —— 上游 onnxruntime 已停发 x86_64
+> macOS 构建,Intel mac 使用默认硬指纹引擎)。见 [隐私过滤器](../concepts/privacy-filter.md)。
 
 ---
 

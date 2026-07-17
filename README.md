@@ -17,7 +17,7 @@
 
 ---
 
-AI agents (Claude Code, Cursor, Zed, MCP clients, browser assistants) call tools, read
+AI agents (Claude Code, Codex, Cursor, Zed, Kimi CLI, ZCode, pi, browser assistants) call tools, read
 files, hit APIs, and paste into web UIs on your behalf. That power is useful — and risky.
 **Vigils sits between your agents and the tools/data they touch**, and it is *local-first*:
 your prompts, secrets, and audit trail never leave your machine.
@@ -58,9 +58,13 @@ Four guarantees, enforced locally:
 - **🔌 MCP gateway** — sits in front of MCP servers over **stdio and HTTP**; descriptor
   pinning with drift detection (alerts when a tool's definition changes); bare-command stdio
   upstreams (`npx`/`node`/`python`) resolve via host PATH before sandboxing.
-- **🖥️ Desktop app** (Tauri 2 + Vue 3) — Approval Queue, Activity Feed, Server Registry,
-  Session Replay, Privacy Findings; keyboard shortcuts, light/dark/system theme, real-time
-  updates, bilingual (zh / en) UI.
+- **🖥️ Desktop app** (Tauri 2 + Vue 3) — the **Aegis command deck**: shield hero with an
+  eight-emblem defense ring, Protection Overview, Approval Queue, Activity Feed, Server
+  Registry, Session Replay, Privacy Findings and Settings on one dark-first design language.
+  Runs as a **resident guardian** (close-to-tray, single-instance) with one-click **Deploy
+  Guardian**, missing-engine detect + secure auto-download, engine-mode / posture switches,
+  daemon lifecycle and ML model install — all driving the same `vigil-hub` engine as the CLI.
+  Bilingual (zh / en), real-time updates.
 - **🌐 Browser extension** (Chrome MV3) — redacts secrets/PII *before* paste or submit on AI
   sites (ChatGPT, Claude, Gemini, Perplexity).
 
@@ -90,7 +94,7 @@ testable and composed by the **Hub** (the MCP gateway).
 | Binary | Crate | What it is |
 |---|---|---|
 | `vigil-hub` | `vigil-hub-cli` | CLI MCP gateway: `vigil-hub serve --stdio`, `add-remote-mcp`, `inspect`, … |
-| `gui` | `apps/desktop` | Tauri 2 desktop app (embeds the Vue 3 UI + an in-process Hub) |
+| `vigils` | `apps/desktop` | Tauri 2 desktop app (embeds the Vue 3 UI + an in-process Hub) |
 | `vigil-native-host` | `apps/native-host` | Native-messaging bridge for the Chrome extension |
 | — | `extensions/chrome-mv3` | Chrome MV3 extension (vanilla JS, zero npm deps) |
 
@@ -114,7 +118,8 @@ Or grab a pre-built installer / binary for **Windows, macOS, or Linux** from any
 | Platform | Desktop app | CLI |
 |---|---|---|
 | **Windows** | `.exe` (NSIS) / `.msi` | `vigil-hub.exe` (in `vigils-cli-windows-x64.zip`) |
-| **macOS** | `.dmg` | `vigil-hub` (in `vigils-cli-macos-arm64.tar.gz`) |
+| **macOS** (Apple Silicon) | `Vigils_<ver>_aarch64.dmg` | `vigil-hub` (in `vigils-cli-macos-arm64.tar.gz`) |
+| **macOS** (Intel) | `Vigils_<ver>_x64.dmg` | `vigil-hub` (in `vigils-cli-macos-x64.tar.gz`) |
 | **Linux** | `.AppImage` / `.deb` / `.rpm` | `vigil-hub` (in `vigils-cli-linux-x64.tar.gz`) |
 
 ### Two redaction engines: hard-fingerprint (default) or ML
@@ -134,7 +139,7 @@ vigil-hub serve --engine ml       # strict ML: fetches models on first run, fail
 vigil-hub serve --engine auto     # ML only if models are already cached and the dylib is present; otherwise degrades to hardfp and never downloads
 ```
 
-Models are fetched from Hugging Face (primary) with a [vigils.ai](https://vigils.ai) mirror fallback, each verified by SHA-256 (fail-closed). The ML build bundles [ONNX Runtime](https://onnxruntime.ai) 1.24 next to `vigil-hub`. Platform floors for the **ML** build: **Linux glibc ≥ 2.28**, **macOS ≥ 14** — the default hard-fingerprint build has neither. _(ML builds ship with every release since v0.4.0 — look for the `vigils-cli-ml-*` assets.)_
+Models are fetched from Hugging Face (primary) with a [vigils.ai](https://vigils.ai) mirror fallback, each verified by SHA-256 (fail-closed). The ML build bundles [ONNX Runtime](https://onnxruntime.ai) 1.24 next to `vigil-hub`. Platform floors for the **ML** build: **Linux glibc ≥ 2.28**, **macOS ≥ 14 (Apple Silicon only** — upstream onnxruntime no longer publishes x86_64 macOS builds, so Intel macs use the default hard-fingerprint engine**)** — the default hard-fingerprint build has neither. _(ML builds ship with every release since v0.4.0 — look for the `vigils-cli-ml-*` assets.)_
 
 > Early releases aren't OS-code-signed yet; your OS may show a Gatekeeper / SmartScreen prompt
 > on first run — they're still independently verifiable (see below, or the full
@@ -214,7 +219,7 @@ What you'll see (real output, trimmed):
 > received the real value. It's a planted scenario with a freshly-generated local fixture; the
 > firewall, redaction, and audit are Vigils' real code, only the model/tool provider is simulated.
 
-### Protect Claude Code in one command (turnkey)
+### Protect your agents in one command (turnkey)
 
 Download the release, then run **one command** to get fully protected. No manual config editing —
 your existing settings are backed up and only Vigils' own entries are added (fully reversible):
@@ -225,13 +230,17 @@ vigil-hub setup --all       # protect everything, in one step
 
 `setup --all` wires up **both** layers of protection:
 
-1. **Native-tool input guard** — a Claude Code `PreToolUse` hook so **every tool call** (Bash,
-   Edit, Write, Read, MCP tools, …) is checked before it runs; a real credential heading *into* a
-   tool is **blocked fail-closed** and recorded in your tamper-evident audit ledger.
-2. **MCP gateway** — routes each of your stdio MCP servers through Vigils so secrets in tool
+1. **Native-tool input guard** — pre-tool-use hooks for **Claude Code, Codex CLI, Gemini CLI
+   and Cursor**, so **every tool call** (Bash, Edit, Write, Read, MCP tools, …) is checked before
+   it runs; a real credential heading *into* a tool is **blocked fail-closed** and recorded in
+   your tamper-evident audit ledger.
+2. **MCP gateway** — rewrites the stdio MCP servers of every detected agent — **Claude Code,
+   Codex, Cursor, Windsurf, Kimi CLI, ZCode and pi** — to run through Vigils, so secrets in tool
    **results** are scrubbed before the model ever sees them, and every call is audited. It defaults
    to **monitor** posture — your servers stay fully usable while every hard protection stays on
    (raw-secret block, result redaction, tamper-evident audit). Add `--enforce` for default-deny gating.
+   The full per-agent coverage matrix lives in the
+   [Agent Integration guide](https://duncatzat.github.io/vigils/getting-started/agent-integration.html).
 
 ```bash
 vigil-hub setup --mcp --doctor    # pre-flight: will each wrapped MCP server actually start? (PATH check, read-only)
@@ -239,7 +248,7 @@ vigil-hub inspect protection      # after using your agent: see what Vigils caug
 vigil-hub setup --all --uninstall # cleanly remove everything (only Vigils' own entries; your settings restored faithfully)
 ```
 
-Restart Claude Code (or start a new session) and you're protected. This is the fastest path from a
+Restart your agent (or start a new session) and you're protected. This is the fastest path from a
 GitHub download to real protection.
 
 ### As an MCP gateway (CLI)
@@ -269,9 +278,13 @@ for per-agent config and how to verify it's gating.
 
 ### Desktop app
 
-Launch the desktop app to watch and control agents in real time: **Approval Queue** (approve /
-deny / bulk), **Activity Feed** (live audit stream), **Server Registry**, **Session Replay**,
-and **Privacy Findings**.
+Launch the desktop app to watch and control agents in real time from the **Aegis command
+deck**: **Protection Overview** (shield hero + eight-emblem defense ring + one-click **Deploy
+Guardian**), **Approval Queue** (approve / deny / bulk), **Activity Feed** (live audit stream),
+**Server Registry**, **Session Replay**, **Privacy Findings**, and **Settings** (engine mode,
+posture, resident daemon, ML model install, audit checkpoint anchor). Closing the window hides
+to the system tray — Vigils keeps guarding in the background (tray menu to reopen / quit; a
+second launch focuses the existing instance).
 
 ## Build from source
 
@@ -289,7 +302,7 @@ cargo build --release -p vigil-hub-cli --bin vigil-hub
 
 # Desktop UI + app (the `gui` feature embeds the built UI)
 cd apps/desktop/ui && npm ci && npm run build && cd -
-cargo build --release -p vigil-desktop --features gui --bin gui
+cargo build --release -p vigil-desktop --features gui --bin vigils
 ```
 
 > Crate names use the historical `vigil-*` prefix; the product and project are **Vigils**.
@@ -313,10 +326,11 @@ don't open a public issue for security reports.
 ## Project structure
 
 ```
-crates/          # 15 library crates (audit, policy, firewall, mcp, redaction, runner,
-                 #   lease, sandbox-linux, http-auth/transport, ui-protocol, browser, sdk, types)
+crates/          # 16 library crates (audit, policy, firewall, mcp, redaction, runner,
+                 #   lease, sandbox-linux, daemon-ipc, http-auth/transport, ui-protocol,
+                 #   browser, sdk, types)
 apps/
-  desktop/       # Tauri 2 + Vue 3 desktop app (bin: gui)
+  desktop/       # Tauri 2 + Vue 3 desktop app (bin: vigils)
   native-host/   # Chrome native-messaging bridge (bin: vigil-native-host)
   vigil-hub-cli/ # CLI MCP gateway (bin: vigil-hub)
 extensions/
