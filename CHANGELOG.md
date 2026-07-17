@@ -8,7 +8,7 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
-## [Unreleased]
+## [v0.6.0-beta.2] — 2026-07-17 — the Aegis command-deck desktop UI lands in the public build
 
 ### Changed
 
