@@ -8,6 +8,29 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **Desktop app: the Aegis command-deck UI lands in the public build.** The desktop UI is
+  replaced wholesale with the current design line that until now only shipped internally:
+  shield hero + eight-emblem defense ring (dual-state), per-page rework of Activity Feed,
+  Approval Queue, Server Registry, Session Replay and Privacy Findings on a shared design
+  language (window-button cards, bracket status pills, official emblem headers, monospace
+  semantically-colored log streams), official brand assets (`/brand`), dark-first.
+- **Desktop app becomes a resident guardian.** Closing the window now hides to the system
+  tray (tray menu: open / quit); a second launch focuses the existing instance instead of
+  starting a duplicate process (single-instance plugin); Windows release builds no longer
+  flash a console window.
+- **Deploy Guardian & engine controls in the GUI.** One-click protection deploy with
+  per-agent status, missing-engine detection with secure auto-download (HTTPS + SHA-pin +
+  run-verify, fail-closed), engine mode (hardfp/ml/auto) and posture (low/medium/high)
+  switches, resident daemon lifecycle and ML model install — the GUI now drives the same
+  `vigil-hub` engine the CLI uses.
+- The audit **checkpoint anchor** stays: the public build's existing
+  `Settings → checkpoint` anchoring was re-seated into the new Settings page (same
+  `anchor_checkpoint` command, Aegis-styled card).
+
 ## [v0.6.0-beta.1] — 2026-07-17 — three new agent surfaces (Kimi CLI / ZCode / pi) on a hardened integration layer
 
 ### Added

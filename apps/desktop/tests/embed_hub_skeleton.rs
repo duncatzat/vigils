@@ -6,8 +6,8 @@
 //! - (b) `Arc<Hub>` 满足 `Send + Sync + 'static`(`app.manage()` 的隐式约束)
 //! - (c) Hub 内部与 caller 共享同一份 `Arc<Ledger>`(strong_count 至少 +1),
 //!   证明 `gui_build_hub` **没**重 open ledger(避免与 gui.rs single-open 冲突)
-//! - (d) `INVOKE_COMMANDS.len() == 28`(快照守门:gui-gated handler 总数;R3 ADR 0024 daemon/model
-//!   接入 +5。注:公开仓 CI 不跑 `--features gui`,本快照仅本地 / release gui 测时校验,新增须人工同步)
+//! - (d) `INVOKE_COMMANDS.len() == 22`(快照守门:α2 本身不新增 #[tauri::command],但其后
+//!   α3-α5 / ISS / D19 新增 handler 时本断言随 SSOT 同步,漂移即失败)
 //!
 //! 本文件只在 `--features gui` 下编译,与 lib 模块 `vigil_desktop::embed`
 //! 保持同步(模块本身也是 gui-feature-gated)。
@@ -63,20 +63,21 @@ fn gui_build_hub_shares_ledger_arc() {
     );
 }
 
-/// (d) INVOKE_COMMANDS 快照守门(现 = 28)—— gui-gated handler 总数的人工快照。
+/// (d) INVOKE_COMMANDS 快照守门(现 = 26)—— α2 本身通过 Hub.resolve_approval 委托不新增 handler;
+/// 其后 α3-α5 / ISS / D19(protection_summary)新增时本断言随 SSOT 同步。
 ///
-/// R3(ADR 0024)接入 daemon/model GUI 卡:`daemon_status/start/stop` + `model_status/install`
-/// = +5,接到公开仓既有 23 → **28**。本快照 `#![cfg(feature="gui")]`,而公开仓 CI 不跑
-/// `--features gui`(见 ci.yml)→ 仅本地 / release gui 测时校验,故新增/删除 #[tauri::command]
-/// 必须**人工**同步本断言 + commands.rs SSOT 三件套(commands.rs / vigils.rs generate_handler! /
-/// capabilities/default.json);commands.rs 内的 in-sync 测只验三处一致,不锁绝对数,故由本快照兜底。
+/// 与 C1/C2 的关键区别:α2 的功能升级在既有 handler 函数体内部(改走
+/// `hub.resolve_approval`)而非新增 #[tauri::command]。SSOT 三件套
+/// (commands.rs / gui.rs generate_handler! / capabilities/default.json)零修改。
+/// 见 ADR 0014 Revised α2 (TASK-005)。
 #[test]
 fn invoke_commands_count_unchanged_in_alpha2() {
     assert_eq!(
         vigil_desktop::commands::INVOKE_COMMANDS.len(),
-        28,
-        "SSOT handler 数 = 28(既有 23 + R3 daemon/model 5:daemon_status/start/stop + \
-         model_status/install)。新增/删除 #[tauri::command] 时,本快照 + commands.rs SSOT 三件套\
-         (commands.rs / vigils.rs generate_handler! / capabilities/default.json)必须同步。"
+        26,
+        "SSOT handler 数 = 26(α1=1 + α2=3 + α3=3 + α4=10 + α5=2 + ISS-017=1 + ISS-018=1 + D19=1 + P1.3=2 + ③引擎=2)。\
+         α2 本身不新增 handler(功能升级在 hub.resolve_approval 函数体内,见 ADR 0014 Revised α2);\
+         其后 α3-α5 / ISS / D19(protection_summary)新增 handler 时,本快照 + commands.rs SSOT 三件套\
+         必须同步。新增 handler 漂移即本断言失败,强制三处同步。"
     );
 }

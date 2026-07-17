@@ -20,6 +20,7 @@ import enUS from "./locales/en-US.json";
 // 在严格 CSP(`script-src 'self'`,无 'unsafe-eval')下被浏览器拦截 → 桌面 GUI(Tauri
 // WebView2)渲染时抛 EvalError、渲染中断 → 黑屏。本编译器只做纯字符串 `{named}` 插值,
 // 零 eval,完全 CSP 安全。本项目消息均为简单 UI 串(无 plural `|` / linked `@:` 语法),足够覆盖。
+// (与公开仓 v0.1.3 的黑屏修复同源;内外仓本文件由此 reconcile。)
 const cspSafeMessageCompiler: MessageCompiler = (message) => {
   const template = typeof message === "string" ? message : String(message);
   return (ctx: MessageContext) =>
@@ -43,16 +44,18 @@ function detectInitialLocale(): SupportedLocale {
   } catch {
     // localStorage disabled — 用 navigator 兜底
   }
-  // 默认 en-US,与原型图语言保持一致;用户可在顶栏语言选择器切换。
-  return "en-US";
+  // navigator.language 通常 "zh-CN" / "en-US" / "ja-JP" 等;
+  // 任何 zh-* 都映射到 zh-CN,其余回 en-US
+  const nav = (typeof navigator !== "undefined" ? navigator.language : "") || "";
+  return nav.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
 }
 
 export const i18n = createI18n({
   legacy: false,
-  // CSP 安全:用自定义编译器替代默认(默认走 new Function,违反 script-src 'self')
-  messageCompiler: cspSafeMessageCompiler,
   locale: detectInitialLocale(),
   fallbackLocale: "en-US",
+  // CSP 安全:用自定义编译器替代默认(默认走 new Function,违反 script-src 'self')
+  messageCompiler: cspSafeMessageCompiler,
   messages: {
     "zh-CN": zhCN,
     "en-US": enUS,

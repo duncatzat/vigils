@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2/capability",
   "identifier": "default",
-  "description": "I08b-β1 capability 白名单 —— 系统能力(core:default)+ 应用层 30 条 invoke command 显式 allow(ISS-017 加 list_privacy_findings, ISS-018 加 export_session_replay,ADR 0024 加 daemon_status/start/stop + model_status/install)。permission identifier 无前缀 = APP_ACL_KEY(应用自身命令);命令名 underscore 由 tauri-build 在构建期 slugify 为 hyphen(例:`list_sessions` → `allow-list-sessions`)。SSOT 是 `apps/desktop/src/commands.rs::INVOKE_COMMANDS`;新增/删除 handler 必须三处同步:commands.rs + src/bin/vigils.rs 的 generate_handler! + 本文件。参见 https://v2.tauri.app/security/permissions/",
+  "description": "I08b-β1 capability 白名单 —— 系统能力(core:default)+ 应用层 37 条 invoke command 显式 allow(ISS-017 加 list_privacy_findings, ISS-018 加 export_session_replay)。permission identifier 无前缀 = APP_ACL_KEY(应用自身命令);命令名 underscore 由 tauri-build 在构建期 slugify 为 hyphen(例:`list_sessions` → `allow-list-sessions`)。SSOT 是 `apps/desktop/src/commands.rs::INVOKE_COMMANDS`;新增/删除 handler 必须三处同步:commands.rs + src/bin/vigils.rs 的 generate_handler! + 本文件。参见 https://v2.tauri.app/security/permissions/",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -31,13 +31,20 @@
     "allow-list-privacy-findings",
     "allow-export-session-replay",
     "allow-protection-summary",
-    "allow-anchor-checkpoint",
-    "allow-browser-guard-status",
+    "allow-guardian-status",
+    "allow-deploy-guardian",
+    "allow-engine-present",
+    "allow-download-engine",
+    "allow-settings-get",
+    "allow-set-posture",
+    "allow-set-engine-mode",
     "allow-daemon-status",
     "allow-daemon-start",
     "allow-daemon-stop",
     "allow-model-status",
     "allow-model-install",
-    "allow-download-ml-engine"
+    "allow-download-ml-engine",
+    "allow-browser-guard-status",
+    "allow-anchor-checkpoint"
   ]
 }

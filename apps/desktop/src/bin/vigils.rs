@@ -1,3 +1,7 @@
+// Windows release 用 windows 子系统,杜绝 GUI 启动时多出的控制台黑窗(请勿删)。
+// debug 下保留控制台,便于开发期看 stdout/stderr 日志。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! I08b-α1+α2 GUI 二进制入口(feature = "gui")。
 //!
 //! # 架构
@@ -234,25 +238,6 @@ async fn protection_summary(state: State<'_, AppState>) -> Result<ProtectionSumm
         .ledger
         .protection_summary(RECENT_LIMIT)
         .map_err(|e| e.to_string())
-}
-
-/// 手动触发审计检查点锚定(`Settings → Checkpoint anchor`)。
-///
-/// 绑定到 ledger 同目录 sidecar(`<ledger>.checkpoints`),追加当前链头事件作为锚点。
-/// 空账本或链头未前进时返回 `None`,表示没有新的前缀可锚;成功时返回锚点 event_id。
-#[tauri::command]
-async fn anchor_checkpoint(state: State<'_, AppState>) -> Result<Option<i64>, String> {
-    let ledger_path = vigil_desktop::ledger_path::resolve_ledger_path(
-        std::env::var(vigil_desktop::ledger_path::LEDGER_ENV_VAR)
-            .ok()
-            .as_deref(),
-        dirs::data_local_dir().as_deref(),
-    )
-    .map_err(|e| format!("resolve_ledger_path failed: {e}"))?;
-
-    let log = CheckpointLog::sidecar_for(&ledger_path);
-    let checkpoint = log.emit(state.ledger.as_ref()).map_err(|e| e.to_string())?;
-    Ok(checkpoint.map(|cp| cp.event_id))
 }
 
 /// `invoke('list_privacy_findings', { req })` → UiCommand::ListPrivacyFindings →
@@ -634,68 +619,150 @@ async fn verify_chain(state: State<'_, AppState>) -> Result<ChainVerifyReport, S
     }
 }
 
-// ─────────────────── ML 控制平面(ADR 0024):daemon 生命周期 + 模型安装 ───────────────────
+// ─────────────────────────── P1.3 Deploy Guardian ─────────────────────────
 //
-// shell-out 纪律(不把 ort 拉进 GUI):重活在 `vigil-hub` CLI,GUI 只调度 + 解析(逻辑在
-// `vigil_desktop::ml_control`)。这些 handler 取 `AppHandle`(Tauri 自动注入)以经 resource_dir /
-// 稳定启动器 / PATH 解析引擎二进制;不触 Ledger / Hub。引擎缺失时只读 handler 优雅回默认值不报错。
+// GUI 控制平面驱动 vigil-hub CLI 引擎(bundle-and-drive):不读 AppState(ledger),而是解析/复制
+// 引擎二进制 + 跑 `setup --json` 子进程。逻辑在 `vigil_desktop::guardian`。
 
-/// `invoke('browser_guard_status')` → 只读浏览器防线(native host)注册态 + 24h 守门统计。
+/// `invoke('guardian_status')` → 只读守卫状态(逐 agent;含稳定启动器 canonical 比对)。
 #[tauri::command]
-async fn browser_guard_status(
-    state: State<'_, AppState>,
-) -> Result<vigil_desktop::browser_guard::BrowserGuardStatus, String> {
-    vigil_desktop::browser_guard::browser_guard_status(state.ledger.as_ref())
+async fn guardian_status(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::guardian::GuardianStatus, String> {
+    vigil_desktop::guardian::status(&app)
 }
+
+/// `invoke('deploy_guardian')` → **Write**:复制引擎到稳定启动器 + `setup --hook-exe <稳定> --json`,
+/// 把 agent 的 hook 钉在稳定路径上(抗 app 更新/移动,CRIT-1)。返回逐 agent 状态。
+#[tauri::command]
+async fn deploy_guardian(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::guardian::GuardianStatus, String> {
+    vigil_desktop::guardian::deploy(&app)
+}
+
+/// `invoke('engine_present')` → 引擎二进制是否就位(false → 前端提示下载缺失工具)。
+#[tauri::command]
+async fn engine_present(app: tauri::AppHandle) -> Result<bool, String> {
+    Ok(vigil_desktop::guardian::engine_present(&app))
+}
+
+/// `invoke('download_engine')` → **Write**:缺引擎时从发布镜像安全下载(HTTPS + SHA-pin +
+/// 运行核验,fail-closed)到稳定启动器并接 hook。返回部署后逐 agent 状态。
+#[tauri::command]
+async fn download_engine(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::guardian::GuardianStatus, String> {
+    vigil_desktop::guardian::download_engine(&app)
+}
+
+// ─────────────────────────── R3 Phase 1:Settings(引擎模式 + 姿态)─────────────────────────
+
+/// `invoke('settings_get')` → 只读设置(引擎模式 + 姿态 + 引擎是否就位)。
+#[tauri::command]
+async fn settings_get(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::guardian::SettingsStatus, String> {
+    vigil_desktop::guardian::settings_get(&app)
+}
+
+/// `invoke('set_posture', { profile })` → **Write**:切换安全姿态(low|medium|high;hook 即时消费)。
+#[tauri::command]
+async fn set_posture(
+    app: tauri::AppHandle,
+    profile: String,
+) -> Result<vigil_desktop::guardian::SettingsStatus, String> {
+    vigil_desktop::guardian::set_posture(&app, &profile)
+}
+
+/// `invoke('set_engine_mode', { mode })` → **Write**:切换引擎模式(hardfp|ml|auto)。
+#[tauri::command]
+async fn set_engine_mode(
+    app: tauri::AppHandle,
+    mode: String,
+) -> Result<vigil_desktop::guardian::SettingsStatus, String> {
+    vigil_desktop::guardian::set_engine_mode(&app, &mode)
+}
+
+// ───────────────── R3 Phase 2:常驻 daemon 生命周期 + ML 模型安装(ADR 0024)─────────────────
 
 /// `invoke('daemon_status')` → 只读 daemon 运行态(running / pii_loaded / engine_present)。
 #[tauri::command]
 async fn daemon_status(
     app: tauri::AppHandle,
-) -> Result<vigil_desktop::ml_control::DaemonStatus, String> {
-    vigil_desktop::ml_control::daemon_status(&app)
+) -> Result<vigil_desktop::guardian::DaemonStatus, String> {
+    vigil_desktop::guardian::daemon_status(&app)
 }
 
 /// `invoke('daemon_start')` → **Write**:detached 启动常驻 daemon(暖载 ML 供 hook 主路径)。
 #[tauri::command]
 async fn daemon_start(
     app: tauri::AppHandle,
-) -> Result<vigil_desktop::ml_control::DaemonStatus, String> {
-    vigil_desktop::ml_control::daemon_start(&app)
+) -> Result<vigil_desktop::guardian::DaemonStatus, String> {
+    vigil_desktop::guardian::daemon_start(&app)
 }
 
 /// `invoke('daemon_stop')` → **Write**:停止常驻 daemon(R1+token 验存活后杀 pid)。
 #[tauri::command]
 async fn daemon_stop(
     app: tauri::AppHandle,
-) -> Result<vigil_desktop::ml_control::DaemonStatus, String> {
-    vigil_desktop::ml_control::daemon_stop(&app)
+) -> Result<vigil_desktop::guardian::DaemonStatus, String> {
+    vigil_desktop::guardian::daemon_stop(&app)
 }
 
 /// `invoke('model_status')` → 只读 ML 模型缓存态(privacy/injection installed + ml_supported)。
 #[tauri::command]
 async fn model_status(
     app: tauri::AppHandle,
-) -> Result<vigil_desktop::ml_control::ModelStatus, String> {
-    vigil_desktop::ml_control::model_status(&app)
+) -> Result<vigil_desktop::guardian::ModelStatus, String> {
+    vigil_desktop::guardian::model_status(&app)
 }
 
 /// `invoke('model_install')` → **Write**:下载 ML 模型(阻塞,数十秒;fail-closed)。
 #[tauri::command]
 async fn model_install(
     app: tauri::AppHandle,
-) -> Result<vigil_desktop::ml_control::ModelStatus, String> {
-    vigil_desktop::ml_control::model_install(&app)
+) -> Result<vigil_desktop::guardian::ModelStatus, String> {
+    vigil_desktop::guardian::model_install(&app)
 }
 
 /// `invoke('download_ml_engine')` → **Write**:下载安装 ML 引擎变体(`--features ort` 的 vigil-hub +
-/// 同目录 ONNX Runtime 库;HTTPS + 签名清单 SHA-pin + 运行核验,fail-closed)到稳定目录,使 GUI 用户
-/// 的 ML 真正可用。返回安装后模型态(`ml_supported` 应翻 true)。
+/// 同目录 ONNX Runtime dylib;HTTPS + 整包 SHA-pin + 运行核验,fail-closed)到稳定目录,使 GUI 用户
+/// 的 ML 真正可用(出厂硬指纹引擎无法装模型)。返回安装后模型态(`ml_supported` 应翻 true)。
 #[tauri::command]
 async fn download_ml_engine(
     app: tauri::AppHandle,
-) -> Result<vigil_desktop::ml_control::ModelStatus, String> {
-    vigil_desktop::ml_control::download_ml_engine(&app)
+) -> Result<vigil_desktop::guardian::ModelStatus, String> {
+    vigil_desktop::guardian::download_ml_engine(&app)
+}
+
+/// 手动触发审计检查点锚定(`Settings → Checkpoint anchor`;公开版既有功能,Aegis 移植时保留)。
+///
+/// 绑定到 ledger 同目录 sidecar(`<ledger>.checkpoints`),追加当前链头事件作为锚点。
+/// 空账本或链头未前进时返回 `None`,表示没有新的前缀可锚;成功时返回锚点 event_id。
+#[tauri::command]
+async fn anchor_checkpoint(state: State<'_, AppState>) -> Result<Option<i64>, String> {
+    let ledger_path = vigil_desktop::ledger_path::resolve_ledger_path(
+        std::env::var(vigil_desktop::ledger_path::LEDGER_ENV_VAR)
+            .ok()
+            .as_deref(),
+        dirs::data_local_dir().as_deref(),
+    )
+    .map_err(|e| format!("resolve_ledger_path failed: {e}"))?;
+
+    let log = CheckpointLog::sidecar_for(&ledger_path);
+    let checkpoint = log.emit(state.ledger.as_ref()).map_err(|e| e.to_string())?;
+    Ok(checkpoint.map(|cp| cp.event_id))
+}
+
+/// `invoke('browser_guard_status')` → 只读:浏览器防线状态(扩展体系 Phase 2「策略+观测」)。
+/// native host 注册态(manifest + Windows 注册表,复用 host 自身路径推导)+ 最近 24h
+/// 守门统计(ledger 纯读,整数计数不携带内容)。
+#[tauri::command]
+async fn browser_guard_status(
+    state: State<'_, AppState>,
+) -> Result<vigil_desktop::guardian::BrowserGuardStatus, String> {
+    vigil_desktop::guardian::browser_guard(&state.ledger)
 }
 
 // ─────────────────────────── Tauri setup ──────────────────────────────────
@@ -705,6 +772,15 @@ async fn download_ml_engine(
 //   含单测守门 fail-closed / env override / parent dir / 错误脱敏 8 条),依赖注入
 //   本 binary 提供 `dirs::data_local_dir()` 查询结果
 // - Fail-closed:任一步失败立即 `exit(1)`,**不回退 in-memory**,避免审计不变量无声丢失
+
+/// 唤起并聚焦主窗口(托盘左键 / 菜单"打开 Vigils";窗口此前可能被关闭收起到托盘)。
+fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
 
 fn main() {
     // β5:OS local data dir 查询(仅 gui feature 引 dirs;lib 侧 `ledger_path` 模块
@@ -756,6 +832,12 @@ fn main() {
     let ledger_for_poller = Arc::clone(&ledger);
 
     tauri::Builder::default()
+        // 单实例守卫(必须最先注册):再次启动 .exe 时,回调在**首实例**触发 → 只唤起已有主窗口,
+        // 第二进程自退。根治「桌面程序多开」(关窗=收托盘后再次启动会起第二进程+第二托盘+第二 Ledger
+        // 连接)。纯 Rust 生命周期插件,不暴露 invoke 命令 → 无需 capability 条目。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .manage(AppState {
             ledger: Arc::clone(&ledger),
             // Least privilege — session 默认 Read;写 handler 内部显式升 Write。
@@ -765,6 +847,14 @@ fn main() {
         // α2 写 resolve_approval handler 时可同时 inject `State<'_, AppState>` +
         // `State<'_, Arc<Hub>>`,把 Ledger-write 与 Hub.approval_broker.publish() 双路 atomic
         .manage(hub)
+        // 关闭主窗口 = 收起到系统托盘(Aegis 后台继续守护),不退出进程;
+        // 真正退出仅经托盘菜单"退出 Vigils"。符合常驻守护类应用的交互标准。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             // α1
             list_sessions,
@@ -796,21 +886,71 @@ fn main() {
             export_session_replay,
             // D19(Protection Overview —— 1 read)
             protection_summary,
-            // Settings: 手动锚定审计检查点
-            anchor_checkpoint,
-            // ML 控制平面(ADR 0024):daemon 生命周期(3)+ 模型安装(2)
+            // P1.3(Deploy Guardian —— 1 read + 1 write)
+            guardian_status,
+            deploy_guardian,
+            // ③ 缺失引擎:检测 + 安全自动下载
+            engine_present,
+            download_engine,
+            // R3 Phase 1(Settings —— 1 read + 2 write)
+            settings_get,
+            set_posture,
+            set_engine_mode,
+            // R3 Phase 2(daemon 生命周期 —— 1 read + 2 write;ML 模型 —— 1 read + 1 write)
             daemon_status,
             daemon_start,
             daemon_stop,
             model_status,
             model_install,
-            // ML 引擎变体安装(端到端 ML 最后一公里)
+            // R3 Phase 2.5(ML 引擎变体安装 —— 1 write)
             download_ml_engine,
-            // 浏览器防线卡(Protection Overview —— 1 read)
+            // 扩展体系 Phase 2「策略+观测」(浏览器防线卡 —— 1 read)
             browser_guard_status,
+            // Settings:手动锚定审计检查点(公开版既有功能 —— 1 write)
+            anchor_checkpoint,
         ])
         .setup(move |app| {
             let _main_window = app.get_webview_window("main");
+
+            // ── 系统托盘(Aegis 常驻守护)─────────────────────────────────────
+            // 图标复用 bundle 内嵌的官方应用图标(default_window_icon);菜单 = 状态行
+            // + 打开 + 退出。左键点击托盘 → 唤起主窗口;关闭窗口只收起(见 on_window_event)。
+            {
+                use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+
+                let status_i =
+                    MenuItem::with_id(app, "tray_status", "● 守护中 · Aegis", false, None::<&str>)?;
+                let show_i = MenuItem::with_id(app, "tray_show", "打开 Vigils", true, None::<&str>)?;
+                let sep = PredefinedMenuItem::separator(app)?;
+                let quit_i =
+                    MenuItem::with_id(app, "tray_quit", "退出 Vigils", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&status_i, &sep, &show_i, &quit_i])?;
+
+                let mut tray = TrayIconBuilder::with_id("vigils-tray")
+                    .tooltip("Vigils — 守护中 · Aegis")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "tray_show" => show_main_window(app),
+                        "tray_quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            show_main_window(tray.app_handle());
+                        }
+                    });
+                if let Some(icon) = app.default_window_icon() {
+                    tray = tray.icon(icon.clone());
+                }
+                tray.build(app)?;
+            }
 
             // Theme G:real-time ledger-events-changed poller(read-only,fail-soft)。
             // 专用 OS 线程 + std sleep —— KISS,避免 async runtime 耦合;AppHandle.emit 同步。

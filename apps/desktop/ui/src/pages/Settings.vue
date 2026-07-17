@@ -1,67 +1,143 @@
 <script setup lang="ts">
 /**
- * Settings —— 桌面客户端偏好设置。
+ * Settings —— 系统设置中枢(R3 Phase 1 引擎模式 + 姿态;Phase 2 模型安装 + 常驻 daemon 已接活)。
  *
- * 配置全部来自 `useSettingsStore`,只做 UI 绑定与持久化(localStorage),
- * 不新增后端命令。ONNX / Checkpoint 管理按钮当前为占位操作。
+ * - 引擎模式(hardfp/ml/auto)+ 安全姿态(low/medium/high):经 vigil-hub CLI 落盘读写
+ *   (engine.json / posture.json)。**姿态即时生效**(hook 每次工具调用消费 posture)。
+ * - 模型安装(`model install/status`)+ 常驻 daemon 生命周期(`daemon start/stop/status`,ADR 0024):
+ *   经 vigil-hub CLI shell-out。turnkey:装模型 → 启 daemon(暖载)→ 引擎设 ml → hook 主路径跑 ML。
+ *   daemon 独立于 GUI 生命周期(detached;为 agent hook 服务,不随关窗而停)。
+ *
+ * 安全契约:文案经 i18n 纯 {named} 插值(CSP-safe),禁 v-html;写入值后端 whitelist 校验。
  */
-import { computed, onMounted, ref } from "vue";
-import {
-  NButton,
-  NInputNumber,
-  NSelect,
-  NSlider,
-  NSwitch,
-  NTag,
-  useMessage,
-} from "naive-ui";
-import type { SelectOption } from "naive-ui";
+import { onMounted, onUnmounted, ref } from "vue";
+import { NButton } from "naive-ui";
 import { useI18n } from "vue-i18n";
-import { invoke } from "@tauri-apps/api/core";
-import { useSettingsStore } from "@/stores/settings";
+import { useRouter } from "vue-router";
+import { getVersion } from "@tauri-apps/api/app";
 import {
+  settingsGet,
+  setPosture,
+  setEngineMode,
   daemonStatus,
   daemonStart,
   daemonStop,
   modelStatus,
   modelInstall,
   downloadMlEngine,
+  guardianStatus,
+  anchorCheckpoint,
+  type SettingsStatus,
   type DaemonStatus,
   type ModelStatus,
 } from "@/api/ipc";
-import PanelCard from "@/components/PanelCard.vue";
+import WindowCard from "@/components/WindowCard.vue";
+import StatusPill from "@/components/StatusPill.vue";
 
 const { t } = useI18n();
-const settings = useSettingsStore();
-const message = useMessage();
+const router = useRouter();
 
-// ─── ML 控制平面（ADR 0024）：常驻 daemon 生命周期 + ML 模型安装（经 vigil-hub CLI shell-out）───
+const ENGINE_MODES = ["hardfp", "ml", "auto"] as const;
+const POSTURES = ["low", "medium", "high"] as const;
+
+const settings = ref<SettingsStatus | null>(null);
 const daemon = ref<DaemonStatus | null>(null);
 const model = ref<ModelStatus | null>(null);
-// busy 标记当前进行中的写操作（'daemon:start' | 'daemon:stop' | 'model:install'），驱动按钮 loading 态。
-const busy = ref<string | null>(null);
+const loading = ref(false);
+const busy = ref<string | null>(null); // 正在写入的项 key(防并发点击)
+const error = ref<string | null>(null);
+// about 卡事实(此前只有「将在此显示」占位句,版本/账本从未真正渲染)
+const appVersion = ref<string>("");
+const ledgerPath = ref<string>("");
 
-const modelInstalled = computed<boolean>(
-  () => !!model.value?.privacy_installed && !!model.value?.injection_installed,
-);
-
-async function refreshMlControl(): Promise<void> {
+async function refresh(): Promise<void> {
+  loading.value = true;
+  error.value = null;
   try {
-    const [d, m] = await Promise.all([daemonStatus(), modelStatus()]);
+    const [s, d, m] = await Promise.all([
+      settingsGet(),
+      daemonStatus(),
+      modelStatus(),
+    ]);
+    settings.value = s;
     daemon.value = d;
     model.value = m;
+    // 账本路径来自 guardian 聚合状态;best-effort,失败不阻塞设置页主体。
+    try {
+      ledgerPath.value = (await guardianStatus()).ledger;
+    } catch {
+      /* 保持上次值 */
+    }
   } catch (e) {
-    message.error(t("common.ipc_error") + ": " + String(e));
+    error.value = String(e);
+  } finally {
+    loading.value = false;
   }
 }
+
+async function pickEngine(mode: string): Promise<void> {
+  if (busy.value || settings.value?.engine_mode === mode) return;
+  busy.value = `engine:${mode}`;
+  error.value = null;
+  try {
+    settings.value = await setEngineMode(mode);
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function pickPosture(profile: string): Promise<void> {
+  if (busy.value || settings.value?.posture === profile) return;
+  busy.value = `posture:${profile}`;
+  error.value = null;
+  try {
+    settings.value = await setPosture(profile);
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = null;
+  }
+}
+
+// GUI-06(审核 ISS-20260702-008):daemon_start 后端只等 800ms,cached-model 暖载可能
+// 更久 —— 启动后短时轮询(1s × ≤60 次,覆盖 ~45s 的 ort 暖载上限)至 pii_loaded/停止,
+// 让 pill 从「启动中(暖载)」自动走到「运行中 · ML 已暖」,不再需要手动刷新。
+// 只读轮询,不占 busy 锁。
+let warmPollTimer: ReturnType<typeof setInterval> | null = null;
+function stopWarmPoll(): void {
+  if (warmPollTimer !== null) clearInterval(warmPollTimer);
+  warmPollTimer = null;
+}
+function startWarmPoll(): void {
+  stopWarmPoll();
+  let ticks = 0;
+  warmPollTimer = setInterval(async () => {
+    ticks += 1;
+    try {
+      const d = await daemonStatus();
+      daemon.value = d;
+      // warming(暖载窗口)期间继续轮;彻底停止 / 已暖 / 超时上限才收手。
+      if ((!d.running && !d.warming) || d.pii_loaded || ticks >= 60) stopWarmPoll();
+    } catch {
+      stopWarmPoll(); // 查询失败不重试轰炸;用户可手动刷新
+    }
+  }, 1000);
+}
+onUnmounted(stopWarmPoll);
 
 async function startDaemon(): Promise<void> {
   if (busy.value) return;
   busy.value = "daemon:start";
+  error.value = null;
   try {
     daemon.value = await daemonStart();
+    // running(快速就绪但 ML 未暖)或 warming(暖载窗口)都继续轮询到就绪。
+    if (daemon.value && !daemon.value.pii_loaded && (daemon.value.running || daemon.value.warming))
+      startWarmPoll();
   } catch (e) {
-    message.error(t("settings.daemon.error", { msg: String(e) }));
+    error.value = String(e);
   } finally {
     busy.value = null;
   }
@@ -70,10 +146,11 @@ async function startDaemon(): Promise<void> {
 async function stopDaemon(): Promise<void> {
   if (busy.value) return;
   busy.value = "daemon:stop";
+  error.value = null;
   try {
     daemon.value = await daemonStop();
   } catch (e) {
-    message.error(t("settings.daemon.error", { msg: String(e) }));
+    error.value = String(e);
   } finally {
     busy.value = null;
   }
@@ -82,435 +159,418 @@ async function stopDaemon(): Promise<void> {
 async function installModel(): Promise<void> {
   if (busy.value) return;
   busy.value = "model:install";
+  error.value = null;
   try {
     model.value = await modelInstall();
   } catch (e) {
-    message.error(t("settings.model.error", { msg: String(e) }));
+    error.value = String(e);
+  } finally {
+    busy.value = null;
+  }
+}
+
+// 手动锚定审计检查点(公开版既有功能):成功显示锚点 event id,链头未前进则如实提示。
+const anchorResult = ref<string | null>(null);
+async function handleAnchorCheckpoint(): Promise<void> {
+  if (busy.value) return;
+  busy.value = "checkpoint:anchor";
+  error.value = null;
+  anchorResult.value = null;
+  try {
+    const eventId = await anchorCheckpoint();
+    anchorResult.value =
+      eventId != null
+        ? t("settings.checkpoint.anchored", { eventId })
+        : t("settings.checkpoint.no_new_event");
+  } catch (e) {
+    error.value = String(e);
   } finally {
     busy.value = null;
   }
 }
 
 // 装 ML 引擎变体（让 ml_supported 翻 true，再可装模型）。出厂硬指纹引擎无 ort，必经此步。
+// 该安装自带完整引擎（不要求本机已有引擎）；装好后全量 refresh —— engine_present 翻 true,
+// 引擎模式/姿态/daemon 等控件的门禁随之解锁（GUI-01 鸡生蛋修复的收尾）。
 async function installMlEngine(): Promise<void> {
   if (busy.value) return;
   busy.value = "ml-engine:install";
+  error.value = null;
   try {
     model.value = await downloadMlEngine();
+    await refresh();
   } catch (e) {
-    message.error(t("settings.model.error", { msg: String(e) }));
+    error.value = String(e);
   } finally {
     busy.value = null;
   }
 }
 
 onMounted(() => {
-  void refreshMlControl();
+  void refresh();
+  // 应用版本(Tauri core API,静态一次即可;失败保持 "—")。
+  getVersion()
+    .then((v) => {
+      appVersion.value = v;
+    })
+    .catch(() => {});
 });
-
-async function handleAnchorCheckpoint(): Promise<void> {
-  try {
-    const eventId = await invoke<Option<number>>("anchor_checkpoint");
-    if (eventId != null) {
-      message.success(t("settings.anchor_success", { eventId }));
-    } else {
-      message.info(t("settings.anchor_no_new_event"));
-    }
-  } catch (e) {
-    message.error(t("settings.anchor_error", { msg: String(e) }));
-  }
-}
-
-type Option<T> = T | null;
-
-async function handleOnnxManage(): Promise<void> {
-  // 当前桌面端未接入真实 ONNX 模型镜像;给出明确提示而非静默无响应。
-  message.info(t("settings.onnx_not_implemented"));
-}
-
-const themeOptions = computed<SelectOption[]>(() => [
-  { label: t("theme.dark"), value: "dark" },
-  { label: t("theme.light"), value: "light" },
-  { label: t("theme.system"), value: "system" },
-]);
-
-const localeOptions = computed<SelectOption[]>(() => [
-  { label: t("settings.lang_zh"), value: "zh-CN" },
-  { label: t("settings.lang_en"), value: "en-US" },
-]);
-
-const postureOptions = computed<SelectOption[]>(() => [
-  { label: t("settings.posture_monitor_label"), value: "monitor" },
-  { label: t("settings.posture_enforce_label"), value: "enforce" },
-]);
-
-const ledgerPath = "~/Library/Application Support/Vigil/ledger.sqlite3";
-
-function updatePollingInterval(v: number | null): void {
-  if (typeof v === "number" && !Number.isNaN(v) && v >= 100) {
-    settings.setPollingIntervalMs(v);
-  }
-}
 </script>
 
 <template>
-  <div class="p-6 space-y-5 max-w-4xl mx-auto">
-    <!-- General -->
-    <PanelCard>
-      <template #header>
-        <h2 class="text-base font-semibold text-vigils-text-primary">
-          {{ t("settings.section_general") }}
-        </h2>
-      </template>
+  <div class="settings">
+    <div class="phead">
+      <span class="ptitle">{{ t("settings.page_title") }}</span>
+      <StatusPill v-if="settings && !settings.engine_present" tone="yellow">
+        {{ t("settings.engine_absent") }}
+      </StatusPill>
+      <!-- GUI-04(审核 ISS-20260702-006):引擎缺失时本页给出前进路径,不再全灰无解 -->
+      <NButton
+        v-if="settings && !settings.engine_present"
+        size="tiny"
+        type="primary"
+        data-testid="engine-absent-cta"
+        @click="router.push('/protection')"
+      >
+        {{ t("settings.engine_absent_cta") }}
+      </NButton>
+    </div>
 
-      <div class="space-y-5">
-        <div class="flex items-center justify-between gap-4">
-          <div>
-            <div class="text-sm font-medium text-vigils-text-primary">
-              {{ t("settings.theme_label") }}
-            </div>
-            <div class="text-xs text-vigils-text-muted mt-0.5">
-              {{ t("settings.theme_desc") }}
-            </div>
-          </div>
-          <NSelect
-            :value="settings.themeMode"
-            :options="themeOptions"
+    <!-- 1. AI 引擎与模型 -->
+    <WindowCard title="engine · model" class="block" data-testid="settings-engine-card">
+      <div class="sec-head">
+        <div>
+          <div class="s-title">{{ t("settings.engine.title") }}</div>
+          <div class="s-sub">{{ t("settings.engine.subtitle") }}</div>
+        </div>
+      </div>
+      <div class="modes">
+        <button
+          v-for="m in ENGINE_MODES"
+          :key="m"
+          type="button"
+          class="mode"
+          :class="{ on: settings?.engine_mode === m, busy: busy === `engine:${m}` }"
+          :disabled="!!busy || loading || !settings?.engine_present"
+          :data-testid="`engine-mode-${m}`"
+          @click="pickEngine(m)"
+        >
+          <div class="mode-name">{{ t(`settings.engine.mode_${m}`) }}</div>
+          <div class="mode-desc">{{ t(`settings.engine.mode_${m}_desc`) }}</div>
+        </button>
+      </div>
+      <div class="row">
+        <div>
+          <div class="s-title sm">{{ t("settings.model.title") }}</div>
+          <div class="s-sub">{{ t("settings.model.subtitle") }}</div>
+        </div>
+        <div class="ctl">
+          <StatusPill
+            v-if="model && !model.ml_supported"
+            tone="yellow"
+            data-testid="model-state"
+          >
+            {{ t("settings.model.unsupported") }}
+          </StatusPill>
+          <StatusPill
+            v-else-if="model?.privacy_installed && model?.injection_installed"
+            tone="green"
+            data-testid="model-state"
+          >
+            {{ t("settings.model.installed") }}
+          </StatusPill>
+          <StatusPill v-else tone="cyan" data-testid="model-state">
+            {{ t("settings.model.not_installed") }}
+          </StatusPill>
+          <!-- 安装 ML 引擎变体自带完整引擎(ort vigil-hub + ONNX Runtime),不依赖既有引擎:
+               故此按钮不受 engine_present 门禁约束(否则无引擎首启用户无自救路径,鸡生蛋)。 -->
+          <NButton
+            v-if="model && !model.ml_supported"
             size="small"
-            class="w-48"
-            @update:value="settings.setTheme"
-          />
-        </div>
-
-        <div class="h-px bg-vigils-border" />
-
-        <div class="flex items-center justify-between gap-4">
-          <div>
-            <div class="text-sm font-medium text-vigils-text-primary">
-              {{ t("settings.language_label") }}
-            </div>
-            <div class="text-xs text-vigils-text-muted mt-0.5">
-              {{ t("settings.language_desc") }}
-            </div>
-          </div>
-          <NSelect
-            :value="settings.locale"
-            :options="localeOptions"
-            size="small"
-            class="w-48"
-            @update:value="settings.setLocaleCode"
-          />
-        </div>
-
-        <div class="h-px bg-vigils-border" />
-
-        <div class="flex items-center justify-between gap-4">
-          <div>
-            <div class="text-sm font-medium text-vigils-text-primary">
-              {{ t("settings.ledger_path") }}
-            </div>
-            <div class="text-xs text-vigils-text-muted mt-0.5">
-              {{ t("settings.ledger_readonly") }}
-            </div>
-          </div>
-          <div class="text-sm font-mono text-vigils-text-secondary truncate max-w-md text-right">
-            {{ ledgerPath }}
-          </div>
-        </div>
-      </div>
-    </PanelCard>
-
-    <!-- Protection -->
-    <PanelCard>
-      <template #header>
-        <h2 class="text-base font-semibold text-vigils-text-primary">
-          {{ t("settings.section_protection") }}
-        </h2>
-      </template>
-
-      <div class="space-y-5">
-        <div class="flex items-center justify-between gap-4">
-          <div>
-            <div class="text-sm font-medium text-vigils-text-primary">
-              {{ t("settings.default_posture") }}
-            </div>
-            <div class="text-xs text-vigils-text-muted mt-0.5">
-              {{ t("settings.posture_monitor") }}
-            </div>
-          </div>
-          <NSelect
-            :value="settings.defaultPosture"
-            :options="postureOptions"
-            size="small"
-            class="w-48"
-            @update:value="settings.setDefaultPosture"
-          />
-        </div>
-
-        <div class="h-px bg-vigils-border" />
-
-        <div class="flex items-center justify-between gap-4">
-          <div class="text-sm font-medium text-vigils-text-primary">
-            {{ t("settings.auto_approve_first_seen") }}
-          </div>
-          <NSwitch
-            :value="settings.autoApproveFirstSeen"
-            @update:value="settings.setAutoApproveFirstSeen"
-          />
-        </div>
-
-        <div class="h-px bg-vigils-border" />
-
-        <div class="flex items-center justify-between gap-4">
-          <div class="text-sm font-medium text-vigils-text-primary">
-            {{ t("settings.redact_tool_results") }}
-          </div>
-          <NSwitch
-            :value="settings.redactToolResults"
-            @update:value="settings.setRedactToolResults"
-          />
-        </div>
-      </div>
-    </PanelCard>
-
-    <!-- AI Model (ADR 0024 — ML 模型安装) -->
-    <PanelCard>
-      <template #header>
-        <h2 class="text-base font-semibold text-vigils-text-primary">
-          {{ t("settings.model.title") }}
-        </h2>
-        <NTag size="small" :bordered="false" type="info">
-          {{ t("settings.model.phase2") }}
-        </NTag>
-      </template>
-
-      <div class="space-y-5">
-        <div class="flex items-start justify-between gap-4">
-          <div class="flex-1">
-            <div class="text-sm font-medium text-vigils-text-primary">
-              {{ t("settings.model.title") }}
-            </div>
-            <div class="text-xs text-vigils-text-muted mt-0.5">
-              {{ t("settings.model.subtitle") }}
-            </div>
-          </div>
-          <div class="flex items-center gap-3 shrink-0">
-            <NTag
-              v-if="model && !model.ml_supported"
-              size="small"
-              :bordered="false"
-              type="warning"
-              data-testid="model-state"
-            >
-              {{ t("settings.model.unsupported") }}
-            </NTag>
-            <NTag
-              v-else-if="modelInstalled"
-              size="small"
-              :bordered="false"
-              type="success"
-              data-testid="model-state"
-            >
-              {{ t("settings.model.installed") }}
-            </NTag>
-            <NTag
-              v-else-if="model"
-              size="small"
-              :bordered="false"
-              type="info"
-              data-testid="model-state"
-            >
-              {{ t("settings.model.not_installed") }}
-            </NTag>
-            <NTag v-else size="small" :bordered="false" data-testid="model-state">
-              {{ t("settings.model.status_unknown") }}
-            </NTag>
-            <NButton
-              v-if="model && !model.ml_supported"
-              size="small"
-              type="primary"
-              :loading="busy === 'ml-engine:install'"
-              :disabled="busy !== null || !model?.engine_present"
-              data-testid="ml-engine-install"
-              @click="installMlEngine()"
-            >
-              {{ t("settings.model.install_ml_engine") }}
-            </NButton>
-            <NButton
-              size="small"
-              tertiary
-              :loading="busy === 'model:install'"
-              :disabled="
-                busy !== null ||
-                !model?.engine_present ||
-                !model?.ml_supported ||
-                modelInstalled
-              "
-              data-testid="model-install"
-              @click="installModel()"
-            >
-              {{ t("settings.model.install") }}
-            </NButton>
-          </div>
-        </div>
-      </div>
-    </PanelCard>
-
-    <!-- Daemon (ADR 0024 — 常驻引擎生命周期) -->
-    <PanelCard>
-      <template #header>
-        <h2 class="text-base font-semibold text-vigils-text-primary">
-          {{ t("settings.daemon.title") }}
-        </h2>
-      </template>
-
-      <div class="space-y-5">
-        <div class="flex items-start justify-between gap-4">
-          <div class="flex-1">
-            <div class="text-sm font-medium text-vigils-text-primary">
-              {{ t("settings.daemon.title") }}
-            </div>
-            <!-- 模型未装时如实降级承诺:此时启动的 daemon 两个模型都不加载,hook 走硬指纹底座。 -->
-            <div class="text-xs text-vigils-text-muted mt-0.5">
-              {{
-                model && !(model.privacy_installed || model.injection_installed)
-                  ? t("settings.daemon.subtitle_no_model")
-                  : t("settings.daemon.subtitle")
-              }}
-            </div>
-          </div>
-          <div class="flex items-center gap-3 shrink-0">
-            <NTag
-              v-if="daemon?.running"
-              size="small"
-              :bordered="false"
-              type="success"
-              data-testid="daemon-state"
-            >
-              {{
-                daemon.pii_loaded
-                  ? t("settings.daemon.status_ml")
-                  : t("settings.daemon.status_running")
-              }}
-            </NTag>
-            <NTag
-              v-else-if="daemon?.warming"
-              size="small"
-              :bordered="false"
-              type="warning"
-              data-testid="daemon-state"
-            >
-              {{ t("settings.daemon.status_warming") }}
-            </NTag>
-            <NTag
-              v-else
-              size="small"
-              :bordered="false"
-              type="warning"
-              data-testid="daemon-state"
-            >
-              {{ t("settings.daemon.status_stopped") }}
-            </NTag>
-            <NButton
-              v-if="!daemon?.running && !daemon?.warming"
-              size="small"
-              tertiary
-              :loading="busy === 'daemon:start'"
-              :disabled="busy !== null || !daemon?.engine_present"
-              data-testid="daemon-start"
-              @click="startDaemon()"
-            >
-              {{ t("settings.daemon.start") }}
-            </NButton>
-            <NButton
-              v-else
-              size="small"
-              tertiary
-              :loading="busy === 'daemon:stop'"
-              :disabled="busy !== null || !daemon?.engine_present"
-              data-testid="daemon-stop"
-              @click="stopDaemon()"
-            >
-              {{ t("settings.daemon.stop") }}
-            </NButton>
-          </div>
-        </div>
-      </div>
-    </PanelCard>
-
-    <!-- Advanced -->
-    <PanelCard>
-      <template #header>
-        <h2 class="text-base font-semibold text-vigils-text-primary">
-          {{ t("settings.section_advanced") }}
-        </h2>
-      </template>
-
-      <div class="space-y-5">
-        <div class="flex items-center justify-between gap-4">
-          <div>
-            <div class="text-sm font-medium text-vigils-text-primary">
-              {{ t("settings.polling_interval") }}
-            </div>
-            <div class="text-xs text-vigils-text-muted mt-0.5">
-              {{ t("settings.polling_slider") }}
-            </div>
-          </div>
-          <div class="w-48 space-y-2">
-            <NInputNumber
-              :value="settings.pollingIntervalMs"
-              :min="100"
-              :max="10000"
-              :step="100"
-              size="small"
-              @update:value="updatePollingInterval"
-            >
-              <template #suffix>
-                <span class="text-vigils-text-muted">ms</span>
-              </template>
-            </NInputNumber>
-            <NSlider
-              :value="settings.pollingIntervalMs"
-              :min="100"
-              :max="5000"
-              :step="100"
-              @update:value="updatePollingInterval"
-            />
-          </div>
-        </div>
-
-        <div class="h-px bg-vigils-border" />
-
-        <div class="flex items-center justify-between gap-4">
-          <div>
-            <div class="text-sm font-medium text-vigils-text-primary">
-              {{ t("settings.onnx_pii_model") }}
-            </div>
-            <div class="text-xs text-vigils-text-muted mt-0.5">
-              {{ t("settings.onnx_bootstrap") }}
-            </div>
-          </div>
-          <NButton size="small" tertiary @click="handleOnnxManage">
-            {{ t("common.manage") }}
+            type="primary"
+            :loading="busy === 'ml-engine:install'"
+            :disabled="!!busy || loading"
+            data-testid="ml-engine-install"
+            @click="installMlEngine()"
+          >
+            {{ t("settings.model.install_ml_engine") }}
           </NButton>
-        </div>
-
-        <div class="h-px bg-vigils-border" />
-
-        <div class="flex items-center justify-between gap-4">
-          <div>
-            <div class="text-sm font-medium text-vigils-text-primary">
-              {{ t("settings.checkpoint_anchor") }}
-            </div>
-            <div class="text-xs text-vigils-text-muted mt-0.5">
-              {{ t("settings.anchor_button") }}
-            </div>
-          </div>
-          <NButton size="small" tertiary @click="handleAnchorCheckpoint">
-            {{ t("common.manage") }}
+          <NButton
+            size="small"
+            type="primary"
+            :loading="busy === 'model:install'"
+            :disabled="
+              !!busy ||
+              loading ||
+              !settings?.engine_present ||
+              !model?.ml_supported ||
+              !!(model?.privacy_installed && model?.injection_installed)
+            "
+            data-testid="model-install"
+            @click="installModel()"
+          >
+            {{ t("settings.model.install") }}
           </NButton>
         </div>
       </div>
-    </PanelCard>
+    </WindowCard>
+
+    <!-- 2. 安全姿态(即时生效:hook 消费) -->
+    <WindowCard title="posture" class="block" data-testid="settings-posture-card">
+      <div class="sec-head">
+        <div>
+          <div class="s-title">{{ t("settings.posture.title") }}</div>
+          <div class="s-sub">{{ t("settings.posture.subtitle") }}</div>
+        </div>
+      </div>
+      <div class="modes">
+        <button
+          v-for="p in POSTURES"
+          :key="p"
+          type="button"
+          class="mode"
+          :class="{ on: settings?.posture === p, busy: busy === `posture:${p}` }"
+          :disabled="!!busy || loading || !settings?.engine_present"
+          :data-testid="`posture-${p}`"
+          @click="pickPosture(p)"
+        >
+          <div class="mode-name">{{ t(`settings.posture.${p}`) }}</div>
+          <div class="mode-desc">{{ t(`settings.posture.${p}_desc`) }}</div>
+        </button>
+      </div>
+    </WindowCard>
+
+    <!-- 3. 守护进程(ADR 0024:暖载 ML 供 hook 主路径) -->
+    <WindowCard title="daemon · aegis" class="block" data-testid="settings-daemon-card">
+      <div class="row first">
+        <div>
+          <div class="s-title">{{ t("settings.daemon.title") }}</div>
+          <!-- 模型未装时如实降级承诺:此时启动的 daemon 两个模型都不加载,hook 走硬指纹底座。 -->
+          <div class="s-sub">{{
+            model && !(model.privacy_installed || model.injection_installed)
+              ? t("settings.daemon.subtitle_no_model")
+              : t("settings.daemon.subtitle")
+          }}</div>
+        </div>
+        <div class="ctl">
+          <StatusPill v-if="daemon?.running" tone="green" data-testid="daemon-state">
+            {{
+              daemon.pii_loaded
+                ? t("settings.daemon.status_ml")
+                : t("settings.daemon.status_running")
+            }}
+          </StatusPill>
+          <StatusPill v-else-if="daemon?.warming" tone="yellow" data-testid="daemon-state">
+            {{ t("settings.daemon.status_warming") }}
+          </StatusPill>
+          <StatusPill v-else tone="yellow" data-testid="daemon-state">
+            {{ t("settings.daemon.status_stopped") }}
+          </StatusPill>
+          <NButton
+            v-if="!daemon?.running && !daemon?.warming"
+            size="small"
+            type="primary"
+            :loading="busy === 'daemon:start'"
+            :disabled="!!busy || loading || !settings?.engine_present"
+            data-testid="daemon-start"
+            @click="startDaemon()"
+          >
+            {{ t("settings.daemon.start") }}
+          </NButton>
+          <NButton
+            v-else
+            size="small"
+            :loading="busy === 'daemon:stop'"
+            :disabled="!!busy || loading"
+            data-testid="daemon-stop"
+            @click="stopDaemon()"
+          >
+            {{ t("settings.daemon.stop") }}
+          </NButton>
+        </div>
+      </div>
+    </WindowCard>
+
+    <!-- 4. 关于(版本 + 账本路径自动加载,不再是「将在此显示」的占位) -->
+    <WindowCard
+      title="audit · checkpoint"
+      class="block"
+      data-testid="settings-checkpoint-card"
+    >
+      <div class="row first">
+        <div>
+          <div class="s-title">{{ t("settings.checkpoint.title") }}</div>
+          <div class="s-sub">{{ t("settings.checkpoint.note") }}</div>
+          <div v-if="anchorResult" class="s-sub" data-testid="checkpoint-anchor-result">
+            {{ anchorResult }}
+          </div>
+        </div>
+        <NButton
+          size="small"
+          tertiary
+          :loading="busy === 'checkpoint:anchor'"
+          data-testid="checkpoint-anchor-btn"
+          @click="handleAnchorCheckpoint"
+        >
+          {{ t("settings.checkpoint.anchor_now") }}
+        </NButton>
+      </div>
+    </WindowCard>
+
+    <WindowCard title="about" class="block" data-testid="settings-about-card">
+      <div class="row first">
+        <div>
+          <div class="s-sub">{{ t("settings.about.note") }}</div>
+          <div class="about-facts">
+            <div>
+              <span class="af-label">{{ t("settings.about.version_label") }}</span>
+              <span class="af-val" data-testid="about-version">{{ appVersion || "—" }}</span>
+            </div>
+            <div>
+              <span class="af-label">{{ t("settings.about.ledger_label") }}</span>
+              <span class="af-val" data-testid="about-ledger">{{ ledgerPath || "—" }}</span>
+            </div>
+          </div>
+        </div>
+        <NButton size="small" quaternary :loading="loading" @click="refresh()">
+          {{ t("common.refresh") }}
+        </NButton>
+      </div>
+    </WindowCard>
+
+    <div v-if="error" class="errline" data-testid="settings-error">⚠ {{ error }}</div>
   </div>
 </template>
+
+<style scoped>
+.settings {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 18px 28px 40px;
+}
+.phead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.ptitle {
+  font-family: var(--vigil-mono);
+  font-size: 13px;
+  letter-spacing: 1px;
+  color: var(--vigil-text-secondary);
+}
+.block {
+  margin-top: 14px;
+}
+.sec-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.s-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--vigil-text);
+}
+.s-title.sm {
+  font-size: 13.5px;
+}
+.s-sub {
+  margin-top: 3px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--vigil-text-secondary);
+}
+.modes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 14px;
+}
+.mode {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  text-align: left;
+  padding: 12px 14px;
+  border: 1px solid var(--vigil-border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  color: inherit;
+  font-family: inherit;
+  cursor: pointer;
+  opacity: 0.78;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    opacity 0.15s ease;
+}
+.mode:hover:not(:disabled):not(.on) {
+  opacity: 1;
+  border-color: rgba(5, 217, 232, 0.25);
+}
+.mode.on {
+  border-color: rgba(5, 217, 232, 0.45);
+  background: rgba(5, 217, 232, 0.07);
+  opacity: 1;
+}
+.mode.busy {
+  opacity: 0.55;
+}
+.mode:disabled {
+  cursor: default;
+}
+.mode-name {
+  font-family: var(--vigil-mono);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--vigil-text);
+}
+.mode-desc {
+  margin-top: 5px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--vigil-text-secondary);
+}
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 14px;
+}
+.row.first {
+  margin-top: 0;
+}
+.ctl {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.errline {
+  margin-top: 14px;
+  font-size: 12.5px;
+  color: var(--vigil-red);
+}
+
+/* about 卡事实行(版本 / 账本路径,mono 仪表风) */
+.about-facts {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-family: var(--vigil-mono);
+  font-size: 11.5px;
+}
+.about-facts .af-label {
+  color: var(--vigil-text-muted);
+  margin-right: 10px;
+}
+.about-facts .af-val {
+  color: var(--vigil-text);
+  word-break: break-all;
+}
+</style>

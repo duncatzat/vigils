@@ -13,6 +13,11 @@ use vigil_ui_protocol::{
 
 use crate::export::render_session_replay;
 
+/// 前端可控读路径的结果集硬上限(审计 ISS-20260702-017):`ListRecentEvents` /
+/// `FtsSearch` 的 `limit` 来自渲染层,超大值会拉全表拖垮 UI/内存。服务端 clamp 到此值,
+/// 与 DoS 面解耦(正常分页远小于此;需要更多由前端分页续拉)。
+const MAX_QUERY_LIMIT: u32 = 1000;
+
 /// 把 typed `UiCommand` 翻译为 Ledger 操作。
 ///
 /// `actor_capability` 来自调用端(CLI `--capability` 或 Tauri capability token);
@@ -32,7 +37,7 @@ pub fn dispatch(
     match cmd {
         // --- Activity / Audit ---
         UiCommand::ListRecentEvents(req) => {
-            let limit = req.limit.max(1);
+            let limit = req.limit.clamp(1, MAX_QUERY_LIMIT);
             let filter = req.event_type_filter.as_deref();
             let hits = ledger
                 .list_recent_events(req.session_id.as_deref(), filter, limit)
@@ -66,8 +71,9 @@ pub fn dispatch(
             }))
         }
         UiCommand::FtsSearch(req) => {
+            let cap = req.limit.min(MAX_QUERY_LIMIT) as usize;
             let hits = ledger.fts_search(&req.query).map_err(ledger_err)?;
-            let limited: Vec<_> = hits.into_iter().take(req.limit as usize).collect();
+            let limited: Vec<_> = hits.into_iter().take(cap).collect();
             Ok(UiResponse::SearchHits(limited))
         }
 
