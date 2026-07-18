@@ -206,7 +206,11 @@ fn classify_depth(command: &str, project_root: Option<&str>, depth: u8) -> Optio
         // 吞成空 argv(真机实证这几个变体曾漏),故不能等到 argv 分类阶段。
         if depth < MAX_NEST_DEPTH {
             if let Some(payload) = env_split_string_payload(&raw_argv) {
-                if let Some(risk) = classify_depth(payload, project_root, depth + 1) {
+                // payload 按 **GNU env 自己的** split-string 词法(反斜杠空白转义 `\_`/`\t`… 亦为分隔符)
+                // 切分并规范成空格分隔命令再递归分类——否则 `env -S 'rm\_-rf\_/'` 经 shlex 落单 token
+                // `rm\_-rf\_/`(basename 不匹配 rm)→ 绕过(codex HIGH + 真机实证放行)。
+                let normalized = env_s_split(payload).join(" ");
+                if let Some(risk) = classify_depth(&normalized, project_root, depth + 1) {
                     consider(risk);
                 }
             }
@@ -468,32 +472,142 @@ fn eval_flag_script(argv: &[String]) -> Option<&str> {
     None
 }
 
-/// GNU coreutils `env -S <payload>` / `env --split-string=<payload>`:env 把 payload 按类 shell
-/// 词法 split 后**作为真实命令执行**。payload 是自包含命令(不依赖 stdin),故当嵌套脚本递归分类
-/// —— 否则 `env -S 'rm -rf /'` 的 payload 落单 token,basename 不匹配 `rm` → `_` 分支绕过 argv
-/// 级灾难检测(真机实证放行,codex review)。用**未剥离**的 raw_argv(env 尚在);扫到 env wrapper
-/// (可带 sudo 等前缀)之后的分裂选项。递归受 `MAX_NEST_DEPTH` 守门,`env -S` 套 `env -S` 不失控。
-fn env_split_string_payload(argv: &[String]) -> Option<&str> {
-    let env_pos = argv.iter().position(|a| {
+/// env 是否是本段**真正的命令**(而非某命令的参数),返回 env token 下标。仅当 env 之前只有前导
+/// 裸环境赋值与合法 wrapper(sudo/nohup/…及其被吞选项)时才成立——否则 `printf '%s\n' env -S
+/// 'rm -rf /'` 只是打印文本,却因 env 出现在 argv 中而被误判为 split-string 灾难命令(codex 误报)。
+fn env_command_position(argv: &[String]) -> Option<usize> {
+    let mut i = 0;
+    loop {
+        while i < argv.len() && is_env_assignment(&argv[i]) {
+            i += 1; // 跳过前导裸环境赋值
+        }
+        let a = argv.get(i)?;
         let b = basename(a).to_ascii_lowercase();
         let b = b.strip_suffix(".exe").unwrap_or(&b);
-        b == "env"
-    })?;
+        if b == "env" {
+            return Some(i);
+        }
+        if !CMD_WRAPPERS.contains(&b) {
+            return None; // 命中真实命令(非 env / 非 wrapper)→ env 不是本段命令
+        }
+        i += 1; // 是 wrapper(非 env):跳过它及其选项 / 赋值 / 时长参数
+        while let Some(a) = argv.get(i) {
+            let is_flag = a.starts_with('-');
+            let is_assign = a.contains('=') && !a.starts_with('/');
+            let is_dur = a.chars().any(|c| c.is_ascii_digit())
+                && a.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | 's' | 'm' | 'h' | 'd'));
+            if is_flag || is_assign || is_dur {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// GNU coreutils `env -S <payload>` / `env --split-string=<payload>`:env 把 payload 按**自己的**
+/// split-string 词法 split 后作为真实命令执行。payload 是自包含命令,故规范化后当嵌套脚本递归分类
+/// —— 否则 `env -S 'rm -rf /'` 的 payload 落单 token,basename 不匹配 `rm` → `_` 分支绕过 argv 级
+/// 灾难检测(真机实证放行,codex review)。用**未剥离**的 raw_argv(env 尚在);仅当 env 确为本段命令
+/// (`env_command_position`)时扫其分裂选项。递归受 `MAX_NEST_DEPTH` 守门,`env -S` 套 `env -S` 不失控。
+fn env_split_string_payload(argv: &[String]) -> Option<&str> {
+    let env_pos = env_command_position(argv)?;
     for i in (env_pos + 1)..argv.len() {
         let a = &argv[i];
-        if a == "-S" || a == "--split-string" {
-            return argv.get(i + 1).map(String::as_str); // `-S <payload>` / `--split-string <payload>`
+        if a == "--split-string" {
+            return argv.get(i + 1).map(String::as_str); // `--split-string <payload>`
         }
         if let Some(p) = a.strip_prefix("--split-string=") {
             return Some(p); // `--split-string=<payload>`
         }
-        if let Some(p) = a.strip_prefix("-S") {
-            if !p.is_empty() {
-                return Some(p); // `-S<payload>` 粘连式
+        // 短选项簇 `-S` / `-S<payload>` / `-iS<payload>` / `-i0S <payload>`:GNU env 的 getopt 会
+        // **顺序**解析簇内每个短选项——无参的 `-i`(ignore-env)/`-0`(null)/`-v`(verbose) 之后紧跟的
+        // `S` 才触发 split-string(payload = 簇内其余字符,空则取下一个 token);取参的 `-u`(unset)/
+        // `-C`(chdir) 会把簇内其余字符吞作**自身参数**,S 不再可达。真机 coreutils 8.32 实证:
+        // `-iS`/`-vS`/`-i0S` 执行 payload(曾漏放行灾难命令),`-uS…` 不执行。`--` 长选项已在上方处理。
+        if let Some(cluster) = a.strip_prefix('-') {
+            if !cluster.starts_with('-') {
+                for (off, c) in cluster.char_indices() {
+                    match c {
+                        'S' => {
+                            let rest = &cluster[off + 1..];
+                            return if rest.is_empty() {
+                                argv.get(i + 1).map(String::as_str) // `-…S` <payload>
+                            } else {
+                                Some(rest) // `-…S<payload>` 粘连式
+                            };
+                        }
+                        'i' | '0' | 'v' => {} // 无参短选项:继续扫描簇内下一字符
+                        _ => break,           // 取参/未知短选项 → S 不可达,停止扫描本 token
+                    }
+                }
             }
         }
     }
     None
+}
+
+/// 按 **GNU env `-S`** 的 split-string 词法把 payload 切成 argv。关键:除字面空白(空格/制表)外,
+/// 反斜杠空白转义 `\_`/`\t`/`\n`/`\r`/`\f`/`\v` **也是参数分隔符**(真机 coreutils 8.32 实证 `\_`/`\t`
+/// 分隔),`\\`/`\#`/`\$` 等 → 字面字符,单/双引号分组。安全导向:把这些转义当分隔符可能比 env 略**多**
+/// 切(fail-closed 方向),但绝不会把 `rm\_-rf\_/` 误当单 token 而漏检。`${VAR}` 展开不建模(诚实边界:
+/// 变量替换属深混淆,与既有 command_guard 边界一致)。
+fn env_s_split(payload: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut has_tok = false; // 已开 token?(区分空 token 与分隔)
+    let mut quote: Option<char> = None;
+    let mut chars = payload.chars();
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if c == '\\' && q == '"' {
+                if let Some(n) = chars.next() {
+                    cur.push(n); // 双引号内转义:取下一字符字面
+                    has_tok = true;
+                }
+            } else {
+                cur.push(c);
+                has_tok = true;
+            }
+            continue;
+        }
+        match c {
+            ' ' | '\t' | '\n' | '\r' | '\x0c' | '\x0b' => {
+                if has_tok {
+                    args.push(std::mem::take(&mut cur));
+                    has_tok = false;
+                }
+            }
+            '\'' | '"' => {
+                quote = Some(c);
+                has_tok = true; // 引号本身开一个(可能为空的)token
+            }
+            '\\' => match chars.next() {
+                Some('_') | Some('t') | Some('n') | Some('r') | Some('f') | Some('v') => {
+                    if has_tok {
+                        args.push(std::mem::take(&mut cur)); // env 空白转义 → 分隔符
+                        has_tok = false;
+                    }
+                }
+                Some(other) => {
+                    cur.push(other); // `\\`/`\#`/`\$`… → 字面
+                    has_tok = true;
+                }
+                None => {}
+            },
+            _ => {
+                cur.push(c);
+                has_tok = true;
+            }
+        }
+    }
+    if has_tok {
+        args.push(cur);
+    }
+    args
 }
 
 /// 一个 token 是否是 shell 变量赋值 `NAME=VALUE`(NAME 须为 `[A-Za-z_][A-Za-z0-9_]*`)。
@@ -794,6 +908,89 @@ mod tests {
             classify("env -S 'echo hello'", Some("/proj")).is_none(),
             "良性 env -S payload 不应命中"
         );
+    }
+
+    #[test]
+    fn env_combined_short_option_split_does_not_bypass() {
+        // 回归(#90 followup:复审 + 真机 coreutils 8.32 实证放行):GNU env 的 getopt 允许把 `-S`
+        // **合并**进短选项簇。无参短选项 `-i`(ignore-env)/`-0`(null)/`-v`(verbose) 之后紧跟的 `S`
+        // 仍触发 split-string 并执行 payload——而 token `-iS` 不匹配 `-S`/`-S<glued>`/`--split-string`,
+        // payload 永不被递归分类 → argv 级灾难检测被静默绕过(真机 `env -iS 'rm -rf /'` exit=0 放行)。
+        // 合并簇(多个无参前缀 / wrapper 前缀 / 粘连 payload)均须灾难级。
+        for cmd in [
+            "env -iS 'rm -rf /'",      // i(无参) + S,payload = 下一 token
+            "env -vS 'rm -rf /'",      // v(无参) + S
+            "env -i0S 'rm -rf /'",     // i + 0 + S 多个无参前缀
+            "env -iS'rm -rf /'",       // 粘连 payload(shlex 合并为 `-iSrm -rf /`)
+            "sudo env -iS 'rm -rf /'", // wrapper 前缀 + 合并簇
+        ] {
+            assert_eq!(
+                cat(cmd, Some("/proj")).tier,
+                GuardTier::Catastrophic,
+                "`{cmd}` 应灾难级(env 合并短选项 split-string 不绕过)"
+            );
+        }
+        // 良性 payload 经合并簇仍不误命中(payload 递归分类无危险)。取参短选项 `-u`(unset)/`-C`(chdir)
+        // 会吞掉簇内 `S` 作自身参数(真机 `-uS` → ENOENT rc=127,S 非 split-string),故不作 payload 提取。
+        assert!(
+            classify("env -iS 'ls -la'", Some("/proj")).is_none(),
+            "良性合并簇 payload 不应命中"
+        );
+    }
+
+    #[test]
+    fn env_split_string_backslash_escapes_do_not_bypass() {
+        // 回归(codex HIGH + 真机 coreutils 8.32 实证放行):GNU env `-S` 的 payload 用 **env 自己的**
+        // 词法 split——反斜杠空白转义 `\_`/`\t`/`\n` 等是参数分隔符。原代码用 `shlex::split` 再解析,
+        // `\_` 被当转义下划线 → `rm\_-rf\_/` 落单 token → basename 不匹配 rm → 绕过。须先按 env 词法
+        // 规范化。注:raw string 保留字面反斜杠(与 hook 收到的 JSON 解码后一致)。
+        for cmd in [
+            r"env -S 'rm\_-rf\_/'", // \_ 分隔
+            r"env -S 'rm\t-rf\t/'", // \t 分隔
+            r"env --split-string='rm\_-rf\_/'",
+            r"env -iS 'rm\_-rf\_/'", // 合并短选项 + 反斜杠分隔(双缺陷叠加)
+            r"sudo env -S 'rm\_-rf\_/'", // wrapper + 反斜杠分隔
+        ] {
+            assert_eq!(
+                cat(cmd, Some("/proj")).tier,
+                GuardTier::Catastrophic,
+                "`{cmd}` 应灾难级(env 反斜杠分隔 split-string 不绕过)"
+            );
+        }
+        // 良性反斜杠分隔 payload 不误命中。
+        assert!(
+            classify(r"env -S 'ls\_-la'", Some("/proj")).is_none(),
+            "良性 env -S 反斜杠分隔 payload 不应命中"
+        );
+    }
+
+    #[test]
+    fn env_as_argument_is_not_treated_as_split_string() {
+        // 回归(codex LOW 误报):`env` 出现在**另一命令的参数**中(printf/echo 打印文本)不应被当作
+        // split-string 命令拦截——原代码在 argv 任意位置搜 `env` token。仅当 env 是本段真实命令
+        // (前面只有前导裸赋值 / 合法 wrapper)时才解析 `-S`。
+        for cmd in [
+            "printf '%s\\n' env -S 'rm -rf /'",
+            "echo env -S 'rm -rf /'",
+            "echo running env -S mode",
+        ] {
+            assert!(
+                classify(cmd, Some("/proj")).is_none(),
+                "`{cmd}` env 作参数,不应误判为 split-string 命令"
+            );
+        }
+        // env 确为真实命令(可含 wrapper 前缀)时,split-string 检测照常生效。
+        for cmd in [
+            "env -S 'rm -rf /'",
+            "sudo env -S 'rm -rf /'",
+            "FOO=1 env -S 'rm -rf /'",
+        ] {
+            assert_eq!(
+                cat(cmd, Some("/proj")).tier,
+                GuardTier::Catastrophic,
+                "`{cmd}` env 为真实命令,split-string 应命中"
+            );
+        }
     }
 
     #[test]
