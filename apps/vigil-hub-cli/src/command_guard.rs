@@ -200,6 +200,18 @@ fn classify_depth(command: &str, project_root: Option<&str>, depth: u8) -> Optio
                 continue;
             }
         };
+        // GNU `env -S <payload>`:payload 是 env split 后执行的完整命令,当嵌套脚本递归分类。用
+        // **raw_argv**(env 尚未 unwrap)。**必须在 `argv.is_empty()` 提前 continue 之前** —— 粘连式
+        // `-S<payload>` / `--split-string=<payload>` / payload 含 `=` 会被 `unwrap_argv` 当 flag/assign
+        // 吞成空 argv(真机实证这几个变体曾漏),故不能等到 argv 分类阶段。
+        if depth < MAX_NEST_DEPTH {
+            if let Some(payload) = env_split_string_payload(&raw_argv) {
+                if let Some(risk) = classify_depth(payload, project_root, depth + 1) {
+                    consider(risk);
+                }
+            }
+        }
+
         // 剥离 sudo / env / nohup 等前缀 wrapper,拿到真正的命令(`sudo rm -rf /` 的 rm)。
         let argv = unwrap_argv(&raw_argv);
         if argv.is_empty() {
@@ -451,6 +463,34 @@ fn eval_flag_script(argv: &[String]) -> Option<&str> {
     for i in 1..argv.len() {
         if EVAL_FLAGS.contains(&argv[i].as_str()) {
             return argv.get(i + 1).map(String::as_str);
+        }
+    }
+    None
+}
+
+/// GNU coreutils `env -S <payload>` / `env --split-string=<payload>`:env 把 payload 按类 shell
+/// 词法 split 后**作为真实命令执行**。payload 是自包含命令(不依赖 stdin),故当嵌套脚本递归分类
+/// —— 否则 `env -S 'rm -rf /'` 的 payload 落单 token,basename 不匹配 `rm` → `_` 分支绕过 argv
+/// 级灾难检测(真机实证放行,codex review)。用**未剥离**的 raw_argv(env 尚在);扫到 env wrapper
+/// (可带 sudo 等前缀)之后的分裂选项。递归受 `MAX_NEST_DEPTH` 守门,`env -S` 套 `env -S` 不失控。
+fn env_split_string_payload(argv: &[String]) -> Option<&str> {
+    let env_pos = argv.iter().position(|a| {
+        let b = basename(a).to_ascii_lowercase();
+        let b = b.strip_suffix(".exe").unwrap_or(&b);
+        b == "env"
+    })?;
+    for i in (env_pos + 1)..argv.len() {
+        let a = &argv[i];
+        if a == "-S" || a == "--split-string" {
+            return argv.get(i + 1).map(String::as_str); // `-S <payload>` / `--split-string <payload>`
+        }
+        if let Some(p) = a.strip_prefix("--split-string=") {
+            return Some(p); // `--split-string=<payload>`
+        }
+        if let Some(p) = a.strip_prefix("-S") {
+            if !p.is_empty() {
+                return Some(p); // `-S<payload>` 粘连式
+            }
         }
     }
     None
@@ -721,6 +761,38 @@ mod tests {
         assert!(
             classify("grep --color=auto pattern file", Some("/proj")).is_none(),
             "--flag=x 不是环境赋值,不应误命中"
+        );
+    }
+
+    #[test]
+    fn env_split_string_does_not_bypass_argv_detection() {
+        // 回归(review followup:codex HIGH + 真机实证放行):GNU `env -S <payload>` 把 payload
+        // 按类 shell 词法 split 后当**完整命令**执行。payload 曾落单 token(basename 不匹配 rm)
+        // → `_` 分支绕过 argv 级灾难检测。四语法变体 + wrapper 前缀 + payload 内含前导赋值(验证
+        // 递归里 #84 的裸赋值剥离亦生效)均须灾难级。
+        for cmd in [
+            "env -S 'rm -rf /'",
+            "env -S'rm -rf /'",
+            "env --split-string='rm -rf /'",
+            "env --split-string 'rm -rf /'",
+            "env -S 'FOO=1 rm -rf /'",
+            "sudo env -S 'rm -rf /'",
+        ] {
+            let r = cat(cmd, Some("/proj"));
+            assert_eq!(
+                r.tier,
+                GuardTier::Catastrophic,
+                "`{cmd}` 应灾难级(env split-string 不绕过)"
+            );
+        }
+        // 良性 payload 不被误命中(payload 递归分类无危险 → None)。
+        assert!(
+            classify("env -S 'ls -la'", Some("/proj")).is_none(),
+            "良性 env -S payload 不应命中"
+        );
+        assert!(
+            classify("env -S 'echo hello'", Some("/proj")).is_none(),
+            "良性 env -S payload 不应命中"
         );
     }
 
