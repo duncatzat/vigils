@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -261,9 +262,94 @@ fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 安装互斥(M3):`download_engine` / `install_ml_engine_into` / `model_install` 共用,防并发
+/// 安装踩同一 bin 目录(staging 目录共享 + rename 交错 → 混装)。前端按钮防抖不是边界 ——
+/// 命令层自持不变量。
+static INSTALL_LOCK: Mutex<()> = Mutex::new(());
+
+/// 非阻塞取安装锁:安装进行中再点 → 立即可读错误(不排队,前端可提示)。中毒(安装线程
+/// panic)→ 收回守卫继续 —— 可用性优先,半成品由 [`sweep_stale_installs`] + 两阶段换装回滚兜底。
+fn acquire_install_lock() -> Result<MutexGuard<'static, ()>, String> {
+    match INSTALL_LOCK.try_lock() {
+        Ok(g) => Ok(g),
+        Err(TryLockError::Poisoned(p)) => Ok(p.into_inner()),
+        Err(TryLockError::WouldBlock) => Err(
+            "another engine/model install is already in progress — wait for it to finish"
+                .to_string(),
+        ),
+    }
+}
+
+/// 清扫历史残留:`.ml-staging`(进程中途死亡遗留的下载/解包半成品)+ `*.vigil-old`(上次
+/// 换装时在用、删不掉的旧件)。尽力而为(仍在用则下次再扫);安装入口调用。
+fn sweep_stale_installs(bin_dir: &Path) {
+    let _ = std::fs::remove_dir_all(bin_dir.join(".ml-staging"));
+    if let Ok(entries) = std::fs::read_dir(bin_dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".vigil-old") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// 两阶段换装(H1):把 staged 成员换进 `bin_dir`,**绝不留混装**(如「新引擎 + 旧 dylib」)。
+///
+/// - **阶段 A**:已存在的同名目标先 rename 到 `<name>.vigil-old`。Windows 对**在用**文件的
+///   namespace rename 也能成功 —— daemon 正跑旧引擎时安装照样完成,旧进程继续用已挪走的旧件
+///   直至重启;任一 aside 失败 → 已挪的全部还原,`bin_dir` 回到调用前状态。
+/// - **阶段 B**:staged → 目标位(staging 是 `bin_dir` 子目录 → 同卷 rename);失败 → 删已
+///   进位的新件 + 还原全部 aside。
+/// - 成功尾声:尽力删 aside(在用删不掉 → 留待 [`sweep_stale_installs`])。
+fn swap_in_staged(bin_dir: &Path, staged: &[(String, PathBuf)]) -> Result<(), String> {
+    // 阶段 A:挪开旧件。
+    let mut asides: Vec<(PathBuf, PathBuf)> = Vec::new(); // (原位, aside 位)
+    for (name, _) in staged {
+        let target = bin_dir.join(name);
+        if !target.exists() {
+            continue;
+        }
+        let aside = bin_dir.join(format!("{name}.vigil-old"));
+        let _ = std::fs::remove_file(&aside); // 上次残留;删不掉则下方 rename 失败走还原
+        if let Err(e) = std::fs::rename(&target, &aside) {
+            for (orig, moved) in asides.iter().rev() {
+                let _ = std::fs::rename(moved, orig);
+            }
+            return Err(format!(
+                "failed to move the old {name} aside ({e}) — if the daemon is running from the \
+                 old engine, stop it first (Settings → daemon → stop) and retry"
+            ));
+        }
+        asides.push((target, aside));
+    }
+    // 阶段 B:新件进位。
+    let mut placed: Vec<PathBuf> = Vec::new();
+    for (name, from) in staged {
+        let to = bin_dir.join(name);
+        if let Err(e) = std::fs::rename(from, &to) {
+            for newly in placed.iter().rev() {
+                let _ = std::fs::remove_file(newly);
+            }
+            for (orig, moved) in asides.iter().rev() {
+                let _ = std::fs::rename(moved, orig);
+            }
+            return Err(format!(
+                "failed to install {name} to {} ({e})",
+                to.display()
+            ));
+        }
+        placed.push(to);
+    }
+    for (_, moved) in &asides {
+        let _ = std::fs::remove_file(moved);
+    }
+    Ok(())
+}
+
 /// 写:下载 vigil-hub 引擎到稳定启动器位置(HTTPS + SHA-pin + 运行核验,fail-closed),
 /// 再返回部署后守卫状态。缺 pinned SHA → 拒绝(绝不执行未校验二进制)。
 pub fn download_engine(app: &AppHandle) -> Result<GuardianStatus, String> {
+    let _install = acquire_install_lock()?;
     let src = engine_source()?;
     if !src.url.starts_with("https://") {
         return Err(format!("refusing non-HTTPS engine URL: {}", src.url));
@@ -281,6 +367,7 @@ pub fn download_engine(app: &AppHandle) -> Result<GuardianStatus, String> {
         .ok_or_else(|| "invalid stable launcher path".to_string())?;
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    sweep_stale_installs(parent);
 
     let tmp = parent.join(format!("{ENGINE_BIN}.download"));
     let _ = std::fs::remove_file(&tmp);
@@ -326,10 +413,12 @@ pub fn download_engine(app: &AppHandle) -> Result<GuardianStatus, String> {
         );
     }
 
-    std::fs::rename(&tmp, &stable).map_err(|e| {
+    // 两阶段换装(H1):旧引擎先挪 aside(Windows 在用文件也成功 —— daemon 跑着旧引擎
+    // 也能装,重启 daemon 后用新件),任一步失败自动还原,绝不半装。
+    if let Err(e) = swap_in_staged(parent, &[(ENGINE_BIN.to_string(), tmp.clone())]) {
         let _ = std::fs::remove_file(&tmp);
-        format!("failed to install engine to {}: {e}", stable.display())
-    })?;
+        return Err(e);
+    }
 
     // 装好后引擎已落稳定路径 → status(app) 经 resolve_engine 命中并钉稳定 hook。
     status(app)
@@ -529,6 +618,7 @@ pub fn model_status(app: &AppHandle) -> Result<ModelStatus, String> {
 /// 写:安装 ML 模型(shell `vigil-hub model install` —— 下载两模型,**阻塞**:16-chunk 并发实测数十秒,
 /// 前端转圈)。fail-closed:非 ML 变体 / 网络 / sha256 不符 → 非零退出 → Err 透传前端。回安装后状态。
 pub fn model_install(app: &AppHandle) -> Result<ModelStatus, String> {
+    let _install = acquire_install_lock()?;
     let engine = resolve_engine(app).ok_or_else(|| ENGINE_NOT_FOUND.to_string())?;
     run_cli_capture(&engine, &["model", "install"])?;
     model_status(app)
@@ -868,6 +958,7 @@ fn extract_ml_bundle(archive: &Path, staging: &Path) -> Result<PathBuf, String> 
 /// [[feedback_production_logic_testable]]):解析源 → 下载 → 整包 SHA-pin → 嗅探解包 → 运行核验 →
 /// 把引擎 + 全部 ORT 库移入 `bin_dir`。全程 fail-closed,任何错误清 staging 后 Err。
 fn install_ml_engine_into(bin_dir: &Path) -> Result<(), String> {
+    let _install = acquire_install_lock()?;
     let src = resolve_ml_engine_source()?;
     if !src.url.starts_with("https://") {
         return Err(format!("refusing non-HTTPS ML engine URL: {}", src.url));
@@ -882,8 +973,9 @@ fn install_ml_engine_into(bin_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed to create {}: {e}", bin_dir.display()))?;
 
     // 隔离 staging 子目录:下载 + 解包 + 核验都在此,全过后才把成员移入 bin_dir(避免半成品被探测命中)。
+    // 入口先清扫历史残留(中途死亡的 staging + 上次换装删不掉的 *.vigil-old)。
+    sweep_stale_installs(bin_dir);
     let staging = bin_dir.join(".ml-staging");
-    let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging)
         .map_err(|e| format!("failed to create ML staging dir: {e}"))?;
 
@@ -928,8 +1020,11 @@ fn install_ml_engine_into(bin_dir: &Path) -> Result<(), String> {
         );
     }
 
-    // 移入稳定 bin 目录:引擎 + 全部 ORT 库(按谓词筛,跳过下载的压缩包)。staging 是 bin_dir 子目录
-    // → 同卷 rename。Windows 下若旧二进制正被 daemon 运行 → rename 失败,提示先停 daemon。
+    // 收集 staged 成员(引擎 + 全部 ORT 库,按谓词筛,跳过下载的压缩包)→ 两阶段换装(H1):
+    // 先挪旧件 aside 再进位,任一步失败**全量还原** —— 绝不留「新引擎 + 旧 dylib」混装
+    // (read_dir 顺序任意,逐文件直换的中途失败会产生这种状态)。staging 是 bin_dir 子目录 →
+    // 同卷 rename;Windows 下 daemon 正跑旧件也能完成换装(见 [`swap_in_staged`])。
+    let mut staged: Vec<(String, PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(&staging).map_err(|e| format!("read ML staging failed: {e}"))? {
         let from = entry
             .map_err(|e| format!("read ML staging entry failed: {e}"))?
@@ -941,15 +1036,11 @@ fn install_ml_engine_into(bin_dir: &Path) -> Result<(), String> {
         if fname != ENGINE_BIN && !is_ort_lib(&fname) {
             continue;
         }
-        let to = bin_dir.join(&fname);
-        if let Err(e) = std::fs::rename(&from, &to) {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(format!(
-                "failed to install {fname} to {} ({e}) — if the daemon is running from the old \
-                 engine, stop it first (Settings → daemon → stop) and retry",
-                to.display()
-            ));
-        }
+        staged.push((fname, from));
+    }
+    if let Err(e) = swap_in_staged(bin_dir, &staged) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
     }
     let _ = std::fs::remove_dir_all(&staging);
     Ok(())
@@ -1251,6 +1342,110 @@ mod tests {
         // 同目录放 dylib → true
         std::fs::write(dir.path().join(ort_dylib_basename()), b"lib").expect("write dylib");
         assert!(stable_has_ml_dylib(&engine));
+    }
+
+    // ── H1/M3:两阶段换装 + 安装互斥 ──
+
+    fn write_file(p: &Path, content: &[u8]) {
+        std::fs::write(p, content).expect("write test file");
+    }
+
+    #[test]
+    fn swap_in_staged_fresh_install_places_all_members() {
+        let bin = tempfile::tempdir().expect("tempdir");
+        let staging = bin.path().join(".ml-staging");
+        std::fs::create_dir_all(&staging).expect("staging");
+        write_file(&staging.join("a.bin"), b"new-a");
+        write_file(&staging.join("b.bin"), b"new-b");
+        let staged = vec![
+            ("a.bin".to_string(), staging.join("a.bin")),
+            ("b.bin".to_string(), staging.join("b.bin")),
+        ];
+        swap_in_staged(bin.path(), &staged).expect("fresh swap");
+        assert_eq!(std::fs::read(bin.path().join("a.bin")).unwrap(), b"new-a");
+        assert_eq!(std::fs::read(bin.path().join("b.bin")).unwrap(), b"new-b");
+        assert!(
+            !bin.path().join("a.bin.vigil-old").exists(),
+            "fresh 装无 aside"
+        );
+    }
+
+    #[test]
+    fn swap_in_staged_replaces_existing_and_cleans_asides() {
+        let bin = tempfile::tempdir().expect("tempdir");
+        write_file(&bin.path().join("a.bin"), b"old-a");
+        let staging = bin.path().join(".ml-staging");
+        std::fs::create_dir_all(&staging).expect("staging");
+        write_file(&staging.join("a.bin"), b"new-a");
+        let staged = vec![("a.bin".to_string(), staging.join("a.bin"))];
+        swap_in_staged(bin.path(), &staged).expect("replace swap");
+        assert_eq!(std::fs::read(bin.path().join("a.bin")).unwrap(), b"new-a");
+        assert!(
+            !bin.path().join("a.bin.vigil-old").exists(),
+            "换装成功后 aside 应被清掉"
+        );
+    }
+
+    #[test]
+    fn swap_in_staged_midway_failure_restores_bin_dir_exactly() {
+        // 阶段 B 中途失败注入:第 2 成员 staged 源不存在 → rename 必败。断言 bin_dir **精确还原**:
+        // 旧内容都在、无新件残留、无 aside 残留 —— 绝不留「新 a + 旧 b」混装(H1 核心)。
+        let bin = tempfile::tempdir().expect("tempdir");
+        write_file(&bin.path().join("a.bin"), b"old-a");
+        write_file(&bin.path().join("b.bin"), b"old-b");
+        let staging = bin.path().join(".ml-staging");
+        std::fs::create_dir_all(&staging).expect("staging");
+        write_file(&staging.join("a.bin"), b"new-a");
+        let staged = vec![
+            ("a.bin".to_string(), staging.join("a.bin")),
+            ("b.bin".to_string(), staging.join("missing-b.bin")),
+        ];
+        let err = swap_in_staged(bin.path(), &staged).unwrap_err();
+        assert!(err.contains("b.bin"), "错误应指认失败成员: {err}");
+        assert_eq!(
+            std::fs::read(bin.path().join("a.bin")).unwrap(),
+            b"old-a",
+            "旧 a 应还原"
+        );
+        assert_eq!(
+            std::fs::read(bin.path().join("b.bin")).unwrap(),
+            b"old-b",
+            "旧 b 应未动"
+        );
+        assert!(
+            !bin.path().join("a.bin.vigil-old").exists(),
+            "无 aside 残留"
+        );
+        assert!(
+            !bin.path().join("b.bin.vigil-old").exists(),
+            "无 aside 残留"
+        );
+    }
+
+    #[test]
+    fn sweep_stale_installs_removes_staging_and_old_files() {
+        let bin = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(bin.path().join(".ml-staging")).expect("mk staging");
+        write_file(&bin.path().join("x.dll.vigil-old"), b"stale");
+        write_file(&bin.path().join("keep.dll"), b"live");
+        sweep_stale_installs(bin.path());
+        assert!(!bin.path().join(".ml-staging").exists(), "staging 应清掉");
+        assert!(
+            !bin.path().join("x.dll.vigil-old").exists(),
+            "aside 残留应清掉"
+        );
+        assert!(bin.path().join("keep.dll").exists(), "常规文件不动");
+    }
+
+    #[test]
+    fn install_lock_rejects_concurrent_second_acquire() {
+        // M3:同刻只允许一个安装;第二个立即得可读错误(非阻塞不排队)。释放后可再获取。
+        let first = acquire_install_lock().expect("first acquire");
+        let err = acquire_install_lock().expect_err("second must be rejected");
+        assert!(err.contains("in progress"), "可读的进行中提示: {err}");
+        drop(first);
+        let reacquired = acquire_install_lock().expect("release 后可再获取");
+        drop(reacquired);
     }
 
     /// 对**真发布 ML artifact** 的端到端验证([[feedback_test_published_artifact_before_promote]]):
