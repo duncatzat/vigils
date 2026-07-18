@@ -118,10 +118,31 @@ pub struct AgentHookSpec {
     versioned_root: bool,
 }
 
-/// 通用 agent 配置目录解析:env 非空白 → 该值(`~`/`~/...` 展开到 home);否则 `default()`。
-/// Codex(`CODEX_HOME`)与 pi(`PI_AGENT_DIR`)共用同一展开语义(SSOT,注入式可测)。
+/// 通用 agent 配置目录解析:env 非空白 → 该值(`~`/`~/...` 展开到 home;**无根相对路径在本
+/// 进程 CWD 绝对化**);否则 `default()`。Codex(`CODEX_HOME`)与 pi(`PI_AGENT_DIR`)共用
+/// 同一展开语义(SSOT,注入式可测)。
+///
+/// 相对路径语义**对齐 vendor**:openai/codex(`codex-utils-home-dir`,源码实证)把 env 值
+/// `canonicalize()` —— 即按 codex 进程 CWD 解析;pi adapter 为 node 生态同 CWD 惯例。用户在
+/// 项目目录内 `setup`,写入位置与其在同目录跑 agent 时 vendor 读取的位置一致。此前相对值
+/// 原样透传,后续 join 出 CWD 依赖的未绝对化路径 —— setup/status/doctor 换目录即漂移且不
+/// 自知;绝对化后单次调用内确定,跨目录差异回归 vendor 本身的语义。判据用 `has_root`(非
+/// `is_absolute`):Windows 上 `/x`(root-relative)与 `C:x`(drive-relative)保持原样交 OS
+/// 按其规则解析,不强行拼接。
 pub(crate) fn resolve_agent_dir(
     home: &Path,
+    env_val: Option<&str>,
+    default: impl FnOnce() -> PathBuf,
+) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    resolve_agent_dir_with_cwd(home, &cwd, env_val, default)
+}
+
+/// [`resolve_agent_dir`] 的纯核心(cwd 注入可测)。`cwd` 空(取 CWD 失败)→ 相对值退回
+/// 原样透传(不 panic,行为等同旧版)。
+fn resolve_agent_dir_with_cwd(
+    home: &Path,
+    cwd: &Path,
     env_val: Option<&str>,
     default: impl FnOnce() -> PathBuf,
 ) -> PathBuf {
@@ -130,8 +151,10 @@ pub(crate) fn resolve_agent_dir(
         Some(s) => {
             if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
                 home.join(rest)
-            } else {
+            } else if Path::new(s).has_root() || cwd.as_os_str().is_empty() {
                 PathBuf::from(s)
+            } else {
+                cwd.join(s)
             }
         }
         None => default(),
@@ -645,6 +668,40 @@ mod tests {
         assert_eq!(
             resolve_codex_home(home, Some("/opt/codex")),
             PathBuf::from("/opt/codex")
+        );
+    }
+
+    #[test]
+    fn relative_agent_dir_env_is_absolutized_against_cwd() {
+        // vendor 契约(openai/codex `codex-utils-home-dir`,源码实证):相对 CODEX_HOME 按
+        // 进程 CWD canonicalize。本解析对齐之 —— 绝不原样透传相对路径(那会随每次调用的
+        // CWD 漂移且不自知)。
+        let home = Path::new("/home/u");
+        let cwd = Path::new(if cfg!(windows) { r"C:\proj" } else { "/proj" });
+        assert_eq!(
+            super::resolve_agent_dir_with_cwd(home, cwd, Some("./ch"), || unreachable!()),
+            cwd.join("./ch")
+        );
+        assert_eq!(
+            super::resolve_agent_dir_with_cwd(home, cwd, Some("sub/dir"), || unreachable!()),
+            cwd.join("sub/dir")
+        );
+        // 有根路径原样(Windows `/x` root-relative 交 OS 解析,不强行拼接)
+        assert_eq!(
+            super::resolve_agent_dir_with_cwd(home, cwd, Some("/opt/codex"), || unreachable!()),
+            PathBuf::from("/opt/codex")
+        );
+        // 取 CWD 失败(空 cwd)→ 相对值退回原样透传(不 panic,等同旧行为)
+        assert_eq!(
+            super::resolve_agent_dir_with_cwd(home, Path::new(""), Some("rel"), || {
+                unreachable!()
+            }),
+            PathBuf::from("rel")
+        );
+        // 默认分支不受影响
+        assert_eq!(
+            super::resolve_agent_dir_with_cwd(home, cwd, None, || PathBuf::from("/d")),
+            PathBuf::from("/d")
         );
     }
 
