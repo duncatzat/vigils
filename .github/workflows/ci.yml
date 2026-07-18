@@ -37,8 +37,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # gui feature 默认关(workspace 矩阵不覆盖)——guardian(安装/换装/互斥)是发布关键面,
+      # 单独开 feature 过 clippy + 测试(系统依赖上方已装;--lib 限定桌面单测,不动集成测试矩阵)。
+      - name: Clippy (desktop gui feature)
+        run: cargo clippy -p vigil-desktop --features gui --all-targets -- -D warnings
+
       - name: Test
         run: cargo test --workspace
+
+      - name: Test (desktop gui feature)
+        run: cargo test -p vigil-desktop --features gui --lib
 
   ui:
     name: Desktop UI (typecheck / build)
