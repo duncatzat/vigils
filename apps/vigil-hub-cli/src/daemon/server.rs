@@ -262,19 +262,24 @@ fn spawn_classify_injection(caps: &DaemonCaps, session_id: &str, text: &str) {
     if !acquire_slot(&ACTIVE, MAX_ACTIVE_CLASSIFIES) {
         return; // 满员丢弃:软信号损失,绝不累积推理线程
     }
+    // RAII 退坑:guard 必须在 `thread::spawn` **之前**构造 —— spawn 是 `.expect()`,OS 拒绝建线程
+    // (EAGAIN / RLIMIT_NPROC,负载下真实)会 panic,此时若 guard 尚未建则坑永久泄漏(8 次后注入
+    // 分类静默永久禁用)。spawn 前建 + move 进闭包:panic 时随栈展开 drop 退坑,成功时闭包末尾
+    // drop 退坑。与 [`serve_with_limit`] 的 SlotGuard 同范式(classify 曾分叉,hostile review 抓出)。
+    // classify panic 也不漏坑;推理失败 = 无信号,hook 正则元指令仍兜底。
+    struct ClassifyGuard;
+    impl Drop for ClassifyGuard {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    let guard = ClassifyGuard;
     let inj = Arc::clone(inj);
     let ledger = Arc::clone(ledger);
     let sid = session_id.to_string();
     let text = text.to_string();
     std::thread::spawn(move || {
-        // RAII 退坑(classify panic 也不漏坑;推理失败 = 无信号,hook 正则元指令仍兜底)。
-        struct ClassifyGuard;
-        impl Drop for ClassifyGuard {
-            fn drop(&mut self) {
-                ACTIVE.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-        let _guard = ClassifyGuard;
+        let _guard = guard;
         if let Ok(score) = inj.classify(&text) {
             maybe_bump_injection(&ledger, &sid, score);
         }
