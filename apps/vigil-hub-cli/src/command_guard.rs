@@ -206,12 +206,22 @@ fn classify_depth(command: &str, project_root: Option<&str>, depth: u8) -> Optio
         // 吞成空 argv(真机实证这几个变体曾漏),故不能等到 argv 分类阶段。
         if depth < MAX_NEST_DEPTH {
             if let Some(payload) = env_split_string_payload(&raw_argv) {
-                // payload 按 **GNU env 自己的** split-string 词法(反斜杠空白转义 `\_`/`\t`… 亦为分隔符)
-                // 切分并规范成空格分隔命令再递归分类——否则 `env -S 'rm\_-rf\_/'` 经 shlex 落单 token
-                // `rm\_-rf\_/`(basename 不匹配 rm)→ 绕过(codex HIGH + 真机实证放行)。
-                let normalized = env_s_split(payload).join(" ");
-                if let Some(risk) = classify_depth(&normalized, project_root, depth + 1) {
-                    consider(risk);
+                // payload 按 **GNU env 自己的** split-string 词法(`\_` 为分隔符;`\c` 截断;`\t…` 嵌入
+                // 字面控制符——见 `env_s_split`)切成 argv。env **直接 exec argv[0]**(不经 shell):若程序名
+                // 含嵌入空白(来自 `\t`/`\n`… 转义),真机 ENOENT 跑不起来 → 无威胁,不分类(F:`rm\t-rf\t/`
+                // 整体是个跑不起来的程序名,过切会误判灾难)。否则**保边界**拼回(`env_s_join`:含空白/元字符
+                // 的 token 单引号包裹,防下游 `segments`/`shlex` 重切)再递归分类——否则 `env -S 'rm\_-rf\_/'`
+                // 经 shlex 落单 token → 绕过(codex HIGH + 真机实证放行)。
+                let tokens = env_s_split(payload);
+                let prog_runnable = match tokens.first() {
+                    Some(p) => !p.chars().any(char::is_whitespace),
+                    None => false,
+                };
+                if prog_runnable {
+                    let normalized = env_s_join(&tokens);
+                    if let Some(risk) = classify_depth(&normalized, project_root, depth + 1) {
+                        consider(risk);
+                    }
                 }
             }
         }
@@ -462,6 +472,113 @@ const SHELL_INTERP: &[&str] = &["sh", "bash", "zsh", "ksh", "dash", "ash", "busy
 /// wrapper 的「后跟字符串即执行」选项。取其**下一个** token 作内层脚本。
 const EVAL_FLAGS: &[&str] = &["-c", "-lc", "-ic", "--command"];
 
+/// wrapper 的**取参短选项**字符(getopt:`-X <arg>`,arg 为独立 token 或粘连)。跳过 wrapper 选项时
+/// 必须连带吞掉其**独立 token 参数**——否则 `sudo -u root env` 的 `root` 被误当命令 → 提前收尾 →
+/// 漏检 `sudo -u root rm -rf /` 全部 argv 级灾难命令(A/B,真机实证放行)。数字参数虽已被 is_dur
+/// 兜住,列出无害;非数字参数(用户名/组名/信号名)是本洞根因。command/setsid/nohup 无此类短选项。
+fn wrapper_arg_short_opts(w: &str) -> &'static [char] {
+    match w {
+        "sudo" => &['C', 'D', 'g', 'h', 'p', 'R', 'r', 't', 'T', 'U', 'u'],
+        "doas" => &['C', 'u'],
+        "env" => &['u', 'C', 'S'],
+        "nice" => &['n'],
+        "ionice" => &['c', 'n', 'p', 't'],
+        "time" => &['o', 'f'],
+        "timeout" => &['s', 'k'],
+        "stdbuf" => &['i', 'o', 'e'],
+        "xargs" => &['a', 'd', 'E', 'I', 'L', 'n', 'P', 's'],
+        _ => &[],
+    }
+}
+
+/// wrapper 的**取参长选项**名(`--opt <arg>` 独立参数形式;`--opt=<arg>` 已由一般 `=` 赋值判定吞掉)。
+/// 同 A/B 根因的长选项形态(`sudo --user root env -S …`)。
+fn wrapper_arg_long_opts(w: &str) -> &'static [&'static str] {
+    match w {
+        "sudo" => &[
+            "chdir",
+            "close-from",
+            "group",
+            "host",
+            "prompt",
+            "role",
+            "type",
+            "other-user",
+            "user",
+            "command-timeout",
+        ],
+        "env" => &[
+            "unset",
+            "chdir",
+            "block-signal",
+            "default-signal",
+            "ignore-signal",
+        ],
+        "nice" => &["adjustment"],
+        "ionice" => &["class", "classdata", "pid"],
+        "time" => &["output", "format"],
+        "timeout" => &["signal", "kill-after"],
+        "stdbuf" => &["input", "output", "error"],
+        "xargs" => &[
+            "arg-file",
+            "delimiter",
+            "eof",
+            "replace",
+            "max-lines",
+            "max-args",
+            "max-procs",
+            "max-chars",
+        ],
+        _ => &[],
+    }
+}
+
+/// token 是否为 wrapper `w` 的取参选项且其参数是**下一个独立 token**(而非粘连 / `=` 形式)。短簇
+/// `-…X`:逐字符解析,遇取参 char——其后簇内还有字符=glued 参数(下一 token 不被吃),否则吃下一 token。
+/// 长选项 `--opt`(无 `=`):在取参长选项表中即吃下一 token。用于 wrapper 跳参,堵 A/B。
+fn option_consumes_next(w: &str, token: &str) -> bool {
+    if let Some(long) = token.strip_prefix("--") {
+        // 孤立 `--`(选项终止)/ `--opt=val`(赋值形式)不在此吃独立 token。
+        return !long.is_empty() && !long.contains('=') && wrapper_arg_long_opts(w).contains(&long);
+    }
+    if let Some(cluster) = token.strip_prefix('-') {
+        if cluster.is_empty() {
+            return false; // 孤立 `-`(stdin)
+        }
+        let arg_chars = wrapper_arg_short_opts(w);
+        for (off, c) in cluster.char_indices() {
+            if arg_chars.contains(&c) {
+                return off + c.len_utf8() >= cluster.len(); // 末位取参 char → 吃下一 token
+            }
+        }
+    }
+    false
+}
+
+/// 跳过 wrapper `w`(下标 `start` 起)之后的选项 / `KEY=VAL` / 时长参数,返回真实命令的起始下标。对
+/// 取参选项(`sudo -u <user>`、`timeout -s <SIG>`、`sudo --user <user>` 等)**连带吞掉其独立 token
+/// 参数**——否则参数被误当命令,unwrap/命令定位提前收尾 → 漏检 A/B(真机实证放行)。
+fn skip_wrapper_operands(w: &str, argv: &[String], start: usize) -> usize {
+    let mut i = start;
+    while let Some(a) = argv.get(i) {
+        if option_consumes_next(w, a) {
+            i = (i + 2).min(argv.len()); // 选项 token + 其独立参数 token(clamp 防末位无参溢出)
+            continue;
+        }
+        let is_flag = a.starts_with('-');
+        let is_assign = a.contains('=') && !a.starts_with('/');
+        let is_dur = a.chars().any(|c| c.is_ascii_digit())
+            && a.chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '.' | 's' | 'm' | 'h' | 'd'));
+        if is_flag || is_assign || is_dur {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
 /// 若 argv 是 `<interp> … -c <script> …`,返回 `<script>`(内层脚本供递归分类)。
 fn eval_flag_script(argv: &[String]) -> Option<&str> {
     for i in 1..argv.len() {
@@ -490,19 +607,9 @@ fn env_command_position(argv: &[String]) -> Option<usize> {
         if !CMD_WRAPPERS.contains(&b) {
             return None; // 命中真实命令(非 env / 非 wrapper)→ env 不是本段命令
         }
-        i += 1; // 是 wrapper(非 env):跳过它及其选项 / 赋值 / 时长参数
-        while let Some(a) = argv.get(i) {
-            let is_flag = a.starts_with('-');
-            let is_assign = a.contains('=') && !a.starts_with('/');
-            let is_dur = a.chars().any(|c| c.is_ascii_digit())
-                && a.chars()
-                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | 's' | 'm' | 'h' | 'd'));
-            if is_flag || is_assign || is_dur {
-                i += 1;
-            } else {
-                break;
-            }
-        }
+        // 是 wrapper(非 env):跳过它及其选项 / 赋值 / 时长 / **取参选项的独立参数**(堵 B:`sudo -u
+        // root env -S …` 的 `root` 曾被误当命令 → env 定位失败 → payload 漏检)。
+        i = skip_wrapper_operands(b, argv, i + 1);
     }
 }
 
@@ -515,19 +622,35 @@ fn env_split_string_payload(argv: &[String]) -> Option<&str> {
     let env_pos = env_command_position(argv)?;
     for i in (env_pos + 1)..argv.len() {
         let a = &argv[i];
-        if a == "--split-string" {
-            return argv.get(i + 1).map(String::as_str); // `--split-string <payload>`
+        if a == "--" {
+            break; // getopt `--`:终止选项,其后 `-S` 是命令名非选项(真机 rc=127 不执行)——不提取(D)
         }
-        if let Some(p) = a.strip_prefix("--split-string=") {
-            return Some(p); // `--split-string=<payload>`
+        // 长选项:`--split-string` 及其**无歧义缩写**(短至 `--s`——env 长选项中唯一以 s 开头者)。getopt
+        // 接受任意前缀,精确匹配漏 `env --s='rm -rf /'` / `env --spl 'rm -rf /'`(真机 8.32 实证放行,
+        // codex/hostile C)。`--<p>=<payload>` 与 `--<p> <payload>` 皆可。`--null`(及 `-0`)与运行命令
+        // 互斥,env 直接拒跑(rc=125),不提取(G)。
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, glued) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            if !name.is_empty() && "null".starts_with(name) {
+                return None; // `--null` 及缩写:env 拒跑
+            }
+            if !name.is_empty() && "split-string".starts_with(name) {
+                return match glued {
+                    Some(v) => Some(v),                          // `--<p>=<payload>`
+                    None => argv.get(i + 1).map(String::as_str), // `--<p> <payload>`
+                };
+            }
+            continue; // 其它长选项:非 split-string,跳过
         }
-        // 短选项簇 `-S` / `-S<payload>` / `-iS<payload>` / `-i0S <payload>`:GNU env 的 getopt 会
-        // **顺序**解析簇内每个短选项——无参的 `-i`(ignore-env)/`-0`(null)/`-v`(verbose) 之后紧跟的
-        // `S` 才触发 split-string(payload = 簇内其余字符,空则取下一个 token);取参的 `-u`(unset)/
-        // `-C`(chdir) 会把簇内其余字符吞作**自身参数**,S 不再可达。真机 coreutils 8.32 实证:
-        // `-iS`/`-vS`/`-i0S` 执行 payload(曾漏放行灾难命令),`-uS…` 不执行。`--` 长选项已在上方处理。
+        // 短选项簇 `-S` / `-S<payload>` / `-iS<payload>` / `-vS <payload>`:GNU env 的 getopt 顺序解析
+        // 簇内每个短选项——无参 `-i`(ignore-env)/`-v`(verbose) 之后紧跟 `S` 触发 split-string(payload
+        // = 簇内其余,空则取下一 token);取参 `-u`/`-C` 吞其余字符,S 不可达;`-0`(null)与命令互斥令
+        // env 拒跑(rc=125,G)。真机 8.32:`-iS`/`-vS` 执行,`-uS…`/`-i0S` 不执行。
         if let Some(cluster) = a.strip_prefix('-') {
-            if !cluster.starts_with('-') {
+            if !cluster.is_empty() {
                 for (off, c) in cluster.char_indices() {
                     match c {
                         'S' => {
@@ -538,8 +661,9 @@ fn env_split_string_payload(argv: &[String]) -> Option<&str> {
                                 Some(rest) // `-…S<payload>` 粘连式
                             };
                         }
-                        'i' | '0' | 'v' => {} // 无参短选项:继续扫描簇内下一字符
-                        _ => break,           // 取参/未知短选项 → S 不可达,停止扫描本 token
+                        '0' => return None, // -0/--null 与命令互斥,env 拒跑(G)——不提取
+                        'i' | 'v' => {}     // 无参短选项:继续扫描簇内下一字符
+                        _ => break,         // 取参/未知短选项 → S 不可达,停止扫描本 token
                     }
                 }
             }
@@ -548,11 +672,13 @@ fn env_split_string_payload(argv: &[String]) -> Option<&str> {
     None
 }
 
-/// 按 **GNU env `-S`** 的 split-string 词法把 payload 切成 argv。关键:除字面空白(空格/制表)外,
-/// 反斜杠空白转义 `\_`/`\t`/`\n`/`\r`/`\f`/`\v` **也是参数分隔符**(真机 coreutils 8.32 实证 `\_`/`\t`
-/// 分隔),`\\`/`\#`/`\$` 等 → 字面字符,单/双引号分组。安全导向:把这些转义当分隔符可能比 env 略**多**
-/// 切(fail-closed 方向),但绝不会把 `rm\_-rf\_/` 误当单 token 而漏检。`${VAR}` 展开不建模(诚实边界:
-/// 变量替换属深混淆,与既有 command_guard 边界一致)。
+/// 按 **GNU env `-S`** 的 split-string 词法把 payload 切成 argv(真机 coreutils 8.32 逐条实证)。字面
+/// 空白(空格/制表/换行等)分隔参数,单/双引号分组;`\_` 是**唯一**的反斜杠分隔符(产生分隔用空格)。
+/// `\t`/`\n`/`\r`/`\f`/`\v` 产生**嵌入当前 token 的字面控制符**而**非**分隔符(F:原实现误当分隔符,把
+/// `rm\t-rf\t/` 这条 env 实际 ENOENT 跑不起来的单 token 过切成 `[rm,-rf,/]` 并固化进错误测试)。`\c` 是
+/// 注释/截断符,其后全部忽略(E:原实现落字面 'c',使 `rm -rf /\cX` 的 `/` 变 `/cX` → 灾难级 `rm -rf /`
+/// 被降级 Dangerous)。`\\`/`\#`/`\$` 等 → 字面该字符。`${VAR}` 展开不建模(诚实边界:变量替换属深
+/// 混淆,与既有 command_guard 边界一致)。
 fn env_s_split(payload: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut cur = String::new();
@@ -586,14 +712,39 @@ fn env_s_split(payload: &str) -> Vec<String> {
                 has_tok = true; // 引号本身开一个(可能为空的)token
             }
             '\\' => match chars.next() {
-                Some('_') | Some('t') | Some('n') | Some('r') | Some('f') | Some('v') => {
+                // `\_` 是**唯一**的反斜杠分隔符(真 env 8.32:产生分隔用空格)。
+                Some('_') => {
                     if has_tok {
-                        args.push(std::mem::take(&mut cur)); // env 空白转义 → 分隔符
+                        args.push(std::mem::take(&mut cur));
                         has_tok = false;
                     }
                 }
+                // `\c`:注释/截断——忽略其后全部字符(真 env 8.32 实证 E)。
+                Some('c') => break,
+                // `\t\n\r\f\v`:嵌入**字面**控制符到当前 token,**非**分隔符(真 env 8.32 实证 F)。
+                Some('t') => {
+                    cur.push('\t');
+                    has_tok = true;
+                }
+                Some('n') => {
+                    cur.push('\n');
+                    has_tok = true;
+                }
+                Some('r') => {
+                    cur.push('\r');
+                    has_tok = true;
+                }
+                Some('f') => {
+                    cur.push('\u{0c}');
+                    has_tok = true;
+                }
+                Some('v') => {
+                    cur.push('\u{0b}');
+                    has_tok = true;
+                }
+                // 其它(`\\`/`\#`/`\$`/…)→ 字面该字符。
                 Some(other) => {
-                    cur.push(other); // `\\`/`\#`/`\$`… → 字面
+                    cur.push(other);
                     has_tok = true;
                 }
                 None => {}
@@ -608,6 +759,31 @@ fn env_s_split(payload: &str) -> Vec<String> {
         args.push(cur);
     }
     args
+}
+
+/// 把 `env_s_split` 切出的 argv **保边界地**拼回单条命令串,供 `classify_depth` 递归分类。关键:含
+/// 空白(尤其 `\t\n…` 嵌入的字面控制符,F)或 shell 元字符(`;`/`|`/`&`/`$`…)的 token 必须**单引号
+/// 包裹**——否则下游 `segments`/`shlex::split` 会按这些字符**重新切开**,把 env 已定为**单个 argv**
+/// 的东西打散:`rm\t-rf\t/`(env 实际 ENOENT 的单 token 程序名)被 shlex 按 TAB 切回 `[rm,-rf,/]` →
+/// 误判灾难(F);`echo 'a;rm -rf /'` 类同 `;` 处被 segments 切出假的 `rm -rf /` 段。只对**全安全字符**
+/// (字母数字与路径/flag 常见符)的 token 免引号。
+fn env_s_join(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|t| {
+            let bare_safe = !t.is_empty()
+                && t.chars().all(|c| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '-' | '_' | '.' | '/' | '=' | ':' | '+' | '@' | '%' | ',')
+                });
+            if bare_safe {
+                t.clone()
+            } else {
+                format!("'{}'", t.replace('\'', "'\\''")) // 单引号包裹(内含单引号 → '\'' 转义)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 一个 token 是否是 shell 变量赋值 `NAME=VALUE`(NAME 须为 `[A-Za-z_][A-Za-z0-9_]*`)。
@@ -631,7 +807,7 @@ fn is_env_assignment(tok: &str) -> bool {
 /// 被静默绕过(实证 `FOO=1 rm -rf /` 放行,而 `env FOO=1 rm -rf /` / `rm -rf /` 均被拦 = fail-open)。
 fn unwrap_argv(argv: &[String]) -> &[String] {
     let mut i = 0;
-    'outer: while i < argv.len() {
+    while i < argv.len() {
         // 先吞掉前导裸环境赋值(可多个:`FOO=1 BAR=2 rm ...`)。
         while i < argv.len() && is_env_assignment(&argv[i]) {
             i += 1;
@@ -644,21 +820,10 @@ fn unwrap_argv(argv: &[String]) -> &[String] {
         if !CMD_WRAPPERS.contains(&b) {
             break;
         }
-        i += 1;
-        // 吞掉该 wrapper 的选项 / 环境赋值 / 时长参数,直到下一个裸词(可能仍是 wrapper)。
-        while i < argv.len() {
-            let a = &argv[i];
-            let is_flag = a.starts_with('-');
-            let is_assign = a.contains('=') && !a.starts_with('/');
-            let is_dur = a.chars().any(|c| c.is_ascii_digit())
-                && a.chars()
-                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | 's' | 'm' | 'h' | 'd'));
-            if is_flag || is_assign || is_dur {
-                i += 1;
-            } else {
-                continue 'outer;
-            }
-        }
+        // 吞掉该 wrapper 及其选项 / 赋值 / 时长 / **取参选项的独立参数**(堵 A:`sudo -u root rm -rf /`
+        // 的非数字参数 `root` 曾被误当命令 → bin="root" → 全部 argv 级灾难检测静默绕过)。返回下一个裸词
+        // 下标(可能仍是 wrapper,外层循环续解)。
+        i = skip_wrapper_operands(b, argv, i + 1);
     }
     &argv[i..]
 }
@@ -920,7 +1085,7 @@ mod tests {
         for cmd in [
             "env -iS 'rm -rf /'",      // i(无参) + S,payload = 下一 token
             "env -vS 'rm -rf /'",      // v(无参) + S
-            "env -i0S 'rm -rf /'",     // i + 0 + S 多个无参前缀
+            "env -viS 'rm -rf /'",     // 多个无参前缀 v + i + S(真机执行)
             "env -iS'rm -rf /'",       // 粘连 payload(shlex 合并为 `-iSrm -rf /`)
             "sudo env -iS 'rm -rf /'", // wrapper 前缀 + 合并簇
         ] {
@@ -936,17 +1101,25 @@ mod tests {
             classify("env -iS 'ls -la'", Some("/proj")).is_none(),
             "良性合并簇 payload 不应命中"
         );
+        // G(codex/hostile,真机 8.32 实证):`-0`(--null) 与运行命令**互斥**,env 直接拒跑
+        // (`cannot specify --null (-0) with command` rc=125),故 `-i0S`/`-0S` 根本不执行 payload——
+        // 不应判灾难级(原测试把 env 拒跑的非威胁误断为 Catastrophic)。
+        for cmd in ["env -i0S 'rm -rf /'", "env -0S 'rm -rf /'"] {
+            assert!(
+                classify(cmd, Some("/proj")).is_none(),
+                "`{cmd}` env 因 -0 拒跑,不应判灾难(G)"
+            );
+        }
     }
 
     #[test]
     fn env_split_string_backslash_escapes_do_not_bypass() {
         // 回归(codex HIGH + 真机 coreutils 8.32 实证放行):GNU env `-S` 的 payload 用 **env 自己的**
-        // 词法 split——反斜杠空白转义 `\_`/`\t`/`\n` 等是参数分隔符。原代码用 `shlex::split` 再解析,
+        // 词法 split——`\_` 是**唯一**的反斜杠分隔符(产生分隔用空格)。原代码用 `shlex::split` 再解析,
         // `\_` 被当转义下划线 → `rm\_-rf\_/` 落单 token → basename 不匹配 rm → 绕过。须先按 env 词法
         // 规范化。注:raw string 保留字面反斜杠(与 hook 收到的 JSON 解码后一致)。
         for cmd in [
             r"env -S 'rm\_-rf\_/'", // \_ 分隔
-            r"env -S 'rm\t-rf\t/'", // \t 分隔
             r"env --split-string='rm\_-rf\_/'",
             r"env -iS 'rm\_-rf\_/'", // 合并短选项 + 反斜杠分隔(双缺陷叠加)
             r"sudo env -S 'rm\_-rf\_/'", // wrapper + 反斜杠分隔
@@ -954,7 +1127,7 @@ mod tests {
             assert_eq!(
                 cat(cmd, Some("/proj")).tier,
                 GuardTier::Catastrophic,
-                "`{cmd}` 应灾难级(env 反斜杠分隔 split-string 不绕过)"
+                "`{cmd}` 应灾难级(env \\_ 分隔 split-string 不绕过)"
             );
         }
         // 良性反斜杠分隔 payload 不误命中。
@@ -962,6 +1135,15 @@ mod tests {
             classify(r"env -S 'ls\_-la'", Some("/proj")).is_none(),
             "良性 env -S 反斜杠分隔 payload 不应命中"
         );
+        // F(hostile,真机 8.32 实证):`\t`/`\n`/`\r`/`\f`/`\v` **嵌入字面控制符**(非分隔符)——
+        // `rm\t-rf\t/` 真实是单 token `rm<TAB>-rf<TAB>/`,env 找不到该程序名(ENOENT)什么都不删,
+        // 不应判灾难(原测试把 env 跑不起来的非威胁误断为 Catastrophic)。唯 `\_` 是反斜杠分隔符。
+        for cmd in [r"env -S 'rm\t-rf\t/'", r"env -S 'rm\n-rf\n/'"] {
+            assert!(
+                classify(cmd, Some("/proj")).is_none(),
+                "`{cmd}` \\t/\\n 嵌入非分隔,env ENOENT,不应判灾难(F)"
+            );
+        }
     }
 
     #[test]
@@ -989,6 +1171,121 @@ mod tests {
                 cat(cmd, Some("/proj")).tier,
                 GuardTier::Catastrophic,
                 "`{cmd}` env 为真实命令,split-string 应命中"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_nonnumeric_option_arg_does_not_bypass() {
+        // 回归(自查/codex/hostile HIGH,真机实证 exit=0 放行):`unwrap_argv` 跳 wrapper 选项时把取参
+        // 短/长选项的**非数字独立参数**(用户名/组名/信号名)误当命令 → 返回 `["root","rm",…]` →
+        // bin="root" 落 `_` → 全部 argv 级灾难检测被静默绕过。数字参数(`nice -n 10`/`timeout 5`)因
+        // is_dur 侥幸未中招,非数字参数是根因。须连带吞掉取参选项的独立参数。
+        for cmd in [
+            "sudo -u root rm -rf /",           // -u <user>
+            "doas -u root rm -rf /",           // doas -u <user>
+            "sudo -g wheel rm -rf /",          // -g <group>
+            "sudo --user root rm -rf /",       // 长选项分离参数
+            "sudo -u root -g wheel rm -rf /",  // 多取参选项串联
+            "sudo -H -u root rm -rf /",        // 无参 flag + 取参选项混合
+            "timeout -s TERM 5 rm -rf /",      // -s <SIG>(非数字)+ 时长
+            "sudo -- rm -rf /",                // `--` 终止选项后 rm 仍为真实命令
+            "sudo -u root shred /dev/sda",     // 非 rm 的 argv 级灾难命令(shred)
+            "sudo -u root mkfs.ext4 /dev/sda", // mkfs
+        ] {
+            assert_eq!(
+                cat(cmd, Some("/proj")).tier,
+                GuardTier::Catastrophic,
+                "`{cmd}` 应灾难级(wrapper 取参选项参数不绕过灾难检测)"
+            );
+        }
+        // 良性:取参选项参数被正确吞掉后真实命令是良性 → 不误命中;粘连参数亦然。
+        for cmd in [
+            "sudo -u root ls -la",
+            "sudo -uroot ls -la", // 粘连参数 -uroot(下一 token 才是命令)
+            "doas -u root cat file",
+        ] {
+            assert!(
+                classify(cmd, Some("/proj")).is_none(),
+                "`{cmd}` 良性,取参选项不应误吞真实命令致误报/漏报"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_option_arg_before_env_split_string_does_not_bypass() {
+        // 回归(d687bcb 引入,自查/codex/hostile HIGH):同上根因命中 `env_command_position` → `sudo -u
+        // root env -S 'rm -rf /'` 的 env 定位失败 → payload 永不递归 → 绕过(真机 exit=0;修复前 any-
+        // position 搜 env 能抓,本笔换命令位置门控后回归)。
+        for cmd in [
+            "sudo -u root env -S 'rm -rf /'",
+            "doas -u root env -S 'rm -rf /'",
+            "sudo --user root env -S 'rm -rf /'",
+            "timeout -s TERM 5 env -S 'rm -rf /'",
+            "sudo -u root env --split-string='rm -rf /'",
+        ] {
+            assert_eq!(
+                cat(cmd, Some("/proj")).tier,
+                GuardTier::Catastrophic,
+                "`{cmd}` 应灾难级(wrapper 取参选项后 env -S 不绕过)"
+            );
+        }
+    }
+
+    #[test]
+    fn env_split_string_abbreviation_does_not_bypass() {
+        // 回归(codex 抛线索 + 真机 8.32 实证放行,HIGH):GNU getopt 接受 `--split-string` 的任意无歧义
+        // 缩写(短至 `--s`——env 长选项中唯一以 s 开头者)。原代码只精确匹配 `--split-string`/`=` →
+        // `env --s='rm -rf /'` 绕过(真机 exit=0)。须前缀感知匹配;粘连式与分离式皆须命中。
+        for cmd in [
+            "env --s='rm -rf /'",           // 最短缩写(粘连)
+            "env --spl='rm -rf /'",         // 缩写粘连
+            "env --split-strin='rm -rf /'", // 长缩写粘连
+            "env --spl 'rm -rf /'",         // 缩写分离
+            "env --split 'rm -rf /'",       // 缩写分离
+            "sudo env --s='rm -rf /'",      // wrapper + 缩写
+        ] {
+            assert_eq!(
+                cat(cmd, Some("/proj")).tier,
+                GuardTier::Catastrophic,
+                "`{cmd}` 应灾难级(--split-string 缩写不绕过)"
+            );
+        }
+        // 良性缩写 payload 不误命中。
+        assert!(
+            classify("env --s='ls -la'", Some("/proj")).is_none(),
+            "良性 --s 缩写 payload 不应命中"
+        );
+    }
+
+    #[test]
+    fn env_double_dash_terminator_is_not_split_string() {
+        // 回归(codex/hostile LOW 误报,真机 8.32 rc=127):getopt `--` 终止选项解析,其后 `-S` 变**命令
+        // 名**(env 找不到程序 `-S` → ENOENT 不执行),不应判 split-string。原代码把 `--` 当簇跳过后仍从
+        // `-S` 提取 payload → 过拦。修:遇 `--` 即停止扫描。
+        for cmd in ["env -- -S 'rm -rf /'", "env -- --split-string='rm -rf /'"] {
+            assert!(
+                classify(cmd, Some("/proj")).is_none(),
+                "`{cmd}` -- 终止选项,-S 变命令名不执行,不应判灾难(D)"
+            );
+        }
+    }
+
+    #[test]
+    fn env_split_string_backslash_c_truncation_keeps_catastrophic() {
+        // 回归(hostile MED,真机 8.32 实证 `\c` 截断):env -S 的 `\c` 是注释/截断符,其后全丢,前面
+        // token 保持干净——`rm -rf /\cX` 真实 argv=[rm,-rf,/] **真删根**。原实现把 `\c` 落字面 'c' →
+        // `/` 变 `/cX` → is_catastrophic_rm_target 不命中 → 从 Catastrophic **降级** Dangerous(恒 Deny
+        // 地板失守)。修:`\c` 截断,`/` 保持干净 → 恒灾难级。
+        for cmd in [
+            r"env -S 'rm -rf /\cZZZDROP'",
+            r"env -S 'rm -rf /\c'",
+            r"sudo env -S 'rm -rf /\cX'",
+        ] {
+            assert_eq!(
+                cat(cmd, Some("/proj")).tier,
+                GuardTier::Catastrophic,
+                "`{cmd}` 应灾难级(\\c 截断后 / 干净,rm -rf / 不降级)"
             );
         }
     }
