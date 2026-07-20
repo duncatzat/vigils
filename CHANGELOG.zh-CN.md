@@ -8,6 +8,26 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.6.1-beta.1] — 2026-07-20 — 桌面 Deploy Guardian 修复 + 图标圆角柔化
+
+### 修复
+
+- **桌面 `Deploy Guardian` 报 `unexpected argument '--json'` 直接失败**(#91)。桌面控制
+  平面通过 `vigil-hub setup --json [--status] --hook-exe <稳定路径>` 驱动捆绑引擎,但公开
+  CLI 一直缺这两个 flag —— 点击 `Deploy Guardian` 立即红错。`setup` 现已支持:`--json`
+  输出稳定的**逐 agent** 机器可读状态(供 GUI/脚本消费,绝不一盏聚合灯);`--hook-exe
+  <path>` 把 agent hook 钉在**稳定启动器**位置(随 app 更新/移动不变,CRIT-1)。install
+  时拒绝指向不存在的 `--hook-exe`(hook 启动失败是 fail-open 静默漏);`--status` 则刻意
+  放行,把启动器丢失如实报为 `stale` 而非报错吞掉信号。
+
+### 变更
+
+- **桌面图标圆角柔化**(#92)。全部图标资产从设计源重新生成:外形加 Apple 比例圆角遮罩
+  (半径 ≈ 边长 22.4%);macOS 的 `icon.icns` 按 Apple HIG 图标网格单独生成(图形占
+  824/1024、四周留白),在 Launchpad / Dock / Finder 里不再显得比邻居"更大更方"。
+  Windows / Linux / store 资产共用通用圆角源。流水线可复现:`scripts/gen-icons.py` +
+  `tauri icon`(见 `apps/desktop/icons/README.md`)。
+
 ## [v0.6.0] — 2026-07-18 — 八个 agent、Aegis 桌面与 Intel mac
 
 v0.6.0-beta.1 → beta.4 的稳定汇总,已在三平台真机对已发布产物完成端到端验收

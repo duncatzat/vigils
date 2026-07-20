@@ -8,6 +8,30 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.6.1-beta.1] — 2026-07-20 — desktop Deploy Guardian fix + softer app icon
+
+### Fixed
+
+- **Desktop `Deploy Guardian` failed with `unexpected argument '--json'`** (#91). The
+  desktop control plane drives the bundled engine via `vigil-hub setup --json [--status]
+  --hook-exe <stable>`, but the public CLI never gained those two flags — clicking
+  `Deploy Guardian` errored out immediately. `setup` now supports both: `--json` emits a
+  stable per-agent machine-readable status for GUI/scripts (per-agent, never one
+  aggregated light), and `--hook-exe <path>` pins agent hooks to a stable launcher
+  location that survives app updates/moves (CRIT-1). Installing with a `--hook-exe` that
+  does not exist is refused — a hook that fails to launch is fail-open — while `--status`
+  deliberately keeps reporting a missing launcher honestly as `stale` instead of erroring.
+
+### Changed
+
+- **Softened desktop app icon corners** (#92). All icon assets are regenerated from the
+  design source with an Apple-ratio rounded-corner mask (radius ≈ 22.4% of edge), and
+  macOS now gets its own `icon.icns` built per the Apple HIG icon grid (824/1024 content
+  with padded margins) so the icon no longer looks oversized and overly square next to its
+  neighbors in Launchpad / Dock / Finder. Windows / Linux / store assets share the
+  universal rounded source. The pipeline is reproducible: `scripts/gen-icons.py` +
+  `tauri icon` (documented in `apps/desktop/icons/README.md`).
+
 ## [v0.6.0] — 2026-07-18 — eight agents, the Aegis desktop, and Intel macs
 
 The stable roll-up of v0.6.0-beta.1 → beta.4, verified end-to-end on real machines across
