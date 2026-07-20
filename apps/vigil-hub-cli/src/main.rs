@@ -292,6 +292,16 @@ struct CliSetupArgs {
     /// 覆盖审计账本路径(默认 `<本机数据目录>/Vigil/ledger.sqlite3`)。
     #[arg(long)]
     ledger: Option<PathBuf>,
+    /// 覆盖写入 agent hook 的 vigil-hub 路径。GUI/installer 应传一个**稳定位置**的 vigil-hub
+    /// (随 app 更新/移动不变),而非 app 包内路径 —— 否则更新后 hook 失效,而 hook 启动失败是
+    /// fail-open(放行)= 防护静默关闭(CRIT-1)。省略 = 本可执行自身。本轮仅作用于 hook 注册面;
+    /// 与 `--all`/`--mcp` 互斥(它们的稳定 exe 为后续增量,互斥防半修 footgun)。
+    #[arg(long = "hook-exe", conflicts_with_all = ["all", "mcp"])]
+    hook_exe: Option<PathBuf>,
+    /// 以结构化 JSON 输出**逐 agent**状态(供 GUI/脚本可靠消费),而非人类文本。与 `--all`/`--mcp`
+    /// 互斥(它们有各自流程;本轮 JSON 契约面向 hook 注册面)。配合 install / `--status` / `--uninstall`。
+    #[arg(long, conflicts_with_all = ["all", "mcp"])]
+    json: bool,
     /// **MCP turnkey**:把 Claude Code(`~/.claude.json`)的 stdio MCP server 改写为 `vigil-hub wrap`
     /// 网关(**默认 monitor 姿态**)。**默认保护 user scope(顶层 mcpServers)+ local scope(`projects.*`,
     /// `claude mcp add` 默认写这里)**;local scope 用项目限定 server-id 防跨项目同名身份塌缩。
@@ -595,23 +605,10 @@ fn main() -> std::process::ExitCode {
                     status: args.status,
                     dry_run: args.dry_run,
                     ledger: args.ledger,
+                    hook_exe: args.hook_exe,
                 };
                 match setup::run(&setup_args) {
                     Ok(report) => {
-                        // ISS-20260621-002:status 还需报告 MCP-wrap 保护层(只看 hook 会误报
-                        // `--mcp` turnkey 用户未保护)。逐 agent 统计(F-6:只报 Claude 会让
-                        // setup --all 保护的 Codex/Cursor 覆盖面在 status 里不可见)。
-                        let mcp_counts = dirs::home_dir()
-                            .map(|h| {
-                                setup_mcp::wrapped_server_counts_all_agents(
-                                    &h,
-                                    &setup_mcp::AgentEnv::from_process_env(),
-                                )
-                            })
-                            .unwrap_or_default();
-                        let code = print_setup_report(lang, &setup_args, &report, &mcp_counts);
-                        // 其余 agent 的 hook 注册面(Codex/Gemini/Cursor):检测到才注册,逐面诚实
-                        // 报告。ledger 用 Claude 面已解析出的同一路径(审计链单账本)。
                         let op = if setup_args.status {
                             setup_hooks::AgentHookOp::Status
                         } else if setup_args.uninstall {
@@ -623,7 +620,31 @@ fn main() -> std::process::ExitCode {
                                 dry_run: setup_args.dry_run,
                             }
                         };
-                        run_agent_hook_legs(lang, &report.ledger, op, code)
+                        if args.json {
+                            // GUI/脚本契约:逐 agent 结构化状态(绝不一盏聚合灯,hostile review 要求)。
+                            emit_setup_status_json(&report, &setup_args, op)
+                        } else {
+                            // ISS-20260621-002:status 还需报告 MCP-wrap 保护层(只看 hook 会误报
+                            // `--mcp` turnkey 用户未保护)。逐 agent 统计(F-6:只报 Claude 会让
+                            // setup --all 保护的 Codex/Cursor 覆盖面在 status 里不可见)。
+                            let mcp_counts = dirs::home_dir()
+                                .map(|h| {
+                                    setup_mcp::wrapped_server_counts_all_agents(
+                                        &h,
+                                        &setup_mcp::AgentEnv::from_process_env(),
+                                    )
+                                })
+                                .unwrap_or_default();
+                            let code = print_setup_report(lang, &setup_args, &report, &mcp_counts);
+                            // 其余 agent 的 hook 注册面(Codex/Gemini/Cursor)逐面诚实报告(单账本)。
+                            run_agent_hook_legs(
+                                lang,
+                                &report.ledger,
+                                op,
+                                code,
+                                setup_args.hook_exe.as_deref(),
+                            )
+                        }
                     }
                     Err(e) => fail_cmd(lang, "setup", e),
                 }
@@ -1435,7 +1456,8 @@ fn run_setup_all(
                     dry_run: args.dry_run,
                 }
             };
-            code = run_agent_hook_legs(lang, &ledger, hook_op, code);
+            // --all 与 --hook-exe 互斥 → 此路径恒用 current_exe()(传 None)。
+            code = run_agent_hook_legs(lang, &ledger, hook_op, code, None);
             Ok(code)
         }
         // hook 步就失败 → 什么都没改(hook 写盘前 gate,失败即未写):诚实"nothing changed"。
@@ -1504,6 +1526,86 @@ fn run_setup_all(
     }
 }
 
+/// `--json` 的逐 agent 状态(GUI/脚本契约;`status` ∈ active|stale|not_installed)。
+#[derive(serde::Serialize)]
+struct AgentStatusJson {
+    agent: String,
+    display_name: String,
+    detected: bool,
+    status: String,
+}
+
+/// `--json` 的聚合输出。`protected` = 任一 agent 真生效(state=Active)。
+#[derive(serde::Serialize)]
+struct SetupStatusJson {
+    protected: bool,
+    ledger: String,
+    hook_exe: Option<String>,
+    hook_command: String,
+    agents: Vec<AgentStatusJson>,
+}
+
+fn protection_state_str(s: &setup::ProtectionState) -> &'static str {
+    match s {
+        setup::ProtectionState::Active => "active",
+        setup::ProtectionState::Stale => "stale",
+        setup::ProtectionState::NotInstalled => "not_installed",
+    }
+}
+
+/// 把 Claude + 各 agent(Codex/Gemini/Cursor)的逐面状态聚合成结构化 JSON(stdout),供 GUI/脚本
+/// 可靠消费 —— **逐 agent**,绝不一盏聚合灯(hostile review 要求,防历史"假绿")。
+fn emit_setup_status_json(
+    report: &setup::SetupReport,
+    setup_args: &SetupArgs,
+    op: setup_hooks::AgentHookOp,
+) -> std::process::ExitCode {
+    let mut agents = vec![AgentStatusJson {
+        agent: "claude".to_string(),
+        display_name: "Claude Code".to_string(),
+        detected: report.claude_detected,
+        status: protection_state_str(&report.state).to_string(),
+    }];
+    if let Some(home) = dirs::home_dir() {
+        // hook 目标:与 Claude 面同款解析(稳定路径优先,CRIT-1)。
+        let exe = match setup_args.hook_exe.as_deref() {
+            Some(p) => p.to_path_buf(),
+            None => std::env::current_exe().unwrap_or_default(),
+        };
+        for spec in setup_hooks::all_agent_specs(&home) {
+            if let Ok(rep) = setup_hooks::run_agent_hook(&spec, &exe, &report.ledger, op) {
+                agents.push(AgentStatusJson {
+                    agent: rep.agent.to_string(),
+                    display_name: rep.display_name.to_string(),
+                    detected: rep.detected,
+                    status: protection_state_str(&rep.state).to_string(),
+                });
+            }
+        }
+    }
+    let protected = agents.iter().any(|a| a.status == "active");
+    let out = SetupStatusJson {
+        protected,
+        ledger: report.ledger.display().to_string(),
+        hook_exe: setup_args
+            .hook_exe
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        hook_command: report.hook_command.clone(),
+        agents,
+    };
+    match serde_json::to_string_pretty(&out) {
+        Ok(s) => {
+            println!("{s}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(_) => {
+            eprintln!("vigil-hub setup: failed to serialize status JSON");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 /// 其余 agent CLI 的 hook 注册面(Codex/Gemini/Cursor):逐面执行 + 诚实打印。单面失败不
 /// 中断其它面(各面独立文件、各自可逆),但最终退出码降级 FAILURE(诚实半应用,同 `run_codex_leg`
 /// 模式)。未检测到的 agent 一行说明后跳过,不为不存在的 agent 创建配置。
@@ -1512,14 +1614,36 @@ fn run_agent_hook_legs(
     ledger: &std::path::Path,
     op: setup_hooks::AgentHookOp,
     mut code: std::process::ExitCode,
+    hook_exe: Option<&std::path::Path>,
 ) -> std::process::ExitCode {
-    let (home, exe) = match (dirs::home_dir(), std::env::current_exe()) {
-        (Some(h), Ok(e)) => (h, e),
-        // Claude 面能跑到这里说明 home/exe 可解析;此分支仅防御性兜底。
-        _ => {
-            eprintln!("  agent hooks: cannot resolve home/exe; skipped");
-            return std::process::ExitCode::FAILURE;
-        }
+    let Some(home) = dirs::home_dir() else {
+        eprintln!(
+            "  {}",
+            tr(
+                lang,
+                "agent hooks: cannot resolve home; skipped",
+                "agent hooks:无法定位 home;已跳过",
+            )
+        );
+        return std::process::ExitCode::FAILURE;
+    };
+    // hook 目标:GUI/installer 传的**稳定路径**优先(与 Claude 面同款,CRIT-1),否则 current_exe()。
+    let exe = match hook_exe {
+        Some(p) => p.to_path_buf(),
+        None => match std::env::current_exe() {
+            Ok(e) => e,
+            Err(_) => {
+                eprintln!(
+                    "  {}",
+                    tr(
+                        lang,
+                        "agent hooks: cannot resolve exe; skipped",
+                        "agent hooks:无法定位可执行文件;已跳过",
+                    )
+                );
+                return std::process::ExitCode::FAILURE;
+            }
+        },
     };
     println!();
     println!(

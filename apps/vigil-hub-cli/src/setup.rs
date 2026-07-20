@@ -60,6 +60,11 @@ pub struct SetupArgs {
     pub dry_run: bool,
     /// 覆盖 ledger 路径;省略 = `VIGIL_LEDGER_PATH` 或 `<data_local>/Vigil/ledger.sqlite3`。
     pub ledger: Option<PathBuf>,
+    /// 覆盖写入 hook 的可执行路径。GUI/installer 应传一个**稳定位置**的 vigil-hub
+    /// (随 app 更新/移动不变,如 `%LOCALAPPDATA%\Vigil\bin\vigil-hub.exe`),**不要**传
+    /// app 包内的 current_exe —— 否则更新后 hook 路径失效,而 Claude/Codex/Gemini 的 hook
+    /// 启动失败是 **fail-open(放行)**= 防护静默关闭(CRIT-1)。省略 = current_exe()(CLI 旧行为)。
+    pub hook_exe: Option<PathBuf>,
 }
 
 /// `setup` 错误(脱敏:不透传 io 原文 / secret)。
@@ -99,6 +104,12 @@ pub enum SetupError {
         /// 目标路径。
         path: PathBuf,
     },
+    /// `--hook-exe` 指向的可执行不存在 —— 拒绝写一个指向不存在二进制的 hook
+    /// (hook 启动失败 = fail-open 静默漏)。GUI 应先装好稳定启动器再 setup(CRIT-1)。
+    HookExeNotFound {
+        /// 不存在的路径(供用户定位;非密钥)。
+        path: PathBuf,
+    },
 }
 
 impl std::fmt::Display for SetupError {
@@ -136,6 +147,12 @@ impl std::fmt::Display for SetupError {
             Self::Io { what, path } => {
                 write!(f, "failed to {} at {}", what, path.display())
             }
+            Self::HookExeNotFound { path } => write!(
+                f,
+                "--hook-exe path {} does not exist; refusing to write a hook pointing at a missing \
+                 binary (a hook that fails to launch is fail-open). Install the stable launcher first.",
+                path.display()
+            ),
         }
     }
 }
@@ -596,10 +613,27 @@ pub struct SetupReport {
 
 // ─────────────────────────── 入口 ───────────────────────────
 
+/// 解析写进 hook 的可执行路径(CRIT-1):`--hook-exe` 稳定路径优先,否则 `current_exe()`。
+/// install 时校验稳定路径存在(绝不写指向不存在二进制的 hook = fail-open 静默漏);
+/// status/uninstall 故意不拦,让 [`protection_state`] 如实报 Stale(启动器丢了 = 防护坏了,该被看见)。
+fn resolve_hook_exe(args: &SetupArgs) -> Result<PathBuf, SetupError> {
+    match args.hook_exe.as_deref() {
+        Some(p) => {
+            if !args.status && !args.uninstall && !p.is_file() {
+                return Err(SetupError::HookExeNotFound {
+                    path: p.to_path_buf(),
+                });
+            }
+            Ok(p.to_path_buf())
+        }
+        None => std::env::current_exe().map_err(|_| SetupError::MissingCurrentExe),
+    }
+}
+
 /// `setup` 子命令入口。生产侧用 `dirs` 解析 home/data_local + `current_exe()`;测试走 [`run_with`] 注入。
 pub fn run(args: &SetupArgs) -> Result<SetupReport, SetupError> {
     let home = dirs::home_dir().ok_or(SetupError::MissingHomeDir)?;
-    let exe = std::env::current_exe().map_err(|_| SetupError::MissingCurrentExe)?;
+    let exe = resolve_hook_exe(args)?;
     let env_ledger = std::env::var(LEDGER_ENV_VAR).ok();
     let data_local = dirs::data_local_dir();
     let ledger = resolve_ledger(
@@ -764,6 +798,50 @@ pub fn doctor_self_test() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRIT-1:`--hook-exe` 让 hook 跟随**稳定路径**而非 current_exe(抗 app 更新/移动),
+    /// 且 install 时拒绝指向不存在的二进制(绝不写 fail-open hook)。
+    #[test]
+    fn resolve_hook_exe_follows_stable_path_and_guards_fail_open() {
+        // 一个真实存在的"稳定路径"(模拟 GUI 装好的稳定启动器),与 current_exe 不同。
+        let stable = std::env::temp_dir().join(format!("vigil-hookexe-{}.bin", std::process::id()));
+        std::fs::write(&stable, b"x").unwrap();
+
+        // 1) Some(存在) → 跟随该稳定路径(≠ current_exe → 这正是抗更新的核心)。
+        let a = SetupArgs {
+            hook_exe: Some(stable.clone()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_hook_exe(&a).unwrap(), stable);
+        assert_ne!(stable, std::env::current_exe().unwrap());
+
+        // 2) 无 --hook-exe → current_exe()(CLI 旧行为不变)。
+        assert_eq!(
+            resolve_hook_exe(&SetupArgs::default()).unwrap(),
+            std::env::current_exe().unwrap()
+        );
+
+        // 3) install 指向不存在 → HookExeNotFound(绝不写指向缺失二进制的 hook = fail-open)。
+        let missing = std::env::temp_dir().join(format!("vigil-nope-{}.bin", std::process::id()));
+        let b = SetupArgs {
+            hook_exe: Some(missing.clone()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            resolve_hook_exe(&b),
+            Err(SetupError::HookExeNotFound { .. })
+        ));
+
+        // 4) status 指向不存在 → 放行(让 protection_state 如实报 Stale,而非 error 把信号藏掉)。
+        let c = SetupArgs {
+            hook_exe: Some(missing),
+            status: true,
+            ..Default::default()
+        };
+        assert!(resolve_hook_exe(&c).is_ok());
+
+        let _ = std::fs::remove_file(&stable);
+    }
     use std::path::PathBuf;
 
     fn exe() -> PathBuf {

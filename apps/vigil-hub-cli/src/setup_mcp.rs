@@ -2306,6 +2306,8 @@ pub fn run_all_with(
         status: false,
         dry_run,
         ledger: Some(ledger.to_path_buf()),
+        // --all 走 run_with(显式 exe 参数),不读 args.hook_exe;此处恒 None(--all 与 --hook-exe 互斥)。
+        hook_exe: None,
     };
     let hook_rep = crate::setup::run_with(&hook_args, home, exe, ledger).map_err(AllError::Hook)?;
 
