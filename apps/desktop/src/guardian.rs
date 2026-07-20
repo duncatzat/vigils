@@ -158,14 +158,24 @@ pub fn status(app: &AppHandle) -> Result<GuardianStatus, String> {
 
 /// 写:部署守卫 —— 把引擎复制到**稳定启动器**位置,再 `setup --hook-exe <稳定> --json`(让 agent 的
 /// hook 钉在稳定路径上,抗 app 更新/移动)。返回逐 agent 状态。
+///
+/// **部署原子性(与 download/ML 安装同款纪律)**:持 [`INSTALL_LOCK`](防与 `download_engine` /
+/// `install_ml_engine_into` 并发踩同一 bin 目录);复制先落 `<name>.deploy-stage` 临时件,再经
+/// [`swap_in_staged`] 两阶段 rename 进位 —— 稳定启动器**任一时刻要么是完整旧件、要么是完整新件**。
+/// 此前的裸 `fs::copy` 直接覆盖:复制中断(崩溃/断电/AV 拦截)= 半写 exe = hook 拉不起 =
+/// **fail-open 静默失防**(CRIT-1 的反面),且 hook 正在并发拉起稳定启动器时 Windows 共享锁
+/// 会让覆盖直接失败;rename 换装两者皆免疫。
 pub fn deploy(app: &AppHandle) -> Result<GuardianStatus, String> {
+    let _install = acquire_install_lock()?;
     let engine = resolve_engine(app).ok_or_else(|| ENGINE_NOT_FOUND.to_string())?;
     let stable = stable_launcher_path()
         .ok_or_else(|| "could not resolve a stable install location".to_string())?;
-    if let Some(parent) = stable.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    }
+    let parent = stable
+        .parent()
+        .ok_or_else(|| "invalid stable launcher path".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    sweep_stale_installs(parent);
     // 若解析到的引擎就是稳定启动器本身(已装 ML 变体 / 已下载到位)→ 跳过自我复制:
     // `std::fs::copy(src, src)` 在 Unix 会先 O_TRUNC 目标再读源 → 清零二进制(数据丢失)。
     // 仅当双方都能 canonicalize 且相等才判定同一文件(任一失败 → 不跳过,正常复制)。
@@ -174,13 +184,71 @@ pub fn deploy(app: &AppHandle) -> Result<GuardianStatus, String> {
             (std::fs::canonicalize(&engine), std::fs::canonicalize(&stable)),
             (Ok(a), Ok(b)) if a == b
         );
-    if !same_file {
-        // 覆盖复制 —— 更新时把新引擎刷到稳定位置;hook 路径(稳定)不变。
-        std::fs::copy(&engine, &stable)
-            .map_err(|e| format!("failed to install the stable launcher: {e}"))?;
-    }
     let s = stable.to_string_lossy().to_string();
-    run_setup_json(&stable, &["--hook-exe", &s])
+    if same_file {
+        return run_setup_json(&stable, &["--hook-exe", &s]);
+    }
+    // 更新时把新引擎刷到稳定位置(staging + 换装);hook 路径(稳定)不变。**旧件保留到
+    // setup 成功后**才清理 —— 换装成功但 `setup --hook-exe` 失败(新引擎损坏/不兼容)时,
+    // 若旧件已删,用户手上一个可用引擎都不剩(codex review 2026-07-20 HIGH-4)。
+    let staged = parent.join(format!("{ENGINE_BIN}.deploy-stage"));
+    let _ = std::fs::remove_file(&staged);
+    if let Err(e) = std::fs::copy(&engine, &staged) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("failed to stage the stable launcher: {e}"));
+    }
+    let aside = parent.join(format!("{ENGINE_BIN}.vigil-old"));
+    let _ = std::fs::remove_file(&aside);
+    let had_old = stable.exists();
+    if had_old {
+        if let Err(e) = std::fs::rename(&stable, &aside) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!(
+                "failed to move the old launcher aside ({e}) — if the daemon is running from it, \
+                 stop it first (Settings → daemon → stop) and retry"
+            ));
+        }
+    }
+    if let Err(e) = std::fs::rename(&staged, &stable) {
+        let _ = std::fs::remove_file(&staged);
+        let mut msg = format!("failed to install the stable launcher: {e}");
+        if had_old {
+            match std::fs::rename(&aside, &stable) {
+                Ok(()) => msg.push_str(" — the previous engine was restored"),
+                // 回滚失败绝不静默(HIGH-4):明说磁盘终态,旧件仍在 aside 可手工恢复。
+                Err(re) => msg.push_str(&format!(
+                    " — rollback also failed ({re}); the stable launcher at {} is currently \
+                     missing and the previous engine is preserved at {}",
+                    stable.display(),
+                    aside.display()
+                )),
+            }
+        }
+        return Err(msg);
+    }
+    match run_setup_json(&stable, &["--hook-exe", &s]) {
+        Ok(status) => {
+            // 新引擎已被 setup 验证可用 → 此刻才清理旧件(在用删不掉 → sweep 下次收)。
+            if had_old {
+                let _ = std::fs::remove_file(&aside);
+            }
+            Ok(status)
+        }
+        Err(e) => {
+            let mut msg = format!("deploy failed while registering hooks: {e}");
+            if had_old {
+                let _ = std::fs::remove_file(&stable);
+                match std::fs::rename(&aside, &stable) {
+                    Ok(()) => msg.push_str(" — the previous engine was restored"),
+                    Err(re) => msg.push_str(&format!(
+                        " — restoring the previous engine also failed ({re}); it is preserved at {}",
+                        aside.display()
+                    )),
+                }
+            }
+            Err(msg)
+        }
+    }
 }
 
 // ─────────────────────── ③ 缺失引擎:检测 + 提醒 + 安全自动下载 ───────────────────────
@@ -262,9 +330,9 @@ fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 安装互斥(M3):`download_engine` / `install_ml_engine_into` / `model_install` 共用,防并发
-/// 安装踩同一 bin 目录(staging 目录共享 + rename 交错 → 混装)。前端按钮防抖不是边界 ——
-/// 命令层自持不变量。
+/// 安装互斥(M3):`deploy` / `download_engine` / `install_ml_engine_into` / `model_install`
+/// 共用,防并发安装踩同一 bin 目录(staging 目录共享 + rename 交错 → 混装)。前端按钮防抖
+/// 不是边界 —— 命令层自持不变量。
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 /// 非阻塞取安装锁:安装进行中再点 → 立即可读错误(不排队,前端可提示)。中毒(安装线程
@@ -281,12 +349,14 @@ fn acquire_install_lock() -> Result<MutexGuard<'static, ()>, String> {
 }
 
 /// 清扫历史残留:`.ml-staging`(进程中途死亡遗留的下载/解包半成品)+ `*.vigil-old`(上次
-/// 换装时在用、删不掉的旧件)。尽力而为(仍在用则下次再扫);安装入口调用。
+/// 换装时在用、删不掉的旧件)+ `*.deploy-stage`(deploy 复制中途死亡的半成品)。尽力而为
+/// (仍在用则下次再扫);安装入口调用。
 fn sweep_stale_installs(bin_dir: &Path) {
     let _ = std::fs::remove_dir_all(bin_dir.join(".ml-staging"));
     if let Ok(entries) = std::fs::read_dir(bin_dir) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().ends_with(".vigil-old") {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".vigil-old") || name.ends_with(".deploy-stage") {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
