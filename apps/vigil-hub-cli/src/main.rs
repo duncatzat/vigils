@@ -931,6 +931,20 @@ fn setup_mcp_dispatch(
             "uninstall",
             code,
         );
+        code = run_json_agent_leg(
+            lang,
+            setup_mcp::run_grok_uninstall(&home, args.dry_run),
+            "Grok CLI",
+            "uninstall",
+            code,
+        );
+        code = run_json_agent_leg(
+            lang,
+            setup_mcp::run_opencode_uninstall(&home, args.dry_run),
+            "OpenCode",
+            "uninstall",
+            code,
+        );
         for agent in setup_mcp::all_json_mcp_agents(&home, &agent_env) {
             code = run_json_agent_leg(
                 lang,
@@ -948,21 +962,7 @@ fn setup_mcp_dispatch(
         let unresolvable = setup_mcp::unresolvable_wrappables(&home, &agent_env);
         let rep = setup_mcp::run_apply(&home, &exe, args.dry_run, args.user_scope_only, monitor)?;
         let mut code = print_mcp_apply(lang, &rep, "apply");
-        // #16:非阻塞 WARN —— 底层程序找不到的 server 仍被 wrap(配置正确),但会在 agent 启动时静默
-        // 失败,故诚实告知(避免"Protected"虚假安全感)。
-        for (agent_label, name, prog) in &unresolvable {
-            match lang {
-                Lang::En => eprintln!(
-                    "  WARNING: [{agent_label}] MCP server '{name}' command '{prog}' not found on PATH; \
-                     once wrapped it will fail when the agent starts it (install it or fix the path in \
-                     your config)"
-                ),
-                Lang::Zh => eprintln!(
-                    "  警告:[{agent_label}] MCP 服务器 '{name}' 的命令 '{prog}' 不在 PATH 中;一旦被 \
-                     wrap,agent 启动它时会失败(请安装它,或在配置里修好路径)"
-                ),
-            }
-        }
+        warn_unresolvable(lang, &unresolvable);
         code = run_codex_leg(
             lang,
             setup_mcp::run_codex_apply(
@@ -979,6 +979,20 @@ fn setup_mcp_dispatch(
             lang,
             setup_mcp::run_zcode_apply(&home, &exe, args.dry_run, monitor),
             "ZCode",
+            "apply",
+            code,
+        );
+        code = run_json_agent_leg(
+            lang,
+            setup_mcp::run_grok_apply(&home, &exe, args.dry_run, monitor),
+            "Grok CLI",
+            "apply",
+            code,
+        );
+        code = run_json_agent_leg(
+            lang,
+            setup_mcp::run_opencode_apply(&home, &exe, args.dry_run, monitor),
+            "OpenCode",
             "apply",
             code,
         );
@@ -1015,23 +1029,45 @@ fn setup_mcp_dispatch(
                 }
             }
         }
-        // ZCode(嵌套键专线;报告结构与 JSON-agent 同款,渲染复用)。
-        match setup_mcp::run_zcode_preview(&home, &exe, monitor) {
-            Ok(r) => print_json_agent_preview(lang, &r),
-            Err(e) => {
-                println!();
-                println!(
-                    "  {}{}",
-                    tr(lang, "ZCode config: ", "ZCode 配置:"),
-                    setup_mcp::zcode_config_path(&home).display()
-                );
-                match lang {
-                    Lang::En => println!(
-                        "  (could not read it: {e} -- fix the file to preview/protect ZCode MCP servers)"
-                    ),
-                    Lang::Zh => println!(
-                        "  (无法读取:{e} —— 修好该文件以预览 / 保护 ZCode 的 MCP 服务器)"
-                    ),
+        // 专线面(ZCode 嵌套键 / Grok TOML / OpenCode 数组形态;报告结构与 JSON-agent 同款,渲染复用)。
+        let special_previews: [(&str, PathBuf, Result<_, _>); 3] = [
+            (
+                "ZCode",
+                setup_mcp::zcode_config_path(&home),
+                setup_mcp::run_zcode_preview(&home, &exe, monitor),
+            ),
+            (
+                "Grok CLI",
+                setup_mcp::grok_config_path(&home),
+                setup_mcp::run_grok_preview(&home, &exe, monitor),
+            ),
+            (
+                "OpenCode",
+                setup_mcp::opencode_config_path(&home),
+                setup_mcp::run_opencode_preview(&home, &exe, monitor),
+            ),
+        ];
+        for (label, cfg_path, res) in special_previews {
+            match res {
+                Ok(r) => print_json_agent_preview(lang, &r),
+                Err(e) => {
+                    println!();
+                    println!(
+                        "  {}{}",
+                        match lang {
+                            Lang::En => format!("{label} config: "),
+                            Lang::Zh => format!("{label} 配置:"),
+                        },
+                        cfg_path.display()
+                    );
+                    match lang {
+                        Lang::En => println!(
+                            "  (could not read it: {e} -- fix the file to preview/protect {label} MCP servers)"
+                        ),
+                        Lang::Zh => println!(
+                            "  (无法读取:{e} —— 修好该文件以预览 / 保护 {label} 的 MCP 服务器)"
+                        ),
+                    }
                 }
             }
         }
@@ -1382,6 +1418,25 @@ fn build_injection_config(
 
 /// `setup --all`:一条命令同时接入 hook + MCP 网关 wrap(兑现 download→直接保护)。
 /// `--uninstall` 撤销两者;`--dry-run` 预览两者;MCP 侧默认 monitor(`--enforce` 升级硬拦)。
+/// #16:非阻塞 WARN —— 底层程序找不到的 server 仍被 wrap(配置正确),但会在 agent 启动时静默
+/// 失败,故诚实告知(避免"Protected"虚假安全感)。`setup --mcp --apply` 与 `setup --all` 共用
+/// (此前 --all 漏掉本警告;codex review 2026-07-20 LOW-8)。
+fn warn_unresolvable(lang: Lang, unresolvable: &[(String, String, String)]) {
+    for (agent_label, name, prog) in unresolvable {
+        match lang {
+            Lang::En => eprintln!(
+                "  WARNING: [{agent_label}] MCP server '{name}' command '{prog}' not found on PATH; \
+                 once wrapped it will fail when the agent starts it (install it or fix the path in \
+                 your config)"
+            ),
+            Lang::Zh => eprintln!(
+                "  警告:[{agent_label}] MCP 服务器 '{name}' 的命令 '{prog}' 不在 PATH 中;一旦被 \
+                 wrap,agent 启动它时会失败(请安装它,或在配置里修好路径)"
+            ),
+        }
+    }
+}
+
 fn run_setup_all(
     lang: Lang,
     args: &CliSetupArgs,
@@ -1402,6 +1457,13 @@ fn run_setup_all(
     } else {
         "apply"
     };
+    // LOW-8:apply 前对**全部接入面**查底层程序 PATH 可解析性(apply 后条目 AlreadyWrapped
+    // 查不到),与 `setup --mcp --apply` 同款即时预警。
+    let unresolvable = if args.uninstall {
+        Vec::new()
+    } else {
+        setup_mcp::unresolvable_wrappables(&home, &setup_mcp::AgentEnv::from_process_env())
+    };
     match setup_mcp::run_all_with(
         &home,
         &exe,
@@ -1413,6 +1475,7 @@ fn run_setup_all(
     ) {
         Ok((hook_rep, mcp_rep)) => {
             let mut code = print_setup_all(lang, &hook_rep, &mcp_rep, op);
+            warn_unresolvable(lang, &unresolvable);
             // 其余接入面:Codex + Cursor + Windsurf。各独立文件,hook + Claude-MCP 成功后逐一做;失败经
             // `run_*_leg` **诚实半应用报告**(不回滚已应用面 —— 各面独立、各自可逆)。op 在 dry-run 时为
             // "preview";各步只认 apply/uninstall(dry 措辞由报告里 dry_run 决定)。
@@ -1437,6 +1500,18 @@ fn run_setup_all(
                 setup_mcp::run_zcode_apply(&home, &exe_str, args.dry_run, monitor)
             };
             code = run_json_agent_leg(lang, zcode_res, "ZCode", mcp_op, code);
+            let grok_res = if args.uninstall {
+                setup_mcp::run_grok_uninstall(&home, args.dry_run)
+            } else {
+                setup_mcp::run_grok_apply(&home, &exe_str, args.dry_run, monitor)
+            };
+            code = run_json_agent_leg(lang, grok_res, "Grok CLI", mcp_op, code);
+            let opencode_res = if args.uninstall {
+                setup_mcp::run_opencode_uninstall(&home, args.dry_run)
+            } else {
+                setup_mcp::run_opencode_apply(&home, &exe_str, args.dry_run, monitor)
+            };
+            code = run_json_agent_leg(lang, opencode_res, "OpenCode", mcp_op, code);
             for agent in setup_mcp::all_json_mcp_agents(&home, &agent_env) {
                 let res = if args.uninstall {
                     setup_mcp::run_json_agent_uninstall(&agent, args.dry_run)

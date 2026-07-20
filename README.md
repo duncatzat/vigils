@@ -236,7 +236,8 @@ vigil-hub setup --all       # protect everything, in one step
    it runs; a real credential heading *into* a tool is **blocked fail-closed** and recorded in
    your tamper-evident audit ledger.
 2. **MCP gateway** — rewrites the stdio MCP servers of every detected agent — **Claude Code,
-   Codex, Cursor, Windsurf, Kimi CLI, ZCode and pi** — to run through Vigils, so secrets in tool
+   Codex, Gemini CLI, Cursor, Windsurf, Kimi CLI, ZCode, pi, Grok CLI, OpenCode, CodeBuddy and
+   Cline** — to run through Vigils, so secrets in tool
    **results** are scrubbed before the model ever sees them, and every call is audited. It defaults
    to **monitor** posture — your servers stay fully usable while every hard protection stays on
    (raw-secret block, result redaction, tamper-evident audit). Add `--enforce` for default-deny gating.

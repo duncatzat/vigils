@@ -145,6 +145,33 @@ pub fn read_claude_json(path: &Path) -> Result<Option<Value>, SetupError> {
     }
 }
 
+use crate::setup::stamp_for_existing;
+
+/// server-id 派生唯一性预检(改写前,对一个身份域内**全部** server 名跑):
+/// [`server_id_component`] 对合法名原样、非法名 slug+hash —— 如 `Playwright` 与字面
+/// `playwright-<hash>` 会派生**相同** id,共享账本 / 审批 / descriptor pin 以 server-id 为
+/// 身份键,塌缩 = 串号。撞则该面 abort([`SetupError::DuplicateServerId`]),用户改名后重跑
+/// (codex review 2026-07-20 HIGH-3)。
+fn ensure_unique_server_ids<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    id_of: &dyn Fn(&str) -> String,
+    path: &Path,
+) -> Result<(), SetupError> {
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for name in names {
+        let id = id_of(name);
+        if let Some(first) = seen.insert(id.clone(), name.to_string()) {
+            return Err(SetupError::DuplicateServerId {
+                path: path.to_path_buf(),
+                id,
+                first,
+                second: name.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// 校验已解析 JSON 配置的 **MCP 根形状**(读层之后、分类之前的统一守门):根必须是 object;
 /// `mcpServers` **存在则必须**是 object;`projects`(Claude 专有)存在则必须是 object,其每个
 /// 项目的 `mcpServers` 同。键**不存在** = 合法"未配置"(绝大多数用户),不报错。
@@ -596,7 +623,41 @@ pub fn wrapped_server_counts_all_agents(
         Ok(None) => Wrapped(0),
         Err(_) => ConfigError,
     };
-    let mut out = vec![("Claude Code", claude), ("Codex", codex), ("ZCode", zcode)];
+    let grok_path = grok_config_path(home);
+    let grok = match read_codex_config(&grok_path) {
+        Ok(Some(doc)) => match ensure_codex_root_shape(&doc, &grok_path) {
+            Ok(()) => Wrapped(
+                classify_codex_servers(&doc)
+                    .iter()
+                    .filter(|c| matches!(c, McpServerClass::AlreadyWrapped { .. }))
+                    .count(),
+            ),
+            Err(_) => ConfigError,
+        },
+        Ok(None) => Wrapped(0),
+        Err(_) => ConfigError,
+    };
+    let opencode_path = opencode_config_path(home);
+    let opencode = match read_claude_json(&opencode_path) {
+        Ok(Some(cfg)) => match ensure_opencode_root_shape(&cfg, &opencode_path) {
+            Ok(()) => Wrapped(
+                classify_opencode_servers(&cfg)
+                    .iter()
+                    .filter(|c| matches!(c, McpServerClass::AlreadyWrapped { .. }))
+                    .count(),
+            ),
+            Err(_) => ConfigError,
+        },
+        Ok(None) => Wrapped(0),
+        Err(_) => ConfigError,
+    };
+    let mut out = vec![
+        ("Claude Code", claude),
+        ("Codex", codex),
+        ("ZCode", zcode),
+        ("Grok CLI", grok),
+        ("OpenCode", opencode),
+    ];
     for agent in all_json_mcp_agents(home, env) {
         let st = match read_claude_json(&agent.config_path) {
             Ok(Some(cfg)) => match ensure_mcp_root_shape(&cfg, &agent.config_path) {
@@ -928,6 +989,16 @@ pub fn unresolvable_wrappables(home: &Path, env: &AgentEnv) -> Vec<(String, Stri
             }
         }
     }
+    if let Ok(Some(doc)) = read_codex_config(&grok_config_path(home)) {
+        for class in classify_codex_servers(&doc) {
+            push_unresolvable("Grok CLI", class);
+        }
+    }
+    if let Ok(Some(cfg)) = read_claude_json(&opencode_config_path(home)) {
+        for class in classify_opencode_servers(&cfg) {
+            push_unresolvable("OpenCode", class);
+        }
+    }
     for agent in all_json_mcp_agents(home, env) {
         if let Ok(Some(cfg)) = read_claude_json(&agent.config_path) {
             for class in classify_user_scope_servers(&cfg) {
@@ -965,6 +1036,25 @@ pub fn run_apply(
             })
         }
     };
+    // 身份唯一性预检(HIGH-3):user scope 一个域;local scope 每 project 一个域(id 带
+    // project 限定,跨 project 前缀不相交)。
+    if let Some(servers) = cfg.get("mcpServers").and_then(Value::as_object) {
+        ensure_unique_server_ids(
+            servers.keys().map(String::as_str),
+            &user_scope_server_id,
+            &path,
+        )?;
+    }
+    if !user_scope_only {
+        if let Some(projects) = cfg.get("projects").and_then(Value::as_object) {
+            for (proj, p) in projects {
+                if let Some(servers) = p.get("mcpServers").and_then(Value::as_object) {
+                    let id_of = |n: &str| local_scope_server_id(proj, n);
+                    ensure_unique_server_ids(servers.keys().map(String::as_str), &id_of, &path)?;
+                }
+            }
+        }
+    }
     // `--user-scope-only` 显式跳过 local scope —— 诚实报告被留作不保护的 local Wrappable 数。
     let local_skipped = if user_scope_only {
         count_unprotected_local_scope(&cfg)
@@ -972,9 +1062,7 @@ pub fn run_apply(
         0
     };
     // 读取时刻的 (mtime, len) → TOCTOU 防护(替换前比对;Claude Code 并发改写则 abort 不覆盖)。
-    let stamp = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let stamp = Some(stamp_for_existing(&path)?);
     let (new_cfg, changed, local_changed) =
         apply_wrap_to_config(&cfg, exe, user_scope_only, monitor);
     let backup = if !dry_run && (changed + local_changed) > 0 {
@@ -1011,9 +1099,7 @@ pub fn run_uninstall(home: &Path, dry_run: bool) -> Result<McpApplyReport, Setup
             })
         }
     };
-    let stamp = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let stamp = Some(stamp_for_existing(&path)?);
     let (new_cfg, changed, local_changed) = apply_unwrap_config(&cfg);
     let backup = if !dry_run && (changed + local_changed) > 0 {
         crate::setup::atomic_write_with_backup(&path, &new_cfg, stamp)?
@@ -1200,6 +1286,17 @@ pub fn classify_codex_servers(doc: &DocumentMut) -> Vec<McpServerClass> {
 /// 对 Codex `[mcp_servers.*]` 里每个 Wrappable 条目就地 wrap(`command`→vigil-hub,`args`→wrap 包裹 argv;
 /// 格式保留)。返回改写数。server-id = `codex-<name>`。
 pub fn apply_wrap_to_codex(doc: &mut DocumentMut, exe: &str, monitor: bool) -> usize {
+    apply_wrap_to_toml_servers(doc, exe, monitor, &codex_scope_server_id)
+}
+
+/// TOML `[mcp_servers.*]` wrap 的共享内核(Codex / Grok 两条 TOML 专线唯一改写路径;
+/// 仅 server-id 派生器不同)。
+fn apply_wrap_to_toml_servers(
+    doc: &mut DocumentMut,
+    exe: &str,
+    monitor: bool,
+    id_of: &dyn Fn(&str) -> String,
+) -> usize {
     // 先按分类器选出 Wrappable 的 (name, command, args, env_keys)(只读借用),再改写,
     // 避免迭代期对 servers 的 &mut 借用纠缠;且确保"预览说会改的" == "apply 真改的"(同一 classify_one)。
     let plan: Vec<(String, String, Vec<String>, Vec<String>)> = {
@@ -1227,14 +1324,7 @@ pub fn apply_wrap_to_codex(doc: &mut DocumentMut, exe: &str, monitor: bool) -> u
     let mut changed = 0;
     for (name, command, args, env_keys) in plan {
         if let Some(entry) = servers.get_mut(&name) {
-            let argv = wrapped_argv(
-                exe,
-                &codex_scope_server_id(&name),
-                &command,
-                &args,
-                &env_keys,
-                monitor,
-            );
+            let argv = wrapped_argv(exe, &id_of(&name), &command, &args, &env_keys, monitor);
             // argv[0] = 新 command(vigil-hub),argv[1..] = 新 args(wrap ... -- origcmd origargs)。
             set_codex_command_args(entry, &argv[0], &argv[1..]);
             changed += 1;
@@ -1371,9 +1461,15 @@ pub fn run_codex_apply(
         }
     };
     // 读取时刻的 (mtime, len) → TOCTOU 防护(替换前比对;Codex 并发改写则 abort 不覆盖)。
-    let stamp = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    if let Some(servers) = codex_servers_table(&doc) {
+        let names: Vec<String> = servers.iter().map(|(n, _)| n.to_string()).collect();
+        ensure_unique_server_ids(
+            names.iter().map(String::as_str),
+            &codex_scope_server_id,
+            &path,
+        )?;
+    }
+    let stamp = Some(stamp_for_existing(&path)?);
     let changed = apply_wrap_to_codex(&mut doc, exe, monitor);
     let backup = if !dry_run && changed > 0 {
         let rendered = doc.to_string(); // 格式保留序列化(只命中条目的 command+args 变)
@@ -1410,9 +1506,7 @@ pub fn run_codex_uninstall(
             })
         }
     };
-    let stamp = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let stamp = Some(stamp_for_existing(&path)?);
     let changed = apply_unwrap_codex(&mut doc);
     let backup = if !dry_run && changed > 0 {
         let rendered = doc.to_string();
@@ -1428,23 +1522,26 @@ pub fn run_codex_uninstall(
     })
 }
 
-// ============================ JSON `mcpServers` agent 接入面(Cursor / Windsurf / Kimi / pi) ============================
+// ============ JSON `mcpServers` agent 接入面(Cursor / Windsurf / Kimi / pi / Gemini / CodeBuddy / Cline) ============
 //
 // Cursor(`~/.cursor/mcp.json`)、Windsurf(`~/.codeium/windsurf/mcp_config.json`)、Kimi CLI
-// (`~/.kimi/mcp.json`)与 pi(`$PI_AGENT_DIR/mcp.json`,经 pi-mcp-adapter)的 MCP 配置**形态与
-// Claude user scope 完全一致**:专用 JSON 文件、顶层 `mcpServers` 对象、条目 `command`/`args`/`env`、
-// 远程用 `url`(Windsurf 另用 `serverUrl`,已并入 `classify_one` 远程检测)。故**直接复用 Claude 路径的
-// read/classify/wrap/unwrap/atomic-write 机制**,仅 config 路径与 server-id 前缀不同;无 `projects.*` 嵌套
-// (那是 Claude 专有),只处理顶层 scope。server-id 用 `<prefix>-<name>`(与 `user-`/`local-`/`codex-`
+// (`~/.kimi/mcp.json`)、pi(`$PI_AGENT_DIR/mcp.json`,经 pi-mcp-adapter)、Gemini CLI
+// (`~/.gemini/settings.json` **共享文件**顶层 `mcpServers` —— 管道读整 doc 只改该键,原子写
+// preserve 其余键,与 hook 面共存)、CodeBuddy(user scope 三路径优先链,条目带显式
+// `type:"stdio"`,preserve)与 Cline(VS Code globalStorage 专用文件,`disabled`/`autoApprove`
+// 扩展键 preserve)的 MCP 配置**顶层 `mcpServers` 形态与 Claude user scope 一致**:条目
+// `command`/`args`/`env`、远程用 `url`(Windsurf 另用 `serverUrl`,已并入 `classify_one` 远程检测)。
+// 故**直接复用 Claude 路径的 read/classify/wrap/unwrap/atomic-write 机制**,仅 config 路径与
+// server-id 前缀不同;无 `projects.*` 嵌套(那是 Claude/CodeBuddy-legacy 专有,CodeBuddy 面本
+// 增量只处理 user scope 顶层)。server-id 用 `<prefix>-<name>`(与 `user-`/`local-`/`codex-`
 // 命名空间不相交,前缀合法性由 [`JsonMcpAgent::new`] 门禁)。实例清单唯一来源 = [`all_json_mcp_agents`]。
 //
-// **范围**:上述四家 —— 均为专用、安全可重写文件、零形态差异。Cline(globalStorage 路径随
-// VS Code 版本/fork 漂移 + 有删配置数据丢失史)、Zed(`context_servers` 键且嵌入共享 settings.json/JSONC)、
-// VS Code(`servers` 键 + 显式 `type`)形态/风险不同,留后续专门增量。ZCode(嵌套 `mcp.servers`
-// 键,GUI 管理的共享 `~/.zcode/cli/config.json`)**不走本通用管道** —— 已由下文独立专线覆盖
-// (契约 = 解包 vendor app.asar 实锤,见"ZCode 接入面"段)。Kimi 的 hook 面(`~/.kimi/config.toml`
-// `[[hooks]]`)**刻意不做**:Beta + 官方 fail-open(hook 超时/崩溃=放行),不满足 Vigil 强保护
-// 语义,等 GA 后独立评估。
+// **仍在范围外**:Zed(`context_servers` 键且嵌入共享 settings.json/JSONC)、VS Code 原生
+// (`servers` 键 + 显式 `type`)形态/风险不同,留后续专门增量。ZCode(嵌套 `mcp.servers` 键)、
+// Grok(`~/.grok/config.toml` TOML)、OpenCode(`mcp.<name>` + command **数组**形态)**不走本
+// 通用管道** —— 各由下文独立专线覆盖。Kimi 的 hook 面(`~/.kimi/config.toml` `[[hooks]]`)
+// **刻意不做**:Beta + 官方 fail-open(hook 超时/崩溃=放行),不满足 Vigil 强保护语义,等 GA
+// 后独立评估。Cline 的路径漂移边界见 [`JsonMcpAgent::cline`](稳定版 VS Code + env 逃生舱)。
 
 /// 生产环境变量快照(**注入式**):库函数绝不直接读 env —— 否则 fixture 测试会被开发机真实
 /// `CODEX_HOME`/`PI_AGENT_DIR` 污染,apply 类测试甚至可能误写真实配置。main/quickstart 生产
@@ -1456,6 +1553,11 @@ pub struct AgentEnv {
     /// pi 的 agent 配置目录(`None` = 默认 `~/.pi/agent`)。取自 `PI_CODING_AGENT_DIR`
     /// (pi-mcp-adapter 文档对 mcp.json 点名的变量)或 `PI_AGENT_DIR`(pi 本体文档),前者优先。
     pub pi_agent_dir: Option<String>,
+    /// Cline 的 `cline_mcp_settings.json` 显式路径覆盖(`VIGIL_CLINE_MCP_PATH`)。
+    /// Cline 配置埋在 VS Code globalStorage,路径随发行版(Insiders/VSCodium/portable/
+    /// remote-server)漂移;默认只探测**稳定版 VS Code** 标准布局,其余发行版用户用本变量
+    /// 显式指定(逃生舱,诚实边界而非静默漏保护)。
+    pub cline_mcp_path: Option<String>,
 }
 
 impl AgentEnv {
@@ -1466,6 +1568,7 @@ impl AgentEnv {
             pi_agent_dir: std::env::var("PI_CODING_AGENT_DIR")
                 .ok()
                 .or_else(|| std::env::var("PI_AGENT_DIR").ok()),
+            cline_mcp_path: std::env::var("VIGIL_CLINE_MCP_PATH").ok(),
         }
     }
 }
@@ -1496,9 +1599,13 @@ impl JsonMcpAgent {
             "JsonMcpAgent id_prefix must be non-empty [a-z0-9]+: {id_prefix:?}"
         );
         assert!(
-            // `zcode` 由嵌套键专线用 [`zcode_scope_server_id`] 派生,与 JsonMcpAgent 同属共享账本
-            // 命名空间 —— 一并保留,防未来 JsonMcpAgent::new(_, _, "zcode") 与 ZCode 面 server-id 塌缩。
-            !matches!(id_prefix, "user" | "local" | "codex" | "zcode"),
+            // `zcode`/`grok`/`opencode` 由各自专线派生(zcode 嵌套键 / grok TOML / opencode
+            // `mcp.<name>` 数组形态),与 JsonMcpAgent 同属共享账本命名空间 —— 一并保留,
+            // 防未来 JsonMcpAgent::new 用同前缀造成跨面 server-id 塌缩。
+            !matches!(
+                id_prefix,
+                "user" | "local" | "codex" | "zcode" | "grok" | "opencode"
+            ),
             "JsonMcpAgent id_prefix collides with a reserved namespace: {id_prefix:?}"
         );
         JsonMcpAgent {
@@ -1537,6 +1644,62 @@ impl JsonMcpAgent {
         });
         Self::new("pi", dir.join("mcp.json"), "pi")
     }
+    /// Gemini CLI:`~/.gemini/settings.json` **顶层 `mcpServers`**(官方 schema + 本机实锤
+    /// 2026-07-20)。这是与 hook 注册面**共享**的 settings.json —— 管道读整 doc、只改顶层
+    /// `mcpServers`、原子写回 preserve 其余键(hooks/theme/...),两面互不clobber。项目级
+    /// `<repo>/.gemini/settings.json` 是提交文件,不碰(与 Cursor 项目级同决策)。
+    pub fn gemini(home: &Path) -> Self {
+        Self::new(
+            "Gemini CLI",
+            home.join(".gemini").join("settings.json"),
+            "gemini",
+        )
+    }
+    /// CodeBuddy Code(腾讯):user scope 三路径**优先链**(官方 docs/cli/mcp 2026-07 核实):
+    /// `~/.codebuddy/.mcp.json`(推荐)>`~/.codebuddy/mcp.json`(废弃)>`~/.codebuddy.json`(legacy)。
+    /// 与官方写入规则同构:**取第一个存在的**;都不存在 → 指向最高优先路径(exists:false 诚实,
+    /// 管道绝不创建)。条目带显式 `type:"stdio"` 键(preserve;classify 按 command/url 判定,不受
+    /// 影响)。legacy 文件的 `projects.*` local scope 本增量不碰(CodeBuddy 默认 scope=user)。
+    pub fn codebuddy(home: &Path) -> Self {
+        let chain = [
+            home.join(".codebuddy").join(".mcp.json"),
+            home.join(".codebuddy").join("mcp.json"),
+            home.join(".codebuddy.json"),
+        ];
+        let path = chain
+            .iter()
+            .find(|p| p.is_file())
+            .cloned()
+            .unwrap_or_else(|| chain[0].clone());
+        Self::new("CodeBuddy", path, "codebuddy")
+    }
+    /// Cline(VS Code 扩展):`<config_dir>/Code/User/globalStorage/saoudrizwan.claude-dev/
+    /// settings/cline_mcp_settings.json`(专用文件,标准顶层 `mcpServers`;条目内 `disabled`/
+    /// `autoApprove` 扩展键由 classify 的 clone-保留-未知字段纪律 preserve)。
+    ///
+    /// **路径漂移诚实边界**:默认只探测**稳定版 VS Code** 标准布局(Win `%APPDATA%`、
+    /// mac `~/Library/Application Support`、linux `~/.config` —— 均按 home 标准派生);
+    /// Insiders / VSCodium / portable / remote-server 变体不猜(Cline 有删配置数据丢失史,
+    /// 写错发行版文件比不写更糟),用 `VIGIL_CLINE_MCP_PATH` 显式指定(逃生舱)。
+    pub fn cline(home: &Path, cline_mcp_path_env: Option<&str>) -> Self {
+        // env 值经 [`crate::setup_hooks::resolve_agent_dir`] 同款解析(`~` 展开 + 相对路径按 CWD
+        // 绝对化,SSOT);默认 = 稳定版 VS Code 标准布局。
+        let path = crate::setup_hooks::resolve_agent_dir(home, cline_mcp_path_env, || {
+            #[cfg(target_os = "windows")]
+            let base = home.join("AppData").join("Roaming");
+            #[cfg(target_os = "macos")]
+            let base = home.join("Library").join("Application Support");
+            #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+            let base = home.join(".config");
+            base.join("Code")
+                .join("User")
+                .join("globalStorage")
+                .join("saoudrizwan.claude-dev")
+                .join("settings")
+                .join("cline_mcp_settings.json")
+        });
+        Self::new("Cline", path, "cline")
+    }
     /// 派生 server-id(经 [`json_agent_server_id`],preview 渲染与 apply 落盘同源)。
     pub fn server_id(&self, name: &str) -> String {
         json_agent_server_id(self.id_prefix, name)
@@ -1560,6 +1723,9 @@ pub fn all_json_mcp_agents(home: &Path, env: &AgentEnv) -> Vec<JsonMcpAgent> {
         JsonMcpAgent::windsurf(home),
         JsonMcpAgent::kimi(home),
         JsonMcpAgent::pi(home, env.pi_agent_dir.as_deref()),
+        JsonMcpAgent::gemini(home),
+        JsonMcpAgent::codebuddy(home),
+        JsonMcpAgent::cline(home, env.cline_mcp_path.as_deref()),
     ]
 }
 
@@ -1655,9 +1821,15 @@ pub fn run_json_agent_apply(
             })
         }
     };
-    let stamp = std::fs::metadata(&agent.config_path)
-        .ok()
-        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    if let Some(servers) = cfg.get("mcpServers").and_then(Value::as_object) {
+        let id_of = |n: &str| agent.server_id(n);
+        ensure_unique_server_ids(
+            servers.keys().map(String::as_str),
+            &id_of,
+            &agent.config_path,
+        )?;
+    }
+    let stamp = Some(stamp_for_existing(&agent.config_path)?);
     let mut new_cfg = cfg.clone();
     let changed = new_cfg
         .get_mut("mcpServers")
@@ -1699,9 +1871,7 @@ pub fn run_json_agent_uninstall(
             })
         }
     };
-    let stamp = std::fs::metadata(&agent.config_path)
-        .ok()
-        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let stamp = Some(stamp_for_existing(&agent.config_path)?);
     let mut new_cfg = cfg.clone();
     let changed = new_cfg
         .get_mut("mcpServers")
@@ -1858,9 +2028,14 @@ pub fn run_zcode_apply(
             })
         }
     };
-    let stamp = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    if let Some(servers) = zcode_servers_obj(&cfg) {
+        ensure_unique_server_ids(
+            servers.keys().map(String::as_str),
+            &zcode_scope_server_id,
+            &path,
+        )?;
+    }
+    let stamp = Some(stamp_for_existing(&path)?);
     let mut new_cfg = cfg.clone();
     let changed = zcode_servers_obj_mut(&mut new_cfg)
         .map(|servers| wrap_servers_object(servers, exe, monitor, zcode_scope_server_id))
@@ -1897,9 +2072,7 @@ pub fn run_zcode_uninstall(home: &Path, dry_run: bool) -> Result<JsonAgentApplyR
             })
         }
     };
-    let stamp = std::fs::metadata(&path)
-        .ok()
-        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    let stamp = Some(stamp_for_existing(&path)?);
     let mut new_cfg = cfg.clone();
     let changed = zcode_servers_obj_mut(&mut new_cfg)
         .map(unwrap_servers_object)
@@ -1911,6 +2084,462 @@ pub fn run_zcode_uninstall(home: &Path, dry_run: bool) -> Result<JsonAgentApplyR
     };
     Ok(JsonAgentApplyReport {
         display_name: "ZCode",
+        config_path: path,
+        changed,
+        dry_run,
+        backup,
+    })
+}
+
+// ============================ Grok 接入面(`~/.grok/config.toml`,`[mcp_servers.<name>]`) ============================
+//
+// xAI 官方 grok CLI 的用户级 MCP 配置在 `~/.grok/config.toml` 的 **`[mcp_servers.<name>]`** 表
+// (契约 = 本机 grok 0.2.101 `grok mcp add` 真实落盘核实 2026-07-20:`command` string +
+// `args` array + `enabled` bool)—— **与 Codex 的 TOML 形态完全同构**,整条专线复用 Codex 的
+// TOML 管道([`read_codex_config`] / [`ensure_codex_root_shape`] / [`classify_codex_servers`] /
+// [`apply_wrap_to_toml_servers`] / [`apply_unwrap_codex`] —— doc 层无 Codex 特异逻辑),仅
+// config 路径与 server-id 前缀(`grok-`)不同。`enabled` 等额外键由外科手术式改写天然 preserve。
+//
+// **诚实边界**:项目级 `./.grok/config.toml` 是仓库内提交文件,不碰(与 Cursor/ZCode 项目级同
+// 决策)。grok 的 cross-vendor compat 会加载 `~/.claude.json`/`.cursor/mcp.json` —— 那些文件被
+// Vigil wrap 后 grok 侧**自动继承保护**(同一份配置),本专线只负责 grok 自有的 config.toml。
+
+/// grok CLI 的用户级 MCP 配置路径:`~/.grok/config.toml`。
+pub fn grok_config_path(home: &Path) -> PathBuf {
+    home.join(".grok").join("config.toml")
+}
+
+/// 为 Grok `[mcp_servers.<name>]` 条目派生 server-id:`grok-<组件>`(命名空间与
+/// `user-`/`local-`/`codex-`/JSON-agent 前缀可证不相交,`grok` 已入保留表)。
+pub fn grok_scope_server_id(name: &str) -> String {
+    format!("grok-{}", server_id_component(name))
+}
+
+/// 读真实 `~/.grok/config.toml` → 枚举 + 分类,产出只读预览。**不写**。home/exe 注入 → 测试走 fixture。
+pub fn run_grok_preview(
+    home: &Path,
+    exe: &str,
+    monitor: bool,
+) -> Result<JsonAgentPreviewReport, SetupError> {
+    let path = grok_config_path(home);
+    let (exists, servers) = match read_codex_config(&path)? {
+        Some(doc) => {
+            ensure_codex_root_shape(&doc, &path)?; // 类型错绝不静默当"无 server"
+            (true, classify_codex_servers(&doc))
+        }
+        None => (false, Vec::new()),
+    };
+    Ok(JsonAgentPreviewReport {
+        display_name: "Grok CLI",
+        config_path: path,
+        exists,
+        exe: exe.to_string(),
+        servers,
+        monitor,
+        id_prefix: "grok",
+    })
+}
+
+/// `setup --mcp --apply`(Grok):读 → wrap `[mcp_servers.*]`(格式保留)→ 原子写。`dry_run` 只算不写。
+pub fn run_grok_apply(
+    home: &Path,
+    exe: &str,
+    dry_run: bool,
+    monitor: bool,
+) -> Result<JsonAgentApplyReport, SetupError> {
+    let path = grok_config_path(home);
+    let mut doc = match read_codex_config(&path)? {
+        Some(d) => {
+            ensure_codex_root_shape(&d, &path)?; // 类型错的根形状绝不改写
+            d
+        }
+        None => {
+            return Ok(JsonAgentApplyReport {
+                display_name: "Grok CLI",
+                config_path: path,
+                changed: 0,
+                dry_run,
+                backup: None,
+            })
+        }
+    };
+    if let Some(servers) = codex_servers_table(&doc) {
+        let names: Vec<String> = servers.iter().map(|(n, _)| n.to_string()).collect();
+        ensure_unique_server_ids(
+            names.iter().map(String::as_str),
+            &grok_scope_server_id,
+            &path,
+        )?;
+    }
+    let stamp = Some(stamp_for_existing(&path)?);
+    let changed = apply_wrap_to_toml_servers(&mut doc, exe, monitor, &grok_scope_server_id);
+    let backup = if !dry_run && changed > 0 {
+        let rendered = doc.to_string();
+        crate::setup::atomic_write_str_with_backup(&path, &rendered, stamp)?
+    } else {
+        None
+    };
+    Ok(JsonAgentApplyReport {
+        display_name: "Grok CLI",
+        config_path: path,
+        changed,
+        dry_run,
+        backup,
+    })
+}
+
+/// `setup --mcp --uninstall`(Grok):读 → self-describing 还原全部 Vigil 托管条目 → 原子写。
+pub fn run_grok_uninstall(home: &Path, dry_run: bool) -> Result<JsonAgentApplyReport, SetupError> {
+    let path = grok_config_path(home);
+    let mut doc = match read_codex_config(&path)? {
+        Some(d) => {
+            ensure_codex_root_shape(&d, &path)?; // 读不懂的形状绝不声称"还原了 0 个"
+            d
+        }
+        None => {
+            return Ok(JsonAgentApplyReport {
+                display_name: "Grok CLI",
+                config_path: path,
+                changed: 0,
+                dry_run,
+                backup: None,
+            })
+        }
+    };
+    let stamp = Some(stamp_for_existing(&path)?);
+    let changed = apply_unwrap_codex(&mut doc);
+    let backup = if !dry_run && changed > 0 {
+        let rendered = doc.to_string();
+        crate::setup::atomic_write_str_with_backup(&path, &rendered, stamp)?
+    } else {
+        None
+    };
+    Ok(JsonAgentApplyReport {
+        display_name: "Grok CLI",
+        config_path: path,
+        changed,
+        dry_run,
+        backup,
+    })
+}
+
+// ============================ OpenCode 接入面(`~/.config/opencode/opencode.json`,`mcp.<name>`) ============================
+//
+// OpenCode(opencode.ai)的全局配置 `~/.config/opencode/opencode.json`(官方文档核实 2026-07:
+// 跨平台均为 `~/.config` 下,Windows 同样按 home 展开)在 **`mcp.<name>`** 键下配 MCP server,
+// **v1 形态**(当前 stable):`{"type":"local","command":["cmd","arg",..],"enabled":true,
+// "environment":{..}}` / `{"type":"remote","url":..}`。与 Claude 形态两点不同:(a)`command`
+// 是**单数组**(argv 合体,无 `args` 键);(b)env 键名叫 `environment`。策略 = **形态桥接后
+// 复用共享安全内核**:每条目桥接成 Claude 形(`command[0]`/`command[1..]`/`environment`→`env`)
+// 喂 [`classify_one`](sentinel/危险字符/远程跳过全护栏生效),改写时把 [`wrapped_argv`] 全量
+// argv 合回 `command` 数组;还原经 [`unwrap_entry`](self-describing SSOT)后同样合回。
+// `type`/`enabled`/`environment` 等其余键**原位不动**(只替换 `command` 值)。
+//
+// **v2 拒绝(诚实边界)**:OpenCode v2 把 server 挪到 `mcp.servers.<name>` 且配置文件是
+// `opencode.jsonc`(JSONC 带注释)。v2 布局(`mcp.servers` 存在且为 object 且**无** string 型
+// `type` 键 —— v1 里恰好叫 "servers" 的 server 条目必有 `type`)→ `UnsupportedConfigShape`
+// abort,绝不按 v1 语义盲改;`.jsonc` 注释会让 JSON 解析失败 → 同样 abort(天然 fail-safe)。
+
+/// OpenCode 的全局配置路径:`~/.config/opencode/opencode.json`。
+pub fn opencode_config_path(home: &Path) -> PathBuf {
+    home.join(".config").join("opencode").join("opencode.json")
+}
+
+/// v1 的 `.json` 缺失时探测 v2 的 `opencode.jsonc`:在场 = 用户是**真实 v2 用户**,必须
+/// `UnsupportedConfigShape` 诚实拒绝 —— 此前按"未配置"返回 `exists:false`/`changed:0`,
+/// v2 gate 永远不触发,其全部 server 静默漏保护(codex review 2026-07-20 HIGH-1)。
+fn opencode_missing_v1_guard(home: &Path) -> Result<(), SetupError> {
+    let jsonc = home.join(".config").join("opencode").join("opencode.jsonc");
+    if jsonc.is_file() {
+        return Err(SetupError::UnsupportedConfigShape {
+            path: jsonc,
+            field: "opencode.jsonc (OpenCode v2 config)",
+        });
+    }
+    Ok(())
+}
+
+/// 为 OpenCode `mcp.<name>` 条目派生 server-id:`opencode-<组件>`。
+pub fn opencode_scope_server_id(name: &str) -> String {
+    format!("opencode-{}", server_id_component(name))
+}
+
+/// 校验 OpenCode 配置的 MCP 根形状:根必须是 object、`mcp` 存在则必须是 object;v2 布局
+/// (见模块注释)拒绝。根非 object(`[]`/字符串等合法 JSON)绝不静默当"未配置"
+/// (codex review 2026-07-20 MED-5)。
+pub fn ensure_opencode_root_shape(cfg: &Value, path: &Path) -> Result<(), SetupError> {
+    if !cfg.is_object() {
+        return Err(SetupError::UnsupportedConfigShape {
+            path: path.to_path_buf(),
+            field: "<root>",
+        });
+    }
+    let Some(mcp) = cfg.get("mcp") else {
+        return Ok(()); // 缺省 = 未配置,合法
+    };
+    let Some(map) = mcp.as_object() else {
+        return Err(SetupError::UnsupportedConfigShape {
+            path: path.to_path_buf(),
+            field: "mcp",
+        });
+    };
+    if let Some(servers) = map.get("servers") {
+        // v1 里名为 "servers" 的合法 server 条目必带 string 型 `type`;无 type 的 object = v2 容器。
+        let is_v2_container = servers
+            .as_object()
+            .is_some_and(|o| !o.get("type").is_some_and(Value::is_string));
+        if is_v2_container {
+            return Err(SetupError::UnsupportedConfigShape {
+                path: path.to_path_buf(),
+                field: "mcp.servers (OpenCode v2 layout)",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// 把一个 OpenCode v1 条目桥接成 Claude 形条目(供共享 [`classify_one`])。
+/// `command` 非数组 / 空数组 / 含非字符串 → `None`(调用方分类为 Skipped,fail-safe 不动)。
+/// 远程条目(`url` 键)**原样透传**(不桥接 command)—— classify_one 的远程检测直接命中。
+/// `type` 存在且非 `"local"`(如畸形的 `type:"remote"` **无** url 但带 command)同样 `None`:
+/// 桥接丢 `type` 会让此类条目冒充隐式 stdio 被改写,违反"形态异常不动"纪律
+/// (codex review 2026-07-20 MED-6)。
+fn opencode_entry_to_claude_shape(entry: &Value) -> Option<Value> {
+    let obj = entry.as_object()?;
+    if obj.contains_key("url") || obj.contains_key("serverUrl") {
+        return Some(entry.clone()); // 远程形态:classify_one 自行 Skip(reason=非 stdio)
+    }
+    if let Some(ty) = obj.get("type") {
+        if ty.as_str() != Some("local") {
+            return None; // 非 local(含畸形 remote-无-url / 未知 type)→ 不动
+        }
+    }
+    let cmd_arr = obj.get("command")?.as_array()?;
+    if cmd_arr.is_empty() || !cmd_arr.iter().all(Value::is_string) {
+        return None;
+    }
+    let mut bridged = serde_json::Map::new();
+    bridged.insert("command".into(), cmd_arr[0].clone());
+    bridged.insert("args".into(), Value::Array(cmd_arr[1..].to_vec()));
+    if let Some(env) = obj.get("environment") {
+        bridged.insert("env".into(), env.clone());
+    }
+    Some(Value::Object(bridged))
+}
+
+/// 取 `mcp` 键下的 server map(只读 / 可变)。根形状已由 [`ensure_opencode_root_shape`] 先行校验。
+fn opencode_servers_obj(cfg: &Value) -> Option<&serde_json::Map<String, Value>> {
+    cfg.get("mcp").and_then(Value::as_object)
+}
+fn opencode_servers_obj_mut(cfg: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    cfg.get_mut("mcp").and_then(Value::as_object_mut)
+}
+
+/// 从已解析的 OpenCode 配置枚举 `mcp.<name>` 并分类(纯函数)。
+pub fn classify_opencode_servers(cfg: &Value) -> Vec<McpServerClass> {
+    let Some(servers) = opencode_servers_obj(cfg) else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .map(
+            |(name, entry)| match opencode_entry_to_claude_shape(entry) {
+                Some(bridged) => classify_one(name, &bridged),
+                None => McpServerClass::Skipped {
+                    name: name.clone(),
+                    reason: "unsupported command shape (expected array of strings)",
+                },
+            },
+        )
+        .collect()
+}
+
+/// 对 OpenCode `mcp.<name>` 里每个 Wrappable 条目就地 wrap:`command` 数组 ← [`wrapped_argv`]
+/// 全量 argv(其余键原位不动)。返回改写数。
+fn apply_wrap_to_opencode(cfg: &mut Value, exe: &str, monitor: bool) -> usize {
+    let plan: Vec<(String, String, Vec<String>, Vec<String>)> = {
+        let Some(servers) = opencode_servers_obj(cfg) else {
+            return 0;
+        };
+        servers
+            .iter()
+            .filter_map(|(name, entry)| {
+                let bridged = opencode_entry_to_claude_shape(entry)?;
+                match classify_one(name, &bridged) {
+                    McpServerClass::Wrappable {
+                        name,
+                        command,
+                        args,
+                        env_keys,
+                    } => Some((name, command, args, env_keys)),
+                    _ => None,
+                }
+            })
+            .collect()
+    };
+    let Some(servers) = opencode_servers_obj_mut(cfg) else {
+        return 0;
+    };
+    let mut changed = 0;
+    for (name, command, args, env_keys) in plan {
+        if let Some(obj) = servers.get_mut(&name).and_then(Value::as_object_mut) {
+            let argv = wrapped_argv(
+                exe,
+                &opencode_scope_server_id(&name),
+                &command,
+                &args,
+                &env_keys,
+                monitor,
+            );
+            obj.insert(
+                "command".into(),
+                Value::Array(argv.into_iter().map(Value::String).collect()),
+            );
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// 对 OpenCode `mcp.<name>` 里所有 Vigil 托管条目 self-describing 还原(合回 `command` 数组)。
+fn apply_unwrap_opencode(cfg: &mut Value) -> usize {
+    let Some(servers) = opencode_servers_obj_mut(cfg) else {
+        return 0;
+    };
+    let mut changed = 0;
+    for (_name, entry) in servers.iter_mut() {
+        let Some(bridged) = opencode_entry_to_claude_shape(entry) else {
+            continue;
+        };
+        let Some(restored) = unwrap_entry(&bridged) else {
+            continue; // 非 Vigil 托管 / 形态异常 → 不动,fail-safe
+        };
+        let cmd = restored.get("command").and_then(Value::as_str);
+        let args_ok = restored
+            .get("args")
+            .and_then(Value::as_array)
+            .filter(|arr| arr.iter().all(Value::is_string));
+        // abort-on-unexpected:还原出的 argv 必须全字符串,否则跳过(留作 wrapped,数据不丢)。
+        if let (Some(cmd), Some(arr)) = (cmd, args_ok) {
+            let mut full = vec![Value::String(cmd.to_string())];
+            full.extend(arr.iter().cloned());
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("command".into(), Value::Array(full));
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
+/// 读真实 OpenCode 配置 → 枚举 + 分类,产出只读预览。**不写**。
+pub fn run_opencode_preview(
+    home: &Path,
+    exe: &str,
+    monitor: bool,
+) -> Result<JsonAgentPreviewReport, SetupError> {
+    let path = opencode_config_path(home);
+    let (exists, servers) = match read_claude_json(&path)? {
+        Some(cfg) => {
+            ensure_opencode_root_shape(&cfg, &path)?;
+            (true, classify_opencode_servers(&cfg))
+        }
+        None => {
+            opencode_missing_v1_guard(home)?;
+            (false, Vec::new())
+        }
+    };
+    Ok(JsonAgentPreviewReport {
+        display_name: "OpenCode",
+        config_path: path,
+        exists,
+        exe: exe.to_string(),
+        servers,
+        monitor,
+        id_prefix: "opencode",
+    })
+}
+
+/// `setup --mcp --apply`(OpenCode):读 → wrap `mcp.<name>` → 原子写。`dry_run` 只算不写。
+pub fn run_opencode_apply(
+    home: &Path,
+    exe: &str,
+    dry_run: bool,
+    monitor: bool,
+) -> Result<JsonAgentApplyReport, SetupError> {
+    let path = opencode_config_path(home);
+    let cfg = match read_claude_json(&path)? {
+        Some(v) => {
+            ensure_opencode_root_shape(&v, &path)?;
+            v
+        }
+        None => {
+            opencode_missing_v1_guard(home)?;
+            return Ok(JsonAgentApplyReport {
+                display_name: "OpenCode",
+                config_path: path,
+                changed: 0,
+                dry_run,
+                backup: None,
+            });
+        }
+    };
+    if let Some(servers) = opencode_servers_obj(&cfg) {
+        ensure_unique_server_ids(
+            servers.keys().map(String::as_str),
+            &opencode_scope_server_id,
+            &path,
+        )?;
+    }
+    let stamp = Some(stamp_for_existing(&path)?);
+    let mut new_cfg = cfg.clone();
+    let changed = apply_wrap_to_opencode(&mut new_cfg, exe, monitor);
+    let backup = if !dry_run && changed > 0 {
+        crate::setup::atomic_write_with_backup(&path, &new_cfg, stamp)?
+    } else {
+        None
+    };
+    Ok(JsonAgentApplyReport {
+        display_name: "OpenCode",
+        config_path: path,
+        changed,
+        dry_run,
+        backup,
+    })
+}
+
+/// `setup --mcp --uninstall`(OpenCode):读 → 还原全部 Vigil 托管条目 → 原子写。
+pub fn run_opencode_uninstall(
+    home: &Path,
+    dry_run: bool,
+) -> Result<JsonAgentApplyReport, SetupError> {
+    let path = opencode_config_path(home);
+    let cfg = match read_claude_json(&path)? {
+        Some(v) => {
+            ensure_opencode_root_shape(&v, &path)?;
+            v
+        }
+        None => {
+            opencode_missing_v1_guard(home)?;
+            return Ok(JsonAgentApplyReport {
+                display_name: "OpenCode",
+                config_path: path,
+                changed: 0,
+                dry_run,
+                backup: None,
+            });
+        }
+    };
+    let stamp = Some(stamp_for_existing(&path)?);
+    let mut new_cfg = cfg.clone();
+    let changed = apply_unwrap_opencode(&mut new_cfg);
+    let backup = if !dry_run && changed > 0 {
+        crate::setup::atomic_write_with_backup(&path, &new_cfg, stamp)?
+    } else {
+        None
+    };
+    Ok(JsonAgentApplyReport {
+        display_name: "OpenCode",
         config_path: path,
         changed,
         dry_run,
@@ -2213,6 +2842,63 @@ fn append_codex_doctor_rows(
     }
 }
 
+fn append_grok_doctor_rows(
+    home: &Path,
+    probe_timeout: Option<Duration>,
+    rows: &mut Vec<McpDoctorRow>,
+) {
+    let path = grok_config_path(home);
+    match read_codex_config(&path).and_then(|doc| match doc {
+        Some(d) => ensure_codex_root_shape(&d, &path).map(|()| Some(d)),
+        None => Ok(None),
+    }) {
+        Ok(Some(doc)) => {
+            if let Some(servers) = codex_servers_table(&doc) {
+                for (name, item) in servers.iter() {
+                    rows.push(doctor_row(
+                        name,
+                        "Grok CLI",
+                        &item_to_json(item),
+                        probe_timeout,
+                    ));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => rows.push(config_error_doctor_row("Grok CLI", &path, &e)),
+    }
+}
+
+fn append_opencode_doctor_rows(
+    home: &Path,
+    probe_timeout: Option<Duration>,
+    rows: &mut Vec<McpDoctorRow>,
+) {
+    let path = opencode_config_path(home);
+    match read_claude_json(&path).and_then(|cfg| match cfg {
+        Some(v) => ensure_opencode_root_shape(&v, &path).map(|()| Some(v)),
+        None => Ok(None),
+    }) {
+        Ok(Some(cfg)) => {
+            if let Some(servers) = opencode_servers_obj(&cfg) {
+                for (name, entry) in servers {
+                    // 桥接成 Claude 形(command 数组拆解);桥接失败的条目按原样喂
+                    // doctor_row(其内部按形态异常诚实 Skipped,不静默吞行)。
+                    let bridged = opencode_entry_to_claude_shape(entry);
+                    rows.push(doctor_row(
+                        name,
+                        "OpenCode",
+                        bridged.as_ref().unwrap_or(entry),
+                        probe_timeout,
+                    ));
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => rows.push(config_error_doctor_row("OpenCode", &path, &e)),
+    }
+}
+
 /// `setup --mcp --doctor`:对**所有** agent 接入面(Claude user+local / Codex / 全部
 /// [`all_json_mcp_agents`] registry)的每个 MCP server 做启动预检 —— 兑现"turnkey wrap 之后,
 /// 所有 agent 的 server 是否还能起"。
@@ -2252,10 +2938,12 @@ pub fn run_doctor(
             }
         }
     }
-    // 其余 agent 面(best-effort,各自独立文件):Codex(TOML)+ ZCode(嵌套键)+ 全部
-    // JSON-agent registry。
+    // 其余 agent 面(best-effort,各自独立文件):Codex(TOML)+ ZCode(嵌套键)+ Grok(TOML)
+    // + OpenCode(`mcp.<name>` 数组形态)+ 全部 JSON-agent registry。
     append_codex_doctor_rows(home, env.codex_home.as_deref(), probe_timeout, &mut rows);
     append_zcode_doctor_rows(home, probe_timeout, &mut rows);
+    append_grok_doctor_rows(home, probe_timeout, &mut rows);
+    append_opencode_doctor_rows(home, probe_timeout, &mut rows);
     for agent in all_json_mcp_agents(home, env) {
         append_json_agent_doctor_rows(&agent, probe_timeout, &mut rows);
     }
@@ -2755,9 +3443,13 @@ mod tests {
         let env = AgentEnv {
             codex_home: None,
             pi_agent_dir: None,
+            cline_mcp_path: None,
         };
         let agents = all_json_mcp_agents(home, &env);
-        assert!(agents.len() >= 4, "cursor/windsurf/kimi/pi expected");
+        assert!(
+            agents.len() >= 7,
+            "cursor/windsurf/kimi/pi/gemini/codebuddy/cline expected"
+        );
         for a in &agents {
             assert!(
                 !a.id_prefix.is_empty()
@@ -2955,6 +3647,374 @@ mod tests {
         assert_eq!(restored["theme"], "dark");
     }
 
+    /// Grok 契约(2026-07-20 本机 grok 0.2.101 `grok mcp add` 落盘核实):`~/.grok/config.toml`
+    /// 的 `[mcp_servers.<name>]`,`command` string + `args` array + `enabled` bool。wrap 必须:
+    /// 只动 command/args;`enabled`、其它 TOML 段、注释逐字保留(toml_edit 外科手术);可逆幂等。
+    #[test]
+    fn grok_toml_wrap_roundtrip_preserves_enabled_comments_and_other_sections() {
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        std::fs::create_dir_all(home.join(".grok")).unwrap();
+        let orig = r#"# user settings
+[cli]
+installer = "npm"
+
+[mcp_servers.memory]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+enabled = true
+"#;
+        let p = grok_config_path(home);
+        std::fs::write(&p, orig).unwrap();
+
+        let prev = run_grok_preview(home, "vigil-hub", true).unwrap();
+        assert!(prev.exists);
+        assert_eq!(prev.id_prefix, "grok");
+        assert_eq!(prev.wrappable_count(), 1);
+
+        let rep = run_grok_apply(home, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 1);
+        let wrapped = std::fs::read_to_string(&p).unwrap();
+        assert!(wrapped.contains("# user settings"), "注释逐字保留");
+        assert!(wrapped.contains("installer = \"npm\""), "其它段保留");
+        assert!(wrapped.contains("enabled = true"), "enabled 键保留");
+        assert!(wrapped.contains("grok-memory"), "grok- namespace server-id");
+        assert!(wrapped.contains("command = \"vigil-hub\""));
+        // 幂等 + 可逆。
+        assert_eq!(
+            run_grok_apply(home, "vigil-hub", false, true)
+                .unwrap()
+                .changed,
+            0
+        );
+        let rep2 = run_grok_uninstall(home, false).unwrap();
+        assert_eq!(rep2.changed, 1);
+        let restored = std::fs::read_to_string(&p).unwrap();
+        assert!(restored.contains("command = \"npx\""));
+        assert!(restored.contains("# user settings"));
+        assert!(restored.contains("enabled = true"));
+    }
+
+    /// OpenCode v1 契约(官方 docs 2026-07):`~/.config/opencode/opencode.json` 的 `mcp.<name>`,
+    /// `command` 为**单数组**(argv 合体),env 键叫 `environment`,禁用是 `enabled:false`。
+    /// wrap 必须:只替换 command 数组;type/enabled/environment/其它顶层键逐字保留;远程条目
+    /// (type:remote+url)不动;可逆幂等。
+    #[test]
+    fn opencode_v1_array_command_wrap_roundtrip_preserves_shape() {
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        std::fs::create_dir_all(home.join(".config").join("opencode")).unwrap();
+        let orig = json!({
+            "$schema": "https://opencode.ai/config.json",
+            "theme": "dark",
+            "mcp": {
+                "memory": {
+                    "type": "local",
+                    "command": ["npx", "-y", "@modelcontextprotocol/server-memory"],
+                    "enabled": true,
+                    "environment": {"MEM_KEY": "v"}
+                },
+                "remote-one": {"type": "remote", "url": "https://example.com/mcp"}
+            }
+        });
+        let p = opencode_config_path(home);
+        std::fs::write(&p, orig.to_string()).unwrap();
+
+        let prev = run_opencode_preview(home, "vigil-hub", true).unwrap();
+        assert!(prev.exists);
+        assert_eq!(prev.id_prefix, "opencode");
+        assert_eq!(prev.wrappable_count(), 1, "local 可保护,remote Skip");
+
+        let rep = run_opencode_apply(home, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 1);
+        let wrapped: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(wrapped["theme"], "dark");
+        let mem = &wrapped["mcp"]["memory"];
+        assert_eq!(mem["type"], "local", "type 键保留");
+        assert_eq!(mem["enabled"], true, "enabled 键保留");
+        assert_eq!(mem["environment"]["MEM_KEY"], "v", "environment 键保留");
+        let cmd = mem["command"].as_array().unwrap();
+        assert_eq!(cmd[0], "vigil-hub", "command[0] = 网关 exe");
+        assert!(
+            cmd.iter().any(|v| v == "opencode-memory"),
+            "opencode- namespace server-id 在 argv 中"
+        );
+        assert_eq!(
+            wrapped["mcp"]["remote-one"]["url"], "https://example.com/mcp",
+            "远程条目不动"
+        );
+        // 幂等 + 可逆。
+        assert_eq!(
+            run_opencode_apply(home, "vigil-hub", false, true)
+                .unwrap()
+                .changed,
+            0
+        );
+        let rep2 = run_opencode_uninstall(home, false).unwrap();
+        assert_eq!(rep2.changed, 1);
+        let restored: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        let rcmd = restored["mcp"]["memory"]["command"].as_array().unwrap();
+        assert_eq!(rcmd[0], "npx");
+        assert_eq!(rcmd[1], "-y");
+        assert_eq!(restored["mcp"]["memory"]["environment"]["MEM_KEY"], "v");
+    }
+
+    /// OpenCode v2 布局(`mcp.servers` 容器)与 `mcp` 非 object → 诚实拒绝,绝不按 v1 语义盲改。
+    /// v1 里恰好名为 "servers" 的 server(带 string 型 `type`)不误伤。
+    #[test]
+    fn opencode_v2_layout_rejected_v1_server_named_servers_ok() {
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        std::fs::create_dir_all(home.join(".config").join("opencode")).unwrap();
+        let p = opencode_config_path(home);
+
+        // v2:mcp.servers 是无 type 的 object 容器 → 拒绝。
+        let v2 = json!({"mcp": {"servers": {"x": {"type": "local", "command": ["npx"]}}}});
+        std::fs::write(&p, v2.to_string()).unwrap();
+        assert!(matches!(
+            run_opencode_preview(home, "vigil-hub", true),
+            Err(SetupError::UnsupportedConfigShape { .. })
+        ));
+        assert!(matches!(
+            run_opencode_apply(home, "vigil-hub", false, true),
+            Err(SetupError::UnsupportedConfigShape { .. })
+        ));
+
+        // v1 边界:名为 "servers" 的真 server(带 string type)→ 不误伤,照常分类。
+        let v1_edge = json!({"mcp": {"servers": {"type": "local", "command": ["npx", "srv"]}}});
+        std::fs::write(&p, v1_edge.to_string()).unwrap();
+        let prev = run_opencode_preview(home, "vigil-hub", true).unwrap();
+        assert_eq!(
+            prev.wrappable_count(),
+            1,
+            "v1 server 恰好叫 servers 不误判 v2"
+        );
+
+        // mcp 非 object → 拒绝。
+        std::fs::write(&p, json!({"mcp": []}).to_string()).unwrap();
+        assert!(matches!(
+            run_opencode_preview(home, "vigil-hub", true),
+            Err(SetupError::UnsupportedConfigShape { .. })
+        ));
+
+        // 根非 object(合法 JSON 但形状不对)→ 拒绝,绝不静默当"未配置"(MED-5)。
+        std::fs::write(&p, "[]").unwrap();
+        assert!(matches!(
+            run_opencode_preview(home, "vigil-hub", true),
+            Err(SetupError::UnsupportedConfigShape { .. })
+        ));
+
+        // 畸形 `type:"remote"` 无 url 但带 command → 不桥接不改写(MED-6:桥接丢 type 会让它
+        // 冒充隐式 stdio 被 wrap)。
+        std::fs::write(
+            &p,
+            json!({"mcp": {"weird": {"type": "remote", "command": ["cmd"]}}}).to_string(),
+        )
+        .unwrap();
+        let prev = run_opencode_preview(home, "vigil-hub", true).unwrap();
+        assert_eq!(prev.wrappable_count(), 0, "remote-无-url 畸形条目不可 wrap");
+        assert_eq!(
+            run_opencode_apply(home, "vigil-hub", false, true)
+                .unwrap()
+                .changed,
+            0
+        );
+
+        // v1 `.json` 缺失但 v2 `.jsonc` 在场 → 诚实拒绝,绝不报"未配置"(HIGH-1:
+        // exists:false/changed:0 会让真实 v2 用户的全部 server 静默漏保护)。
+        std::fs::remove_file(&p).unwrap();
+        std::fs::write(
+            home.join(".config").join("opencode").join("opencode.jsonc"),
+            "// v2 config\n{}",
+        )
+        .unwrap();
+        assert!(matches!(
+            run_opencode_preview(home, "vigil-hub", true),
+            Err(SetupError::UnsupportedConfigShape { .. })
+        ));
+        assert!(matches!(
+            run_opencode_apply(home, "vigil-hub", false, true),
+            Err(SetupError::UnsupportedConfigShape { .. })
+        ));
+        assert!(matches!(
+            run_opencode_uninstall(home, false),
+            Err(SetupError::UnsupportedConfigShape { .. })
+        ));
+    }
+
+    /// HIGH-3:同一面内两个 server 名派生相同 server-id(合法字面名撞非法名的 slug+hash)
+    /// → apply **整面 abort**,绝不静默身份塌缩。uninstall(self-describing 反解)不受影响。
+    #[test]
+    fn duplicate_derived_server_id_aborts_apply() {
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        std::fs::create_dir_all(home.join(".cursor")).unwrap();
+        let a = JsonMcpAgent::cursor(home);
+        // "Memory Srv"(非法名 → slug+hash)与其派生结果的字面名(合法名 → 原样)。
+        let collide = server_id_component("Memory Srv");
+        let mut servers = serde_json::Map::new();
+        servers.insert(
+            "Memory Srv".into(),
+            json!({"command": "npx", "args": ["a"]}),
+        );
+        servers.insert(collide.clone(), json!({"command": "npx", "args": ["b"]}));
+        std::fs::write(
+            &a.config_path,
+            Value::Object(
+                [("mcpServers".to_string(), Value::Object(servers))]
+                    .into_iter()
+                    .collect(),
+            )
+            .to_string(),
+        )
+        .unwrap();
+        match run_json_agent_apply(&a, "vigil-hub", false, true) {
+            Err(SetupError::DuplicateServerId { id, .. }) => {
+                assert_eq!(id, format!("cursor-{collide}"));
+            }
+            other => panic!("expected DuplicateServerId, got {other:?}"),
+        }
+        // 文件未被改动(abort 在写前)。
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(&a.config_path).unwrap()).unwrap();
+        assert_eq!(cfg["mcpServers"]["Memory Srv"]["command"], "npx");
+    }
+
+    /// CodeBuddy user scope 三路径优先链(官方 docs/cli/mcp):`.codebuddy/.mcp.json` >
+    /// `.codebuddy/mcp.json`(废弃)> `~/.codebuddy.json`(legacy);都不存在 → 指向最高优先
+    /// (exists:false,绝不创建)。条目显式 `type:"stdio"` 键 preserve 且不影响 classify。
+    #[test]
+    fn codebuddy_path_chain_picks_first_existing_and_preserves_type_key() {
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+
+        // 都不存在 → 默认最高优先路径。
+        let a = JsonMcpAgent::codebuddy(home);
+        assert_eq!(a.config_path, home.join(".codebuddy").join(".mcp.json"));
+        assert_eq!(a.id_prefix, "codebuddy");
+
+        // 仅 legacy 存在 → 选 legacy。
+        std::fs::write(
+            home.join(".codebuddy.json"),
+            json!({"mcpServers": {"t": {"type": "stdio", "command": "npx", "args": ["srv"]}}})
+                .to_string(),
+        )
+        .unwrap();
+        let a = JsonMcpAgent::codebuddy(home);
+        assert_eq!(a.config_path, home.join(".codebuddy.json"));
+
+        // 推荐路径出现 → 优先链翻转到最高优先。
+        std::fs::create_dir_all(home.join(".codebuddy")).unwrap();
+        std::fs::write(
+            home.join(".codebuddy").join(".mcp.json"),
+            json!({"mcpServers": {"t": {"type": "stdio", "command": "npx", "args": ["srv"]}}})
+                .to_string(),
+        )
+        .unwrap();
+        let a = JsonMcpAgent::codebuddy(home);
+        assert_eq!(a.config_path, home.join(".codebuddy").join(".mcp.json"));
+
+        // type:"stdio" 显式键:wrap 往返 preserve 且 classify 不受影响。
+        let rep = run_json_agent_apply(&a, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 1);
+        let wrapped: Value =
+            serde_json::from_str(&std::fs::read_to_string(&a.config_path).unwrap()).unwrap();
+        assert_eq!(wrapped["mcpServers"]["t"]["type"], "stdio", "type 键保留");
+        assert_eq!(wrapped["mcpServers"]["t"]["command"], "vigil-hub");
+        let rep2 = run_json_agent_uninstall(&a, false).unwrap();
+        assert_eq!(rep2.changed, 1);
+    }
+
+    /// Cline:默认 = 稳定版 VS Code globalStorage 标准布局(按 home 平台派生);
+    /// `VIGIL_CLINE_MCP_PATH` 显式覆盖(经 resolve_agent_dir 同款 `~`/相对路径解析)。
+    /// 条目 `disabled`/`autoApprove` 扩展键 wrap 往返 preserve。
+    #[test]
+    fn cline_default_path_env_override_and_extension_keys_roundtrip() {
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+
+        let a = JsonMcpAgent::cline(home, None);
+        assert!(
+            a.config_path.ends_with(
+                Path::new("saoudrizwan.claude-dev")
+                    .join("settings")
+                    .join("cline_mcp_settings.json")
+            ),
+            "默认路径落在 Cline globalStorage 标准布局: {:?}",
+            a.config_path
+        );
+        assert_eq!(a.id_prefix, "cline");
+
+        // env 覆盖(绝对路径)。
+        let custom = home.join("custom-cline.json");
+        let a = JsonMcpAgent::cline(home, Some(custom.to_str().unwrap()));
+        assert_eq!(a.config_path, custom);
+
+        // 扩展键 preserve 往返。
+        std::fs::write(
+            &custom,
+            json!({"mcpServers": {"srv": {
+                "command": "npx", "args": ["-y", "x"],
+                "disabled": false, "autoApprove": ["toolA"]
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let rep = run_json_agent_apply(&a, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 1);
+        let wrapped: Value =
+            serde_json::from_str(&std::fs::read_to_string(&custom).unwrap()).unwrap();
+        assert_eq!(wrapped["mcpServers"]["srv"]["disabled"], false);
+        assert_eq!(wrapped["mcpServers"]["srv"]["autoApprove"][0], "toolA");
+        assert_eq!(wrapped["mcpServers"]["srv"]["command"], "vigil-hub");
+        let rep2 = run_json_agent_uninstall(&a, false).unwrap();
+        assert_eq!(rep2.changed, 1);
+        let restored: Value =
+            serde_json::from_str(&std::fs::read_to_string(&custom).unwrap()).unwrap();
+        assert_eq!(restored["mcpServers"]["srv"]["command"], "npx");
+        assert_eq!(restored["mcpServers"]["srv"]["autoApprove"][0], "toolA");
+    }
+
+    /// Gemini:`~/.gemini/settings.json` 是与 hook 注册面**共享**的文件 —— wrap 只动顶层
+    /// `mcpServers`,`hooks`/`theme` 等其余顶层键逐字保留(两面互不 clobber)。
+    #[test]
+    fn gemini_shared_settings_wrap_preserves_hooks_and_other_top_level_keys() {
+        let td = tempfile::TempDir::new().unwrap();
+        let home = td.path();
+        std::fs::create_dir_all(home.join(".gemini")).unwrap();
+        let a = JsonMcpAgent::gemini(home);
+        assert_eq!(a.config_path, home.join(".gemini").join("settings.json"));
+        std::fs::write(
+            &a.config_path,
+            json!({
+                "theme": "dark",
+                "hooks": {"PreToolUse": [{"hooks": [{"type": "command", "command": "existing-hook"}]}]},
+                "mcpServers": {"srv": {"command": "npx", "args": ["-y", "x"]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let rep = run_json_agent_apply(&a, "vigil-hub", false, true).unwrap();
+        assert_eq!(rep.changed, 1);
+        let wrapped: Value =
+            serde_json::from_str(&std::fs::read_to_string(&a.config_path).unwrap()).unwrap();
+        assert_eq!(wrapped["theme"], "dark", "非 MCP 顶层键保留");
+        assert_eq!(
+            wrapped["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "existing-hook",
+            "hook 注册面(共享文件)逐字保留"
+        );
+        assert_eq!(wrapped["mcpServers"]["srv"]["command"], "vigil-hub");
+        let rep2 = run_json_agent_uninstall(&a, false).unwrap();
+        assert_eq!(rep2.changed, 1);
+        let restored: Value =
+            serde_json::from_str(&std::fs::read_to_string(&a.config_path).unwrap()).unwrap();
+        assert_eq!(restored["mcpServers"]["srv"]["command"], "npx");
+        assert_eq!(
+            restored["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "existing-hook"
+        );
+    }
+
     #[test]
     fn zcode_shape_errors_abort_and_missing_is_honest_skip() {
         // `mcp` / `mcp.servers` 存在但类型错 → abort(ZCode 自身静默 {},Vigil 绝不效仿);
@@ -3058,6 +4118,7 @@ mod tests {
         let env = AgentEnv {
             codex_home: Some(env_val.clone()),
             pi_agent_dir: None,
+            cline_mcp_path: None,
         };
         let rows = run_doctor(home, &env, None).unwrap();
         assert!(

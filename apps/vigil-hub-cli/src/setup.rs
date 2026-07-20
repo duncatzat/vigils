@@ -110,6 +110,20 @@ pub enum SetupError {
         /// 不存在的路径(供用户定位;非密钥)。
         path: PathBuf,
     },
+    /// 同一接入面的两个 server 名派生出**相同** Vigil server-id(`server_id_component` 对合法名
+    /// 原样、非法名 slug+hash —— 如 `Playwright` 与字面 `playwright-<hash>` 撞车)。共享账本 /
+    /// 审批 / descriptor pin 以 server-id 为身份键,塌缩 = 串号 → **整面 abort**,绝不静默让两个
+    /// server 共享 trust identity(codex review 2026-07-20 HIGH-3)。
+    DuplicateServerId {
+        /// 配置文件路径。
+        path: PathBuf,
+        /// 撞车的派生 id。
+        id: String,
+        /// 第一个 server 名。
+        first: String,
+        /// 第二个 server 名。
+        second: String,
+    },
 }
 
 impl std::fmt::Display for SetupError {
@@ -151,6 +165,18 @@ impl std::fmt::Display for SetupError {
                 f,
                 "--hook-exe path {} does not exist; refusing to write a hook pointing at a missing \
                  binary (a hook that fails to launch is fail-open). Install the stable launcher first.",
+                path.display()
+            ),
+            Self::DuplicateServerId {
+                path,
+                id,
+                first,
+                second,
+            } => write!(
+                f,
+                "servers {first:?} and {second:?} in {} derive the same Vigil server-id {id:?} \
+                 (identity collision would merge their audit/approval/pin trust); rename one of \
+                 them, then re-run",
                 path.display()
             ),
         }
@@ -538,14 +564,25 @@ pub(crate) fn atomic_write_str_with_backup(
     // TOCTOU(Codex mutation review Medium):替换前再 stat;若文件在我们读取后被并发改写
     // (mtime/len 变)→ abort,清理 tmp,绝不用陈旧 clone 覆盖(用户的并发新写不丢)。窗口收窄到
     // 此 stat 与下面 rename 之间(微秒级)。serialize/temp-write 的耗时已在 stat **之前**发生。
+    // stat **失败**(文件在读取后被删/移走)同样 abort —— 此前静默跳过比对继续 rename,等于把
+    // 已删除的配置文件用旧快照重建(违反 never-create;codex review 2026-07-20 MED-7)。
     if let Some((exp_mtime, exp_len)) = expect_unchanged {
-        if let Ok(m) = std::fs::metadata(path) {
-            let changed =
-                m.len() != exp_len || m.modified().map(|t| t != exp_mtime).unwrap_or(true);
-            if changed {
+        match std::fs::metadata(path) {
+            Ok(m) => {
+                let changed =
+                    m.len() != exp_len || m.modified().map(|t| t != exp_mtime).unwrap_or(true);
+                if changed {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(SetupError::Io {
+                        what: "config changed during update (close Claude Code, then re-run; original left intact)",
+                        path: path.to_path_buf(),
+                    });
+                }
+            }
+            Err(_) => {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(SetupError::Io {
-                    what: "config changed during update (close Claude Code, then re-run; original left intact)",
+                    what: "config disappeared during update (nothing was changed; re-run to reconfigure)",
                     path: path.to_path_buf(),
                 });
             }
@@ -564,6 +601,22 @@ pub(crate) fn atomic_write_str_with_backup(
     }
 
     Ok(backup_path)
+}
+
+/// 读取成功(文件确认存在)后取 TOCTOU 写守护 stamp(`(mtime, len)`,喂
+/// [`atomic_write_with_backup`] 的 `expect_unchanged`)。**stat 失败即 abort** —— 此前各调用点
+/// 用 `metadata().ok()` 降级 `None` = 放弃写前比对:文件在读取后被删/stat 失败时,旧快照会被
+/// 无守护写回(重建已删除的配置,违反 never-create;codex review 2026-07-20 MED-7)。
+pub(crate) fn stamp_for_existing(path: &Path) -> Result<(std::time::SystemTime, u64), SetupError> {
+    let m = std::fs::metadata(path).map_err(|_| SetupError::Io {
+        what: "stat config for write guard",
+        path: path.to_path_buf(),
+    })?;
+    let t = m.modified().map_err(|_| SetupError::Io {
+        what: "stat config for write guard",
+        path: path.to_path_buf(),
+    })?;
+    Ok((t, m.len()))
 }
 
 fn backup_path_for(path: &Path) -> PathBuf {

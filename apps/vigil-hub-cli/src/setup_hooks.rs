@@ -523,6 +523,14 @@ pub fn run_agent_hook(
     let detected = crate::setup::agent_installed(&spec.detect_dir, path_binary);
     let command = hook_command_with_cli(exe, ledger, Some(spec.agent));
     let existing = read_settings(&spec.config_path)?; // 非法 JSON → abort(MalformedConfig)
+                                                      // TOCTOU stamp:文件存在则捕获读取时刻 (mtime, len),写前比对(codex review 2026-07-20
+                                                      // HIGH-2:Gemini 的 settings.json 是 hook + MCP-wrap **两面共写**的共享文件,此前 hook 侧
+                                                      // `None` = 不比对,可用旧快照覆盖并发写入的 wrap 改动)。不存在 → None(hook install 允许
+                                                      // 创建新配置,与 MCP 面 never-create 语义不同)。
+    let stamp = match existing.is_some() {
+        true => Some(crate::setup::stamp_for_existing(&spec.config_path)?),
+        false => None,
+    };
     let state = agent_state(spec, existing.as_ref(), &command, exe);
 
     // Codex hooks 功能开关警告(检测到才查,best-effort,绝不改写 config.toml)。
@@ -574,7 +582,7 @@ pub fn run_agent_hook(
     };
 
     let backup_path = if changed && !dry_run {
-        atomic_write_with_backup(&spec.config_path, &new_settings, None)?
+        atomic_write_with_backup(&spec.config_path, &new_settings, stamp)?
     } else {
         None
     };

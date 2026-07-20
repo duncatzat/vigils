@@ -166,7 +166,28 @@ pub fn run(home: &Path, exe: &str, lang: Lang) -> i32 {
         Err(e) => println!("{}", could_not_read(lang, "ZCode", e)),
     }
 
-    // 全部 JSON `mcpServers` 形态 agent(registry SSOT:Cursor / Windsurf / Kimi / pi)。
+    // Grok(`~/.grok/config.toml` TOML 专线,与 Codex 同构)。
+    match setup_mcp::run_grok_preview(home, exe, monitor) {
+        Ok(r) => {
+            let c = count_servers(&r.servers);
+            println!("{}", agent_line(lang, "Grok CLI", c.total() > 0, c));
+            total_unprotected += c.unprotected;
+        }
+        Err(e) => println!("{}", could_not_read(lang, "Grok CLI", e)),
+    }
+
+    // OpenCode(`~/.config/opencode/opencode.json` `mcp.<name>` 数组形态专线)。
+    match setup_mcp::run_opencode_preview(home, exe, monitor) {
+        Ok(r) => {
+            let c = count_servers(&r.servers);
+            println!("{}", agent_line(lang, "OpenCode", c.total() > 0, c));
+            total_unprotected += c.unprotected;
+        }
+        Err(e) => println!("{}", could_not_read(lang, "OpenCode", e)),
+    }
+
+    // 全部 JSON `mcpServers` 形态 agent(registry SSOT:Cursor / Windsurf / Kimi / pi /
+    // Gemini / CodeBuddy / Cline)。
     for agent in setup_mcp::all_json_mcp_agents(home, &agent_env) {
         match setup_mcp::run_json_agent_preview(&agent, exe, monitor) {
             Ok(r) => {
