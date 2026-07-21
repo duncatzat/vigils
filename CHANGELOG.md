@@ -8,6 +8,59 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.7.0-beta.1] — 2026-07-21 — 12-agent MCP wrap, codex trust honesty, prompt-side guard
+
+### Added
+
+- **Five new MCP gateway surfaces — Gemini CLI, CodeBuddy, Cline, Grok, OpenCode** —
+  bringing turnkey `setup --mcp` coverage to **12 agents**. Grok rides the Codex-style TOML
+  line (`[mcp_servers.*]`, verified against a real `grok mcp add` on-disk contract);
+  OpenCode gets its own v1 `mcp.<name>` lane (single-array `command` + `environment`, with
+  an explicit refusal guard when only a v2 `opencode.jsonc` layout is present — never
+  silently unprotected); CodeBuddy follows its official three-path priority chain; Cline
+  uses the stable globalStorage layout with a `VIGIL_CLINE_MCP_PATH` escape hatch; Gemini
+  shares `settings.json` safely (top-level unknown keys preserved, hook + wrap co-writes
+  TOCTOU-stamped).
+- **Codex prompt-side guard**: the Codex hook surface now also registers
+  **UserPromptSubmit** — bare high-confidence credentials pasted straight into the codex
+  chat box are blocked before they reach the model (codex refusal contract: exit 0 +
+  top-level `{"decision":"block"}`; other CLIs defensively fail closed). Prompts are free
+  text, so only hard-fingerprint secrets are checked — no soft heuristics, no false
+  positives on normal pasting. The audit trail records a sha256 + finding kind, never the
+  prompt text itself.
+
+### Fixed
+
+- **Codex "protected" could be a false green — now reported honestly as
+  `pending_trust`.** codex (0.144.x) only executes user-level hooks after a one-time
+  interactive `/hooks` review persists a trust hash into `config.toml [hooks.state]`;
+  headless runs (`codex exec`) never trust, so an untrusted hook prints
+  `hook: PreToolUse Failed` and **fails open**. Previously Vigil judged `active` purely on
+  "config entry present + exe exists", so the desktop Aegis card and `setup --json` showed
+  *Protected* while codex was in fact running unprotected. Vigil now replicates codex's
+  trust-hash verification byte-for-byte (anchored in tests against real persisted samples)
+  and reports a registered-but-untrusted codex as **`pending_trust`** (never counted as
+  protected), with per-event guidance to run `/hooks` once. Fail-honest by design: state
+  unreadable / hash mismatch / hook disabled all degrade to `pending_trust` rather than
+  claiming safety. Vigil never writes codex managed-hook config and never bypasses trust —
+  that review is the user's to make.
+- **Wrap-surface review fixes (7 findings from an adversarial codex review)**, the biggest
+  three: an OpenCode v2-only `.jsonc` install could be misread as "not configured" =
+  silently unprotected (now an explicit refusal); derived server-id collisions could
+  conflate two servers' identity across approvals/audit/pinning (all six apply surfaces now
+  pre-check uniqueness); TOCTOU stamps were silently downgraded in 12 call sites (now a
+  fail-closed helper, including abort-if-deleted inside atomic writes).
+
+### Changed
+
+- **Desktop deploy is now atomic**: engine swap uses an install mutex + staged two-phase
+  replacement, and the old engine binary stays alive until the new setup run succeeds —
+  a failed deploy can no longer strand the user with zero working engine; rollback
+  failures report the true on-disk end state.
+- `setup --json` per-agent entries gained a `warnings` array (additive schema change) and
+  the `status` value set gained `pending_trust`; the desktop Aegis card shows a yellow
+  "Awaiting codex trust" pill plus a one-time `/hooks` walkthrough hint (EN/中文).
+
 ## [v0.6.1-beta.1] — 2026-07-20 — desktop Deploy Guardian fix + softer app icon
 
 ### Fixed

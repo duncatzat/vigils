@@ -8,6 +8,48 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.7.0-beta.1] — 2026-07-21 — MCP wrap 扩容至 12 家、codex trust 诚实化、prompt 侧守门
+
+### 新增
+
+- **五个新的 MCP 网关接入面 —— Gemini CLI、CodeBuddy、Cline、Grok、OpenCode**,
+  `setup --mcp` turnkey 覆盖达到 **12 家 agent**。Grok 复用 Codex 同构 TOML 线
+  (`[mcp_servers.*]`,以真机 `grok mcp add` 落盘契约实证);OpenCode 走独立 v1
+  `mcp.<name>` 专线(`command` 单数组 + `environment`,且对「只有 v2 `opencode.jsonc`
+  布局」显式拒绝守门 —— 绝不静默漏保护);CodeBuddy 按官方三路径优先链;Cline 用
+  globalStorage 稳定布局 + `VIGIL_CLINE_MCP_PATH` 逃生舱;Gemini 共享 `settings.json`
+  安全共写(顶层未知键保留,hook + wrap 两面 TOCTOU stamp)。
+- **Codex prompt 侧守门**:Codex hook 面新注册 **UserPromptSubmit** —— 把裸的高置信
+  凭据直接贴进 codex 对话框,现在会在抵达模型前被拦下(codex 拒绝契约:exit 0 + 顶层
+  `{"decision":"block"}`;其余 CLI 防御性 fail-closed)。prompt 是自由文本,只查硬指纹
+  secret —— 不上软规则,不误伤正常粘贴。审计只落 sha256 + 检出类别,绝不记录 prompt
+  原文。
+
+### 修复
+
+- **Codex「已保护」可能是假绿 —— 现在如实报 `pending_trust`。** codex(0.144.x)只在
+  用户完成一次性交互 `/hooks` 审阅、并把 trust hash 持久化进 `config.toml [hooks.state]`
+  后才执行用户级 hook;headless(`codex exec`)从不 trust,未信任的 hook 打印
+  `hook: PreToolUse Failed` 后 **fail-open 放行**。此前 Vigil 判 `active` 只看「配置在位
+  + exe 存在」,桌面 Aegis 卡与 `setup --json` 在 codex 实际裸奔时仍显示「已保护」。
+  Vigil 现在逐字节复刻 codex 的 trust hash 校验(以真机落盘样本为测试锚),把「已注册但
+  未信任」的 codex 如实报为 **`pending_trust`**(绝不计入 protected),并给出精确到事件的
+  一次性 `/hooks` 引导。设计上 fail-honest:状态不可读 / hash 不符 / hook 被禁用一律降级
+  为 `pending_trust`,绝不虚报安全。Vigil 绝不代写 codex managed 配置、绝不替用户绕过
+  trust —— 那次审阅属于用户。
+- **wrap 面评审修复(codex 对抗评审 7 项)**,最重三条:OpenCode 仅 v2 `.jsonc` 在场时
+  被误读为「未配置」= 静默漏保护(现为显式拒绝);派生 server-id 碰撞会让两个 server 在
+  审批/审计/pin 中身份塌缩(六个 apply 面写前唯一性预检);TOCTOU stamp 在 12 处调用点
+  被静默降级(现为 fail-closed helper,原子写内部文件被删也 abort)。
+
+### 变更
+
+- **桌面 deploy 原子化**:引擎换装走安装互斥 + staging 两阶段替换,旧引擎保活到新 setup
+  成功为止 —— 部署失败不再可能把用户留在「零可用引擎」;回滚失败时如实报告磁盘终态。
+- `setup --json` 逐 agent 条目新增 `warnings` 数组(只增性 schema 变更),`status` 值域
+  新增 `pending_trust`;桌面 Aegis 卡新增黄色「待 codex 信任」标签 + 一次性 `/hooks`
+  引导提示(中英)。
+
 ## [v0.6.1-beta.1] — 2026-07-20 — 桌面 Deploy Guardian 修复 + 图标圆角柔化
 
 ### 修复
