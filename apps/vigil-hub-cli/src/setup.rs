@@ -641,6 +641,12 @@ pub enum ProtectionState {
     Active,
     /// 有 Vigil 托管条目,但 command 与当前 canonical 不符(exe/ledger 漂移)或 exe 缺失 → 需重跑 setup。
     Stale,
+    /// 配置在位且 canonical,但 **agent 侧尚未信任/已禁用**该 hook —— agent 不会执行它,
+    /// 防护未生效(fail-open 面)。目前仅 Codex 面产生:codex 的用户级 hook 需一次性交互
+    /// `/hooks` review 并持久化 trust(`config.toml [hooks.state] trusted_hash`)才会执行;
+    /// headless(`codex exec`)既不 trust 也不执行。Vigil 绝不替用户 trust / 写 managed 配置
+    /// (越权企业 policy),只诚实报告并引导。**不算 protected**。
+    PendingTrust,
 }
 
 /// 安装/卸载/状态结果(供 CLI 层打印)。

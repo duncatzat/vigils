@@ -1601,13 +1601,15 @@ fn run_setup_all(
     }
 }
 
-/// `--json` 的逐 agent 状态(GUI/脚本契约;`status` ∈ active|stale|not_installed)。
+/// `--json` 的逐 agent 状态(GUI/脚本契约;`status` ∈ active|stale|not_installed|pending_trust)。
+/// 字段**只增不删**(schema 稳定):`warnings` 携带诚实化明细(如 codex 待信任的 /hooks 引导)。
 #[derive(serde::Serialize)]
 struct AgentStatusJson {
     agent: String,
     display_name: String,
     detected: bool,
     status: String,
+    warnings: Vec<String>,
 }
 
 /// `--json` 的聚合输出。`protected` = 任一 agent 真生效(state=Active)。
@@ -1625,6 +1627,8 @@ fn protection_state_str(s: &setup::ProtectionState) -> &'static str {
         setup::ProtectionState::Active => "active",
         setup::ProtectionState::Stale => "stale",
         setup::ProtectionState::NotInstalled => "not_installed",
+        // 配置在位但 agent 侧未信任/已禁用(目前仅 codex)—— 不算 protected。
+        setup::ProtectionState::PendingTrust => "pending_trust",
     }
 }
 
@@ -1640,6 +1644,7 @@ fn emit_setup_status_json(
         display_name: "Claude Code".to_string(),
         detected: report.claude_detected,
         status: protection_state_str(&report.state).to_string(),
+        warnings: Vec::new(),
     }];
     if let Some(home) = dirs::home_dir() {
         // hook 目标:与 Claude 面同款解析(稳定路径优先,CRIT-1)。
@@ -1654,6 +1659,7 @@ fn emit_setup_status_json(
                     display_name: rep.display_name.to_string(),
                     detected: rep.detected,
                     status: protection_state_str(&rep.state).to_string(),
+                    warnings: rep.warnings,
                 });
             }
         }
@@ -1755,6 +1761,12 @@ fn run_agent_hook_legs(
                         ProtectionState::NotInstalled => {
                             tr(lang, "hook not registered", "hook 未注册").to_string()
                         }
+                        ProtectionState::PendingTrust => tr(
+                            lang,
+                            "REGISTERED, awaiting codex trust (run codex, type /hooks, trust the Vigil entries)",
+                            "已注册,待 codex 信任(在 codex 中输入 /hooks 审阅并信任 Vigil 条目)",
+                        )
+                        .to_string(),
                     },
                     setup_hooks::AgentHookOp::Install { dry_run } => {
                         let did = if !rep.changed {
@@ -2771,6 +2783,9 @@ fn print_setup_report(
                     "已失效 —— Vigil 程序或账本路径变了(可能升级 / 移动过),请重跑 `vigil-hub setup` 修复",
                 ),
                 ProtectionState::NotInstalled => tr(lang, "not installed", "未安装"),
+                // Claude 面无 trust 概念,此臂当前不可达;为 exhaustive match 诚实补齐。
+                ProtectionState::PendingTrust =>
+                    tr(lang, "registered, awaiting agent trust", "已注册,待 agent 侧信任"),
             }
         );
         // 逐 agent 明细(非零项 + ConfigError 项):用户能一眼确认 setup --all 的全局覆盖面。

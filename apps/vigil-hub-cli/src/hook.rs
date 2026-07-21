@@ -301,6 +301,11 @@ pub enum HookOutcome {
     Allow,
     /// 拦截:reason 回喂模型(**不含任何 secret 真值**)。输出形状按 CLI 分流见 [`respond`]。
     Deny(String),
+    /// 拦截 `UserPromptSubmit`:用户提交给模型的 **prompt** 里检出裸凭据 → 阻止 prompt 进模型。
+    /// 与 [`Deny`](Self::Deny) 分开是因为拦截响应契约**不同形**:Codex/Gemini `UserPromptSubmit`
+    /// 用顶层 `{"decision":"block","reason"}`(非 PreToolUse 的 `hookSpecificOutput.permissionDecision`);
+    /// Claude/Cursor 走 exit 2 + stderr。reason **不含任何 secret 真值**。见 [`respond`]。
+    DenyPrompt(String),
     /// 交工具链原生确认 UI。生产者是姿态档位决策(Medium 档占位符)与共同批准超时回退。
     /// 输出形状:Claude=`hookSpecificOutput.permissionDecision=ask`;Cursor=顶层
     /// `{"permission":"ask"}`;**Codex/Gemini 无 ask 语义 → [`respond`] 降级 deny(fail-closed)**。
@@ -384,6 +389,25 @@ pub fn respond(outcome: &HookOutcome, cli: CliKind) -> HookResponse {
             CliKind::Cursor => HookResponse {
                 exit_code: 0,
                 stdout: Some(cursor_permission_json("deny", Some(reason))),
+                stderr: Some(reason.clone()),
+            },
+        },
+        // UserPromptSubmit 拦截(prompt 里检出裸凭据)。响应契约与 PreToolUse deny **不同形**。
+        HookOutcome::DenyPrompt(reason) => match cli {
+            // Codex `UserPromptSubmit` 拒绝:exit 0 + 顶层 `{"decision":"block","reason"}`
+            // (developers.openai.com/codex/hooks;user-prompt-submit.command.output 契约,
+            // **非** PreToolUse 的 `hookSpecificOutput.permissionDecision`)。stderr 同步带 reason 供排查。
+            CliKind::Codex => HookResponse {
+                exit_code: 0,
+                stdout: Some(json!({ "decision": "block", "reason": reason }).to_string()),
+                stderr: Some(reason.clone()),
+            },
+            // 本轮仅 Codex 注册 `UserPromptSubmit`(见 setup_hooks::CODEX_EVENTS),其余 CLI 不注册
+            // 该事件 → 理论不可达。防御性 fail-closed:exit 2 + stderr 是版本无关的「阻止」信号,
+            // 绝不放行含 secret 的 prompt(其余 CLI 的 prompt 面契约未逐一核实前不臆造 JSON 形状)。
+            CliKind::Claude | CliKind::Gemini | CliKind::Cursor => HookResponse {
+                exit_code: 2,
+                stdout: None,
                 stderr: Some(reason.clone()),
             },
         },
@@ -601,6 +625,12 @@ pub fn run<R: Read>(args: &HookArgs, stdin: &mut R) -> HookOutcome {
             // 落到下方 Allow(无行为回归:再脱敏纯加性)。
             if normalized == "PostToolUse" {
                 return handle_post_tool_use(args, &raw);
+            }
+            // UserPromptSubmit:prompt 输入侧守门(根因 B)。此前只注册 Pre/PostToolUse —— 用户直接
+            // 把裸凭据贴进 agent 对话框(非工具调用)时,secret 走 UserPromptSubmit 完全绕过 Vigil。
+            // 在此对提交给模型的 prompt 扫裸硬指纹 secret,命中即 block(阻止 prompt 进模型)。
+            if normalized == "UserPromptSubmit" {
+                return handle_user_prompt_submit(args, &raw);
             }
             // 其它已知事件(SessionStart 等)静默放过;**无法识别**的事件名打 warning:
             // 上游 CLI 若某版本改了事件名拼写,精确匹配会静默失守(整个事件绕过扫描),
@@ -1412,6 +1442,78 @@ fn try_boundary_injection(
         updated_input,
         note,
     })
+}
+
+/// `UserPromptSubmit` 处置(根因 B:prompt 输入侧守门)。对用户提交给模型的 **prompt** 扫
+/// **裸硬指纹 secret**(`ghp_`/PEM/`sk-ant`/AWS key 等确定性凭据),命中 → block(prompt 不进模型);
+/// 未命中 → 放行。
+///
+/// **只拦裸硬凭据**(与 PreToolUse 的 raw-secret 硬地板同一判据 [`vigil_redaction::detect_hard_secret`]):
+/// prompt 是自由文本,ML/软规则会误伤正常对话;硬指纹是高熵固定前缀,拦它零争议、误报率极低。
+/// 不做占位符注入 / 命令分类 / 姿态处置 —— prompt 面无工具执行语义。
+fn handle_user_prompt_submit(args: &HookArgs, raw: &Value) -> HookOutcome {
+    // prompt 文本字段:Codex `user-prompt-submit.command.input` 的 `prompt`(必填);兼容 camelCase。
+    let Some(prompt) = extract_str(raw, &["prompt", "user_prompt", "userPrompt"]) else {
+        // 无 `prompt` 字段(schema 漂移 / 非 prompt 事件)→ 无可扫面,放行(不 fail-closed block:
+        // 会误拦正常空 prompt 或契约漂移)。打 warning 供检出(同未知事件纪律)。
+        eprintln!(
+            "vigil-hook: UserPromptSubmit event without a `prompt` field \
+             (passing through; check the hook registration/schema)"
+        );
+        return HookOutcome::Allow;
+    };
+    let Some(kind) = vigil_redaction::detect_hard_secret(prompt) else {
+        return HookOutcome::Allow;
+    };
+    // best-effort 审计(不落 prompt 原文,只落 sha256 + FindingKind 名);失败不改变决策。
+    audit_prompt_block(args, raw, kind, prompt);
+    HookOutcome::DenyPrompt(format!(
+        "Vigil blocked this prompt: a raw {kind} credential was detected in the message submitted \
+         to the model. The prompt was NOT sent. This is a FINAL security decision — never paste real \
+         secrets into the chat; declare it as a Vigil secret alias and reference `secret://<alias>` \
+         so the real value is injected only at the execution boundary, never exposed to the model \
+         or the audit log.",
+        kind = kind,
+    ))
+}
+
+/// `UserPromptSubmit` 拦截的 best-effort 审计(与 [`audit_deny`] 同纪律:失败不改变决策,
+/// **绝不**落 prompt 原文 —— 只落 sha256 指纹 + FindingKind 名)。
+fn audit_prompt_block(args: &HookArgs, raw: &Value, kind: &'static str, prompt: &str) {
+    let Some(path) = &args.ledger_path else {
+        return;
+    };
+    let ledger = match Ledger::open(path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("vigil-hook: audit ledger open failed ({e}); decision still enforced");
+            return;
+        }
+    };
+    let session_id = extract_str(raw, &["session_id", "sessionId"]);
+    let sid = match ledger.start_session("vigil-hook", session_id) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("vigil-hook: audit start_session failed ({e}); decision still enforced");
+            return;
+        }
+    };
+    let payload = json!({
+        "decision": "block",
+        "reason_kind": "raw_secret_in_prompt",
+        "finding": kind,                      // FindingKind 名(静态串)—— 非真值
+        "prompt_sha256": sha256_hex(prompt),  // 可审计指纹,不落原文
+        "cli": args.cli.as_str(),
+    });
+    let summary = format!("hook blocked prompt (raw {kind} in user prompt)");
+    if let Err(e) = ledger.append_event(
+        &sid,
+        "hook.userpromptsubmit.blocked",
+        &payload,
+        Some(&summary),
+    ) {
+        eprintln!("vigil-hook: audit append_event failed ({e}); decision still enforced");
+    }
 }
 
 /// PostToolUse 统筹(P0 注入防护 Slice 2b + TASK-006 再脱敏)。整合两条**叠加**的处置:
@@ -3116,6 +3218,106 @@ mod tests {
         assert_eq!(out, HookOutcome::Allow);
     }
 
+    // ── 根因 B:UserPromptSubmit prompt 输入侧守门 ──────────────────────────────────
+    #[test]
+    fn user_prompt_submit_with_raw_secret_blocks_the_prompt() {
+        // 用户把裸 token 贴进对话框(非工具调用)→ 走 UserPromptSubmit → block(prompt 不进模型)。
+        let out = run_json_cli(
+            json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": format!("here is my token {FAKE_GH_TOKEN}, push to origin"),
+            }),
+            CliKind::Codex,
+        );
+        assert!(
+            matches!(out, HookOutcome::DenyPrompt(_)),
+            "a raw secret in the prompt must block the prompt (got {out:?})"
+        );
+    }
+
+    #[test]
+    fn user_prompt_submit_clean_prompt_passes_through() {
+        // 正常 prompt 无裸凭据 → 放行(prompt 是自由文本,只拦确定性硬指纹,不误伤对话)。
+        let out = run_json_cli(
+            json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "refactor the auth module and add unit tests for the JWT path",
+            }),
+            CliKind::Codex,
+        );
+        assert_eq!(out, HookOutcome::Allow, "clean prompt must pass through");
+    }
+
+    #[test]
+    fn user_prompt_submit_without_prompt_field_passes_through() {
+        // 无 `prompt` 字段(schema 漂移)→ 无可扫面,放行(不 fail-closed 误拦),仅 warning。
+        let out = run_json_cli(
+            json!({ "hook_event_name": "UserPromptSubmit" }),
+            CliKind::Codex,
+        );
+        assert_eq!(out, HookOutcome::Allow);
+    }
+
+    #[test]
+    fn deny_prompt_reason_never_echoes_the_secret() {
+        // 安全不变量:拦截 reason 只带 FindingKind 名,绝不回显 prompt 里的裸真值。
+        let out = run_json_cli(
+            json!({
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": format!("token={FAKE_GH_TOKEN}"),
+            }),
+            CliKind::Codex,
+        );
+        match out {
+            HookOutcome::DenyPrompt(reason) => {
+                assert!(
+                    !reason.contains(FAKE_GH_TOKEN),
+                    "reason must never echo the raw secret"
+                );
+                assert!(
+                    reason.contains("github_token"),
+                    "reason names the FindingKind (github_token), not the value"
+                );
+            }
+            other => panic!("expected DenyPrompt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn respond_codex_deny_prompt_is_top_level_decision_block() {
+        // Codex UserPromptSubmit 契约:exit 0 + 顶层 {"decision":"block","reason"}(非 permissionDecision)。
+        let r = respond(
+            &HookOutcome::DenyPrompt("blocked: raw github_token".into()),
+            CliKind::Codex,
+        );
+        assert_eq!(r.exit_code, 0);
+        let body: Value = serde_json::from_str(r.stdout.as_deref().unwrap()).unwrap();
+        assert_eq!(body["decision"], "block");
+        assert_eq!(body["reason"], "blocked: raw github_token");
+        assert!(
+            body.get("hookSpecificOutput").is_none(),
+            "UserPromptSubmit uses top-level decision:block, not the PreToolUse wrapper"
+        );
+        assert_eq!(r.stderr.as_deref(), Some("blocked: raw github_token"));
+    }
+
+    #[test]
+    fn respond_non_codex_deny_prompt_is_exit_two_fail_closed() {
+        // 本轮仅 Codex 注册 UserPromptSubmit;其余 CLI 防御性 exit 2 + stderr(绝不放行含 secret 的 prompt)。
+        for cli in [CliKind::Claude, CliKind::Gemini, CliKind::Cursor] {
+            let r = respond(&HookOutcome::DenyPrompt("blocked: x".into()), cli);
+            assert_eq!(
+                r.exit_code, 2,
+                "{cli:?} deny-prompt must fail closed (exit 2)"
+            );
+            assert_eq!(r.stderr.as_deref(), Some("blocked: x"));
+            assert!(
+                r.stdout.is_none(),
+                "{cli:?} must not emit an unverified JSON shape"
+            );
+        }
+    }
+
     #[test]
     fn missing_tool_input_is_denied_fail_closed() {
         // Codex R1 BLOCKER:有 tool_name 但**缺** tool_input(schema 漂移)绝不能 fail-open 放行。
@@ -3541,6 +3743,8 @@ mod tests {
                 HookOutcome::Deny(_) => "deny",
                 HookOutcome::Inject { .. } => "inject",
                 HookOutcome::RedactOutput { .. } => "redact",
+                // UserPromptSubmit-only 变体;此 posture×placeholder-native 矩阵不产生它,但需 exhaustive。
+                HookOutcome::DenyPrompt(_) => "deny_prompt",
             };
             assert_eq!(
                 actual, expected,

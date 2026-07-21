@@ -81,7 +81,9 @@
     "not_detected": "Not detected",
     "protected": "Protected",
     "stale": "Needs re-deploy",
-    "not_installed": "Not protected"
+    "not_installed": "Not protected",
+    "pending_trust": "Awaiting codex trust",
+    "pending_trust_hint": "Codex requires a one-time review before it runs any user hook: open codex, type /hooks, and trust the Vigil entries. Until then codex will not run the protection."
   },
   "browser_guard": {
     "title": "Browser Guard",

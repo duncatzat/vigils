@@ -15,7 +15,8 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-/// 单 agent 的保护状态(镜像 CLI `setup --json` 的 agent 条目;`status` ∈ active|stale|not_installed)。
+/// 单 agent 的保护状态(镜像 CLI `setup --json` 的 agent 条目;
+/// `status` ∈ active|stale|not_installed|pending_trust)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStatus {
     /// 稳定小写名(`claude` / `codex` / `gemini` / `cursor`)。
@@ -24,7 +25,8 @@ pub struct AgentStatus {
     pub display_name: String,
     /// 是否检测到该 agent(配置目录存在)。
     pub detected: bool,
-    /// 保护状态:`active` | `stale` | `not_installed`。
+    /// 保护状态:`active` | `stale` | `not_installed` | `pending_trust`(配置在位但
+    /// agent 侧未信任 —— 目前仅 codex:须用户在 codex `/hooks` 一次性 review;不算 protected)。
     pub status: String,
 }
 
@@ -1145,15 +1147,20 @@ mod tests {
     #[test]
     fn guardian_status_deserializes_cli_json_contract() {
         // 必须能反序列化 CLI `setup --json` 的真实 shape(否则 GUI 解析会炸)。
+        // 含 v0.6.2+ 新增字段:status="pending_trust"(codex trust 诚实化)与 warnings
+        // (未知字段,serde 默认忽略 —— 新旧 CLI 输出都要能吃)。
         let json = r#"{"protected":true,"ledger":"/x/l.sqlite3","hook_exe":"/stable/vigil-hub",
             "hook_command":"...","agents":[
               {"agent":"claude","display_name":"Claude Code","detected":true,"status":"active"},
-              {"agent":"codex","display_name":"Codex CLI","detected":false,"status":"not_installed"}]}"#;
+              {"agent":"codex","display_name":"Codex CLI","detected":true,"status":"pending_trust",
+               "warnings":["codex has not trusted the Vigil hook(s) ..."]},
+              {"agent":"gemini","display_name":"Gemini CLI","detected":false,"status":"not_installed"}]}"#;
         let s: GuardianStatus = serde_json::from_str(json).expect("parse CLI json contract");
         assert!(s.protected);
-        assert_eq!(s.agents.len(), 2);
+        assert_eq!(s.agents.len(), 3);
         assert_eq!(s.agents[0].status, "active");
-        assert!(!s.agents[1].detected);
+        assert_eq!(s.agents[1].status, "pending_trust");
+        assert!(!s.agents[2].detected);
     }
 
     #[test]

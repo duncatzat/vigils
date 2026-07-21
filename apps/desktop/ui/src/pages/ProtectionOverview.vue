@@ -112,6 +112,12 @@ const guardedAgents = computed(() =>
     .map((a) => a.display_name),
 );
 
+// codex trust 诚实化:任一已检测 agent 处于 pending_trust(配置在位但 codex 侧未信任,
+// hook 不会执行)→ 卡片尾部显示一次性 /hooks 授权引导。
+const hasPendingTrust = computed(() =>
+  (guardian.value?.agents ?? []).some((a) => a.detected && a.status === "pending_trust"),
+);
+
 const heroSubtitle = computed(() =>
   guardedAgents.value.length > 0
     ? t("protection.hero.subtitle", { agents: guardedAgents.value.join(" · ") })
@@ -285,8 +291,18 @@ onMounted(() => {
           <span v-if="!a.detected" class="agent-dim">{{ t("guardian.not_detected") }}</span>
           <StatusPill v-else-if="a.status === 'active'" tone="green">{{ t("guardian.protected") }}</StatusPill>
           <StatusPill v-else-if="a.status === 'stale'" tone="yellow">{{ t("guardian.stale") }}</StatusPill>
+          <StatusPill
+            v-else-if="a.status === 'pending_trust'"
+            tone="yellow"
+            data-testid="agent-pending-trust"
+            >{{ t("guardian.pending_trust") }}</StatusPill
+          >
           <StatusPill v-else tone="red">{{ t("guardian.not_installed") }}</StatusPill>
         </div>
+      </div>
+      <!-- codex trust 引导:配置在位但 codex 未信任 = 防护未生效,如实引导一次性 /hooks 授权 -->
+      <div v-if="hasPendingTrust" class="trust-hint" data-testid="guardian-pending-trust-hint">
+        {{ t("guardian.pending_trust_hint") }}
       </div>
     </WindowCard>
 
@@ -452,6 +468,11 @@ onMounted(() => {
 .agent-dim {
   font-family: var(--vigil-mono);
   font-size: 11px;
+  color: var(--vigil-text-muted);
+}
+.trust-hint {
+  margin-top: 10px;
+  font-size: 12.5px;
   color: var(--vigil-text-muted);
 }
 

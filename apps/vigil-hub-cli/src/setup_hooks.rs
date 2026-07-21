@@ -28,6 +28,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+use sha2::Digest;
 
 use crate::setup::{
     atomic_write_with_backup, command_is_vigil_managed, hook_command_with_cli, is_vigil_entry,
@@ -40,6 +41,8 @@ use crate::setup::{
 const CODEX_PRE_TOOL_USE_TIMEOUT_SECS: u64 = 86_400;
 /// Codex PostToolUse 超时(秒):结果再脱敏是本地快速操作,60s 与 Claude 注册面一致。
 const CODEX_POST_TOOL_USE_TIMEOUT_SECS: u64 = 60;
+/// Codex UserPromptSubmit 超时(秒):对 prompt 扫裸硬指纹 secret 是本地快速操作,不走 co-approval,60s 充裕。
+const CODEX_USER_PROMPT_SUBMIT_TIMEOUT_SECS: u64 = 60;
 /// Gemini hook 超时(**毫秒**,官方契约单位):co-approval 等待预算 45s + 输出余量 → 60000ms。
 const GEMINI_HOOK_TIMEOUT_MS: u64 = 60_000;
 /// Cursor hook 超时(秒):co-approval 等待预算 45s + 输出余量 → 60s。
@@ -52,8 +55,9 @@ struct EventSpec {
     timeout: u64,
 }
 
-/// Codex 注册事件集:PreToolUse(输入守门 + co-approval 长等待)+ PostToolUse(再脱敏面,TASK-006)。
-const CODEX_EVENTS: [EventSpec; 2] = [
+/// Codex 注册事件集:PreToolUse(输入守门 + co-approval 长等待)+ PostToolUse(再脱敏面,TASK-006)
+/// + UserPromptSubmit(prompt 输入侧守门,根因 B —— 贴进对话框的裸 secret 走此事件,非工具调用)。
+const CODEX_EVENTS: [EventSpec; 3] = [
     EventSpec {
         event: "PreToolUse",
         timeout: CODEX_PRE_TOOL_USE_TIMEOUT_SECS,
@@ -61,6 +65,12 @@ const CODEX_EVENTS: [EventSpec; 2] = [
     EventSpec {
         event: "PostToolUse",
         timeout: CODEX_POST_TOOL_USE_TIMEOUT_SECS,
+    },
+    // 根因 B:用户直接把裸凭据贴进 codex 对话框(非工具调用)时,secret 走 UserPromptSubmit;
+    // 此前只注册 Pre/PostToolUse → 完全绕过 Vigil。hook 侧 [`handle_user_prompt_submit`] 扫裸硬指纹 block。
+    EventSpec {
+        event: "UserPromptSubmit",
+        timeout: CODEX_USER_PROMPT_SUBMIT_TIMEOUT_SECS,
     },
 ];
 /// Gemini 注册事件集(官方事件名 BeforeTool/AfterTool;hook 侧归一为 PreToolUse/PostToolUse)。
@@ -469,6 +479,218 @@ fn codex_hooks_disabled(config_toml_raw: &str) -> bool {
     hooks_val.or(alias_val) == Some(false)
 }
 
+// ───────────────────── Codex hook trust(状态诚实化)─────────────────────
+//
+// codex(实证 0.144.6)只执行 `Managed | Trusted` 的 hook:用户级 `hooks.json` 条目须经
+// 交互式 `/hooks` review,trust 决定持久化在 `$CODEX_HOME/config.toml`:
+//
+//   [hooks.state.'<hooks.json 绝对路径>:<event 蛇形名>:<组索引>:<处理器索引>']
+//   trusted_hash = "sha256:<hex>"        # 另可有 enabled = false(用户在 /hooks 里禁用)
+//
+// headless(`codex exec`)既不能交互 trust 也不默认 bypass → 未信任的 hook 打印
+// `hook: PreToolUse Failed` 后 **fail-open 放行**。因此「配置在位」≠「防护生效」——
+// 此前 Active 判定只看前者,桌面 Aegis 卡对未信任 codex 谎报「已保护」(真机取证 2026-07-20)。
+//
+// hash 复刻(源码:codex-rs `hooks/src/engine/discovery.rs::command_hook_hash` +
+// `config/src/fingerprint.rs::version_for_toml`;三条真机 trust 样本逐字节验证,见测试):
+// NormalizedHookIdentity → JSON、对象键**字典序**、compact 序列化、UTF-8 → SHA-256。
+// 归一化语义(照抄 codex):handler = {async(缺省 false), command, statusMessage(None 略),
+// timeout(缺省 600、下限 1), type:"command"},commandWindows 强制剥除;matcher 对
+// Pre/PostToolUse 透传、UserPromptSubmit 恒无;event 名蛇形化。
+//
+// 判定方向 **fail-honest**:state 键查无 / config.toml 缺失或不可解析 / hash 不符 /
+// enabled=false → 一律降 [`ProtectionState::PendingTrust`](宁把已信任误报待信任 ——
+// 用户跑一次 /hooks 即自愈;绝不把未信任虚报 Active)。诚实边界:锚定 0.144.6 的持久化
+// schema,codex 未来变更该 schema → 读不到 → 保守降级,不虚报。Vigil 绝不替用户 trust /
+// 写 managed hooks 配置(越权企业 policy 层),只报告 + 引导。
+
+/// Camel 事件名 → codex state key 的蛇形 label(`PreToolUse` → `pre_tool_use`)。
+fn codex_event_label(event: &str) -> String {
+    let mut out = String::with_capacity(event.len() + 4);
+    for (i, c) in event.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 复刻 codex `command_hook_hash`:对磁盘 hooks.json 中一条 matcher 组(Nested 形状、单
+/// handler)算 trust hash。输入是**磁盘实际内容**(用户 trust 的就是这份,与 canonical 无关,
+/// 自定义 ledger 也不影响)。返回 None = 取不出 command(仅防御:调用前提是结构已 canonical)。
+///
+/// 边界(codex 侧另有两条本函数不处理的语义,均被 Active 前提天然挡住 —— 带这些字段的
+/// 条目≠canonical,先判 Stale 不进 trust 检查):`commandWindows` 存在时 Windows 上 codex
+/// 以它为 hash 的 command;`async=true` / 空 command 的 handler codex 直接跳过不算 hash。
+fn codex_trust_hash(event: &str, entry: &Value) -> Option<String> {
+    let handler = entry.get("hooks").and_then(Value::as_array)?.first()?;
+    let command = handler.get("command").and_then(Value::as_str)?;
+    let timeout = handler
+        .get("timeout")
+        .and_then(Value::as_u64)
+        .unwrap_or(600)
+        .max(1);
+    let is_async = handler
+        .get("async")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status_message = handler.get("statusMessage").and_then(Value::as_str);
+    // UserPromptSubmit 不支持 matcher,codex 归一化时恒丢弃;其余事件透传磁盘值。
+    let matcher = (event != "UserPromptSubmit")
+        .then(|| entry.get("matcher").and_then(Value::as_str))
+        .flatten();
+    // canonical JSON:键按**字典序字面书写**(serde_json 开 preserve_order = 保插入序,
+    // 插入序即输出序);`to_string` 的 compact 输出与 codex `serde_json::to_vec` 逐字节一致。
+    let handler_json = match status_message {
+        Some(sm) => json!({
+            "async": is_async, "command": command, "statusMessage": sm,
+            "timeout": timeout, "type": "command"
+        }),
+        None => json!({
+            "async": is_async, "command": command, "timeout": timeout, "type": "command"
+        }),
+    };
+    let identity = match matcher {
+        Some(m) => {
+            json!({ "event_name": codex_event_label(event), "hooks": [handler_json], "matcher": m })
+        }
+        None => json!({ "event_name": codex_event_label(event), "hooks": [handler_json] }),
+    };
+    let digest = sha2::Sha256::digest(identity.to_string().as_bytes());
+    Some(format!("sha256:{}", hex::encode(digest)))
+}
+
+/// codex trust 判定(Active 前提下调用)。返回 `None` = 全部注册事件已信任且未禁用;
+/// `Some(warnings)` = 存在未信任 / 已改动 / 已禁用 / 无法确认,按问题类聚合的引导文案。
+fn codex_trust_problems(
+    spec: &AgentHookSpec,
+    settings: &Value,
+    config_toml_raw: Option<&str>,
+) -> Option<Vec<String>> {
+    // config.toml 在但不是合法 TOML → trust 无从确认,单条保守警告(fail-honest)。
+    let doc: Option<toml_edit::DocumentMut> = match config_toml_raw {
+        Some(raw) => match raw.parse::<toml_edit::DocumentMut>() {
+            Ok(d) => Some(d),
+            Err(_) => {
+                return Some(vec![format!(
+                    "cannot verify codex hook trust ({} is not valid TOML); codex only runs \
+                     hooks it has trusted via /hooks",
+                    spec.detect_dir.join("config.toml").display()
+                )]);
+            }
+        },
+        // config.toml 缺失 = codex 从未持久化任何 trust → 按未信任处理(准确)。
+        None => None,
+    };
+    let state_table = doc
+        .as_ref()
+        .and_then(|d| d.get("hooks"))
+        .and_then(|h| h.as_table_like())
+        .and_then(|h| h.get("state"))
+        .and_then(|s| s.as_table_like());
+    // state key 的 source 候选:codex 对 `CODEX_HOME` env 值 canonicalize(vendor 语义),
+    // 与 vigil 的 display 构造可能有 `\\?\` 前缀 / 符号链接差异 → display + canonicalize
+    // (含剥前缀变体)多候选,任一命中即可;全部查无 → 保守按未信任(不虚报)。
+    let mut sources = vec![spec.config_path.display().to_string()];
+    if let Ok(canon) = std::fs::canonicalize(&spec.config_path) {
+        let c = canon.display().to_string();
+        let stripped = c.strip_prefix(r"\\?\").map(str::to_string);
+        for cand in [Some(c), stripped].into_iter().flatten() {
+            if !sources.contains(&cand) {
+                sources.push(cand);
+            }
+        }
+    }
+    let (mut untrusted, mut modified, mut disabled) = (Vec::new(), Vec::new(), Vec::new());
+    for ev in spec.events {
+        let label = codex_event_label(ev.event);
+        // state key 按**磁盘数组位置**寻址:取托管条目的实际索引(Active 前提 = 恰一条)。
+        let found = settings
+            .get("hooks")
+            .and_then(|h| h.get(ev.event))
+            .and_then(Value::as_array)
+            .and_then(|a| {
+                a.iter()
+                    .enumerate()
+                    .find(|(_, e)| entry_is_managed(spec.style, e))
+            });
+        let Some((gi, entry)) = found else {
+            untrusted.push(ev.event); // 防御(Active 前提下不可达)
+            continue;
+        };
+        let Some(current) = codex_trust_hash(ev.event, entry) else {
+            untrusted.push(ev.event);
+            continue;
+        };
+        let item = state_table.and_then(|t| {
+            sources
+                .iter()
+                .find_map(|s| t.get(&format!("{s}:{label}:{gi}:0")))
+        });
+        let Some(item) = item else {
+            untrusted.push(ev.event);
+            continue;
+        };
+        let field = |k: &str| item.as_table_like().and_then(|t| t.get(k));
+        if field("enabled").and_then(|v| v.as_bool()) == Some(false) {
+            disabled.push(ev.event);
+            continue;
+        }
+        match field("trusted_hash").and_then(|v| v.as_str()) {
+            Some(h) if h == current => {}
+            Some(_) => modified.push(ev.event),
+            None => untrusted.push(ev.event),
+        }
+    }
+    let mut problems = Vec::new();
+    if !untrusted.is_empty() {
+        problems.push(format!(
+            "codex has not trusted the Vigil hook(s) for {} — codex will not run them until \
+             you review once: run codex, type /hooks, and trust the Vigil entries",
+            untrusted.join(", ")
+        ));
+    }
+    if !modified.is_empty() {
+        problems.push(format!(
+            "codex trust for the Vigil hook(s) {} is out of date (definition changed since \
+             trusted); re-review via /hooks in codex",
+            modified.join(", ")
+        ));
+    }
+    if !disabled.is_empty() {
+        problems.push(format!(
+            "the Vigil hook(s) for {} are disabled inside codex; re-enable via /hooks in codex",
+            disabled.join(", ")
+        ));
+    }
+    (!problems.is_empty()).then_some(problems)
+}
+
+/// [`agent_state`] + codex trust 诚实化:结构 Active 的 codex 面再过 trust 门,未全数
+/// 信任 → 降 [`ProtectionState::PendingTrust`] 并附引导警告。其余 agent 原样透传。
+fn agent_state_honest(
+    spec: &AgentHookSpec,
+    settings: Option<&Value>,
+    command: &str,
+    exe: &Path,
+    config_toml_raw: Option<&str>,
+) -> (ProtectionState, Vec<String>) {
+    let state = agent_state(spec, settings, command, exe);
+    if spec.agent == "codex" && state == ProtectionState::Active {
+        if let Some(settings) = settings {
+            if let Some(problems) = codex_trust_problems(spec, settings, config_toml_raw) {
+                return (ProtectionState::PendingTrust, problems);
+            }
+        }
+    }
+    (state, Vec::new())
+}
+
 /// 一个 agent 面的操作:只读状态 / 安装 / 卸载(dry_run 只算不写)。
 #[derive(Debug, Clone, Copy)]
 pub enum AgentHookOp {
@@ -531,22 +753,32 @@ pub fn run_agent_hook(
         true => Some(crate::setup::stamp_for_existing(&spec.config_path)?),
         false => None,
     };
-    let state = agent_state(spec, existing.as_ref(), &command, exe);
-
-    // Codex hooks 功能开关警告(检测到才查,best-effort,绝不改写 config.toml)。
+    // Codex 面读一次 config.toml:hooks 开关警告 + trust 诚实化共用(best-effort,绝不改写)。
+    let config_toml_raw = (spec.agent == "codex" && detected)
+        .then(|| std::fs::read_to_string(spec.detect_dir.join("config.toml")).ok())
+        .flatten();
     let mut warnings = Vec::new();
-    if spec.agent == "codex" && detected {
-        let config_toml = spec.detect_dir.join("config.toml");
-        if let Ok(raw) = std::fs::read_to_string(&config_toml) {
-            if codex_hooks_disabled(&raw) {
-                warnings.push(format!(
-                    "Codex hooks are disabled ([features] hooks = false in {}); the Vigil hook \
-                     is registered but will not run until you re-enable hooks",
-                    config_toml.display()
-                ));
-            }
+    if let Some(raw) = config_toml_raw.as_deref() {
+        if codex_hooks_disabled(raw) {
+            warnings.push(format!(
+                "Codex hooks are disabled ([features] hooks = false in {}); the Vigil hook \
+                 is registered but will not run until you re-enable hooks",
+                spec.detect_dir.join("config.toml").display()
+            ));
         }
     }
+    let (state, trust_warnings) = agent_state_honest(
+        spec,
+        existing.as_ref(),
+        &command,
+        exe,
+        config_toml_raw.as_deref(),
+    );
+    // status 时刻的完整警告(基础 + trust);install 真写盘后按新内容重算 trust 部分。
+    let status_warnings = |mut base: Vec<String>| -> Vec<String> {
+        base.extend(trust_warnings.iter().cloned());
+        base
+    };
 
     let no_op = |state: ProtectionState, warnings: Vec<String>| AgentHookReport {
         agent: spec.agent,
@@ -561,13 +793,13 @@ pub fn run_agent_hook(
     };
 
     let (uninstall, dry_run) = match op {
-        AgentHookOp::Status => return Ok(no_op(state, warnings)),
+        AgentHookOp::Status => return Ok(no_op(state, status_warnings(warnings))),
         AgentHookOp::Install { dry_run } => (false, dry_run),
         AgentHookOp::Uninstall { dry_run } => (true, dry_run),
     };
 
     if !detected && !uninstall {
-        return Ok(no_op(state, warnings));
+        return Ok(no_op(state, status_warnings(warnings)));
     }
 
     let base = existing.unwrap_or_else(|| json!({}));
@@ -587,10 +819,21 @@ pub fn run_agent_hook(
         None
     };
 
-    let final_state = if dry_run {
-        state
+    // 写盘后按**新内容**重算状态与 trust 警告(codex 面:刚写入的新条目 codex 端必然未
+    // 信任 → 诚实报 PendingTrust 并引导,而非谎报 Active)。
+    let (final_state, final_warnings) = if dry_run {
+        (state, status_warnings(warnings))
     } else {
-        agent_state(spec, Some(&new_settings), &command, exe)
+        let (st, trust) = agent_state_honest(
+            spec,
+            Some(&new_settings),
+            &command,
+            exe,
+            config_toml_raw.as_deref(),
+        );
+        let mut w = warnings;
+        w.extend(trust);
+        (st, w)
     };
 
     Ok(AgentHookReport {
@@ -602,7 +845,7 @@ pub fn run_agent_hook(
         state: final_state,
         backup_path,
         dry_run,
-        warnings,
+        warnings: final_warnings,
     })
 }
 
@@ -726,11 +969,23 @@ mod tests {
         )
         .unwrap();
         assert!(rep.changed);
-        assert_eq!(rep.state, ProtectionState::Active);
+        // 新装的用户级 hook codex 端必然未信任(trust 须用户在 codex `/hooks` 一次性 review)
+        // → 诚实报 PendingTrust 而非 Active,并附引导警告。
+        assert_eq!(rep.state, ProtectionState::PendingTrust);
+        assert!(
+            rep.warnings.iter().any(|w| w.contains("/hooks")),
+            "install report guides the user to codex /hooks: {:?}",
+            rep.warnings
+        );
 
         let out = read_settings(&spec.config_path).unwrap().unwrap();
         let cmd = hook_command_with_cli(&exe(), &ledger(), Some("codex"));
-        for (event, timeout) in [("PreToolUse", 86_400u64), ("PostToolUse", 60u64)] {
+        // UserPromptSubmit(根因 B)与 Pre/PostToolUse 同注册面 —— sync 守门:三事件都须 canonical。
+        for (event, timeout) in [
+            ("PreToolUse", 86_400u64),
+            ("PostToolUse", 60u64),
+            ("UserPromptSubmit", 60u64),
+        ] {
             let arr = out["hooks"][event].as_array().unwrap();
             assert_eq!(arr.len(), 1, "{event}: exactly one matcher group");
             let group = &arr[0];
@@ -840,7 +1095,13 @@ mod tests {
             )
             .unwrap();
             assert!(!r2.changed, "{}: second install is a no-op", spec.agent);
-            assert_eq!(r2.state, ProtectionState::Active);
+            // codex 面:tempdir 无 trust 持久化 → 诚实 PendingTrust;其余面无 trust 概念 → Active。
+            let expected = if spec.agent == "codex" {
+                ProtectionState::PendingTrust
+            } else {
+                ProtectionState::Active
+            };
+            assert_eq!(r2.state, expected, "{}", spec.agent);
         }
     }
 
@@ -1134,10 +1395,212 @@ mod tests {
         )
         .unwrap();
         assert!(rep.changed, "registration still happens");
-        assert_eq!(rep.warnings.len(), 1, "exactly one disabled-hooks warning");
+        // 两条警告:hooks 功能被关(disabled)+ 新装条目未信任(pending trust)。
+        assert_eq!(rep.warnings.len(), 2, "warnings: {:?}", rep.warnings);
         assert!(rep.warnings[0].contains("hooks = false"));
+        assert!(rep.warnings[1].contains("/hooks"));
         // config.toml 原样未动(只警告不改写)。
         let raw = std::fs::read_to_string(spec.detect_dir.join("config.toml")).unwrap();
         assert_eq!(raw, "[features]\nhooks = false\n");
+    }
+
+    // ── Codex trust 诚实化:hash 复刻锚 + PendingTrust 判定矩阵 ──
+
+    #[test]
+    fn codex_event_label_snake_cases_events() {
+        assert_eq!(codex_event_label("PreToolUse"), "pre_tool_use");
+        assert_eq!(codex_event_label("PostToolUse"), "post_tool_use");
+        assert_eq!(codex_event_label("UserPromptSubmit"), "user_prompt_submit");
+        assert_eq!(codex_event_label("SessionStart"), "session_start");
+        assert_eq!(codex_event_label("Stop"), "stop");
+    }
+
+    /// hash 复刻锚:三条**真机** codex-cli 0.144.6 交互 `/hooks` trust 后 `config.toml`
+    /// `[hooks.state]` 落盘样本(2026-07-21 取证;maestro 是取证机上与 Vigil 无关的第三方
+    /// hook,借其已 trust 的定义做逐字节校验)。序列化任何细节漂移(键序 / compact / 字段
+    /// 名 / 缺省 timeout=600 / matcher 语义)都会在这里炸出来。
+    #[test]
+    fn codex_trust_hash_replicates_real_codex_persisted_hashes() {
+        let cases = [
+            (
+                "UserPromptSubmit",
+                json!({ "hooks": [
+                    { "type": "command", "command": "maestro hooks run skill-context" }
+                ] }),
+                "sha256:9a90ef18f5e346b40e26f389fc6a1501b4829b0672d6963ae06840f010ba11dd",
+            ),
+            (
+                "PreToolUse",
+                json!({ "matcher": "Bash", "hooks": [
+                    { "type": "command", "command": "maestro hooks run preflight-guard",
+                      "statusMessage": "Running preflight checks" }
+                ] }),
+                "sha256:9068d25fcc3b5239d166d1397e78a353ce6e7e8cde0b578854ad7bde28d0490f",
+            ),
+            (
+                "SessionStart",
+                json!({ "matcher": "startup|resume", "hooks": [
+                    { "type": "command", "command": "maestro hooks run session-context",
+                      "statusMessage": "Loading workflow context" }
+                ] }),
+                "sha256:7c3da2a205c35e51efd92df5138605f29f6c4ac5b45309ca374ca4cdb1cec9cb",
+            ),
+        ];
+        for (event, entry, expected) in cases {
+            assert_eq!(
+                codex_trust_hash(event, &entry).as_deref(),
+                Some(expected),
+                "{event}"
+            );
+        }
+    }
+
+    /// 把磁盘 hooks.json 里 Vigil 条目的 trust hash 种进 config.toml(模拟用户已在 codex
+    /// `/hooks` 完成信任)。hash 由 `codex_trust_hash` 计算 —— 其正确性由真机样本锚独立
+    /// 守门,这里只打通判定管线。
+    fn seed_codex_trust(spec: &AgentHookSpec) {
+        let settings = read_settings(&spec.config_path).unwrap().unwrap();
+        let mut toml = String::new();
+        for ev in spec.events {
+            let arr = settings["hooks"][ev.event].as_array().unwrap();
+            let (gi, entry) = arr
+                .iter()
+                .enumerate()
+                .find(|(_, e)| entry_is_managed(spec.style, e))
+                .unwrap();
+            toml.push_str(&format!(
+                "[hooks.state.'{}:{}:{}:0']\ntrusted_hash = \"{}\"\n",
+                spec.config_path.display(),
+                codex_event_label(ev.event),
+                gi,
+                codex_trust_hash(ev.event, entry).unwrap()
+            ));
+        }
+        std::fs::write(spec.detect_dir.join("config.toml"), toml).unwrap();
+    }
+
+    #[test]
+    fn codex_trust_matrix_pending_until_trusted() {
+        let (_td, spec) = detected_spec(|h| codex_spec(h, None));
+        run_agent_hook(
+            &spec,
+            &exe(),
+            &ledger(),
+            AgentHookOp::Install { dry_run: false },
+        )
+        .unwrap();
+        let status = || run_agent_hook(&spec, &exe(), &ledger(), AgentHookOp::Status).unwrap();
+        let config = spec.detect_dir.join("config.toml");
+
+        // 1. 无 config.toml = codex 从未持久化任何 trust → PendingTrust + /hooks 引导。
+        let rep = status();
+        assert_eq!(rep.state, ProtectionState::PendingTrust);
+        assert!(rep.warnings.iter().any(|w| w.contains("has not trusted")));
+
+        // 2. 有 config.toml 但无 [hooks.state] → 同上。
+        std::fs::write(&config, "[features]\n").unwrap();
+        assert_eq!(status().state, ProtectionState::PendingTrust);
+
+        // 3. 种上与磁盘定义一致的 trust → Active,零警告(诚实的绿)。
+        seed_codex_trust(&spec);
+        let rep = status();
+        assert_eq!(rep.state, ProtectionState::Active);
+        assert!(rep.warnings.is_empty(), "{:?}", rep.warnings);
+
+        // 4. trusted_hash 与磁盘定义不符(定义变更未重审)→ PendingTrust("out of date")。
+        let seeded = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, seeded.replace("sha256:", "sha256:00")).unwrap();
+        let rep = status();
+        assert_eq!(rep.state, ProtectionState::PendingTrust);
+        assert!(rep.warnings.iter().any(|w| w.contains("out of date")));
+
+        // 5. enabled = false(用户在 codex 里禁用)→ PendingTrust("disabled")。
+        seed_codex_trust(&spec);
+        let seeded = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            seeded.replace("trusted_hash", "enabled = false\ntrusted_hash"),
+        )
+        .unwrap();
+        let rep = status();
+        assert_eq!(rep.state, ProtectionState::PendingTrust);
+        assert!(rep
+            .warnings
+            .iter()
+            .any(|w| w.contains("disabled inside codex")));
+
+        // 6. config.toml 非法 TOML → 保守 PendingTrust("cannot verify",fail-honest)。
+        std::fs::write(&config, "not [valid toml").unwrap();
+        let rep = status();
+        assert_eq!(rep.state, ProtectionState::PendingTrust);
+        assert!(rep.warnings.iter().any(|w| w.contains("cannot verify")));
+    }
+
+    #[test]
+    fn codex_trust_key_source_accepts_canonicalized_paths() {
+        // codex 对 `CODEX_HOME` env 值 canonicalize(vendor 语义;Windows 产生 `\\?\` 前缀,
+        // macOS 解析 /var → /private/var 符号链接)后作 state key 的 source。用 canonicalize
+        // 形态的 key 种 trust,判定仍须命中(候选集覆盖)—— 不把已信任误报为待信任。
+        let (_td, spec) = detected_spec(|h| codex_spec(h, None));
+        run_agent_hook(
+            &spec,
+            &exe(),
+            &ledger(),
+            AgentHookOp::Install { dry_run: false },
+        )
+        .unwrap();
+        let canon = std::fs::canonicalize(&spec.config_path).unwrap();
+        let settings = read_settings(&spec.config_path).unwrap().unwrap();
+        let mut toml = String::new();
+        for ev in spec.events {
+            let arr = settings["hooks"][ev.event].as_array().unwrap();
+            let (gi, entry) = arr
+                .iter()
+                .enumerate()
+                .find(|(_, e)| entry_is_managed(spec.style, e))
+                .unwrap();
+            toml.push_str(&format!(
+                "[hooks.state.'{}:{}:{}:0']\ntrusted_hash = \"{}\"\n",
+                canon.display(),
+                codex_event_label(ev.event),
+                gi,
+                codex_trust_hash(ev.event, entry).unwrap()
+            ));
+        }
+        std::fs::write(spec.detect_dir.join("config.toml"), toml).unwrap();
+        let rep = run_agent_hook(&spec, &exe(), &ledger(), AgentHookOp::Status).unwrap();
+        assert_eq!(rep.state, ProtectionState::Active);
+    }
+
+    #[test]
+    fn codex_trust_respects_user_hooks_ahead_of_vigil_entry() {
+        // state key 按**磁盘数组位置**寻址:用户自己的 hook 排在 Vigil 前面时,组索引随之
+        // 偏移 —— 判定必须按实际位置构造 key,不能假定 0。
+        let (_td, spec) = detected_spec(|h| codex_spec(h, None));
+        std::fs::write(
+            &spec.config_path,
+            serde_json::to_string(&json!({ "hooks": { "PreToolUse": [
+                { "matcher": "Bash",
+                  "hooks": [{ "type": "command", "command": "/usr/bin/mine" }] }
+            ] } }))
+            .unwrap(),
+        )
+        .unwrap();
+        run_agent_hook(
+            &spec,
+            &exe(),
+            &ledger(),
+            AgentHookOp::Install { dry_run: false },
+        )
+        .unwrap();
+        // Vigil 的 PreToolUse 条目此时在索引 1(用户条目保留在 0)。
+        seed_codex_trust(&spec);
+        let rep = run_agent_hook(&spec, &exe(), &ledger(), AgentHookOp::Status).unwrap();
+        assert_eq!(rep.state, ProtectionState::Active);
+        let seeded = std::fs::read_to_string(spec.detect_dir.join("config.toml")).unwrap();
+        assert!(
+            seeded.contains(":pre_tool_use:1:0'"),
+            "vigil entry is addressed at its real on-disk index: {seeded}"
+        );
     }
 }

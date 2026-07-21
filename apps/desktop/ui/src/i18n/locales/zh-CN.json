@@ -81,7 +81,9 @@
     "not_detected": "未检测到",
     "protected": "已保护",
     "stale": "需重新部署",
-    "not_installed": "未保护"
+    "not_installed": "未保护",
+    "pending_trust": "待 codex 信任",
+    "pending_trust_hint": "Codex 执行任何用户 hook 前需要一次性审阅授权:打开 codex,输入 /hooks,信任 Vigil 条目。在此之前 codex 不会运行该防护。"
   },
   "browser_guard": {
     "title": "浏览器防线",
