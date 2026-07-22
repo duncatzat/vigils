@@ -941,15 +941,16 @@ mod tests {
         let codex = hook_command_with_cli(exe, led, Some("codex"));
         let claude = hook_command_with_cli(exe, led, None);
         assert!(codex.contains("hook --vigil-managed --cli codex"));
-        assert!(
-            codex.contains("--ledger \""),
-            "ledger stays quoted (mid-command position, cmd /C safe): {codex}"
-        );
         #[cfg(windows)]
         {
+            // Windows codex:exe 裸(cmd /C 不 strip),ledger 仍双引号(命令中间位置,cmd /C 安全)。
             assert!(
                 !codex.starts_with('"'),
                 "Windows codex: exe must be bare so cmd /C does not strip it: {codex}"
+            );
+            assert!(
+                codex.contains("--ledger \""),
+                "Windows: ledger stays double-quoted (mid-command, cmd /C safe): {codex}"
             );
             assert!(
                 claude.starts_with('"'),
@@ -958,9 +959,14 @@ mod tests {
         }
         #[cfg(not(windows))]
         {
+            // Unix codex 走 sh -lc:exe/ledger 均单引号(shell_quote Unix 分支),无 cmd /C 陷阱。
             assert!(
                 codex.starts_with('\''),
                 "Unix codex (sh -lc) keeps single-quoted exe: {codex}"
+            );
+            assert!(
+                codex.contains("--ledger '"),
+                "Unix: ledger single-quoted: {codex}"
             );
             let _ = claude;
         }
