@@ -8,6 +8,24 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [v0.7.0-beta.2] — 2026-07-22 — 修复:codex hook 在 Windows fail-open(cmd /C 引号陷阱)
+
+### 修复
+
+- **codex hook 在 Windows 上 fail-open,凭据越过防线泄漏。** 真机取证发现 codex 通过
+  `cmd.exe /C "<command>"` 执行 hook,而 Vigil 注册的 command 给可执行文件路径加了双引号
+  (为 Claude Code 设计的格式)。`cmd /C` 的引号规则:当 command 以 `"` 开头且含多个引号时,
+  strip 首尾引号 → 破坏带引号的 exe 路径 → 找不到命令 → exit 1 → codex 判 hook `Failed`
+  → **fail-open**,真实 `github_token` 明文抵达模型。三个 codex hook 事件
+  (PreToolUse / PostToolUse / UserPromptSubmit)全部受影响。修复让 codex 面 command 的 exe
+  路径**不加引号**(仅 Windows + codex;Unix codex 走 `sh -lc`,单引号安全;Claude/Gemini/
+  Cursor 保持引号——它们的执行方式兼容引号,真机 Claude 运行仍正确拦截,已实证)。command 首
+  字符非引号后,`cmd /C` 不再 strip,其后的 `--ledger "..."` 引号正常保留。端到端验证:修复
+  引擎自动生成的 command 让 codex 对有效 token 报 `PreToolUse Blocked`(拦截)而非泄漏。若 exe
+  路径本身含空格,codex 的 `cmd /C` 无法可靠执行(此情形无安全的引号格式,是 codex/Windows
+  的限制)——Vigil 现在如实警告,并指向 MCP 网关(`vigil-hub wrap`)作为 codex 的替代保护,而非
+  静默 fail-open。
+
 ## [v0.7.0-beta.1] — 2026-07-21 — MCP wrap 扩容至 12 家、codex trust 诚实化、prompt 侧守门
 
 ### 新增

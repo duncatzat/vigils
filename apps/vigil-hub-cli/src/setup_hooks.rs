@@ -767,6 +767,19 @@ pub fn run_agent_hook(
             ));
         }
     }
+    // Windows codex 走 `cmd /C`,无法可靠执行 exe 路径含空格的 hook(裸路径被空格分词、带引号
+    // 又触发 cmd `/C` 的 strip 陷阱 → 两者皆 fail-open)。诚实警告而非静默失败:安全产品绝不能对
+    // 一个实际会放行的 hook 谎称保护(与 [`ProtectionState::PendingTrust`] 同立场)。MCP 网关面
+    // (`vigil-hub wrap`)不经 cmd `/C`,不受此限,可作 codex 的替代保护。
+    #[cfg(windows)]
+    if spec.agent == "codex" && exe.display().to_string().contains(' ') {
+        warnings.push(format!(
+            "codex executes hooks via `cmd /C`, which cannot reliably run a hook whose \
+             executable path contains spaces ({}); on codex this hook may fail open. Install \
+             Vigil to a space-free path, or protect codex via the MCP gateway (`vigil-hub wrap`).",
+            exe.display()
+        ));
+    }
     let (state, trust_warnings) = agent_state_honest(
         spec,
         existing.as_ref(),

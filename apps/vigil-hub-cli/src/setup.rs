@@ -341,9 +341,25 @@ pub(crate) fn hook_command_with_cli(exe: &Path, ledger: &Path, cli: Option<&str>
     } else {
         ""
     };
+    // Windows 上 codex 用 `cmd.exe /C "<command>"` 执行 hook(vendor `default_shell_command`)。
+    // cmd `/C` 的引号规则:当 command 以 `"` 开头且含多个 `"`,cmd **strip 首尾引号**,使带引号
+    // 的 exe 路径 `"C:\..\vigil-hub.exe"` 尾部残留引号 → 命令名非法 → 找不到 → exit 1 → codex
+    // 判 hook `Failed` → **fail-open 放行**(真机取证 2026-07-22:有效 github_token 明文泄漏)。
+    // 修复:codex 面 exe 路径**不加引号**,让 command 首字符非引号 → cmd `/C` 不 strip → 正确
+    // 解析(裸 exe 到首个空格 + 其后 `--ledger "..."` 的中间引号正常保留)。真机验证:引号=Failed
+    // 泄漏,裸=`PreToolUse Blocked` 拦截。**仅 Windows+codex**:Unix codex 走 `sh -lc`(单引号安全);
+    // Claude/Gemini/Cursor 各自执行方式对引号 exe 正常(Claude Win e2e + 真机对照实证),保持引号。
+    // 含空格的 exe 路径在此裸写会被 cmd 按空格分词截断 → 由 [`crate::setup_hooks`] 检测并诚实警告
+    // (cmd `/C` 对空格+引号无可靠格式,是 codex/Windows 的架构限制,非 vigil 可单方消除)。
+    let exe_display = exe.display().to_string();
+    let exe_str = if cfg!(windows) && cli == Some("codex") {
+        exe_display
+    } else {
+        shell_quote(&exe_display)
+    };
     format!(
         "{} hook {}{}{} --ledger {}",
-        shell_quote(&exe.display().to_string()),
+        exe_str,
         VIGIL_HOOK_MARKER,
         cli_part,
         redact_part,
@@ -912,6 +928,42 @@ mod tests {
     }
     fn cmd(exe: &Path, led: &Path) -> String {
         hook_command(exe, led)
+    }
+
+    /// 回归守门(真机取证 2026-07-22:codex Windows fail-open):codex 走 `cmd /C`,以引号开头的
+    /// command 会被 cmd strip 首尾引号 → 破坏带引号的 exe 路径 → 找不到 → exit 1 → Failed →
+    /// fail-open。codex 面 command **必须以裸 exe 开头**(非引号);Claude/其它 agent 执行方式兼容
+    /// 引号(真机对照实证),保持引号;Unix codex 走 `sh -lc`(单引号安全),亦保持引号。
+    #[test]
+    fn codex_windows_hook_command_uses_bare_exe() {
+        let exe = Path::new("C:\\Vigil\\bin\\vigil-hub.exe");
+        let led = Path::new("C:\\Vigil\\ledger.sqlite3");
+        let codex = hook_command_with_cli(exe, led, Some("codex"));
+        let claude = hook_command_with_cli(exe, led, None);
+        assert!(codex.contains("hook --vigil-managed --cli codex"));
+        assert!(
+            codex.contains("--ledger \""),
+            "ledger stays quoted (mid-command position, cmd /C safe): {codex}"
+        );
+        #[cfg(windows)]
+        {
+            assert!(
+                !codex.starts_with('"'),
+                "Windows codex: exe must be bare so cmd /C does not strip it: {codex}"
+            );
+            assert!(
+                claude.starts_with('"'),
+                "non-codex keeps quoted exe (its executor tolerates quotes): {claude}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(
+                codex.starts_with('\''),
+                "Unix codex (sh -lc) keeps single-quoted exe: {codex}"
+            );
+            let _ = claude;
+        }
     }
 
     #[test]

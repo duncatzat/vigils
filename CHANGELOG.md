@@ -8,6 +8,28 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [v0.7.0-beta.2] — 2026-07-22 — fix: codex hook fail-open on Windows (cmd /C quoting)
+
+### Fixed
+
+- **Codex hook failed open on Windows, leaking credentials past the guard.** Real-machine
+  forensics found that codex executes hooks via `cmd.exe /C "<command>"`, and Vigil's
+  registered command wrapped the executable path in double quotes (a format designed for
+  Claude Code). `cmd /C`'s quote rule strips the leading and trailing quote when the command
+  starts with `"` and contains several quotes, which broke the quoted exe path → command not
+  found → exit 1 → codex reported the hook as `Failed` → **fail-open**, so a real
+  `github_token` reached the model in plaintext. All three codex hook events
+  (PreToolUse / PostToolUse / UserPromptSubmit) were affected. The fix leaves the codex
+  command's exe path **unquoted** (Windows + codex only; Unix codex uses `sh -lc` where single
+  quotes are safe, and Claude/Gemini/Cursor keep quotes — their executors tolerate them, as a
+  real-machine Claude run confirmed by still blocking correctly). With a non-quote first
+  character, `cmd /C` no longer strips, and the trailing `--ledger "..."` quote is preserved
+  normally. Verified end-to-end: the fixed engine's auto-generated command makes codex report
+  `PreToolUse Blocked` on a valid token instead of leaking. An exe path that itself contains
+  spaces cannot be run reliably by codex's `cmd /C` (no safe quoting exists for that case, a
+  codex/Windows limitation) — Vigil now reports this honestly and points to the MCP gateway
+  (`vigil-hub wrap`) as codex protection instead of silently failing open.
+
 ## [v0.7.0-beta.1] — 2026-07-21 — 12-agent MCP wrap, codex trust honesty, prompt-side guard
 
 ### Added
