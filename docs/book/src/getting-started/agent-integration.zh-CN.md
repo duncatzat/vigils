@@ -72,7 +72,7 @@ vigil-hub setup --all --uninstall # 移除全部(配置逐字节还原)
 | Agent | Hook（原生工具守门） | MCP wrap（server 网关） | 涉及配置 |
 |---|---|---|---|
 | Claude Code | ✅ | ✅（user + local scope） | `~/.claude/settings.json` + `~/.claude.json` |
-| Codex CLI | ✅ | ✅（尊重 `$CODEX_HOME`） | `$CODEX_HOME/hooks.json` + `config.toml` |
+| Codex CLI | ✅（需在 Codex 内一次性 `/hooks` 批准 —— 批准前如实显示 **pending trust**） | ✅（尊重 `$CODEX_HOME`） | `$CODEX_HOME/hooks.json` + `config.toml` |
 | Gemini CLI | ✅ | —（MCP 嵌在共享 `settings.json`，留后续增量） | `~/.gemini/settings.json` |
 | Cursor | ✅ | ✅ | `~/.cursor/hooks.json` + `mcp.json` |
 | Windsurf | — | ✅ | `~/.codeium/windsurf/mcp_config.json` |

@@ -234,7 +234,9 @@ vigil-hub setup --all       # protect everything, in one step
 1. **Native-tool input guard** — pre-tool-use hooks for **Claude Code, Codex CLI, Gemini CLI
    and Cursor**, so **every tool call** (Bash, Edit, Write, Read, MCP tools, …) is checked before
    it runs; a real credential heading *into* a tool is **blocked fail-closed** and recorded in
-   your tamper-evident audit ledger.
+   your tamper-evident audit ledger. One caveat: Codex asks you to approve third-party hooks
+   once (run `/hooks` inside Codex) — until you do, Codex skips them, and Vigils honestly
+   reports that agent as **pending trust** rather than protected.
 2. **MCP gateway** — rewrites the stdio MCP servers of every detected agent — **Claude Code,
    Codex, Gemini CLI, Cursor, Windsurf, Kimi CLI, ZCode, pi, Grok CLI, OpenCode, CodeBuddy and
    Cline** — to run through Vigils, so secrets in tool

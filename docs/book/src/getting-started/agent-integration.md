@@ -78,7 +78,7 @@ Restart Claude Code and you're protected.
 | Agent | Hook (native-tool gate) | MCP wrap (server gateway) | Config touched |
 |---|---|---|---|
 | Claude Code | ✅ | ✅ (user + local scope) | `~/.claude/settings.json` + `~/.claude.json` |
-| Codex CLI | ✅ | ✅ (honors `$CODEX_HOME`) | `$CODEX_HOME/hooks.json` + `config.toml` |
+| Codex CLI | ✅ (one-time `/hooks` approval inside Codex — **pending trust** until you approve) | ✅ (honors `$CODEX_HOME`) | `$CODEX_HOME/hooks.json` + `config.toml` |
 | Gemini CLI | ✅ | — (MCP lives inside the shared `settings.json`; later increment) | `~/.gemini/settings.json` |
 | Cursor | ✅ | ✅ | `~/.cursor/hooks.json` + `mcp.json` |
 | Windsurf | — | ✅ | `~/.codeium/windsurf/mcp_config.json` |

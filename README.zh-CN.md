@@ -175,7 +175,9 @@ vigil-hub setup --all       # 一步全保护
 
 1. **原生工具输入侧守门** —— 为 **Claude Code、Codex CLI、Gemini CLI、Cursor** 注册
    pre-tool-use hook,于是**每一次工具调用**(Bash、Edit、Write、Read、MCP 工具……)在执行前都先被
-   检查:真实凭据流*入*工具会被 **fail-closed 拦截**,记入防篡改审计账本。
+   检查:真实凭据流*入*工具会被 **fail-closed 拦截**,记入防篡改审计账本。有一点注意:Codex 要求
+   你在其应用内一次性批准第三方 hook(在 Codex 里执行 `/hooks`)——批准之前 Codex 会跳过 hook,
+   Vigils 会如实显示该 agent 为 **pending trust(待信任)** 而非"已保护"。
 2. **MCP 网关** —— 把每个被探测到的 agent(**Claude Code、Codex、Gemini CLI、Cursor、Windsurf、
    Kimi CLI、ZCode、pi、Grok CLI、OpenCode、CodeBuddy、Cline**)的 stdio MCP server 改写为经
    Vigils 运行,工具**结果**里的 secret 在模型看到之前
