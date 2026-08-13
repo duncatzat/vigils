@@ -30,16 +30,26 @@ Linux)
   [ -x "$BIN" ] && ok "binary on PATH ($BIN)" || { no "vigils binary missing after install"; fin; }
 
   echo "== launch under Xvfb =="
-  Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 &
+  Xvfb :99 -screen 0 1280x800x24 >"$OUT/xvfb.log" 2>&1 &
   XVFB=$!
   export DISPLAY=:99
+  # 必须等 X 真正 listen 再启 app:runner 镜像更新后 Xvfb 首启可慢于 GTK 连接时刻,抢跑
+  # 会 `Failed to initialize GTK` panic(2026-08 UA 周跑连挂两周的根因)。轮询 X socket,
+  # 零新依赖;Xvfb 进程若先死(缺包/端口占用)立即失败并留 xvfb.log。
+  XOK=""
+  for _ in $(seq 1 40); do
+    [ -S /tmp/.X11-unix/X99 ] && { XOK=1; break; }
+    kill -0 "$XVFB" 2>/dev/null || break
+    sleep 0.25
+  done
+  [ -n "$XOK" ] && ok "Xvfb ready (:99)" || { no "Xvfb not ready (see xvfb.log)"; kill "$XVFB" 2>/dev/null; fin; }
   # WebKitGTK 在无 GPU/GL 的 Xvfb 下,合成/DMABUF 渲染路径会「窗口在、内容全黑」——
   # 关掉走软件绘制(两个变量覆盖新旧 WebKitGTK 版本)。
   export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1
   "$BIN" >"$OUT/app.log" 2>&1 &
   APP=$!
   sleep 10
-  kill -0 "$APP" 2>/dev/null && ok "process alive after 10s" || { no "app exited early"; kill "$XVFB" 2>/dev/null; fin; }
+  kill -0 "$APP" 2>/dev/null && ok "process alive after 10s" || { no "app exited early"; sed -n '1,8p' "$OUT/app.log"; kill "$XVFB" 2>/dev/null; fin; }
 
   echo "== window + screenshot =="
   # GTK/tauri 会挂多个同名窗(实测:10x10 辅助窗先出现,1280x800 主窗**后到**——慢机上
