@@ -8,6 +8,38 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
+## [Unreleased] - supply-chain gates: cargo-deny + honest MSRV
+
+### Added
+
+- **cargo-deny supply-chain gate in CI** (`deny.toml` + a `cargo-deny` job in
+  `ci.yml`). Advisories (RUSTSEC vulnerabilities, yanked crates), license
+  compatibility, duplicate/foreign dependency bans, and source restrictions are
+  now checked on every push and PR. Previously dependency-vulnerability tracking
+  was manual (the wasmtime 25 -> 41 upgrade fixed 15 RUSTSEC advisories by hand);
+  now a newly disclosed advisory turns CI red the next time it runs.
+- **Weekly advisory re-check workflow** (`.github/workflows/deny-advisories.yml`).
+  Advisories are disclosed on their own schedule, not ours - every Monday the
+  main-branch lockfile is re-scanned even with no commits or releases, mirroring
+  the acceptance workflow's guard against upstream drift.
+- **MSRV compile-check job in CI** (`msrv` in `ci.yml`). Builds the workspace
+  with the declared minimum Rust version and verifies the declaration matches,
+  so the toolchain floor can no longer silently rot.
+
+### Security
+
+- **Upgraded `h2` 0.4.15 -> 0.4.17 (RUSTSEC-2026-0258)** - unbounded empty DATA frames,
+  found by the new cargo-deny gate on its first run. This is a production-path fix:
+  `h2` sits under hyper/reqwest and carries the MCP HTTP transport. Also refreshed
+  yanked `spin` 0.9.8 -> 0.9.9 (dev-only, transitive under the test-only `rsa` crate).
+
+### Fixed
+
+- **Declared MSRV was stale** - `rust-version = "1.80"` while the dependency
+  tree (wasmtime 44, required for RUSTSEC-2026-0114) needs rustc 1.95. Users on
+  old toolchains hit cryptic syntax errors deep in dependencies instead of a
+  clear "Rust too old" message. The declaration is now `1.95`, matching reality.
+
 ## [v0.7.0-beta.2] — 2026-07-22 — fix: codex hook fail-open on Windows (cmd /C quoting)
 
 ### Fixed

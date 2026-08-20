@@ -1,0 +1,74 @@
+# cargo-deny 配置(依赖供应链防线)
+# 本地: cargo deny check
+# CI:  .github/workflows/ci.yml 的 cargo-deny job + deny-advisories weekly cron
+#
+# 策略(与仓库安全姿态对齐,fail-closed 但允许显式豁免):
+# - advisories: 漏洞级别 RUSTSEC 一票否决;unmaintained 仅告警(先观察存量)
+# - licenses:   只允许宽松 license;GPL/AGPL/SSPL 等一票否决(本项目 Apache-2.0)
+# - bans:       多版本/重复依赖与 wildcard 仅告警(存量 reqwest 0.12/0.13 分叉
+#               已在治理清单;wildcard 均为内部 path 依赖无版本号)
+# - sources:    仅允许 crates.io + 本地 path(防供应链投毒)
+
+# all-features=false:与 CI rust job 的默认矩阵一致;ort 等 optional feature
+# 不进供应链审计面(发布产物默认不含)。若开启 --all-features 发布,须同步改这里。
+[graph]
+all-features = false
+
+# ---------------------------------------------------------------- advisories
+[advisories]
+version = 2
+# RUSTSEC 漏洞:deny(发现即红);豁免走下方 ignore 列表并注明理由与解禁条件
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+
+# 已知且接受的 advisory 在此登记(每条必须带理由 + 复查时间):
+ignore = [
+  # rsa:dev-only 测试夹具(vigil-http-transport e2e_real_tls.rs 的 RS256 round-trip;
+  # rcgen 的 ring 后端不支持 RSA 生成,故引入)。Marvin Attack 是网络可观测的
+  # 时序侧信道,本地测试密钥生成不适用;无安全升级版本(rsa 0.9 系全受影响)。
+  # 复查:若 rcgen 支持非 RSA 的 RS256 测试路径或该测试下线,移除此豁免。
+  { id = "RUSTSEC-2023-0071", reason = "dev-only test fixture for RS256 round-trip; timing side-channel N/A to local keygen; no safe upgrade exists" },
+  # rustls-pemfile:dev-only TLS 测试夹具读 PEM。上游已归档,迁移路径是
+  # rustls-pki-types::pem::PemObject(1.9+)。生产树不受影响。
+  # 复查:迁移测试夹具到 PemObject 后移除。
+  { id = "RUSTSEC-2025-0134", reason = "dev-only TLS test fixture; upstream archived, migration to rustls-pki-types PemObject tracked as follow-up" },
+]
+
+# ---------------------------------------------------------------- licenses
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "MPL-2.0",          # Tauri 系依赖;文件级 copyleft,二进制分发可接受
+  "CDLA-Permissive-2.0",
+  "CC0-1.0",
+  "0BSD",
+]
+# 置信度阈值:license 识别不确定时报出来人工裁决,不静默放行
+confidence-threshold = 0.93
+
+# ---------------------------------------------------------------- bans
+[bans]
+# 存量多版本(reqwest 0.12/0.13 等)先 warn 观察升级路径,不阻塞 CI;
+# 治理完成后可改为 deny
+multiple-versions = "warn"
+highlight = "all"
+# 内部 path 依赖未带 version 字段会被判 wildcard(全部 8 处均为 workspace 内部
+# 引用,无外部 wildcard)。后续给 path 依赖补 version 后可升回 deny。
+wildcards = "warn"
+
+# ---------------------------------------------------------------- sources
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

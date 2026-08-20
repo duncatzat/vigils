@@ -2124,7 +2124,7 @@ fn scrub_preserving_placeholders(
         let mut earliest: Option<(usize, &str)> = None;
         for p in placeholders {
             if let Some(pos) = rest.find(p.as_str()) {
-                if earliest.map_or(true, |(b, _)| pos < b) {
+                if earliest.is_none_or(|(b, _)| pos < b) {
                     earliest = Some((pos, p.as_str()));
                 }
             }

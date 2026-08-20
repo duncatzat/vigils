@@ -84,3 +84,60 @@ jobs:
 
       - name: Test
         run: node --test extensions/chrome-mv3/tests/*.test.mjs
+
+  # 依赖供应链防线(deny.toml):advisories(RUSTSEC)/licenses/bans/sources。
+  # 与 rust job 分开跑--cargo-deny 不编译,1-2 分钟出结果,不用等冷编译。
+  # 漏洞披露不跟发版节奏走,周跑 cron 另见 deny-advisories.yml。
+  cargo-deny:
+    name: Cargo deny (advisories / licenses / bans / sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 预编译二进制秒装;不用 EmbarkStudios/cargo-deny-action 是因为其
+      # arguments 会与内部硬编码的 check 子命令拼接,显式命令行更可读可复现
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny --config deny.toml check
+
+  # MSRV 守门:workspace rust-version 声明曾经悄悄失效(1.80 -> 实际需要 1.95),
+  # 此 job 用声明的最低版本编译,声明再漂移时当天变红而不是用户报 issue 才发现。
+  msrv:
+    name: MSRV (rust-version compile check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 工具链版本硬编码于此处 + 上方注释里的两处同步点;防漂移由最后的
+      # verify 步骤兜底(声明与实际不符当天红)
+      - name: Install Rust toolchain (1.95)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
+      # check 而非 clippy/test:MSRV 只验证"能编译",门禁语义归 rust job。
+      # --all-targets 连 benches/tests 一起验,避免仅 src 过而 dev-deps 不过。
+      - name: cargo check (MSRV)
+        run: cargo check --workspace --all-targets
+
+      # 防漂移:声明的 rust-version 必须等于本 job 用的工具链(上方的 vars.MSRV)。
+      - name: Verify declared rust-version matches
+        run: |
+          DECLARED=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          USED="1.95"
+          if [ "$DECLARED" != "$USED" ]; then
+            echo "::error::Cargo.toml 声明 rust-version=$DECLARED,但 msrv job 用 $USED。请同步更新。"
+            exit 1
+          fi
