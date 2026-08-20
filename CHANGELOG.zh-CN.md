@@ -8,6 +8,33 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
+## [Unreleased] - 供应链门禁:cargo-deny + 诚实的 MSRV
+
+### Added
+
+- **CI 引入 cargo-deny 供应链门禁**(`deny.toml` + `ci.yml` 新增 `cargo-deny` job)。
+  每次 push/PR 检查 advisories(RUSTSEC 漏洞、yanked crate)、license 兼容性、
+  重复/外来依赖与依赖来源白名单。此前依赖漏洞盯梢是手工流程(wasmtime 25 -> 41
+  那次升级手动修了 15 个 RUSTSEC);现在新披露的漏洞在 CI 下一次运行时即变红。
+- **每周漏洞复查 workflow**(`.github/workflows/deny-advisories.yml`)。漏洞披露
+  不跟我们的发版节奏走 -- 每周一对 main 分支的 lockfile 复跑扫描,无提交、无发版
+  也能发现新披露的漏洞(与 acceptance workflow 防"上游漂移"同思路)。
+- **CI 新增 MSRV 编译检查 job**(`ci.yml` 的 `msrv`)。用声明的最低 Rust 版本编译
+  workspace 并比对声明一致性,工具链下限不再会悄悄失效。
+
+### Security
+
+- **升级 `h2` 0.4.15 -> 0.4.17(RUSTSEC-2026-0258)**--无边界空 DATA 帧。这是新
+  cargo-deny 门禁首跑就抓到的**生产路径漏洞**:`h2` 位于 hyper/reqwest 之下,承载
+  MCP HTTP transport。另刷新 yanked 的 `spin` 0.9.8 -> 0.9.9(dev-only,测试专用
+  `rsa` crate 的传递依赖)。
+
+### Fixed
+
+- **MSRV 声明已过期** -- `rust-version = "1.80"`,而依赖树(wasmtime 44,修
+  RUSTSEC-2026-0114 所需)实际需要 rustc 1.95。旧工具链用户会在依赖深处收到
+  难懂的语法错误而非清晰的"Rust 版本过旧"提示。声明现已改为 `1.95`,与事实一致。
+
 ## [v0.7.0-beta.2] — 2026-07-22 — 修复:codex hook 在 Windows fail-open(cmd /C 引号陷阱)
 
 ### 修复

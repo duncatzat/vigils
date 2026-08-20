@@ -1,0 +1,30 @@
+# 依赖漏洞周报:RUSTSEC advisory-db 每天都在长,而 main 上的 push 门禁
+# (ci.yml cargo-deny job)只在有提交时跑。本 workflow 每周一 04:11 UTC
+# 对 main 的 Cargo.lock 复跑 advisories 检查 -- 不发版、不提交也能发现
+# 新披露的漏洞(与 acceptance.yml 周跑防"上游协议漂移"同思路)。
+#
+# 检查项故意只开 advisories + yanked:周跑要盯的是"外部世界变了",
+# licenses/bans/sources 属于仓库内部决策,push 门禁已覆盖。
+name: Deny Advisories (weekly)
+
+on:
+  schedule:
+    - cron: "11 4 * * 1"  # 每周一 04:11 UTC(错峰 acceptance 的 03:23)
+  workflow_dispatch: {}   # 手动补跑
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # 只查 advisories + sources;licenses/bans 是仓库内部决策,push 门禁已覆盖
+      - name: cargo deny check (advisories + sources)
+        run: cargo deny --config deny.toml check advisories sources
