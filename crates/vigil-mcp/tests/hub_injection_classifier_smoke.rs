@@ -8,6 +8,7 @@
 //! 1. `#![cfg(feature = "ort")]` — 默认 feature 完全不编译
 //! 2. `#[ignore]` — 即使 `--features ort` 默认仍跳过
 //! 3. 运行时 `VIGIL_RUN_ORT_SMOKE=1` + `VIGIL_INJECTION_MODEL_DIR` + onnxruntime on PATH
+//!    —— **未 opt-in 才 skip**;**已 opt-in 后前置缺失一律 fail-closed**(见 [`load_classifier`])
 //!
 //! ```bash
 //! VIGIL_RUN_ORT_SMOKE=1 VIGIL_INJECTION_MODEL_DIR=<dir> \
@@ -52,12 +53,32 @@ fn gate() -> bool {
     std::env::var("VIGIL_RUN_ORT_SMOKE").as_deref() == Ok("1")
 }
 
-/// 从 `VIGIL_INJECTION_MODEL_DIR` 载真模型;未设 / 缺 model.onnx → None(caller graceful skip)。
+/// 从 `VIGIL_INJECTION_MODEL_DIR` 载真模型。
+///
+/// # 门控语义(fail-closed)
+///
+/// - **未 opt-in**(见 [`gate`])→ `None`,caller 真正 skip(本地 dev 默认路径)
+/// - **已 opt-in** → 目录未设 / 缺 `model.onnx` 一律 **panic**
+///
+/// 原实现在此静默返回 `None`,让 CI 在模型未下载或 dylib 缺失时照样报 `passed`,
+/// 绿灯失去语义。现改为 fail-closed:做不到就明说。
 fn load_classifier() -> Option<InjectionClassifier> {
-    let dir = PathBuf::from(std::env::var("VIGIL_INJECTION_MODEL_DIR").ok()?);
-    if !dir.join("model.onnx").exists() {
+    if !gate() {
         return None;
     }
+    let dir = std::env::var("VIGIL_INJECTION_MODEL_DIR").unwrap_or_else(|_| {
+        panic!(
+            "VIGIL_RUN_ORT_SMOKE=1 but VIGIL_INJECTION_MODEL_DIR is not set — refusing to \
+             silently skip (fail-closed)"
+        )
+    });
+    let dir = PathBuf::from(dir);
+    assert!(
+        dir.join("model.onnx").exists(),
+        "VIGIL_RUN_ORT_SMOKE=1 but {} does not contain model.onnx — refusing to silently \
+         skip (fail-closed)",
+        dir.display()
+    );
     Some(
         InjectionClassifier::from_model_dir(&dir)
             .unwrap_or_else(|e| panic!("from_model_dir failed: {e:?}")),

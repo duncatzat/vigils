@@ -4,7 +4,20 @@
 //!
 //! 1. `#![cfg(feature = "ort")]` — 默认 feature 完全不编译此文件
 //! 2. `#[ignore]` — 即使 `--features ort` 跑 cargo test,默认仍跳过
-//! 3. 运行时 `VIGIL_RUN_ORT_SMOKE=1` env 检查 — 显式 opt-in;否则即使 `--ignored` 也 graceful skip
+//! 3. 运行时 `VIGIL_RUN_ORT_SMOKE=1` env 检查 —— 语义见下方「门控语义」
+//!
+//! # 门控语义(fail-closed)
+//!
+//! 第三层原为 **graceful skip**:无论 env 未设还是模型缺失,一律 `eprintln` + `return`,
+//! 测试仍计为 **passed**。后果是 CI 即便加上 `-- --ignored` 也会显示全绿而 **0 覆盖**
+//! (实测 `2 passed; 0 ignored; finished in 0.00s`)—— 绿灯失去语义,比不跑更危险:
+//! 现在至少明摆着没跑,改完则会被误认为"验过了"。
+//!
+//! 现改为:
+//! - **未 opt-in**(`VIGIL_RUN_ORT_SMOKE != 1`)→ 真正 skip(保留本地 dev 默认体验)
+//! - **已 opt-in** → 模型目录缺失 / 文件不全 / dylib 不在 → **panic**
+//!
+//! 与项目 fail-closed 哲学一致:做不到就明说,不静默降级。
 //!
 //! # 运行命令(本地 dev)
 //!
@@ -144,14 +157,16 @@ fn ort_smoke_per_label_coverage() {
         return;
     }
 
-    // 模型加载失败视为"模型未分发"→ graceful skip,不 panic
-    let engine = match OrtEngine::from_env() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("skip: OrtEngine::from_env failed (model not distributed?): {e:?}");
-            return;
-        }
-    };
+    // 已 opt-in(VIGIL_RUN_ORT_SMOKE=1)→ 模型不可用是**真失败**,不是 skip。
+    // 原 graceful-skip 让 CI 在模型未下载 / 下载不全 / dylib 缺失时照样报 passed ——
+    // 三重门控的第三层因此成为覆盖盲区。此处按项目 fail-closed 哲学改为 panic。
+    let engine = OrtEngine::from_env().unwrap_or_else(|e| {
+        panic!(
+            "VIGIL_RUN_ORT_SMOKE=1 but OrtEngine::from_env failed — refusing to silently \
+             skip (fail-closed). Check VIGIL_PRIVACY_FILTER_MODEL_DIR + model files + \
+             onnxruntime on PATH: {e:?}"
+        )
+    });
 
     let samples = load_labeled_samples();
     // v0.6 P2:fixture 从 20 扩展到 26(加 6 个 zh/ja/ko multilang-soft 样本);
