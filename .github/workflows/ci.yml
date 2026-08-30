@@ -121,15 +121,21 @@ jobs:
   msrv:
     name: MSRV (rust-version compile check)
     runs-on: ubuntu-latest
+    env:
+      # MSRV 单一真源:下方工具链 / step name / verify 基准全部引用它。
+      # 升 MSRV 只改这里 + Cargo.toml 的 rust-version,两者不一致由 verify 当天判红。
+      # 此前版本号散在三处硬编码,而 verify 只比对「声明 vs USED」、不比对
+      # 「USED vs 实际 toolchain」—— 改一处漏一处时防漂移会静默失效,
+      # 即声明 1.95 却从没真用 1.95 验过。
+      MSRV: "1.95"
     steps:
       - uses: actions/checkout@v4
 
-      # 工具链版本硬编码于此处 + 上方注释里的两处同步点;防漂移由最后的
-      # verify 步骤兜底(声明与实际不符当天红)
-      - name: Install Rust toolchain (1.95)
+      # 工具链版本取自上面的 env.MSRV,不再散落多处硬编码。
+      - name: Install Rust toolchain (${{ env.MSRV }})
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: 1.95
+          toolchain: ${{ env.MSRV }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -145,11 +151,12 @@ jobs:
       - name: cargo check (MSRV)
         run: cargo check --workspace --all-targets
 
-      # 防漂移:声明的 rust-version 必须等于本 job 用的工具链(上方的 vars.MSRV)。
+      # 防漂移:Cargo.toml 声明的 rust-version 必须等于本 job 实际用的工具链。
+      # 两侧都源于 env.MSRV / Cargo.toml,单一真源,不存在改一处漏一处的缝隙。
       - name: Verify declared rust-version matches
         run: |
           DECLARED=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-          USED="1.95"
+          USED="${{ env.MSRV }}"
           if [ "$DECLARED" != "$USED" ]; then
             echo "::error::Cargo.toml 声明 rust-version=$DECLARED,但 msrv job 用 $USED。请同步更新。"
             exit 1
