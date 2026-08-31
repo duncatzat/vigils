@@ -84,12 +84,15 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 # 漏洞(sandbox escape / panic / data leakage)。default-features=false 保留控制
 # 编译体积;preview1 API surface 在 25→41 稳定(Config/Engine/Linker/Module/Store
 # + WasiCtxBuilder + preopened_dir + add_to_linker_sync)。
-wasmtime = { version = "44", default-features = false, features = ["runtime", "cranelift", "wat"] }
+wasmtime = { version = "47", default-features = false, features = ["runtime", "cranelift", "wat"] }
 # v0.12.1(2026-05-14):rustc 1.95 unblock wasmtime 44.0.1+
 # - 修 RUSTSEC-2026-0114(table 超 host 地址空间 panic)— 43.0.2 不在 fix range
 # - wasi feature `p1` 保持(41 已 rename preview1→p1)
-wasmtime-wasi = { version = "44", default-features = false, features = ["p1"] }
-wasi-common = "44"
+# 2026-08-31:44 → 47 修 RUSTSEC-2026-0188(WASI hard link/rename 绕过 FilePerms)
+# + RUSTSEC-2026-0222(Store 跨 engine type index 混淆)——44.x 无补丁线,必须跳 47。
+# API 面(Config/Engine/Linker/Module/Store + WasiCtxBuilder)44→47 零变动,MSRV 1.94≤1.95。
+wasmtime-wasi = { version = "47", default-features = false, features = ["p1"] }
+wasi-common = "47"
 cap-std = "3"
 
 # I08 激活(ADR 0008):CLI 参数解析

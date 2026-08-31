@@ -38,7 +38,7 @@ API、往网页里粘贴。这种能力很有用 —— 也有风险。**Vigils 
 | **看见 Agent 做了什么** | 每次工具调用都记入防篡改的 **SHA-256 哈希链账本**,支持全文检索。 |
 | **高危动作先审批** | 破坏性 / 敏感调用在 **Approval Queue** 暂停,交人工审核,支持按 Agent 策略与范围化授权。 |
 | **凭据不进 prompt / 日志 / UI** | **脱敏引擎**在文本抵达模型、日志或屏幕*之前*,剥离密钥与 PII(硬指纹规则 + 可选 ML 集成)。 |
-| **隔离与回滚** | 账本端到端可追溯,**沙箱 runner 默认 fail-closed**(Wasm + native + Linux Landlock)。 |
+| **隔离与回滚** | 账本端到端可追溯,**沙箱 runner 默认 fail-closed**(native + Linux Landlock;另有 Wasm runner 为编译期可选 feature,不在发布产物中)。 |
 
 ## 特性
 

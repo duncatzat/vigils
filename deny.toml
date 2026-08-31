@@ -9,10 +9,13 @@
 #               已在治理清单;wildcard 均为内部 path 依赖无版本号)
 # - sources:    仅允许 crates.io + 本地 path(防供应链投毒)
 
-# all-features=false:与 CI rust job 的默认矩阵一致;ort 等 optional feature
-# 不进供应链审计面(发布产物默认不含)。若开启 --all-features 发布,须同步改这里。
+# all-features=true:审计面必须覆盖**全部发货产物**,而不止默认 feature 矩阵——
+# ML 变体(vigils-cli-ml-*,--features ort)与桌面 GUI(.deb/.msi/.dmg,--features gui)
+# 自 v0.4.0 起随每个 release 发布,其依赖树(ort/tokenizers、tauri/gtk)若不进图,
+# 已发货面的新漏洞不会红。代价是 tauri Linux 栈的 gtk3 unmaintained 系列需显式豁免
+# (见 advisories.ignore,均为 unmaintained 类而非漏洞类;真 gtk3 CVE 是新 ID,照常拦)。
 [graph]
-all-features = false
+all-features = true
 
 # ---------------------------------------------------------------- advisories
 [advisories]
@@ -33,6 +36,31 @@ ignore = [
   # rustls-pki-types::pem::PemObject(1.9+)。生产树不受影响。
   # 复查:迁移测试夹具到 PemObject 后移除。
   { id = "RUSTSEC-2025-0134", reason = "dev-only TLS test fixture; upstream archived, migration to rustls-pki-types PemObject tracked as follow-up" },
+
+  # ── gtk-rs GTK3 绑定 unmaintained 系列(8 条):tauri 2 的 Linux 栈(tao/wry →
+  # gtk/gdk/atk 0.18)仍基于 GTK3,gtk-rs 上游已转向 GTK4 并停止维护 GTK3 绑定。
+  # unmaintained 类 ≠ 漏洞;真 GTK3 CVE 会以新 RUSTSEC ID 披露,不受此豁免影响。
+  # 无本仓可行动的升级路径(需 tauri 上游迁移)。复查:tauri 发布 GTK4 栈后移除。
+  { id = "RUSTSEC-2024-0411", reason = "unmaintained-class; gtk3 bindings via tauri 2 Linux stack (tao); no action until tauri migrates to gtk4" },
+  { id = "RUSTSEC-2024-0412", reason = "unmaintained-class; gtk3 bindings via tauri 2 Linux stack; no action until tauri migrates to gtk4" },
+  { id = "RUSTSEC-2024-0413", reason = "unmaintained-class; gtk3 bindings via tauri 2 Linux stack; no action until tauri migrates to gtk4" },
+  { id = "RUSTSEC-2024-0415", reason = "unmaintained-class; gtk3 bindings via tauri 2 Linux stack; no action until tauri migrates to gtk4" },
+  { id = "RUSTSEC-2024-0416", reason = "unmaintained-class; gtk3 bindings via tauri 2 Linux stack; no action until tauri migrates to gtk4" },
+  { id = "RUSTSEC-2024-0418", reason = "unmaintained-class; gtk3 bindings via tauri 2 Linux stack; no action until tauri migrates to gtk4" },
+  { id = "RUSTSEC-2024-0419", reason = "unmaintained-class; gtk3-macros via tauri 2 Linux stack; no action until tauri migrates to gtk4" },
+  { id = "RUSTSEC-2024-0420", reason = "unmaintained-class; gtk3-sys via tauri 2 Linux stack; no action until tauri migrates to gtk4" },
+  # proc-macro-error:glib-macros(gtk3 栈)传递依赖,同上 tauri 上游问题。
+  { id = "RUSTSEC-2024-0370", reason = "unmaintained-class; via glib-macros in tauri gtk3 stack; same review condition as gtk3 series" },
+  # paste:tokenizers(ort/ML 面)传递依赖;unmaintained 类,宏 crate 无运行时面。
+  # 复查:tokenizers 升级换掉 paste 后移除。
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained-class; proc-macro only (no runtime surface) via tokenizers; remove when tokenizers drops paste" },
+  # unic-* 系列(5 条):tauri-utils 传递依赖;unmaintained 类,Unicode 数据表 crate。
+  # 复查:tauri-utils 换用维护中的 Unicode 实现后移除。
+  { id = "RUSTSEC-2025-0075", reason = "unmaintained-class; unicode data tables via tauri-utils; remove when tauri-utils migrates" },
+  { id = "RUSTSEC-2025-0080", reason = "unmaintained-class; unicode data tables via tauri-utils; remove when tauri-utils migrates" },
+  { id = "RUSTSEC-2025-0081", reason = "unmaintained-class; unicode data tables via tauri-utils; remove when tauri-utils migrates" },
+  { id = "RUSTSEC-2025-0098", reason = "unmaintained-class; unicode data tables via tauri-utils; remove when tauri-utils migrates" },
+  { id = "RUSTSEC-2025-0100", reason = "unmaintained-class; unicode data tables via tauri-utils; remove when tauri-utils migrates" },
 ]
 
 # ---------------------------------------------------------------- licenses

@@ -37,7 +37,7 @@ Four guarantees, enforced locally:
 | **See what the agent did** | Every tool call is recorded in a tamper-evident **SHA-256 hash-chained ledger** with full-text search. |
 | **Approve risky actions first** | Destructive / sensitive calls pause for human review in an **Approval Queue**, with per-agent policy and scoped grants. |
 | **Keep credentials out of prompts / logs / UI** | A **redaction engine** strips secrets and PII (hard-fingerprint rules + an optional ML ensemble) *before* text reaches a model, a log, or the screen. |
-| **Contain & roll back** | The ledger is traceable end-to-end and the **sandbox runner is fail-closed by default** (Wasm + native + Linux Landlock). |
+| **Contain & roll back** | The ledger is traceable end-to-end and the **sandbox runner is fail-closed by default** (native + Linux Landlock; a Wasm runner exists behind a compile-time feature, not in shipped builds). |
 
 ## Features
 

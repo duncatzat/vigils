@@ -21,6 +21,18 @@ Vigils 的所有重要变更记录于此。格式遵循
   也能发现新披露的漏洞(与 acceptance workflow 防"上游漂移"同思路)。
 - **CI 新增 MSRV 编译检查 job**(`ci.yml` 的 `msrv`)。用声明的最低 Rust 版本编译
   workspace 并比对声明一致性,工具链下限不再会悄悄失效。
+- **ORT 冒烟门控改 fail-closed + `ort` 代码路径进 CI 编译面**(#94)。ML 冒烟三重
+  门控的第三层原是 graceful skip:零覆盖也计 `passed`;现在已 opt-in
+  (`VIGIL_RUN_ORT_SMOKE=1`)而模型缺失会直接 panic,不再假绿。CI 补上
+  `--features ort` 的 clippy/test 步骤--此前 ML 路径在 CI 连编译都没编译过。
+- **CI 新增 Wasm runner 编译+测试门禁**(`--features wasm` clippy/test 步骤)。
+  与 ort 同类盲区:沙箱 Wasm runner 从未在 CI 编译过(crate 注释一直声称
+  「CI 必须启用」,实际无人启用)--下方 wasmtime 升级正是在这个盲区里静默滞后的。
+
+### Changed
+
+- **README 沙箱宣称精确化**--发货的沙箱是 native + Linux Landlock;Wasm runner
+  是编译期可选 feature,不在发布产物中。此前 README 的表述暗示 Wasm 默认随发。
 
 ### Security
 
@@ -28,6 +40,22 @@ Vigils 的所有重要变更记录于此。格式遵循
   cargo-deny 门禁首跑就抓到的**生产路径漏洞**:`h2` 位于 hyper/reqwest 之下,承载
   MCP HTTP transport。另刷新 yanked 的 `spin` 0.9.8 -> 0.9.9(dev-only,测试专用
   `rsa` crate 的传递依赖)。
+- **审计面扩到全部发货产物**--`deny.toml` 改为 **all-features** 分析依赖图。此前
+  仅默认 feature 的图把发货 ML 变体(`--features ort`)与桌面 GUI(`--features gui`)
+  的依赖树静默排除在外:那里新披露的漏洞永远不会让 CI 变红。扩图后浮出的 15 条
+  `unmaintained` 类 advisory(tauri Linux 栈的 gtk3 绑定、tokenizers 的 `paste`、
+  tauri-utils 的 `unic-*`)已登记为带理由与复查条件的豁免--这些 crate 若出真 CVE
+  会以新 advisory ID 披露,照常拦截。随后对扩宽后的图做了一轮清扫:
+  - **`wasmtime`/`wasmtime-wasi` 44.0.3 -> 47.0.3**--修 RUSTSEC-2026-0188(WASI
+    hard link/rename 绕过目标 `FilePerms`--沙箱权限绕过)与 RUSTSEC-2026-0222
+    (Store 跨 engine type index 混淆)。44.x 无补丁线;44 -> 47 API 面零变动,
+    全部 Wasm runner 测试通过。不在任何发货产物中(`wasm` feature 全链默认关),
+    但沙箱代码没有滞后的资格。
+  - **`quick-xml` 0.39.4 -> 0.41.0**(经 `plist` 1.9 -> 1.10)--修 RUSTSEC-2026-0194
+    (重复属性检查二次方复杂度)与 RUSTSEC-2026-0195(命名空间无界分配),均为
+    DoS 类,位于发货桌面 GUI 的 tauri 依赖树。
+  - **`crossbeam-epoch` 0.9.18 -> 0.9.20**--修 RUSTSEC-2026-0204(`fmt::Pointer`
+    无效指针解引用),位于发货 ML 变体的 tokenizers/rayon 依赖树。
 
 ### Fixed
 

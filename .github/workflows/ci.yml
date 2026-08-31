@@ -45,9 +45,17 @@ jobs:
       # ort feature 默认关(同 gui)—— ML 路径此前**从未在 CI 编译过**:卖点功能连编译
       # 错误都无人知晓(ort 钉在 =2.0.0-rc.12、tokenizers 0.20,上游变动不会有任何信号)。
       # `load-dynamic` 意味着编译期不需要 onnxruntime dylib(运行期才 dlopen),所以这里
-      # 只编译、不下载任何模型(1.5GB),成本约 3-5 min。真模型 E2E 归 ml-nightly.yml。
+      # 只编译、不下载任何模型(1.5GB),成本约 3-5 min。真模型 E2E 归 nightly 工作流
+      # (待建,见 #94 follow-up:下载真模型跑 7 个 --ignored 测试)。
       - name: Clippy (ort feature)
         run: cargo clippy -p vigil-redaction -p vigil-firewall -p vigil-mcp --features ort --all-targets -- -D warnings
+
+      # wasm feature 默认关(同 ort)—— Wasm 沙箱 runner 同样此前从未在 CI 编译过
+      # (vigil-runner 的 feature 注释一直写着「CI 必须启用」,但没有任何 workflow 真启用;
+      # wasmtime 44→47 升级即在此盲区里静默滞后)。发货产物不含 wasm(feature 全链默认关),
+      # 但它是安全关键代码,编译+测试门禁在此补上。
+      - name: Clippy (wasm feature)
+        run: cargo clippy -p vigil-runner --features wasm --all-targets -- -D warnings
 
       - name: Test
         run: cargo test --workspace
@@ -56,10 +64,13 @@ jobs:
         run: cargo test -p vigil-desktop --features gui --lib
 
       # 同上:只跑 ort 下**非** ignored 的测试(不需要模型)。刻意**不带** `--ignored` ——
-      # 那 7 个要真模型,归 ml-nightly.yml;且 L1(fail-closed 门控)之后,已 opt-in 而
-      # 无模型会直接 panic,在主 CI 里跑必红。
+      # 那 7 个要真模型,归 nightly 工作流(待建,同上);且 L1(fail-closed 门控)之后,
+      # 已 opt-in 而无模型会直接 panic,在主 CI 里跑必红。
       - name: Test (ort feature, non-ignored)
         run: cargo test -p vigil-redaction -p vigil-firewall -p vigil-mcp --features ort
+
+      - name: Test (wasm feature)
+        run: cargo test -p vigil-runner --features wasm
 
   ui:
     name: Desktop UI (typecheck / build)

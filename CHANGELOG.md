@@ -25,6 +25,21 @@ All notable changes to Vigils are documented here. The format follows
 - **MSRV compile-check job in CI** (`msrv` in `ci.yml`). Builds the workspace
   with the declared minimum Rust version and verifies the declaration matches,
   so the toolchain floor can no longer silently rot.
+- **ORT smoke gates are fail-closed + the `ort` code path now compiles in CI** (#94).
+  The third layer of the ML smoke triple gate was a graceful skip that counted as
+  `passed` with zero coverage; opting in (`VIGIL_RUN_ORT_SMOKE=1`) with a missing
+  model now panics instead of lying green. CI gained `--features ort` clippy/test
+  steps - previously the ML path was never even compiled in CI.
+- **Wasm runner compile+test gate in CI** (`--features wasm` clippy/test steps).
+  Same gap class as ort: the sandbox Wasm runner was never compiled in CI (the
+  crate's own comment claimed CI enables it; nothing did), which is exactly where
+  the wasmtime upgrade below had silently lagged.
+
+### Changed
+
+- **README sandbox claim made precise** - the shipped sandbox is native + Linux
+  Landlock; the Wasm runner exists behind a compile-time feature and is not part
+  of shipped builds. The README previously implied Wasm ships by default.
 
 ### Security
 
@@ -32,6 +47,25 @@ All notable changes to Vigils are documented here. The format follows
   found by the new cargo-deny gate on its first run. This is a production-path fix:
   `h2` sits under hyper/reqwest and carries the MCP HTTP transport. Also refreshed
   yanked `spin` 0.9.8 -> 0.9.9 (dev-only, transitive under the test-only `rsa` crate).
+- **Audit surface widened to every shipped artifact** - `deny.toml` now analyzes the
+  dependency graph with **all features on**. The previous default-features-only graph
+  silently excluded the trees behind the shipped ML variant (`--features ort`) and the
+  shipped desktop GUI (`--features gui`); a new advisory there would never turn CI red.
+  Fifteen `unmaintained`-class advisories surfaced by the wider graph (gtk3 bindings via
+  tauri's Linux stack, `paste` via tokenizers, `unic-*` via tauri-utils) are registered
+  as documented ignores with review conditions - real CVEs in those crates would arrive
+  under new advisory IDs and still fail the gate. Sweeping the widened graph then fixed:
+  - **`wasmtime`/`wasmtime-wasi` 44.0.3 -> 47.0.3** - RUSTSEC-2026-0188 (WASI hard
+    links/renames bypass `FilePerms` on the destination - a sandbox permission bypass)
+    and RUSTSEC-2026-0222 (stores can mix up type indices between engines). The 44.x
+    line has no patch; API surface was unchanged across 44 -> 47 and all Wasm runner
+    tests pass. Not in any shipped build (the `wasm` feature is compile-time optional
+    and off everywhere), but this is sandbox code - it does not get to lag.
+  - **`quick-xml` 0.39.4 -> 0.41.0** (via `plist` 1.9 -> 1.10) - RUSTSEC-2026-0194
+    (quadratic duplicate-attribute check) and RUSTSEC-2026-0195 (unbounded namespace
+    allocation), both DoS-class, in the shipped desktop GUI tree under tauri.
+  - **`crossbeam-epoch` 0.9.18 -> 0.9.20** - RUSTSEC-2026-0204 (invalid pointer
+    dereference in `fmt::Pointer`), in the shipped ML variant tree under tokenizers/rayon.
 
 ### Fixed
 
