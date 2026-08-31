@@ -1,7 +1,15 @@
 [toolchain]
-# I00：采用滚动 "stable" 通道,workspace.package.rust-version = 1.80 负责 MSRV 兜底。
-# 若后续发现上游依赖对某个 stable 版本有硬性要求(例如 Tauri 2 对 rustc 的最低要求),
-# 再改为具体版本号,同步调整 Cargo.toml 的 rust-version。
+# I00：开发者本机用滚动 "stable" 通道(拿最新工具链,不被 MSRV 拖住)。
+#
+# MSRV 兜底由 Cargo.toml 的 `rust-version` 负责 —— 当前是 **1.95**
+# (wasmtime 44 修 RUSTSEC-2026-0114 要求 rustc 1.95.1+;此前声明的 1.80
+# 已失效并订正 —— 依赖树实际编译不了,旧声明只会给出难懂的错误)。
+# 声明漂移由 ci.yml 的 `msrv` job 守门:它用声明的最低版本编译,并校验
+# 声明与本 job 工具链一致;版本号取自 ci.yml 的 `env.MSRV` 单一真源。
+#
+# 若后续上游依赖对某个 stable 有硬性要求(例如 Tauri 2 对 rustc 的最低要求),
+# 再改为具体版本号,并同步三处:本文件 channel、Cargo.toml 的 rust-version、
+# ci.yml 的 env.MSRV。
 channel = "stable"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
