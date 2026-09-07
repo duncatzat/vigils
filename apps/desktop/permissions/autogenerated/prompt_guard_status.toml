@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-prompt-guard-status"
+description = "Enables the prompt_guard_status command without any pre-configured scope."
+commands.allow = ["prompt_guard_status"]
+
+[[permission]]
+identifier = "deny-prompt-guard-status"
+description = "Denies the prompt_guard_status command without any pre-configured scope."
+commands.deny = ["prompt_guard_status"]

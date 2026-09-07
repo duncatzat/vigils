@@ -513,6 +513,30 @@ pub struct SettingsStatus {
     pub engine_present: bool,
 }
 
+/// Codex 用户 Prompt 输入保护状态。状态文件只包含哈希与规则名，不包含 Prompt 原文。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptGuardStatus {
+    /// Prompt 输入保护暂停到此 Unix 秒；`None` 表示正常保护。
+    pub paused_until: Option<u64>,
+    /// 最近一条 Prompt 的单次许可到期 Unix 秒；消费或到期后为 `None`。
+    pub allow_once_expires_at: Option<u64>,
+    /// 最近一次拦截的非敏感元数据，供用户明确选择单次放行。
+    pub last_blocked: Option<PromptGuardBlocked>,
+}
+
+/// 最近一次被拦 Prompt 的非敏感元数据。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptGuardBlocked {
+    /// Prompt 的 SHA-256；不保存原文。
+    pub prompt_sha256: String,
+    /// Codex 会话 ID，用于防止单次许可跨会话使用。
+    pub session_id: Option<String>,
+    /// 命中的敏感信息规则名。
+    pub finding: String,
+    /// 拦截发生时的 Unix 秒。
+    pub blocked_at: u64,
+}
+
 /// 跑 `<engine> <args...>` 捕获 trimmed stdout(非零退出 → Err 带 stderr 摘要)。
 fn run_cli_capture(engine: &Path, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new(engine);
@@ -532,6 +556,32 @@ fn run_cli_capture(engine: &Path, args: &[&str]) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn run_prompt_guard(app: &AppHandle, args: &[&str]) -> Result<PromptGuardStatus, String> {
+    let engine = resolve_engine(app).ok_or_else(|| ENGINE_NOT_FOUND.to_string())?;
+    let stdout = run_cli_capture(&engine, args)?;
+    serde_json::from_str(&stdout).map_err(|e| format!("invalid prompt-guard response: {e}"))
+}
+
+/// 读取当前 Codex Prompt 输入保护状态。
+pub fn prompt_guard_status(app: &AppHandle) -> Result<PromptGuardStatus, String> {
+    run_prompt_guard(app, &["prompt-guard", "status"])
+}
+
+/// 授权最近被拦截的同一 Prompt 在短时窗口内放行一次。
+pub fn prompt_guard_allow_once(app: &AppHandle) -> Result<PromptGuardStatus, String> {
+    run_prompt_guard(app, &["prompt-guard", "allow-once"])
+}
+
+/// 暂停 Codex Prompt 输入保护 5 分钟，不影响工具和 MCP 防护。
+pub fn prompt_guard_pause(app: &AppHandle) -> Result<PromptGuardStatus, String> {
+    run_prompt_guard(app, &["prompt-guard", "pause", "--seconds", "300"])
+}
+
+/// 立即恢复 Codex Prompt 输入保护并撤销未消费的单次许可。
+pub fn prompt_guard_resume(app: &AppHandle) -> Result<PromptGuardStatus, String> {
+    run_prompt_guard(app, &["prompt-guard", "resume"])
 }
 
 /// 只读:当前设置(引擎模式 + 姿态)。引擎二进制缺失 → 返回默认值 + `engine_present=false`

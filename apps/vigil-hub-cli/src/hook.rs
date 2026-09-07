@@ -248,6 +248,8 @@ pub struct HookArgs {
     /// posture 配置路径覆盖。None = canonical `<data_local>/Vigil/posture.json`
     /// (生产 main.rs 不设置;测试注入临时路径保证 hermetic,见 feedback「production logic testable」)。
     pub posture_path: Option<PathBuf>,
+    /// prompt guard 状态路径覆盖。None = canonical `<data_local>/Vigil/prompt-guard.json`。
+    pub prompt_guard_path: Option<PathBuf>,
     /// 共同批准等待预算覆盖(秒)。None = 按 CLI 默认(Claude/Gemini/Cursor 45s,Codex 86000s)。
     /// 仅测试注入用(避免测试真等 45s)。
     pub co_approval_wait_secs: Option<u64>,
@@ -1462,9 +1464,42 @@ fn handle_user_prompt_submit(args: &HookArgs, raw: &Value) -> HookOutcome {
         );
         return HookOutcome::Allow;
     };
+    let prompt_sha256 = sha256_hex(prompt);
+    let session_id = extract_str(raw, &["session_id", "sessionId"]);
+    let guard_path = args
+        .prompt_guard_path
+        .clone()
+        .or_else(crate::prompt_guard::default_state_path);
+    if let Some(path) = guard_path.as_deref() {
+        match crate::prompt_guard::check_and_consume(
+            path,
+            &prompt_sha256,
+            session_id,
+            crate::prompt_guard::now_unix_secs(),
+        ) {
+            Ok(crate::prompt_guard::PromptDecision::AllowOnce) => return HookOutcome::Allow,
+            Ok(crate::prompt_guard::PromptDecision::Paused) => return HookOutcome::Allow,
+            Ok(crate::prompt_guard::PromptDecision::Enforce) => {}
+            Err(e) => eprintln!(
+                "vigil-hook: prompt guard state unavailable ({e}); continuing with protection"
+            ),
+        }
+    }
+
     let Some(kind) = vigil_redaction::detect_hard_secret(prompt) else {
         return HookOutcome::Allow;
     };
+    if let Some(path) = guard_path.as_deref() {
+        if let Err(e) = crate::prompt_guard::record_blocked(
+            path,
+            &prompt_sha256,
+            session_id,
+            kind,
+            crate::prompt_guard::now_unix_secs(),
+        ) {
+            eprintln!("vigil-hook: could not record blocked prompt metadata ({e})");
+        }
+    }
     // best-effort 审计(不落 prompt 原文,只落 sha256 + FindingKind 名);失败不改变决策。
     audit_prompt_block(args, raw, kind, prompt);
     HookOutcome::DenyPrompt(format!(
@@ -2858,6 +2893,7 @@ mod tests {
     fn run_json_posture(v: Value, cli: CliKind, profile: Option<PostureProfile>) -> HookOutcome {
         let td = tempfile::TempDir::new().unwrap();
         let posture_path = td.path().join("posture.json");
+        let prompt_guard_path = td.path().join("prompt-guard.json");
         if let Some(p) = profile {
             crate::posture::store_posture(&posture_path, p).unwrap();
         }
@@ -2866,9 +2902,15 @@ mod tests {
         let args = HookArgs {
             cli,
             posture_path: Some(posture_path),
+            prompt_guard_path: Some(prompt_guard_path),
             ..HookArgs::default()
         };
         run(&args, &mut cur)
+    }
+
+    fn run_json_args(v: Value, args: &HookArgs) -> HookOutcome {
+        let mut cur = Cursor::new(v.to_string().into_bytes());
+        run(args, &mut cur)
     }
 
     const FAKE_GH_TOKEN: &str = "ghp_0123456789abcdef0123456789abcdef0123";
@@ -3233,6 +3275,83 @@ mod tests {
             matches!(out, HookOutcome::DenyPrompt(_)),
             "a raw secret in the prompt must block the prompt (got {out:?})"
         );
+    }
+
+    #[test]
+    fn user_prompt_submit_allow_once_matches_and_is_consumed() {
+        let td = tempfile::tempdir().unwrap();
+        let guard_path = td.path().join("prompt-guard.json");
+        let args = HookArgs {
+            cli: CliKind::Codex,
+            posture_path: Some(td.path().join("posture.json")),
+            prompt_guard_path: Some(guard_path.clone()),
+            ..HookArgs::default()
+        };
+        let event = json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "codex-session",
+            "prompt": format!("token={FAKE_GH_TOKEN}"),
+        });
+
+        assert!(matches!(
+            run_json_args(event.clone(), &args),
+            HookOutcome::DenyPrompt(_)
+        ));
+        crate::prompt_guard::allow_last_blocked(&guard_path, crate::prompt_guard::now_unix_secs())
+            .unwrap();
+        assert_eq!(run_json_args(event.clone(), &args), HookOutcome::Allow);
+        assert!(matches!(
+            run_json_args(event, &args),
+            HookOutcome::DenyPrompt(_)
+        ));
+    }
+
+    #[test]
+    fn user_prompt_submit_pause_allows_until_resumed() {
+        let td = tempfile::tempdir().unwrap();
+        let guard_path = td.path().join("prompt-guard.json");
+        let args = HookArgs {
+            cli: CliKind::Codex,
+            posture_path: Some(td.path().join("posture.json")),
+            prompt_guard_path: Some(guard_path.clone()),
+            ..HookArgs::default()
+        };
+        let event = json!({
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": format!("token={FAKE_GH_TOKEN}"),
+        });
+
+        crate::prompt_guard::pause(&guard_path, crate::prompt_guard::now_unix_secs(), 300).unwrap();
+        assert_eq!(run_json_args(event.clone(), &args), HookOutcome::Allow);
+        crate::prompt_guard::resume(&guard_path, crate::prompt_guard::now_unix_secs()).unwrap();
+        assert!(matches!(
+            run_json_args(event, &args),
+            HookOutcome::DenyPrompt(_)
+        ));
+    }
+
+    #[test]
+    fn user_prompt_submit_malformed_guard_state_still_blocks() {
+        let td = tempfile::tempdir().unwrap();
+        let guard_path = td.path().join("prompt-guard.json");
+        std::fs::write(&guard_path, "not-json").unwrap();
+        let args = HookArgs {
+            cli: CliKind::Codex,
+            posture_path: Some(td.path().join("posture.json")),
+            prompt_guard_path: Some(guard_path),
+            ..HookArgs::default()
+        };
+
+        assert!(matches!(
+            run_json_args(
+                json!({
+                    "hook_event_name": "UserPromptSubmit",
+                    "prompt": format!("token={FAKE_GH_TOKEN}"),
+                }),
+                &args,
+            ),
+            HookOutcome::DenyPrompt(_)
+        ));
     }
 
     #[test]

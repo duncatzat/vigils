@@ -63,7 +63,7 @@ fn gui_build_hub_shares_ledger_arc() {
     );
 }
 
-/// (d) INVOKE_COMMANDS 快照守门(现 = 26)—— α2 本身通过 Hub.resolve_approval 委托不新增 handler;
+/// (d) INVOKE_COMMANDS 快照守门(现 = 41)—— α2 本身通过 Hub.resolve_approval 委托不新增 handler;
 /// 其后 α3-α5 / ISS / D19(protection_summary)新增时本断言随 SSOT 同步。
 ///
 /// 与 C1/C2 的关键区别:α2 的功能升级在既有 handler 函数体内部(改走
@@ -74,8 +74,8 @@ fn gui_build_hub_shares_ledger_arc() {
 fn invoke_commands_count_unchanged_in_alpha2() {
     assert_eq!(
         vigil_desktop::commands::INVOKE_COMMANDS.len(),
-        26,
-        "SSOT handler 数 = 26(α1=1 + α2=3 + α3=3 + α4=10 + α5=2 + ISS-017=1 + ISS-018=1 + D19=1 + P1.3=2 + ③引擎=2)。\
+        41,
+        "SSOT handler 数 = 41(包含 Codex Prompt Guard 的 4 个桌面命令)。\
          α2 本身不新增 handler(功能升级在 hub.resolve_approval 函数体内,见 ADR 0014 Revised α2);\
          其后 α3-α5 / ISS / D19(protection_summary)新增 handler 时,本快照 + commands.rs SSOT 三件套\
          必须同步。新增 handler 漂移即本断言失败,强制三处同步。"
