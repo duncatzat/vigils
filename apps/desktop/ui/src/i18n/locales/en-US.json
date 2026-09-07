@@ -138,6 +138,17 @@
       "high": "High",
       "high_desc": "Placeholders are blocked."
     },
+    "prompt_guard": {
+      "title": "Codex Prompt protection",
+      "subtitle": "Temporary exceptions affect chat prompts only; tool input, tool output, and MCP remain protected.",
+      "protected": "PROTECTED",
+      "paused": "PAUSED",
+      "last_blocked": "Last blocked: {finding}",
+      "allow_once": "Allow last prompt once",
+      "pause": "Pause for 5 minutes",
+      "resume": "Resume now",
+      "confirm": "The raw sensitive content in your prompt may be sent directly to Codex/OpenAI. Vigils will not redact it. Continue?"
+    },
     "daemon": {
       "title": "Daemon (resident engine)",
       "subtitle": "A resident daemon holds the warm AI model so the hook main path runs ML with zero cold-start. Start it to enable ML protection for your agent.",

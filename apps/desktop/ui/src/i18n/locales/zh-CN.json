@@ -138,6 +138,17 @@
       "high": "严格",
       "high_desc": "占位符拦截。"
     },
+    "prompt_guard": {
+      "title": "Codex 输入保护",
+      "subtitle": "临时例外只影响聊天 Prompt；工具输入、工具结果和 MCP 依然受保护。",
+      "protected": "保护中",
+      "paused": "已暂停",
+      "last_blocked": "最近拦截：{finding}",
+      "allow_once": "允许最近一条一次",
+      "pause": "暂停 5 分钟",
+      "resume": "立即恢复",
+      "confirm": "继续后，Prompt 中的原始敏感内容可能直接发送给 Codex/OpenAI，Vigils 不会自动脱敏。确定继续吗？"
+    },
     "daemon": {
       "title": "守护进程(常驻引擎)",
       "subtitle": "常驻 daemon 守住已暖载的 AI 模型,让 hook 主路径零冷启动跑 ML。启动它即为你的 agent 开启 ML 防护。",

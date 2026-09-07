@@ -686,6 +686,35 @@ export async function setEngineMode(mode: string): Promise<SettingsStatus> {
   return await invoke<SettingsStatus>("set_engine_mode", { mode });
 }
 
+export interface PromptGuardBlocked {
+  prompt_sha256: string;
+  session_id: string | null;
+  finding: string;
+  blocked_at: number;
+}
+
+export interface PromptGuardStatus {
+  paused_until: number | null;
+  allow_once_expires_at: number | null;
+  last_blocked: PromptGuardBlocked | null;
+}
+
+export async function promptGuardStatus(): Promise<PromptGuardStatus> {
+  return await invoke<PromptGuardStatus>("prompt_guard_status");
+}
+
+export async function promptGuardAllowOnce(): Promise<PromptGuardStatus> {
+  return await invoke<PromptGuardStatus>("prompt_guard_allow_once");
+}
+
+export async function promptGuardPause(): Promise<PromptGuardStatus> {
+  return await invoke<PromptGuardStatus>("prompt_guard_pause");
+}
+
+export async function promptGuardResume(): Promise<PromptGuardStatus> {
+  return await invoke<PromptGuardStatus>("prompt_guard_resume");
+}
+
 // ─────────────── R3 Phase 2：常驻 daemon 生命周期 + ML 模型安装（ADR 0024）───────────────
 
 /** 对应 Rust `vigil_desktop::guardian::DaemonStatus`。 */

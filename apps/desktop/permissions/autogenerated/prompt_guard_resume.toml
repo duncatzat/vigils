@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-prompt-guard-resume"
+description = "Enables the prompt_guard_resume command without any pre-configured scope."
+commands.allow = ["prompt_guard_resume"]
+
+[[permission]]
+identifier = "deny-prompt-guard-resume"
+description = "Denies the prompt_guard_resume command without any pre-configured scope."
+commands.deny = ["prompt_guard_resume"]

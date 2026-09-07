@@ -16,6 +16,7 @@ use vigil_hub_cli::i18n::{self, Lang};
 use vigil_hub_cli::inspect::{self, InspectArgs};
 use vigil_hub_cli::model;
 use vigil_hub_cli::posture;
+use vigil_hub_cli::prompt_guard;
 use vigil_hub_cli::quickstart;
 use vigil_hub_cli::serve::{self, ServeArgs};
 use vigil_hub_cli::setup::{self, SetupArgs};
@@ -88,6 +89,9 @@ enum Command {
     ///
     /// 用法:`vigil-hub posture show` / `vigil-hub posture set medium`。
     Posture(CliPostureArgs),
+    /// 控制 Codex 用户 Prompt 的敏感信息拦截例外。默认严格拦截；可对最近一次被拦消息
+    /// 放行一次，或限时暂停（最长 15 分钟）。状态只保存 SHA-256，不保存 Prompt 原文。
+    PromptGuard(CliPromptGuardArgs),
     /// 只读查看 Vigil 拦了什么(基于已持久化审计账本的聚合):protection 汇总 / activity 事件流 /
     /// search 全文检索 / approvals 队列 / verify-chain 链校验 —— 用过 agent 后"看见保护"。
     ///
@@ -128,6 +132,29 @@ enum PostureCommand {
         #[arg(long)]
         ledger: Option<PathBuf>,
     },
+}
+
+#[derive(clap::Args, Debug)]
+struct CliPromptGuardArgs {
+    /// 省略子命令 = `status`。
+    #[command(subcommand)]
+    command: Option<PromptGuardCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum PromptGuardCommand {
+    /// 输出机器可读 JSON 状态。
+    Status,
+    /// 允许最近一次被拦截的同一 Prompt 在 60 秒内重新提交一次。
+    AllowOnce,
+    /// 暂停聊天 Prompt 拦截；不影响工具输入、工具结果和 MCP 防护。
+    Pause {
+        /// 暂停秒数，范围 1..=900。
+        #[arg(long, default_value_t = prompt_guard::DEFAULT_PAUSE_SECS)]
+        seconds: u64,
+    },
+    /// 立即恢复 Prompt 拦截，同时撤销尚未消费的单次许可。
+    Resume,
 }
 
 #[derive(clap::Args, Debug)]
@@ -685,6 +712,7 @@ fn main() -> std::process::ExitCode {
             }
         }
         Some(Command::Posture(args)) => run_posture(lang, args),
+        Some(Command::PromptGuard(args)) => run_prompt_guard(lang, args),
         Some(Command::Engine(args)) => run_engine(lang, args),
         Some(Command::Daemon(args)) => run_daemon(lang, args),
         Some(Command::Model(args)) => run_model(lang, args),
@@ -872,6 +900,26 @@ fn run_posture(lang: Lang, args: CliPostureArgs) -> std::process::ExitCode {
                 }
             }
         }
+    }
+}
+
+fn run_prompt_guard(lang: Lang, args: CliPromptGuardArgs) -> std::process::ExitCode {
+    let Some(path) = prompt_guard::default_state_path() else {
+        return fail_cmd(lang, "prompt-guard", "local data directory is unavailable");
+    };
+    let now = prompt_guard::now_unix_secs();
+    let result = match args.command.unwrap_or(PromptGuardCommand::Status) {
+        PromptGuardCommand::Status => prompt_guard::status(&path, now),
+        PromptGuardCommand::AllowOnce => prompt_guard::allow_last_blocked(&path, now),
+        PromptGuardCommand::Pause { seconds } => prompt_guard::pause(&path, now, seconds),
+        PromptGuardCommand::Resume => prompt_guard::resume(&path, now),
+    };
+    match result.and_then(|status| serde_json::to_string(&status).map_err(std::io::Error::other)) {
+        Ok(json) => {
+            println!("{json}");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => fail_cmd(lang, "prompt-guard", e),
     }
 }
 

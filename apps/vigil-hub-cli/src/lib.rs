@@ -18,6 +18,7 @@ pub mod i18n;
 pub mod inspect;
 pub mod model;
 pub mod posture;
+pub mod prompt_guard;
 pub mod quickstart;
 pub mod serve;
 pub mod setup;

@@ -684,6 +684,35 @@ async fn set_engine_mode(
     vigil_desktop::guardian::set_engine_mode(&app, &mode)
 }
 
+/// Codex Prompt 输入保护状态与临时例外。只影响 UserPromptSubmit，不影响工具/MCP 防护。
+#[tauri::command]
+async fn prompt_guard_status(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::guardian::PromptGuardStatus, String> {
+    vigil_desktop::guardian::prompt_guard_status(&app)
+}
+
+#[tauri::command]
+async fn prompt_guard_allow_once(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::guardian::PromptGuardStatus, String> {
+    vigil_desktop::guardian::prompt_guard_allow_once(&app)
+}
+
+#[tauri::command]
+async fn prompt_guard_pause(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::guardian::PromptGuardStatus, String> {
+    vigil_desktop::guardian::prompt_guard_pause(&app)
+}
+
+#[tauri::command]
+async fn prompt_guard_resume(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::guardian::PromptGuardStatus, String> {
+    vigil_desktop::guardian::prompt_guard_resume(&app)
+}
+
 // ───────────────── R3 Phase 2:常驻 daemon 生命周期 + ML 模型安装(ADR 0024)─────────────────
 
 /// `invoke('daemon_status')` → 只读 daemon 运行态(running / pii_loaded / engine_present)。
@@ -896,6 +925,10 @@ fn main() {
             settings_get,
             set_posture,
             set_engine_mode,
+            prompt_guard_status,
+            prompt_guard_allow_once,
+            prompt_guard_pause,
+            prompt_guard_resume,
             // R3 Phase 2(daemon 生命周期 —— 1 read + 2 write;ML 模型 —— 1 read + 1 write)
             daemon_status,
             daemon_start,

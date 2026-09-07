@@ -27,9 +27,14 @@ import {
   downloadMlEngine,
   guardianStatus,
   anchorCheckpoint,
+  promptGuardStatus,
+  promptGuardAllowOnce,
+  promptGuardPause,
+  promptGuardResume,
   type SettingsStatus,
   type DaemonStatus,
   type ModelStatus,
+  type PromptGuardStatus,
 } from "@/api/ipc";
 import WindowCard from "@/components/WindowCard.vue";
 import StatusPill from "@/components/StatusPill.vue";
@@ -43,6 +48,8 @@ const POSTURES = ["low", "medium", "high"] as const;
 const settings = ref<SettingsStatus | null>(null);
 const daemon = ref<DaemonStatus | null>(null);
 const model = ref<ModelStatus | null>(null);
+const promptGuard = ref<PromptGuardStatus | null>(null);
+const nowMs = ref(Date.now());
 const loading = ref(false);
 const busy = ref<string | null>(null); // 正在写入的项 key(防并发点击)
 const error = ref<string | null>(null);
@@ -54,14 +61,16 @@ async function refresh(): Promise<void> {
   loading.value = true;
   error.value = null;
   try {
-    const [s, d, m] = await Promise.all([
+    const [s, d, m, p] = await Promise.all([
       settingsGet(),
       daemonStatus(),
       modelStatus(),
+      promptGuardStatus(),
     ]);
     settings.value = s;
     daemon.value = d;
     model.value = m;
+    promptGuard.value = p;
     // 账本路径来自 guardian 聚合状态;best-effort,失败不阻塞设置页主体。
     try {
       ledgerPath.value = (await guardianStatus()).ledger;
@@ -72,6 +81,49 @@ async function refresh(): Promise<void> {
     error.value = String(e);
   } finally {
     loading.value = false;
+  }
+}
+
+function confirmRawPrompt(): boolean {
+  return window.confirm(t("settings.prompt_guard.confirm"));
+}
+
+async function allowPromptOnce(): Promise<void> {
+  if (busy.value || !confirmRawPrompt()) return;
+  busy.value = "prompt-guard:allow";
+  error.value = null;
+  try {
+    promptGuard.value = await promptGuardAllowOnce();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function pausePromptGuard(): Promise<void> {
+  if (busy.value || !confirmRawPrompt()) return;
+  busy.value = "prompt-guard:pause";
+  error.value = null;
+  try {
+    promptGuard.value = await promptGuardPause();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function resumePromptGuard(): Promise<void> {
+  if (busy.value) return;
+  busy.value = "prompt-guard:resume";
+  error.value = null;
+  try {
+    promptGuard.value = await promptGuardResume();
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = null;
   }
 }
 
@@ -106,6 +158,7 @@ async function pickPosture(profile: string): Promise<void> {
 // 让 pill 从「启动中(暖载)」自动走到「运行中 · ML 已暖」,不再需要手动刷新。
 // 只读轮询,不占 busy 锁。
 let warmPollTimer: ReturnType<typeof setInterval> | null = null;
+let clockTimer: ReturnType<typeof setInterval> | null = null;
 function stopWarmPoll(): void {
   if (warmPollTimer !== null) clearInterval(warmPollTimer);
   warmPollTimer = null;
@@ -125,7 +178,10 @@ function startWarmPoll(): void {
     }
   }, 1000);
 }
-onUnmounted(stopWarmPoll);
+onUnmounted(() => {
+  stopWarmPoll();
+  if (clockTimer !== null) clearInterval(clockTimer);
+});
 
 async function startDaemon(): Promise<void> {
   if (busy.value) return;
@@ -208,6 +264,9 @@ async function installMlEngine(): Promise<void> {
 
 onMounted(() => {
   void refresh();
+  clockTimer = setInterval(() => {
+    nowMs.value = Date.now();
+  }, 1000);
   // 应用版本(Tauri core API,静态一次即可;失败保持 "—")。
   getVersion()
     .then((v) => {
@@ -337,6 +396,65 @@ onMounted(() => {
           <div class="mode-name">{{ t(`settings.posture.${p}`) }}</div>
           <div class="mode-desc">{{ t(`settings.posture.${p}_desc`) }}</div>
         </button>
+      </div>
+    </WindowCard>
+
+    <WindowCard title="prompt guard" class="block" data-testid="settings-prompt-guard-card">
+      <div class="row first">
+        <div>
+          <div class="s-title">{{ t("settings.prompt_guard.title") }}</div>
+          <div class="s-sub">{{ t("settings.prompt_guard.subtitle") }}</div>
+          <div v-if="promptGuard?.last_blocked" class="s-sub" data-testid="prompt-last-blocked">
+            {{
+              t("settings.prompt_guard.last_blocked", {
+                finding: promptGuard.last_blocked.finding,
+              })
+            }}
+          </div>
+        </div>
+        <div class="ctl prompt-guard-controls">
+          <StatusPill
+            v-if="promptGuard?.paused_until && promptGuard.paused_until * 1000 > nowMs"
+            tone="yellow"
+            data-testid="prompt-guard-state"
+          >
+            {{ t("settings.prompt_guard.paused") }}
+          </StatusPill>
+          <StatusPill v-else tone="green" data-testid="prompt-guard-state">
+            {{ t("settings.prompt_guard.protected") }}
+          </StatusPill>
+          <NButton
+            size="small"
+            :loading="busy === 'prompt-guard:allow'"
+            :disabled="!!busy || loading || !settings?.engine_present || !promptGuard?.last_blocked"
+            data-testid="prompt-guard-allow-once"
+            @click="allowPromptOnce"
+          >
+            {{ t("settings.prompt_guard.allow_once") }}
+          </NButton>
+          <NButton
+            v-if="!promptGuard?.paused_until || promptGuard.paused_until * 1000 <= nowMs"
+            size="small"
+            type="warning"
+            :loading="busy === 'prompt-guard:pause'"
+            :disabled="!!busy || loading || !settings?.engine_present"
+            data-testid="prompt-guard-pause"
+            @click="pausePromptGuard"
+          >
+            {{ t("settings.prompt_guard.pause") }}
+          </NButton>
+          <NButton
+            v-else
+            size="small"
+            type="primary"
+            :loading="busy === 'prompt-guard:resume'"
+            :disabled="!!busy || loading"
+            data-testid="prompt-guard-resume"
+            @click="resumePromptGuard"
+          >
+            {{ t("settings.prompt_guard.resume") }}
+          </NButton>
+        </div>
       </div>
     </WindowCard>
 
@@ -549,6 +667,10 @@ onMounted(() => {
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
+}
+.prompt-guard-controls {
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .errline {
   margin-top: 14px;
