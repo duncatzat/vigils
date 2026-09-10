@@ -151,6 +151,59 @@ fn unknown_method_returns_not_found() {
     );
 }
 
+/// P0-3a:2026-07-28 现代客户端的时代探针 `server/discover` —— Hub 是旧时代服务器,须回**非现代**错误
+/// (-32601,让双时代客户端按 spec 回退到 `initialize`),且消息点名支持版本与开场方式(现代专属客户端
+/// 「fail deterministically」时能把它呈现给用户)。绝不能假造 DiscoverResult。
+#[test]
+fn server_discover_returns_legacy_era_hint_not_a_discover_result() {
+    let (_l, hub) = setup_hub();
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0".into(),
+        id: Some(json!(7)),
+        method: "server/discover".into(),
+        params: Some(json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        })),
+    };
+    let resp = hub.handle_request(req).unwrap().unwrap();
+    assert!(resp.result.is_none(), "must not fake a DiscoverResult");
+    let err = resp.error.as_ref().unwrap();
+    assert_eq!(err.code, JsonRpcError::METHOD_NOT_FOUND);
+    assert!(err.message.contains("initialize"), "{}", err.message);
+    assert!(err.message.contains("2025-11-25"), "{}", err.message);
+    assert!(err.message.contains("2025-06-18"), "{}", err.message);
+}
+
+/// P0-3a:旧时代 `initialize` 版本协商 —— 客户端提议的受支持版本被回显;不支持(含现代 2026-07-28)
+/// 或缺省时回默认 2025-06-18(既有行为不变)。
+#[test]
+fn initialize_echoes_supported_requested_version_and_defaults_otherwise() {
+    let cases = [
+        (json!({"protocolVersion": "2025-11-25"}), "2025-11-25"),
+        (json!({"protocolVersion": "2024-11-05"}), "2024-11-05"),
+        (json!({"protocolVersion": "2026-07-28"}), "2025-06-18"),
+        (json!({}), "2025-06-18"),
+    ];
+    for (params, want) in cases {
+        let (_l, hub) = setup_hub();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "initialize".into(),
+            params: Some(params.clone()),
+        };
+        let resp = hub.handle_request(req).unwrap().unwrap();
+        let got = resp.result.as_ref().unwrap()["protocolVersion"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(got, want, "params={params}");
+    }
+}
+
 #[test]
 fn notifications_produce_no_response() {
     let (_l, hub) = setup_hub();

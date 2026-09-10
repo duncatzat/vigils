@@ -106,6 +106,39 @@ pub enum HubError {
     Invalid(String),
 }
 
+/// Hub 作为**旧时代**(initialize 握手)MCP 服务器所支持的协议修订(新→旧)。stdio 工具面上这几版
+/// 无强制性新语义(2025-11-25 的变更全在 HTTP 授权 / 可选能力上),故可回显客户端提议的任一版本。
+/// 现代时代(2026-07-28+,无握手、按请求 `_meta` 协商)**未实现**,刻意不在此列。
+pub const HUB_SERVER_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// 客户端未提议 / 提议了不支持的版本时的服务端默认回应(保持既有行为不变)。
+const HUB_DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// 旧时代 `initialize` 版本协商:提议版本 ∈ 支持集 → 回显;否则回默认。
+fn negotiate_legacy_version(params: Option<&Value>) -> &'static str {
+    let requested = params
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(Value::as_str);
+    match requested {
+        Some(v) => HUB_SERVER_PROTOCOL_VERSIONS
+            .iter()
+            .copied()
+            .find(|s| *s == v)
+            .unwrap_or(HUB_DEFAULT_PROTOCOL_VERSION),
+        None => HUB_DEFAULT_PROTOCOL_VERSION,
+    }
+}
+
+/// `server/discover` 的旧时代回答文案:2026-07-28 spec 建议服务器在时代不匹配的错误里点名支持的
+/// 版本 ——「this message may be the only diagnostic they can surface to users」。
+fn legacy_era_discover_hint() -> String {
+    format!(
+        "vigil-hub is a legacy-era MCP server: open with `initialize` (supported protocol versions: {}).          Modern-era (2026-07-28) per-request negotiation is not implemented yet; dual-era clients          should fall back to `initialize` per the 2026-07-28 stdio backward-compatibility rules.",
+        HUB_SERVER_PROTOCOL_VERSIONS.join(", ")
+    )
+}
+
 /// Hub 配置。
 #[derive(Debug, Clone)]
 pub struct HubConfig {
@@ -869,6 +902,15 @@ impl Hub {
             "shutdown" => Ok(Some(req.success(Value::Null))),
             "ping" => Ok(Some(req.success(json!({})))),
             "notifications/cancelled" => Ok(None),
+            // 2026-07-28 现代时代客户端的时代探针。Hub 当前是**旧时代**服务器(以 `initialize` 开场),
+            // 按 spec 的 stdio 向后兼容规则,回一个**非现代**错误(-32601)即可让双时代客户端回退到
+            // `initialize`;绝不能假造 DiscoverResult(那会让客户端跳过握手、按现代语义直发请求)。
+            // 消息里点名支持版本与开场方式:现代专属客户端「fail deterministically」时能把它呈现给用户。
+            "server/discover" => Ok(Some(req.error(
+                JsonRpcError::METHOD_NOT_FOUND,
+                legacy_era_discover_hint(),
+                None,
+            ))),
             "tools/list" => self.handle_tools_list(req),
             "tools/call" => self.handle_tools_call(req),
             _ => Ok(Some(req.error(
@@ -886,8 +928,11 @@ impl Hub {
             let mut g = self.session_id.lock().map_err(|_| HubError::LockPoisoned)?;
             *g = Some(sid);
         }
+        // 旧时代版本协商(legacy spec):客户端提议的版本若在服务端支持集内,**必须**回同一版本;
+        // 否则回我们的默认版本。现代版本(2026-07-28+)不在集内 → 回默认,客户端按其规则处理。
+        let negotiated = negotiate_legacy_version(req.params.as_ref());
         Ok(Some(req.success(json!({
-            "protocolVersion": "2025-06-18",
+            "protocolVersion": negotiated,
             "capabilities": {
                 "tools": { "listChanged": false }
             },
@@ -2256,6 +2301,38 @@ mod tests {
             params: None,
         };
         assert!(!req.is_notification());
+    }
+
+    /// P0-3a:旧时代版本协商 —— 提议版本在支持集内则回显,否则回默认;现代版本(2026-07-28)回默认。
+    #[test]
+    fn negotiate_legacy_version_echoes_supported_and_defaults_otherwise() {
+        let req = |v: &str| json!({ "protocolVersion": v });
+        assert_eq!(
+            negotiate_legacy_version(Some(&req("2025-11-25"))),
+            "2025-11-25"
+        );
+        assert_eq!(
+            negotiate_legacy_version(Some(&req("2024-11-05"))),
+            "2024-11-05"
+        );
+        assert_eq!(
+            negotiate_legacy_version(Some(&req("2026-07-28"))),
+            "2025-06-18"
+        );
+        assert_eq!(
+            negotiate_legacy_version(Some(&req("garbage"))),
+            "2025-06-18"
+        );
+        assert_eq!(negotiate_legacy_version(None), "2025-06-18");
+        // 支持集新→旧,且不含现代版本
+        assert_eq!(HUB_SERVER_PROTOCOL_VERSIONS[0], "2025-11-25");
+        assert!(!HUB_SERVER_PROTOCOL_VERSIONS.contains(&"2026-07-28"));
+        // discover 提示点名全部支持版本与开场方式
+        let hint = legacy_era_discover_hint();
+        for v in HUB_SERVER_PROTOCOL_VERSIONS {
+            assert!(hint.contains(v), "{hint}");
+        }
+        assert!(hint.contains("initialize"), "{hint}");
     }
 
     #[test]

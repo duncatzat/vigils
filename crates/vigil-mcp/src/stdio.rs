@@ -68,6 +68,25 @@ pub enum StdioError {
         /// 净化后才渲染,字段本身保留原值供程序判定)。
         negotiated: String,
     },
+    /// 上游**只讲现代时代 MCP**(2026-07-28+:无 `initialize` 握手、版本随每请求 `_meta` 协商)。
+    ///
+    /// 判定依据(2026-07-28 spec「Backward Compatibility」):`initialize` 被上游以 JSON-RPC error
+    /// 拒绝后,用 `server/discover` 探针确定性判别 —— 探针得到 `DiscoverResult`(或
+    /// `UnsupportedProtocolVersionError` -32022)即现代服务器;其它错误/超时才是旧时代服务器
+    /// (此时保留原 `initialize` 错误)。按兼容矩阵「Legacy client × Modern server = Fails」,
+    /// vigil-hub 当前作为旧时代客户端无法接入 → fail-closed,但给出**可操作**诊断而非笼统 protocol
+    /// 错误(P0-3a:doctor 显式报「版本不兼容」而非静默断开)。
+    #[error(
+        "upstream speaks modern-era MCP only (no initialize handshake; it advertises {}) - vigil-hub \
+         currently speaks legacy MCP up to {}; modern-era client support is planned",
+        render_supported(.supported),
+        SUPPORTED_PROTOCOL_VERSIONS[0]
+    )]
+    ModernOnlyUpstream {
+        /// 上游 `server/discover` 结果里的 `supportedVersions`(不可信上游输入;已截断到
+        /// `MAX_SUPPORTED_LISTED` 条,Display 逐条经 `safe_protocol_version` 净化)。
+        supported: Vec<String>,
+    },
 }
 
 /// `ProtocolVersionUnsupported.negotiated` 的 Display 净化(Codex D18 R2 Medium):该值来自上游
@@ -92,6 +111,19 @@ fn safe_protocol_version(negotiated: &str) -> String {
     }
 }
 
+/// `ModernOnlyUpstream.supported` 的 Display 渲染:逐条 `safe_protocol_version` 净化(同源不可信输入
+/// 处理),空列表给出明确占位而非空串。列表长度在采集侧已截断(`MAX_SUPPORTED_LISTED`)。
+fn render_supported(supported: &[String]) -> String {
+    if supported.is_empty() {
+        return "no version list".to_string();
+    }
+    supported
+        .iter()
+        .map(|v| safe_protocol_version(v))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// 把不可信的上游错误 `message` 折叠成 sha256 指纹供 `StdioError::Upstream` 的 `Display`。
 ///
 /// 上游 JSON-RPC `error.message` 由远端 server 控制、属不可信输入,可能携带 secret。若原样进
@@ -113,7 +145,56 @@ type PendingTable = Arc<Mutex<HashMap<String, Sender<Value>>>>;
 /// (`ProtocolVersionUnsupported`)。
 ///
 /// 版本来源:MCP spec 历次修订(modelcontextprotocol.io/specification)。新增协议修订时在此登记。
-const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// `server/discover` 探针携带的现代时代版本(2026-07-28 为首个「无握手、按请求 `_meta` 协商」修订)。
+/// 仅用于**判别上游时代**,vigil-hub 尚未实现现代时代客户端语义(Phase 1 第二刀)。
+const MODERN_PROBE_VERSION: &str = "2026-07-28";
+
+/// 2026-07-28 `UnsupportedProtocolVersionError` 的错误码:现代服务器对未支持版本的**确定性**回答
+/// (spec:收到它的客户端应从 `supported` 列表重选版本重试,**不得**回退 `initialize`)。
+const UNSUPPORTED_PROTOCOL_VERSION_CODE: i32 = -32022;
+
+/// 采集上游 `supportedVersions` 的上限(不可信输入:防恶意上游塞超长列表撑爆诊断/日志)。
+const MAX_SUPPORTED_LISTED: usize = 8;
+
+/// 2026-07-28 stdio「Backward Compatibility」三分支裁决(纯函数,无 I/O):
+/// - 探针得到 `DiscoverResult`(含 `supportedVersions`)→ 现代专属上游(`ModernOnlyUpstream`);
+/// - 探针得到 `UnsupportedProtocolVersionError`(-32022)→ 同样是现代服务器(它认识现代协议,
+///   只是不支持探针版本;spec 明确此时不得回退 initialize);
+/// - 其它错误 / 超时 → 旧时代服务器:保留**原 initialize 错误**,不因探针改写诊断。
+fn classify_probe_outcome(
+    init_code: i32,
+    init_message: String,
+    probe: Result<Value, StdioError>,
+) -> StdioError {
+    match probe {
+        Ok(result) => {
+            let supported = result
+                .get("supportedVersions")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .take(MAX_SUPPORTED_LISTED)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            StdioError::ModernOnlyUpstream { supported }
+        }
+        Err(StdioError::Upstream { code, .. }) if code == UNSUPPORTED_PROTOCOL_VERSION_CODE => {
+            StdioError::ModernOnlyUpstream {
+                supported: Vec::new(),
+            }
+        }
+        Err(_) => StdioError::Upstream {
+            code: init_code,
+            message: init_message,
+        },
+    }
+}
 
 /// O3(ADR 0007 §I-7.1 amendment,Codex ACCEPT-design 2026-06-01):把 `argv[0]` 解析为
 /// **绝对路径**。
@@ -498,7 +579,18 @@ impl StdioUpstream {
             "clientInfo": { "name": "vigil-hub", "version": env!("CARGO_PKG_VERSION") },
         });
         // initialize 请求:等响应 = 确认 server 就绪 + 完成协议协商
-        let result = self.call_raw("initialize", Some(params), timeout)?;
+        let result = match self.call_raw("initialize", Some(params), timeout) {
+            Ok(v) => v,
+            // 上游以 JSON-RPC error 拒绝 initialize:可能是现代专属服务器(2026-07-28+ 无此方法,
+            // 以实现自定义错误拒绝)。按 spec 用 server/discover 探针确定性判别,探针超时收紧
+            // (上游已证明在线且会应答,不必再给冷启动余量)。超时/协议错误不在此分支:无法与
+            // 慢启动区分,保持原语义。
+            Err(StdioError::Upstream { code, message }) => {
+                let probe_timeout = timeout.min(Duration::from_secs(5));
+                return Err(self.classify_initialize_rejection(code, message, probe_timeout));
+            }
+            Err(e) => return Err(e),
+        };
         // 版本协商核对(Codex review SHOULD-FIX):server 在响应里回它选定的版本;若回的版本不在
         // 我们支持集内,按 MCP spec 客户端应断开 → fail-closed 返 Err(caller NON-FATAL:log +
         // attach 但其 tools 不可用,避免"以为协商成功却跑在不兼容协议上")。
@@ -512,6 +604,28 @@ impl StdioUpstream {
         }
         // initialized 通知:无此通知 server 不进入 operational 状态(MCP 生命周期)
         self.notify_raw("notifications/initialized", None)
+    }
+
+    /// `initialize` 被上游拒绝后的时代判别:发 `server/discover` 探针(带现代 `_meta`),把探针
+    /// 结果交给纯函数 [`classify_probe_outcome`] 裁决。网络与裁决分离,便于对裁决逻辑做无进程单测。
+    fn classify_initialize_rejection(
+        &self,
+        init_code: i32,
+        init_message: String,
+        probe_timeout: Duration,
+    ) -> StdioError {
+        let params = json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROBE_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "vigil-hub",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            }
+        });
+        let probe = self.call_raw("server/discover", Some(params), probe_timeout);
+        classify_probe_outcome(init_code, init_message, probe)
     }
 
     /// 关闭 stdin 并等待子进程终止。best-effort,不抛异常。
@@ -568,6 +682,10 @@ impl crate::upstream::McpUpstream for StdioUpstream {
             Err(StdioError::ProtocolVersionUnsupported { .. }) => Err(UpstreamError::TransportIo(
                 "stdio_protocol_version_unsupported",
             )),
+            // 仅 initialize_handshake 路径产生;现代专属上游 = 传输层不兼容(fail-closed)
+            Err(StdioError::ModernOnlyUpstream { .. }) => {
+                Err(UpstreamError::TransportIo("stdio_upstream_modern_era_only"))
+            }
             Err(StdioError::LockPoisoned) => Err(UpstreamError::Internal("stdio_lock_poisoned")),
         }
     }
@@ -696,7 +814,7 @@ mod resolve_program_tests {
 #[cfg(test)]
 #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 mod display_redaction_tests {
-    use super::StdioError;
+    use super::*;
 
     /// stderr-leak HIGH(Codex wrap R1 守门):`StdioError::Upstream` 的 `Display` 绝不原样回显
     /// 上游不可信 `message`;只暴露 sha256 指纹(与 `impl McpUpstream::call` 的
@@ -757,5 +875,98 @@ mod display_redaction_tests {
             "不得泄漏 secret 形态: {bad}"
         );
         assert!(bad.contains("sha256:"), "异常 negotiated 应降级指纹: {bad}");
+    }
+
+    /// P0-3a:版本白名单纳入 2025-11-25(stdio 工具面无强制新语义),且以最新版本发起提议。
+    #[test]
+    fn supported_versions_include_2025_11_25_and_propose_newest_first() {
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&"2025-11-25"));
+        assert!(SUPPORTED_PROTOCOL_VERSIONS.contains(&"2025-06-18"));
+        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS[0], "2025-11-25");
+        // 新→旧单调(提议顺序 = 偏好顺序)
+        let mut sorted = SUPPORTED_PROTOCOL_VERSIONS.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(sorted, SUPPORTED_PROTOCOL_VERSIONS);
+        // 现代探针版本**不在**白名单:尚未实现现代客户端语义,绝不能把它当作已支持
+        assert!(!SUPPORTED_PROTOCOL_VERSIONS.contains(&MODERN_PROBE_VERSION));
+    }
+
+    /// 探针得到 DiscoverResult → 现代专属上游,supportedVersions 被采集并截断。
+    #[test]
+    fn classify_discover_result_as_modern_only_and_caps_supported_list() {
+        let many: Vec<Value> = (0..20)
+            .map(|i| Value::String(format!("2026-07-{:02}", i + 1)))
+            .collect();
+        let probe = Ok(json!({
+            "resultType": "complete",
+            "supportedVersions": many,
+            "capabilities": {},
+            "cacheScope": "public",
+            "ttlMs": 60000,
+        }));
+        match classify_probe_outcome(-32601, "method not found".into(), probe) {
+            StdioError::ModernOnlyUpstream { supported } => {
+                assert_eq!(supported.len(), MAX_SUPPORTED_LISTED);
+                assert_eq!(supported[0], "2026-07-01");
+            }
+            other => panic!("expected ModernOnlyUpstream, got {other:?}"),
+        }
+    }
+
+    /// 探针得到 -32022 → 现代服务器(spec:不得回退 initialize),supported 为空但判定不变。
+    #[test]
+    fn classify_unsupported_protocol_version_error_as_modern_only() {
+        let probe = Err(StdioError::Upstream {
+            code: UNSUPPORTED_PROTOCOL_VERSION_CODE,
+            message: "Unsupported protocol version".into(),
+        });
+        match classify_probe_outcome(-32601, "method not found".into(), probe) {
+            StdioError::ModernOnlyUpstream { supported } => assert!(supported.is_empty()),
+            other => panic!("expected ModernOnlyUpstream, got {other:?}"),
+        }
+    }
+
+    /// 探针得到其它错误 / 超时 → 旧时代服务器:原 initialize 错误原样保留(不被探针改写)。
+    #[test]
+    fn classify_other_probe_failures_preserve_original_initialize_error() {
+        for probe in [
+            Err(StdioError::Upstream {
+                code: -32601,
+                message: "unknown method".into(),
+            }),
+            Err(StdioError::Timeout(Duration::from_millis(1))),
+        ] {
+            match classify_probe_outcome(-32000, "init rejected".into(), probe) {
+                StdioError::Upstream { code, message } => {
+                    assert_eq!(code, -32000);
+                    assert_eq!(message, "init rejected");
+                }
+                other => panic!("expected original Upstream error, got {other:?}"),
+            }
+        }
+    }
+
+    /// ModernOnlyUpstream 的 Display:合法版本原样、异常条目指纹化、空列表有占位;
+    /// 且点名当前最高旧时代版本(可操作诊断)。
+    #[test]
+    fn modern_only_display_is_actionable_and_sanitized() {
+        let shown = StdioError::ModernOnlyUpstream {
+            supported: vec![
+                "2026-07-28".into(),
+                "ghp_1234567890abcdef1234567890abcdef12345678".into(),
+            ],
+        }
+        .to_string();
+        assert!(shown.contains("2026-07-28"), "{shown}");
+        assert!(shown.contains("sha256:"), "异常条目应指纹化: {shown}");
+        assert!(
+            !shown.contains("ghp_1234567890"),
+            "不得泄漏上游字节: {shown}"
+        );
+        assert!(shown.contains(SUPPORTED_PROTOCOL_VERSIONS[0]), "{shown}");
+        assert!(shown.contains("modern-era"), "{shown}");
+
+        let empty = StdioError::ModernOnlyUpstream { supported: vec![] }.to_string();
+        assert!(empty.contains("no version list"), "{empty}");
     }
 }

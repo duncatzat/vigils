@@ -530,3 +530,58 @@ fn b2_stage2_strict_upstream_requires_handshake_regression() {
     );
     drop(hub);
 }
+
+/// P0-3a 集成:vigil-hub 作为旧时代客户端遇到**现代专属**(2026-07-28+)上游 —— `initialize` 被拒后
+/// 用 `server/discover` 探针确定性判出「modern-era only」,诊断点名对方版本与我方最高旧时代版本。
+/// 用 Node 起 `mock-mcp-modern-only.mjs`;本机无 Node 则 skip(与 b2_stage2 同策略)。
+#[test]
+fn p03a_modern_only_upstream_is_reported_actionably() {
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !node_ok {
+        eprintln!("[p03a] skip: node not runnable");
+        return;
+    }
+    // 不做 canonicalize:Windows 上会得到 `\\?\` verbatim 前缀,node 对其报 MODULE_NOT_FOUND 并立刻退出
+    // (表现为 stdout EOF → 假「超时」)。`..` 由 node 自行解析即可。
+    let mock_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/test-local/mock-mcp-modern-only.mjs");
+    assert!(
+        mock_script.is_file(),
+        "mock-mcp-modern-only.mjs missing at {}",
+        mock_script.display()
+    );
+    let argv = vec![
+        "node".to_string(),
+        mock_script.to_string_lossy().into_owned(),
+    ];
+    let err = vigil_mcp::stdio::probe_stdio_initialize(
+        "modern-only",
+        &argv,
+        &[],
+        std::time::Duration::from_secs(20),
+    )
+    .expect_err("modern-only upstream must not pass a legacy handshake");
+    let shown = err.to_string();
+    assert!(
+        shown.contains("modern-era"),
+        "diagnosis must name the era: {shown}"
+    );
+    assert!(
+        shown.contains("2026-07-28"),
+        "diagnosis must show upstream versions: {shown}"
+    );
+    assert!(
+        shown.contains("2025-11-25"),
+        "diagnosis must name our highest legacy version: {shown}"
+    );
+    assert!(
+        !shown.contains("code=-32601"),
+        "must not be reported as a generic method-not-found: {shown}"
+    );
+}
