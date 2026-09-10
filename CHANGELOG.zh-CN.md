@@ -85,6 +85,11 @@ Vigils 的所有重要变更记录于此。格式遵循
   保持稳定。Gemini / Cursor 不变。
   诚实边界:触发条件与 Claude 面同一套硬指纹规则,**含 `env_assignment`(`KEY|TOKEN|SECRET|PASSWORD|AUTH=值`)启发式**,
   读 `.env.example` / CI YAML 之类占位值也会被 withheld-and-redacted(模型仍拿到占位符版全文,只多一行说明)。
+- **超界 / 畸形 hook 事件在 Codex `PostToolUse` / `UserPromptSubmit` 上 fail-open。** 16 MiB stdin 上限、
+  stdin 读失败与 JSON 畸形此前一律回 `PreToolUse` 形状的 deny(`hookSpecificOutput.permissionDecision`),
+  Codex 在另外两个事件上会忽略它,超大工具结果或 prompt 未经扫描就进了模型。现在 hook 从缓冲区窥视
+  `hook_event_name`,按事件同形 fail-closed:`PostToolUse` 且结果守门生效 → 整个结果扣留成说明文本
+  (Claude `updatedToolOutput` / Codex block);`UserPromptSubmit` → 阻止 prompt;其余仍是 `PreToolUse` deny。
 - **MSRV 声明已过期** -- `rust-version = "1.80"`,而依赖树(wasmtime 44,修
   RUSTSEC-2026-0114 所需)实际需要 rustc 1.95。旧工具链用户会在依赖深处收到
   难懂的语法错误而非清晰的"Rust 版本过旧"提示。声明现已改为 `1.95`,与事实一致。

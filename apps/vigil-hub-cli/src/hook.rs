@@ -623,24 +623,32 @@ pub fn run<R: Read>(args: &HookArgs, stdin: &mut R) -> HookOutcome {
     // 1) 读 stdin —— **有界**读取(Codex R1 HIGH)。读 MAX+1 字节,超出即 deny;读失败也 deny。
     let mut buf = String::new();
     let mut limited = stdin.by_ref().take(MAX_HOOK_INPUT_BYTES + 1);
+    //    三处早期失败时事件**未解析**,拦截形状须与事件同形(见 fail_closed_unparsed),否则
+    //    PreToolUse 形状的 deny 在 PostToolUse / UserPromptSubmit 上会被 Codex 忽略 = fail-open。
     if limited.read_to_string(&mut buf).is_err() {
-        return HookOutcome::Deny(
-            "Vigil hook: could not read the hook event from stdin (blocked fail-closed).".into(),
+        return fail_closed_unparsed(
+            args,
+            &buf,
+            "Vigil hook: could not read the hook event from stdin (blocked fail-closed).",
         );
     }
     if buf.len() as u64 > MAX_HOOK_INPUT_BYTES {
-        return HookOutcome::Deny(
-            "Vigil hook: the hook event exceeds the safe size limit (blocked fail-closed).".into(),
+        return fail_closed_unparsed(
+            args,
+            &buf,
+            "Vigil hook: the hook event exceeds the safe size limit (blocked fail-closed).",
         );
     }
 
-    // 2) 解析 JSON。解析失败 = 畸形事件 → fail-closed deny。
+    // 2) 解析 JSON。解析失败 = 畸形事件 → fail-closed(形状同上按事件分流)。
     //    消息用「hook event」而非写死「PreToolUse」—— 同一入口也接 PostToolUse 等事件(F-12)。
     let raw: Value = match serde_json::from_str(&buf) {
         Ok(v) => v,
         Err(_) => {
-            return HookOutcome::Deny(
-                "Vigil hook: malformed hook event input (blocked fail-closed).".into(),
+            return fail_closed_unparsed(
+                args,
+                &buf,
+                "Vigil hook: malformed hook event input (blocked fail-closed).",
             );
         }
     };
@@ -1888,14 +1896,9 @@ fn try_result_redaction(args: &HookArgs, raw: &Value) -> Option<HookOutcome> {
     // injection 启用 → 完整再脱敏(逆替换 + 硬指纹);仅 `--redact-results` 启用 → 硬指纹 scrub only
     // (无状态、无声明 secret 依赖,独立于 `--inject`;#12)。两者皆未开 → pass-through(零行为回归)。
     let inj_opt = args.injection.as_ref().filter(|i| i.enabled);
-    // ML 增强(engine=ml/auto)是结果再脱敏的**第三个触发器**(独立于 injection / `--redact-results`):
-    // 三者皆未开 → pass-through(零行为回归)。ML 脱敏与硬指纹 scrub 同样需 updatedToolOutput(仅 Claude)。
-    // Codex:结果守门**默认开**(硬指纹 scrub → block+reason),不依赖 `--redact-results` flag —— 故意不改
-    // Codex 的 hook 定义(codex trust hash 覆盖 hook 定义,定义一变全体用户重触发 /hooks 信任门)。
-    let codex_default_scrub = args.cli == CliKind::Codex;
-    if (inj_opt.is_none() && !args.redact_results && !args.ml_enabled() && !codex_default_scrub)
-        || !cli_supports_result_redaction(args.cli)
-    {
+    // 触发口径(四个触发器任一 + CLI 支持)统一在 result_redaction_active,与超界/畸形输入的
+    // 兜底 fail_closed_unparsed 共用,两处永不漂移。
+    if !result_redaction_active(args) {
         return None;
     }
     // 工具名(精确路由)。#3 二次传播兜底:再脱敏面从"仅边界工具"扩到所有 **native** 工具。
@@ -2403,6 +2406,73 @@ fn sha256_hex(s: &str) -> String {
 
 /// 事件名归一(参照 CodeIsland EventNormalizer):CLI 特定映射先行,通用 snake/camel/Pascal
 /// 折叠兜底(去 `_`/`-` 后小写比较),未识别按原名透传(调用方与 `"PreToolUse"` 比较即不命中)。
+/// PostToolUse 结果再脱敏是否对本次调用生效:injection / `--redact-results` / ML 引擎三个触发器,
+/// 外加 Codex **默认开**(硬指纹 scrub → block+reason,不依赖 `--redact-results` flag —— 故意不改
+/// Codex 的 hook 定义:codex trust hash 覆盖 hook 定义,定义一变全体用户重触发 /hooks 信任门);
+/// 且 CLI 必须支持结果改写。[`try_result_redaction`] 与 [`fail_closed_unparsed`] 共用此口径。
+fn result_redaction_active(args: &HookArgs) -> bool {
+    let injection_on = args.injection.as_ref().is_some_and(|i| i.enabled);
+    let codex_default_scrub = args.cli == CliKind::Codex;
+    (injection_on || args.redact_results || args.ml_enabled() || codex_default_scrub)
+        && cli_supports_result_redaction(args.cli)
+}
+
+/// 早期失败(超界 / stdin 读失败 / 畸形 JSON)时事件**未解析**,而拦截响应契约按事件不同形:
+/// PreToolUse 形状的 deny 在 PostToolUse / UserPromptSubmit 上会被 Codex 忽略,超大结果 / prompt
+/// 原样进模型 = fail-open(敌意评审 2026-09-11)。这里从已读缓冲区**窥视**事件名,按事件返回同形的
+/// fail-closed 结果:
+/// - PostToolUse 且结果再脱敏生效 → 整个结果扣留,用说明文本替换(Claude `updatedToolOutput` /
+///   Codex block+reason;说明文本不含结果任何片段);未生效 → 与常规 PostToolUse 一样 pass-through
+///   (结果面本就不守门,回 deny 只是噪声),stderr 留痕。
+/// - UserPromptSubmit → 阻止 prompt 进模型(`DenyPrompt` 形状:Codex block / Claude exit 2)。
+/// - 其余 / 窥视不到 → PreToolUse 形状 deny(原行为,宁严勿松)。
+fn fail_closed_unparsed(args: &HookArgs, buf: &str, reason: &str) -> HookOutcome {
+    let event = peek_event_name(buf).map(|ev| normalize_event_name(args.cli, ev));
+    match event.as_deref() {
+        Some("PostToolUse") => {
+            if result_redaction_active(args) {
+                HookOutcome::RedactOutput {
+                    updated_output: Value::String(format!(
+                        "[Vigil] The raw tool result was withheld: {reason} It could not be \
+                         scanned for credentials, so none of it is shown."
+                    )),
+                    note: reason.to_string(),
+                }
+            } else {
+                eprintln!(
+                    "vigil-hook: {reason} PostToolUse result redaction is not enabled for this \
+                     CLI; passing the result through unchanged."
+                );
+                HookOutcome::Allow
+            }
+        }
+        Some("UserPromptSubmit") => HookOutcome::DenyPrompt(reason.to_string()),
+        _ => HookOutcome::Deny(reason.to_string()),
+    }
+}
+
+/// 不解析 JSON、只在缓冲区里找 `"hook_event_name": "<Name>"`(及 [`extract_str`] 同一组同义键)
+/// 的窥视器。两家 CLI 的真实 payload 里事件名键都排在巨型字段(`tool_response` / `prompt`)之前,
+/// 所以超界缓冲区(前 16 MiB)里必有它;取**最先出现**的键(顶层键先于任何嵌套或值内文本)。
+/// 值限 64 字节、不含转义;任何不匹配返回 `None`(回落 PreToolUse 形状 deny)。
+fn peek_event_name(buf: &str) -> Option<&str> {
+    const KEYS: [&str; 4] = [
+        "\"hook_event_name\"",
+        "\"hookEventName\"",
+        "\"event_name\"",
+        "\"eventName\"",
+    ];
+    let (pos, key) = KEYS
+        .iter()
+        .filter_map(|k| buf.find(k).map(|p| (p, *k)))
+        .min_by_key(|(p, _)| *p)?;
+    let rest = buf[pos + key.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let name = &rest[..end];
+    (end <= 64 && !name.contains('\\')).then_some(name)
+}
+
 fn normalize_event_name(cli: CliKind, raw: &str) -> String {
     let raw = raw.trim();
     // CLI 特定事件名(Gemini/Cursor 自有命名法)。Cursor 官方名是大写 MCP
@@ -3408,6 +3478,140 @@ mod tests {
             matches!(out, HookOutcome::Deny(_)),
             "oversize input must be denied before parse (fail-closed)"
         );
+    }
+
+    /// 超界输入的 fail-closed 必须与**事件同形**:PreToolUse 形状的 deny 在 PostToolUse 上会被 Codex
+    /// 忽略 → 超大结果原样进模型(敌意评审 2026-09-11 指出的 fail-open)。
+    #[test]
+    fn oversize_post_tool_use_is_withheld_in_post_tool_use_shape() {
+        let big = "a".repeat((MAX_HOOK_INPUT_BYTES as usize) + 1024);
+        let payload = format!(
+            r#"{{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{{"command":"cat big"}},"tool_response":"{big}"}}"#
+        );
+        // Codex:结果守门默认开 → 顶层 block + 说明(不是 hookSpecificOutput.permissionDecision)。
+        let args = HookArgs {
+            cli: CliKind::Codex,
+            ..HookArgs::default()
+        };
+        let out = run(&args, &mut Cursor::new(payload.clone().into_bytes()));
+        match &out {
+            HookOutcome::RedactOutput { updated_output, .. } => {
+                let text = updated_output.as_str().unwrap_or_default();
+                assert!(
+                    text.contains("withheld"),
+                    "notice must say the result was withheld"
+                );
+                assert!(
+                    !text.contains(&big[..64]),
+                    "notice must not carry any of the unscanned result"
+                );
+            }
+            other => panic!("expected RedactOutput for oversize PostToolUse, got {other:?}"),
+        }
+        let resp = respond(&out, CliKind::Codex);
+        let body: Value =
+            serde_json::from_str(resp.stdout.as_deref().unwrap_or_default()).unwrap_or_default();
+        assert_eq!(body["decision"], "block");
+        assert!(body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("withheld"));
+        assert!(body.get("hookSpecificOutput").is_none());
+        assert_eq!(resp.exit_code, 0);
+
+        // Claude(--redact-results):updatedToolOutput 用说明文本替换整个结果。
+        let args = HookArgs {
+            cli: CliKind::Claude,
+            redact_results: true,
+            ..HookArgs::default()
+        };
+        let out = run(&args, &mut Cursor::new(payload.into_bytes()));
+        assert!(matches!(out, HookOutcome::RedactOutput { .. }));
+        let resp = respond(&out, CliKind::Claude);
+        let body: Value =
+            serde_json::from_str(resp.stdout.as_deref().unwrap_or_default()).unwrap_or_default();
+        assert_eq!(body["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        assert!(body["hookSpecificOutput"]["updatedToolOutput"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("withheld"));
+    }
+
+    #[test]
+    fn oversize_post_tool_use_without_result_redaction_passes_through() {
+        // Claude 未开 --redact-results(结果面本就不守门):Allow,而不是回一个 Claude 会当 error
+        // 回喂模型的 exit 2(PostToolUse 上 exit 2 并不替换结果,只是噪声)。
+        let big = "a".repeat((MAX_HOOK_INPUT_BYTES as usize) + 1024);
+        let payload = format!(
+            r#"{{"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{{"command":"x"}},"tool_response":"{big}"}}"#
+        );
+        let out = run(&HookArgs::default(), &mut Cursor::new(payload.into_bytes()));
+        assert_eq!(out, HookOutcome::Allow);
+    }
+
+    #[test]
+    fn oversize_user_prompt_submit_blocks_in_prompt_shape() {
+        // Codex UserPromptSubmit 只认顶层 {"decision":"block"}:超大 prompt 也必须用这个形状挡下。
+        let big = "a".repeat((MAX_HOOK_INPUT_BYTES as usize) + 1024);
+        let payload = format!(r#"{{"hook_event_name":"UserPromptSubmit","prompt":"{big}"}}"#);
+        let args = HookArgs {
+            cli: CliKind::Codex,
+            ..HookArgs::default()
+        };
+        let out = run(&args, &mut Cursor::new(payload.into_bytes()));
+        assert!(matches!(out, HookOutcome::DenyPrompt(_)), "got {out:?}");
+        let resp = respond(&out, CliKind::Codex);
+        let body: Value =
+            serde_json::from_str(resp.stdout.as_deref().unwrap_or_default()).unwrap_or_default();
+        assert_eq!(body["decision"], "block");
+        assert!(body.get("hookSpecificOutput").is_none());
+    }
+
+    #[test]
+    fn malformed_post_tool_use_is_withheld_not_pretooluse_deny() {
+        // 畸形 JSON(被截断的 PostToolUse 事件)同样按事件同形扣留,而非被 Codex 忽略的 PreToolUse deny。
+        let payload = r#"{"session_id":"s","hook_event_name": "PostToolUse", "tool_name":"Bash", "tool_response":"trunc"#;
+        let args = HookArgs {
+            cli: CliKind::Codex,
+            ..HookArgs::default()
+        };
+        let out = run(&args, &mut Cursor::new(payload.as_bytes().to_vec()));
+        assert!(
+            matches!(out, HookOutcome::RedactOutput { .. }),
+            "got {out:?}"
+        );
+        // PreToolUse 畸形事件维持 deny(原行为)。
+        let payload =
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"x"#;
+        let out = run(&args, &mut Cursor::new(payload.as_bytes().to_vec()));
+        assert!(matches!(out, HookOutcome::Deny(_)), "got {out:?}");
+    }
+
+    #[test]
+    fn peek_event_name_takes_first_key_and_rejects_garbage() {
+        assert_eq!(
+            peek_event_name(r#"{"a":1,"hook_event_name" : "PostToolUse","x":"hook_event_name"}"#),
+            Some("PostToolUse")
+        );
+        assert_eq!(
+            peek_event_name(r#"{"hookEventName":"PreToolUse"}"#),
+            Some("PreToolUse")
+        );
+        // 顶层键先于值内出现的同名文本
+        assert_eq!(
+            peek_event_name(
+                r#"{"hook_event_name":"UserPromptSubmit","prompt":"\"hook_event_name\":\"PostToolUse\""}"#
+            ),
+            Some("UserPromptSubmit")
+        );
+        assert_eq!(peek_event_name(r#"{"tool_input":"..."}"#), None);
+        assert_eq!(peek_event_name(r#"{"hook_event_name":123}"#), None);
+        assert_eq!(
+            peek_event_name(r#"{"hook_event_name":"Post\"ToolUse"}"#),
+            None
+        );
+        let long = format!(r#"{{"hook_event_name":"{}"}}"#, "x".repeat(65));
+        assert_eq!(peek_event_name(&long), None);
     }
 
     #[test]

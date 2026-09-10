@@ -107,6 +107,14 @@ All notable changes to Vigils are documented here. The format follows
   `env_assignment` heuristic** (`KEY|TOKEN|SECRET|PASSWORD|AUTH=value`), so reading an `.env.example`
   or a CI YAML with placeholder values is also withheld-and-redacted (the model still receives the full
   placeholder text; only a one-line note is added).
+- **Oversized or malformed hook events failed open on Codex `PostToolUse` / `UserPromptSubmit`.**
+  The 16 MiB stdin cap, a stdin read error and malformed JSON all answered with the `PreToolUse`
+  deny shape (`hookSpecificOutput.permissionDecision`), which Codex ignores on the other two events,
+  so an oversized tool result or prompt reached the model unscanned. The hook now peeks
+  `hook_event_name` in the buffered input and fails closed in the matching shape: `PostToolUse`
+  with result redaction active withholds the whole result behind a notice (Claude
+  `updatedToolOutput` / Codex block), `UserPromptSubmit` blocks the prompt, everything else keeps the
+  `PreToolUse` deny.
 - **Declared MSRV was stale** - `rust-version = "1.80"` while the dependency
   tree (wasmtime 44, required for RUSTSEC-2026-0114) needs rustc 1.95. Users on
   old toolchains hit cryptic syntax errors deep in dependencies instead of a
