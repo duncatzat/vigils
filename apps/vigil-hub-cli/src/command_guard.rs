@@ -713,12 +713,11 @@ fn env_s_split(payload: &str) -> Vec<String> {
             }
             '\\' => match chars.next() {
                 // `\_` 是**唯一**的反斜杠分隔符(真 env 8.32:产生分隔用空格)。
-                Some('_') => {
-                    if has_tok {
-                        args.push(std::mem::take(&mut cur));
-                        has_tok = false;
-                    }
+                Some('_') if has_tok => {
+                    args.push(std::mem::take(&mut cur));
+                    has_tok = false;
                 }
+                Some('_') => {}
                 // `\c`:注释/截断——忽略其后全部字符(真 env 8.32 实证 E)。
                 Some('c') => break,
                 // `\t\n\r\f\v`:嵌入**字面**控制符到当前 token,**非**分隔符(真 env 8.32 实证 F)。

@@ -12,6 +12,21 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ### Added
 
+- **MCP 2026-07-28 互通第一刀。** 网关协议白名单纳入 `2025-11-25`(`initialize` 优先提议)。上游拒绝
+  `initialize` 时,网关按 2026-07-28 规范发 `server/discover` 探针,在 `serve` 日志与 `doctor --probe`
+  里点名双方版本地报出「仅现代时代」,而非笼统协议错误。Hub 自身对 `server/discover` 回 `-32601`
+  并点名 `initialize` 与支持版本(双时代客户端按规范回退;不假造 DiscoverResult),`initialize`
+  回显受支持的提议版本。诚实边界:Hub 两侧仍是旧时代实现,完整 2026-07-28 支持是独立里程碑。
+- **每日更新检查 = 采用计数(ADI)。** `serve --stdio` 与 `daemon start` 每天最多向
+  `https://vigils.ai/desktop-updates/<平台>/<版本>.json` 发一次 GET,URL 只含平台与运行版本,
+  User-Agent 为 `vigil-hub/<版本>`——无标识、无参数、无 body、不跟随跳转;本地唯一状态是节流时间戳。
+  关闭口:`vigil-hub version-ping off`、`VIGIL_NO_VERSION_PING=1`、`DO_NOT_TRACK=1`;新增
+  `vigil-hub version-ping status|on|off|check`。`hook` 路径永不联网(源码守门测试)。`setup` 动手前
+  打一行告知。详见 `docs/book/src/ops/update-check.zh-CN.md`。
+- **真 agent 契约金丝雀**(`tests/canary/`、`.github/workflows/canary.yml`,配置 `GLM_API_KEY` 前
+  仅手动触发):真装最新 Claude Code 与 Codex,用 GLM 模型驱动,在注册了 Vigil hook 的沙箱 HOME 里跑,
+  以审计账本断言 prompt 守门 / 工具输入拦截 / 结果脱敏 / 不误杀。Codex headless 用官方
+  `--dangerously-bypass-hook-trust`;Vigil 仍绝不替用户伪造 Codex hook 信任。
 - **CI 引入 cargo-deny 供应链门禁**(`deny.toml` + `ci.yml` 新增 `cargo-deny` job)。
   每次 push/PR 检查 advisories(RUSTSEC 漏洞、yanked crate)、license 兼容性、
   重复/外来依赖与依赖来源白名单。此前依赖漏洞盯梢是手工流程(wasmtime 25 -> 41
@@ -59,6 +74,17 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ### Fixed
 
+- **Claude Code 缺 prompt 守门。** `setup` 此前只为 Claude Code 注册 `PreToolUse` / `PostToolUse`,
+  贴进对话框的裸凭据会直接进模型(真 agent 金丝雀发现)。现在同时注册 `UserPromptSubmit`(无
+  `matcher`;exit 2 阻止 prompt 进模型并展示原因,绝不含 secret)。已安装用户在重跑 `vigil-hub setup`
+  前 `setup --status` 会如实报 `STALE`。
+- **Codex 工具结果把裸 secret 带进模型。** 结果再脱敏此前只走 Claude 的 `updatedToolOutput`,Codex
+  上 `cat` 出的 token 原样进了模型(金丝雀发现)。现在 Codex 的 `PostToolUse` hook 回
+  `{"decision":"block","reason":...}`,reason 携带**脱敏后**的结果(上限 64 KiB)——模型继续工作但拿不到
+  真值,账本记 `hook.posttooluse.redacted`。对 `--cli codex` 默认开启且不改注册命令,Codex trust hash
+  保持稳定。Gemini / Cursor 不变。
+  诚实边界:触发条件与 Claude 面同一套硬指纹规则,**含 `env_assignment`(`KEY|TOKEN|SECRET|PASSWORD|AUTH=值`)启发式**,
+  读 `.env.example` / CI YAML 之类占位值也会被 withheld-and-redacted(模型仍拿到占位符版全文,只多一行说明)。
 - **MSRV 声明已过期** -- `rust-version = "1.80"`,而依赖树(wasmtime 44,修
   RUSTSEC-2026-0114 所需)实际需要 rustc 1.95。旧工具链用户会在依赖深处收到
   难懂的语法错误而非清晰的"Rust 版本过旧"提示。声明现已改为 `1.95`,与事实一致。

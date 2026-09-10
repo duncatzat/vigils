@@ -12,6 +12,28 @@ All notable changes to Vigils are documented here. The format follows
 
 ### Added
 
+- **MCP 2026-07-28 interop, first cut.** The gateway's protocol whitelist now includes
+  `2025-11-25` (proposed first on `initialize`). When an upstream rejects `initialize`, the
+  gateway sends the 2026-07-28 `server/discover` probe and reports *modern-era only* with the
+  versions each side speaks (in `serve` logs and `doctor --probe`) instead of a generic protocol
+  error. The Hub itself answers `server/discover` with `-32601` naming `initialize` and its
+  supported versions (dual-era clients fall back per spec; no fake DiscoverResult), and echoes a
+  supported proposed version. Honest boundary: the Hub is still a legacy-era implementation on
+  both sides; full 2026-07-28 support is a separate milestone.
+- **Daily update check = adoption count (ADI).** `serve --stdio` and `daemon start` now make at
+  most one `GET https://vigils.ai/desktop-updates/<platform>/<version>.json` per day, with only
+  the platform and the running version in the URL and `vigil-hub/<version>` as User-Agent —
+  no identifiers, no query, no body, no redirects. The only local state is a throttle timestamp.
+  Kill switches: `vigil-hub version-ping off`, `VIGIL_NO_VERSION_PING=1`, `DO_NOT_TRACK=1`;
+  new `vigil-hub version-ping status|on|off|check`. The `hook` path never makes network calls
+  (source-guarded test). `setup` prints a one-line notice before applying. See
+  `docs/book/src/ops/update-check.md`.
+- **Real-agent contract canary** (`tests/canary/`, `.github/workflows/canary.yml`,
+  manual-dispatch until `GLM_API_KEY` is configured): installs the latest Claude Code and Codex,
+  drives them with a GLM model against a sandbox HOME with Vigil hooks registered, and asserts
+  prompt guarding / tool-input denial / result redaction / no over-blocking from the audit
+  ledger. Codex headless runs use the official `--dangerously-bypass-hook-trust`; Vigil still
+  never forges Codex hook trust.
 - **cargo-deny supply-chain gate in CI** (`deny.toml` + a `cargo-deny` job in
   `ci.yml`). Advisories (RUSTSEC vulnerabilities, yanked crates), license
   compatibility, duplicate/foreign dependency bans, and source restrictions are
@@ -69,6 +91,22 @@ All notable changes to Vigils are documented here. The format follows
 
 ### Fixed
 
+- **Claude Code prompt guard was missing.** `setup` registered only `PreToolUse` /
+  `PostToolUse` for Claude Code, so a bare credential pasted into the prompt went straight to
+  the model (found by the real-agent canary). `setup` now also registers `UserPromptSubmit`
+  (no `matcher`; exit 2 blocks the prompt and shows the reason, never the secret). Existing
+  installs report `STALE` in `setup --status` until `vigil-hub setup` is re-run.
+- **Codex tool results carried bare secrets to the model.** The result re-redaction path was
+  gated to Claude's `updatedToolOutput`, so on Codex a `cat` of a token reached the model
+  unredacted (found by the canary). Codex's `PostToolUse` hook now answers
+  `{"decision":"block","reason":...}` where the reason carries the *redacted* result (bounded
+  to 64 KiB) — the model keeps working but never sees the raw value — and the ledger records
+  `hook.posttooluse.redacted`. Enabled by default for `--cli codex` without changing the
+  registered hook command, so the Codex trust hash stays stable. Gemini / Cursor unchanged.
+  Honest boundary: the trigger is the same hard-fingerprint rule set as on Claude, **including the
+  `env_assignment` heuristic** (`KEY|TOKEN|SECRET|PASSWORD|AUTH=value`), so reading an `.env.example`
+  or a CI YAML with placeholder values is also withheld-and-redacted (the model still receives the full
+  placeholder text; only a one-line note is added).
 - **Declared MSRV was stale** - `rust-version = "1.80"` while the dependency
   tree (wasmtime 44, required for RUSTSEC-2026-0114) needs rustc 1.95. Users on
   old toolchains hit cryptic syntax errors deep in dependencies instead of a

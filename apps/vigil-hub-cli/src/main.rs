@@ -21,6 +21,7 @@ use vigil_hub_cli::serve::{self, ServeArgs};
 use vigil_hub_cli::setup::{self, SetupArgs};
 use vigil_hub_cli::setup_hooks;
 use vigil_hub_cli::setup_mcp::{self, McpServerClass};
+use vigil_hub_cli::update_check;
 use vigil_hub_cli::wrap::{self, WrapArgs};
 use vigil_hub_cli::{add_remote, AddRemoteArgs};
 
@@ -102,6 +103,10 @@ enum Command {
     /// `start` 前台运行(单实例:已运行则退出);`status` 查运行态。ort 构建 + 模型已缓存则暖载真
     /// PII scanner,否则 model-less(hook 落硬指纹)。
     Daemon(CliDaemonArgs),
+    /// 每日更新检查(同时是采用计数 ADI)的开关与状态:只发平台 + 版本号,不带任何标识;
+    /// 只从 `serve` / `daemon start` 发,`hook` 永不出站。
+    /// 关闭:`vigil-hub version-ping off` / `VIGIL_NO_VERSION_PING=1` / `DO_NOT_TRACK=1`。
+    VersionPing(CliVersionPingArgs),
     /// 安装 / 查 ML 模型(隐私 PII + 注入分类器,各 ~700MB)。turnkey:`model install` →
     /// `daemon start`(暖载)→ `engine set ml` → hook 走 ML。ort-gated(非 ML 变体报错指向变体)。
     /// 用法:`vigil-hub model install` / `vigil-hub model status`。
@@ -147,6 +152,29 @@ enum EngineCommand {
         #[arg(value_enum)]
         mode: serve::EngineMode,
     },
+}
+
+#[derive(clap::Args, Debug)]
+struct CliVersionPingArgs {
+    /// 省略子命令 = `status`。
+    #[command(subcommand)]
+    command: Option<VersionPingCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum VersionPingCommand {
+    /// 当前是否开启、由谁关闭、发到哪、上次尝试时间。
+    Status {
+        /// 机器可读 JSON 输出(schema 稳定、与界面语言无关)
+        #[arg(long)]
+        json: bool,
+    },
+    /// 开启(删除本机关闭标记;环境变量仍优先)。
+    On,
+    /// 关闭(写入本机关闭标记;本机不再发送任何更新检查)。
+    Off,
+    /// 立刻检查一次并打印结果(含失败原因;仍尊重关闭开关)。
+    Check,
 }
 
 #[derive(clap::Args, Debug)]
@@ -520,6 +548,8 @@ fn main() -> std::process::ExitCode {
                     },
                 )
             );
+            // 每日更新检查(再评估 §9 D1 已决):长驻入口之一。后台线程、best-effort、只写 stderr。
+            let _update_check = update_check::spawn_daily(lang);
             match serve::run(args) {
                 Ok(()) => {
                     eprintln!("{}", i18n::t(lang, i18n::Msg::ServeStopped));
@@ -587,6 +617,25 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(code)
         }
         Some(Command::Setup(args)) => {
+            // 事前告知(D1 硬约束 2):apply 类操作动手前说明 serve / daemon 之后会每日检查更新
+            //(只发平台 + 版本号)。只读 / 撤销 / JSON 模式不打印。
+            let is_apply = !(args.uninstall
+                || args.dry_run
+                || args.status
+                || args.doctor
+                || args.json
+                || (args.mcp && !args.apply));
+            if is_apply {
+                eprintln!(
+                    "{}",
+                    i18n::t(
+                        lang,
+                        i18n::Msg::UpdateCheckNotice {
+                            docs: vigil_update_check::DOCS_URL,
+                        },
+                    )
+                );
+            }
             if args.all {
                 // 一条命令全保护:hook + MCP wrap 一次完成(兑现 download→直接保护)。
                 match run_setup_all(lang, &args) {
@@ -687,6 +736,7 @@ fn main() -> std::process::ExitCode {
         Some(Command::Posture(args)) => run_posture(lang, args),
         Some(Command::Engine(args)) => run_engine(lang, args),
         Some(Command::Daemon(args)) => run_daemon(lang, args),
+        Some(Command::VersionPing(args)) => run_version_ping(lang, args),
         Some(Command::Model(args)) => run_model(lang, args),
     }
 }
@@ -790,6 +840,23 @@ fn run_daemon(lang: Lang, args: CliDaemonArgs) -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => fail_cmd(lang, "daemon", e),
+    }
+}
+
+/// `vigil-hub version-ping status|on|off`:每日更新检查的开关(逻辑在 [`update_check`])。
+fn run_version_ping(lang: Lang, args: CliVersionPingArgs) -> std::process::ExitCode {
+    let result = match args
+        .command
+        .unwrap_or(VersionPingCommand::Status { json: false })
+    {
+        VersionPingCommand::Status { json } => update_check::run_status(lang, json),
+        VersionPingCommand::On => update_check::run_set(lang, true),
+        VersionPingCommand::Off => update_check::run_set(lang, false),
+        VersionPingCommand::Check => update_check::run_check(lang),
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => fail_cmd(lang, "version-ping", e),
     }
 }
 
@@ -2971,12 +3038,16 @@ fn print_setup_report(
     if r.changed {
         match lang {
             Lang::En => {
-                println!("  Protection:    PreToolUse hook registered (all tools)");
+                println!(
+                    "  Protection:    PreToolUse + PostToolUse + UserPromptSubmit hooks registered (all tools + prompt guard)"
+                );
                 println!("  Hook command:  {}", r.hook_command);
                 println!("  Audit ledger:  {}", r.ledger.display());
             }
             Lang::Zh => {
-                println!("  防护状态:    已注册 PreToolUse hook(覆盖所有工具)");
+                println!(
+                    "  防护状态:    已注册 PreToolUse / PostToolUse / UserPromptSubmit hook(覆盖所有工具 + prompt 守门)"
+                );
                 println!("  Hook 命令:    {}", r.hook_command);
                 println!("  审计账本:    {}", r.ledger.display());
             }

@@ -17,6 +17,7 @@ members = [
     "crates/vigil-http-transport",
     "crates/vigil-sandbox-linux",
     "crates/vigil-sdk",
+    "crates/vigil-update-check",
     "apps/desktop",
     "apps/native-host",
     "apps/vigil-hub-cli",

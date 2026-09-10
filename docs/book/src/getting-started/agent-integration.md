@@ -59,7 +59,8 @@ vigil-hub setup --all
 
 1. **Native-tool input guard** — a `PreToolUse` hook so every tool call (Bash, Edit, Write, Read,
    MCP tools, …) is checked before it runs; a real credential heading *into* a tool is blocked
-   fail-closed and audited.
+   fail-closed and audited. Claude Code and Codex also get a `UserPromptSubmit` hook, so a bare
+   credential pasted into the prompt is blocked before it reaches the model.
 2. **MCP gateway** — rewrites each of your stdio MCP servers to run through Vigils, so secrets in
    tool **results** are scrubbed before the model sees them and every call is audited. Defaults to
    **monitor** posture (your servers stay usable; raw-secret block, result redaction, and audit
@@ -78,7 +79,7 @@ Restart Claude Code and you're protected.
 | Agent | Hook (native-tool gate) | MCP wrap (server gateway) | Config touched |
 |---|---|---|---|
 | Claude Code | ✅ | ✅ (user + local scope) | `~/.claude/settings.json` + `~/.claude.json` |
-| Codex CLI | ✅ (one-time `/hooks` approval inside Codex — **pending trust** until you approve) | ✅ (honors `$CODEX_HOME`) | `$CODEX_HOME/hooks.json` + `config.toml` |
+| Codex CLI | ✅ (one-time `/hooks` approval inside Codex — **pending trust** until you approve; headless / CI automation can run the hooks with Codex 0.154+ `codex exec --dangerously-bypass-hook-trust`, only where hook sources are already vetted) | ✅ (honors `$CODEX_HOME`) | `$CODEX_HOME/hooks.json` + `config.toml` |
 | Gemini CLI | ✅ | — (MCP lives inside the shared `settings.json`; later increment) | `~/.gemini/settings.json` |
 | Cursor | ✅ | ✅ | `~/.cursor/hooks.json` + `mcp.json` |
 | Windsurf | — | ✅ | `~/.codeium/windsurf/mcp_config.json` |

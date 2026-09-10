@@ -6263,6 +6263,7 @@ dependencies = [
  "oauth2",
  "once_cell",
  "regex",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_jcs",
@@ -6288,6 +6289,7 @@ dependencies = [
  "vigil-redaction",
  "vigil-runner",
  "vigil-types",
+ "vigil-update-check",
  "vigil-ui-protocol",
 ]
 
@@ -6454,6 +6456,14 @@ dependencies = [
  "vigil-audit",
  "vigil-runner-types",
  "vigil-types",
+]
+
+[[package]]
+name = "vigil-update-check"
+version = "0.7.0-beta.2"
+dependencies = [
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

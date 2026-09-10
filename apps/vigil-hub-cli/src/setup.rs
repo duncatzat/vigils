@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 // ── 常量(与 desktop `ledger_path.rs` 约定对齐:同一 ledger → 统一审计)──
 const CLAUDE_DIR: &str = ".claude";
 const SETTINGS_FILE: &str = "settings.json";
-const VIGIL_SUBDIR: &str = "Vigil";
+pub(crate) const VIGIL_SUBDIR: &str = "Vigil";
 const LEDGER_FILENAME: &str = "ledger.sqlite3";
 const LEDGER_ENV_VAR: &str = "VIGIL_LEDGER_PATH";
 /// Vigil 托管 hook 的专属标记 flag —— 唯一识别 Vigil 写的条目(避免宽/脆匹配)。
@@ -46,8 +46,10 @@ pub const VIGIL_HOOK_MARKER: &str = "--vigil-managed";
 pub(crate) const HOOK_TIMEOUT_SECS: u64 = 60;
 /// Vigil 在 Claude `settings.json` 注册的 hook 事件集。PreToolUse = 输入侧守门(secret 拦截 +
 /// posture 决策);PostToolUse = 结果再脱敏面(TASK-006 消费;在此前 hook 对该事件 pass-through,
-/// 注册无副作用,属前向兼容)。新增事件须同步 [`ensure_mergeable_shape`] 的形状校验。
-const CLAUDE_HOOK_EVENTS: [&str; 2] = ["PreToolUse", "PostToolUse"];
+/// 注册无副作用,属前向兼容);UserPromptSubmit = prompt 输入侧守门(根因 B:贴进对话框的裸凭据不走
+/// 工具调用;2026-09-10 金丝雀真机证实 Claude 会把裸 token 原样送进模型 —— 与 Codex 面对齐,契约 =
+/// exit 2 阻止 prompt 进模型并向用户展示 stderr)。新增事件须同步 [`ensure_mergeable_shape`] 的形状校验。
+const CLAUDE_HOOK_EVENTS: [&str; 3] = ["PreToolUse", "PostToolUse", "UserPromptSubmit"];
 
 /// `setup` 子命令参数。
 #[derive(Debug, Clone, Default)]
@@ -394,12 +396,15 @@ pub(crate) fn command_is_vigil_managed(command: &str) -> bool {
     command.split_whitespace().any(|t| t == VIGIL_HOOK_MARKER)
 }
 
-/// Vigil 的 canonical PreToolUse 条目。
-fn vigil_entry(command: &str) -> Value {
-    json!({
-        "matcher": "*",
-        "hooks": [{ "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS }]
-    })
+/// Vigil 的 canonical 条目。工具事件(Pre/PostToolUse)带 `matcher: "*"`(覆盖全部工具,含 `mcp__*`);
+/// `UserPromptSubmit` 无 matcher 语义(Claude hooks 文档:该事件不使用 matcher),条目只含 `hooks`。
+fn vigil_entry(event: &str, command: &str) -> Value {
+    let hooks = json!([{ "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS }]);
+    if event == "UserPromptSubmit" {
+        json!({ "hooks": hooks })
+    } else {
+        json!({ "matcher": "*", "hooks": hooks })
+    }
 }
 
 /// 校验既有配置形状,**只接受**能安全合并的形状,否则返 [`SetupError::UnsupportedConfigShape`]。
@@ -421,6 +426,7 @@ fn ensure_mergeable_shape(settings: &Value, path: &Path) -> Result<(), SetupErro
         for (event, field) in [
             ("PreToolUse", "hooks.PreToolUse"),
             ("PostToolUse", "hooks.PostToolUse"),
+            ("UserPromptSubmit", "hooks.UserPromptSubmit"),
         ] {
             if let Some(arr) = hooks.get(event) {
                 if !arr.is_array() {
@@ -437,10 +443,10 @@ fn ensure_mergeable_shape(settings: &Value, path: &Path) -> Result<(), SetupErro
 /// 追加唯一 canonical;非 Vigil 条目原样保留。`changed` = 任一事件原本不是"恰好一条且等于 canonical"
 /// (覆盖:新装 / ledger/exe 漂移替换 / 去重 / 旧版只注册了 PreToolUse 的升级补全)。
 fn merge_install(mut settings: Value, command: &str) -> (bool, Value) {
-    let canonical = vigil_entry(command);
     let mut changed = false;
 
     for event in CLAUDE_HOOK_EVENTS {
+        let canonical = vigil_entry(event, command);
         let existing: Vec<Value> = settings
             .get("hooks")
             .and_then(|h| h.get(event))
@@ -835,10 +841,11 @@ fn protection_state(
     };
     // canonical 也按 ledger 归一:status 不带 --ledger 时按默认 ledger 重算 canonical,但注册串可能是用户
     // 安装时给的自定义 ledger —— 归一后只比 exe/flag/结构,自定义 ledger 不再误报 STALE(真机回归)。
-    let canonical_norm = entry_ledger_normalized(&vigil_entry(canonical_command));
     let mut any_vigil = false;
-    let mut all_canonical = canonical_norm.is_some();
+    let mut all_canonical = true;
     for event in CLAUDE_HOOK_EVENTS {
+        let canonical_norm = entry_ledger_normalized(&vigil_entry(event, canonical_command));
+        all_canonical &= canonical_norm.is_some();
         let vigil: Vec<&Value> = s
             .get("hooks")
             .and_then(|h| h.get(event))
@@ -977,7 +984,8 @@ mod tests {
         let c = cmd(&exe(), &ledger());
         let (changed, out) = merge_install(json!({}), &c);
         assert!(changed);
-        // 注册面完整化:PreToolUse(输入守门)+ PostToolUse(结果再脱敏面)两个事件都注册。
+        // 注册面完整化:PreToolUse(输入守门)+ PostToolUse(结果再脱敏面)+ UserPromptSubmit(prompt 守门)
+        // 三个事件都注册;UserPromptSubmit 无 matcher(Claude 该事件不使用 matcher)。
         for event in CLAUDE_HOOK_EVENTS {
             let arr = out["hooks"][event].as_array().unwrap();
             assert_eq!(arr.len(), 1, "{event} must have exactly one entry");
@@ -985,7 +993,14 @@ mod tests {
                 is_vigil_entry(&arr[0]),
                 "{event} entry must be Vigil-managed"
             );
-            assert_eq!(arr[0]["matcher"], "*");
+            if event == "UserPromptSubmit" {
+                assert!(
+                    arr[0].get("matcher").is_none(),
+                    "UserPromptSubmit entry must not carry a matcher"
+                );
+            } else {
+                assert_eq!(arr[0]["matcher"], "*");
+            }
             assert_eq!(
                 arr[0]["hooks"][0]["timeout"],
                 json!(HOOK_TIMEOUT_SECS),
@@ -998,7 +1013,7 @@ mod tests {
     fn legacy_pretooluse_only_install_is_upgraded_and_reported_stale_before() {
         // 旧版只注册了 PreToolUse:status 应诚实报 Stale(注册面不完整),重跑 setup 补全 PostToolUse。
         let c = cmd(&exe(), &ledger());
-        let legacy = json!({ "hooks": { "PreToolUse": [vigil_entry(&c)] } });
+        let legacy = json!({ "hooks": { "PreToolUse": [vigil_entry("PreToolUse", &c)] } });
         assert_eq!(
             protection_state(Some(&legacy), &c, &exe()),
             ProtectionState::Stale,
@@ -1060,8 +1075,8 @@ mod tests {
             shell_quote("vigil-hub")
         );
         let broken = json!({ "hooks": {
-            "PreToolUse":  [vigil_entry(&broken_cmd)],
-            "PostToolUse": [vigil_entry(&broken_cmd)],
+            "PreToolUse":  [vigil_entry("PreToolUse", &broken_cmd)],
+            "PostToolUse": [vigil_entry("PostToolUse", &broken_cmd)],
         }});
         assert_eq!(
             protection_state(Some(&broken), &canonical, &e),

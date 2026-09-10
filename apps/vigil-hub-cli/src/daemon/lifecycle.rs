@@ -141,6 +141,9 @@ pub fn run_start(lang: Lang) -> Result<(), String> {
             if inj_loaded { "已暖载" } else { "未加载" }
         ),
     }
+    // 每日更新检查(再评估 §9 D1 已决):daemon 是长驻入口之一。此处已在 warm-load 之后
+    //(set_var 早已结束),spawn 后台线程不触碰上面的并发不变量;best-effort,失败静默。
+    let _update_check = crate::update_check::spawn_daily(lang);
     let caps = DaemonCaps {
         token,
         scanner,

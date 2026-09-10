@@ -1,0 +1,56 @@
+# Real-agent contract canary (see tests/canary/README.md): installs the *latest* Claude Code and Codex CLIs
+# into a sandbox HOME, drives them with a Zhipu GLM model, registers Vigil hooks with `vigil-hub setup`
+# and asserts, from the audit ledger, that prompt guarding / tool-input denial / result redaction still
+# happen. Red = a vendor hook-contract drift (or our regression) that the frozen synthetic-event
+# acceptance tests cannot see.
+#
+# Manual-dispatch only until the repository owner adds the `GLM_API_KEY` secret (GLM Coding Plan key).
+# The canary fails loudly (exit 3) when the secret is missing — it never silently skips — so a schedule
+# without the secret would just be a daily red. To enable daily runs, add the secret and uncomment `schedule`.
+name: canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'head (build vigil-hub from this checkout) | release (download the shipped binary)'
+        default: 'head'
+      vigil_tag:
+        description: 'release only: vigils release tag (latest = newest stable)'
+        default: 'latest'
+      agents:
+        description: 'comma list of agents (claude,codex)'
+        default: 'claude,codex'
+  # schedule:
+  #   - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: real-agent canary (${{ github.event.inputs.target || 'head' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: build vigil-hub from this checkout (target=head)
+        if: ${{ (github.event.inputs.target || 'head') == 'head' }}
+        run: |
+          cargo build -p vigil-hub-cli
+          ./target/debug/vigil-hub --version
+          echo "VIGIL_HUB_BIN=$GITHUB_WORKSPACE/target/debug/vigil-hub" >> "$GITHUB_ENV"
+      - name: run canary
+        env:
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          VIGIL_TAG: ${{ github.event.inputs.vigil_tag || 'latest' }}
+          CANARY_AGENTS: ${{ github.event.inputs.agents || 'claude,codex' }}
+          CANARY_TMP: ${{ github.workspace }}
+          CANARY_OUT: ${{ github.workspace }}/canary-out
+        run: bash tests/canary/run.sh
+      - name: report (counts and result lines only; no secrets, no agent transcripts)
+        if: always()
+        run: cat canary-out/canary-report.json 2>/dev/null || echo "no report (preflight/install failure?)"

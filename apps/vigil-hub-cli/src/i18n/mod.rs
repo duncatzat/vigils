@@ -184,6 +184,20 @@ pub enum Msg<'a> {
         /// 损坏原因。
         reason: &'a str,
     },
+    /// 每日更新检查的一次性告知(`setup` apply 前、`serve` / `daemon` 首次尝试前;stderr)。
+    UpdateCheckNotice {
+        /// 说明文档 URL。
+        docs: &'a str,
+    },
+    /// 更新检查发现新版本(`latest` 已按 SemVer 子集净化)。
+    UpdateAvailable {
+        /// 本机版本。
+        current: &'a str,
+        /// 清单里的最新版本。
+        latest: &'a str,
+        /// 下载入口。
+        url: &'a str,
+    },
 }
 
 /// 渲染一条 [`Msg`] 为目标语言的整行文本(供 `println!` / `eprintln!` 直接输出)。
@@ -359,6 +373,24 @@ pub fn t(lang: Lang, msg: Msg<'_>) -> String {
         Msg::VerifyStoreCorrupt { reason } => match lang {
             Lang::En => format!("✗ the checkpoint store is corrupt: {reason}"),
             Lang::Zh => format!("✗ 锚点存储已损坏:{reason}"),
+        },
+        Msg::UpdateCheckNotice { docs } => match lang {
+            Lang::En => format!(
+                "note: vigil-hub checks vigils.ai once a day for a newer release (sends only \n                 platform + version, no identifiers). Turn it off: `vigil-hub version-ping off` \n                 or VIGIL_NO_VERSION_PING=1. Details: {docs}"
+            ),
+            Lang::Zh => format!(
+                "提示:vigil-hub 每天向 vigils.ai 检查一次新版本(只发送平台与版本号,不带任何标识)。\n                 关闭:`vigil-hub version-ping off` 或 VIGIL_NO_VERSION_PING=1。说明:{docs}"
+            ),
+        },
+        Msg::UpdateAvailable {
+            current,
+            latest,
+            url,
+        } => match lang {
+            Lang::En => {
+                format!("vigil-hub {current}: a newer release {latest} is available -> {url}")
+            }
+            Lang::Zh => format!("vigil-hub {current}:有新版本 {latest} 可用 → {url}"),
         },
     }
 }

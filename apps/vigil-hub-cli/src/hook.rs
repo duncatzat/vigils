@@ -59,9 +59,12 @@
 //!   find-and-replace 回 `secret://<alias>`(注入的自定义 secret 未必匹配硬指纹,这是唯一捕获手段)。
 //! - **纵深防御 = 硬指纹 scrub**:再对结果跑 `scrub_text`,兜命令产出的**其它**(未声明)secret;
 //!   且**排除**逆向替换刚写入的占位符 span(防 `env_assignment` 二次吞掉,见 [`scrub_preserving_placeholders`])。
-//! - **输出**:仅 Claude 的 `hookSpecificOutput.updatedToolOutput`(实测协议:"Replaces the tool
-//!   output before it is sent to the model")。与注入路径**对称** CLI-gated —— 其余 CLI 从不注入真值,
-//!   边界命令里是占位符字面量,结果无 Vigil 真值可泄漏,pass-through。
+//! - **输出**:Claude 走 `hookSpecificOutput.updatedToolOutput`(实测协议:"Replaces the tool
+//!   output before it is sent to the model");**Codex 走 PostToolUse `{"decision":"block","reason"}`**
+//!   (官方 hooks 参考:block「replaces tool result with hook feedback」,不支持改写)—— `reason` 里携带
+//!   **脱敏后**的结果文本,模型拿到的是占位符版而非原文(2026-09-10 金丝雀:真 Codex 0.154 曾把 `cat`
+//!   出的裸 token 原样送进模型,此路径由此补上;真实 payload 形状 `tool_response` 为字符串已抓包核实)。
+//!   Gemini / Cursor 的结果面契约未核实 → 仍 pass-through(它们从不注入真值,边界命令里是占位符字面量)。
 //! - **fail-closed**:声明了 secret 却无法解析真值(无 ledger / resolve 失败),或再脱敏后自检
 //!   ([`value_contains_any_secret`])发现残留真值 → **整体裁剪**结果(宁可裁掉也绝不透传)。
 //!
@@ -402,9 +405,10 @@ pub fn respond(outcome: &HookOutcome, cli: CliKind) -> HookResponse {
                 stdout: Some(json!({ "decision": "block", "reason": reason }).to_string()),
                 stderr: Some(reason.clone()),
             },
-            // 本轮仅 Codex 注册 `UserPromptSubmit`(见 setup_hooks::CODEX_EVENTS),其余 CLI 不注册
-            // 该事件 → 理论不可达。防御性 fail-closed:exit 2 + stderr 是版本无关的「阻止」信号,
-            // 绝不放行含 secret 的 prompt(其余 CLI 的 prompt 面契约未逐一核实前不臆造 JSON 形状)。
+            // Claude 亦注册 `UserPromptSubmit`(2026-09-10 起,见 setup::CLAUDE_HOOK_EVENTS):Claude 契约
+            // = exit 2 阻止 prompt 进模型并把 stderr 展示给用户(hooks 文档 UserPromptSubmit exit code 2)。
+            // Gemini / Cursor 未注册该事件 → 理论不可达;防御性 fail-closed 同样 exit 2 + stderr,
+            // 绝不放行含 secret 的 prompt(其 prompt 面契约未逐一核实前不臆造 JSON 形状)。
             CliKind::Claude | CliKind::Gemini | CliKind::Cursor => HookResponse {
                 exit_code: 2,
                 stdout: None,
@@ -480,10 +484,17 @@ pub fn respond(outcome: &HookOutcome, cli: CliKind) -> HookResponse {
                 stdout: Some(claude_redact_json(updated_output, note)),
                 stderr: None,
             },
-            // 再脱敏路径已 CLI-gated 到 Claude(见 cli_supports_updated_input);其余 CLI 理论不可达
-            // (它们从不注入真值,无真值可泄漏)。防御性 pass-through(exit 0 静默 / Cursor 显式 allow):
-            // 绝不把 updatedToolOutput 交给契约未核实的宿主,也不阻断正常结果。
-            CliKind::Codex | CliKind::Gemini => HookResponse {
+            // Codex:PostToolUse 不支持改写(`updatedMCPToolOutput` 官方标注「parsed but not supported」),
+            // 但支持 `{"decision":"block","reason"}` = 用 reason 替换返给模型的工具结果 → reason 携带
+            // **脱敏后**的结果(不含真值),模型仍能继续工作;stderr 同步带 note 供人排查。
+            CliKind::Codex => HookResponse {
+                exit_code: 0,
+                stdout: Some(codex_block_with_redacted_json(updated_output, note)),
+                stderr: Some(note.clone()),
+            },
+            // Gemini:结果面契约未核实 → 防御性 pass-through(exit 0 静默);它从不注入真值,
+            // 边界命令里是占位符字面量。绝不把改写交给契约未核实的宿主,也不阻断正常结果。
+            CliKind::Gemini => HookResponse {
                 exit_code: 0,
                 stdout: None,
                 stderr: None,
@@ -539,6 +550,34 @@ fn claude_inject_json(updated_input: &Value, note: &str) -> String {
     })
     .to_string()
 }
+
+/// Codex 的 PostToolUse 结果守门响应:`{"decision":"block","reason"}`。Codex 不支持改写结果,
+/// 只能用 `reason` **替换**返给模型的工具结果 —— 故 reason = 说明 + **脱敏后**的结果文本(字符串结果
+/// 原样、结构化结果 compact JSON),模型拿到占位符版继续工作。有界:超过
+/// [`CODEX_BLOCK_REASON_MAX_BYTES`] 截断并标注(reason 是模型可见文本,不该无上限)。**不含真值**。
+fn codex_block_with_redacted_json(updated_output: &Value, note: &str) -> String {
+    let mut text = match updated_output {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    if text.len() > CODEX_BLOCK_REASON_MAX_BYTES {
+        let mut cut = CODEX_BLOCK_REASON_MAX_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str("\n[Vigil: redacted result truncated]");
+    }
+    let reason = format!(
+        "{note}\n\n[Vigil] The raw tool result was withheld because it matched credential patterns \
+         (hard fingerprints or KEY=value assignments); this is the same result with those \
+         values replaced by placeholders:\n{text}"
+    );
+    json!({ "decision": "block", "reason": reason }).to_string()
+}
+
+/// Codex block `reason` 里脱敏结果文本的上限(64 KiB;真实工具输出通常远小于此)。
+const CODEX_BLOCK_REASON_MAX_BYTES: usize = 64 * 1024;
 
 /// Claude 的 PostToolUse 再脱敏响应:`hookSpecificOutput` 携带再脱敏后的 `tool_response`
 /// (`updatedToolOutput`)。`updated_output` 已不含真值(逆向替换 + 硬指纹脱敏后);`note`
@@ -1132,6 +1171,13 @@ fn is_execution_boundary_tool(tool_name: &str) -> bool {
 /// (检测达标才写 `--inject`);hook 信任该 flag,不在此重复探测版本。
 fn cli_supports_updated_input(cli: CliKind) -> bool {
     matches!(cli, CliKind::Claude)
+}
+
+/// 结果再脱敏(PostToolUse)有可用输出契约的 CLI:Claude(`updatedToolOutput` 改写)与 Codex
+/// (`decision:block` + reason 携带脱敏文本;官方 hooks 参考 + 2026-09-10 真机抓包核实)。
+/// Gemini / Cursor 未核实 → 不启用(pass-through,见 [`respond`])。
+fn cli_supports_result_redaction(cli: CliKind) -> bool {
+    matches!(cli, CliKind::Claude | CliKind::Codex)
 }
 
 /// [`scan_secret_aliases`] 切出的 `secret://<alias>` token(字节偏移 + alias 名)。
@@ -1844,8 +1890,11 @@ fn try_result_redaction(args: &HookArgs, raw: &Value) -> Option<HookOutcome> {
     let inj_opt = args.injection.as_ref().filter(|i| i.enabled);
     // ML 增强(engine=ml/auto)是结果再脱敏的**第三个触发器**(独立于 injection / `--redact-results`):
     // 三者皆未开 → pass-through(零行为回归)。ML 脱敏与硬指纹 scrub 同样需 updatedToolOutput(仅 Claude)。
-    if (inj_opt.is_none() && !args.redact_results && !args.ml_enabled())
-        || !cli_supports_updated_input(args.cli)
+    // Codex:结果守门**默认开**(硬指纹 scrub → block+reason),不依赖 `--redact-results` flag —— 故意不改
+    // Codex 的 hook 定义(codex trust hash 覆盖 hook 定义,定义一变全体用户重触发 /hooks 信任门)。
+    let codex_default_scrub = args.cli == CliKind::Codex;
+    if (inj_opt.is_none() && !args.redact_results && !args.ml_enabled() && !codex_default_scrub)
+        || !cli_supports_result_redaction(args.cli)
     {
         return None;
     }
@@ -3303,7 +3352,7 @@ mod tests {
 
     #[test]
     fn respond_non_codex_deny_prompt_is_exit_two_fail_closed() {
-        // 本轮仅 Codex 注册 UserPromptSubmit;其余 CLI 防御性 exit 2 + stderr(绝不放行含 secret 的 prompt)。
+        // Codex 与 Claude 注册 UserPromptSubmit(Claude 契约即 exit 2 + stderr);Gemini/Cursor 防御性同形(绝不放行含 secret 的 prompt)。
         for cli in [CliKind::Claude, CliKind::Gemini, CliKind::Cursor] {
             let r = respond(&HookOutcome::DenyPrompt("blocked: x".into()), cli);
             assert_eq!(
@@ -4741,19 +4790,38 @@ mod tests {
     }
 
     #[test]
-    fn redaction_non_claude_cli_passes_through() {
-        // 非 Claude CLI 从不注入真值 → 无 Vigil 真值可泄漏 → pass-through(与注入路径 CLI gating 对称)。
-        // Codex 的 updatedToolOutput 契约未核实,绝不臆测改写。
+    fn redaction_gemini_passes_through_codex_scrubs_hard_fingerprints() {
+        // Gemini:结果面契约未核实 → pass-through(它从不注入真值,边界命令里是占位符字面量)。
+        let (out, _lp, _td) = run_redaction(
+            &[("k", "secret://k/ref")],
+            &[("secret://k/ref", FAKE_INJECT_SECRET)],
+            true,
+            CliKind::Gemini,
+            "Bash",
+            json!({ "stdout": FAKE_INJECT_SECRET }),
+            true,
+        );
+        assert_eq!(out, HookOutcome::Allow);
+        // Codex:结果守门默认开 —— 硬指纹 secret 被 scrub 成 RedactOutput(respond 侧转 block+reason)。
         let (out, _lp, _td) = run_redaction(
             &[("k", "secret://k/ref")],
             &[("secret://k/ref", FAKE_INJECT_SECRET)],
             true,
             CliKind::Codex,
             "Bash",
-            json!({ "stdout": FAKE_INJECT_SECRET }),
+            json!({ "stdout": format!("token={HARD_GITHUB_TOKEN}") }),
             true,
         );
-        assert_eq!(out, HookOutcome::Allow);
+        match out {
+            HookOutcome::RedactOutput { updated_output, .. } => {
+                let s = updated_output.to_string();
+                assert!(
+                    !s.contains(HARD_GITHUB_TOKEN),
+                    "codex result must be scrubbed: {s}"
+                );
+            }
+            other => panic!("codex hard-fingerprint result must be redacted, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5053,19 +5121,106 @@ mod tests {
     }
 
     #[test]
-    fn respond_non_claude_redact_does_not_emit_updated_output() {
-        // 防御性:RedactOutput 仅 Claude 产出;其余 CLI 不可达,respond 不输出 updatedToolOutput
-        // (契约未核实),也不阻断 —— Codex/Gemini 静默 exit 0,Cursor 显式 allow。
+    fn respond_codex_redact_is_block_with_redacted_reason() {
+        // Codex 契约:PostToolUse 不能改写,只能 block + reason 替换结果 → reason 携带脱敏文本。
+        let out = HookOutcome::RedactOutput {
+            updated_output: json!("GITHUB_TOKEN=[REDACTED github_token]\n"),
+            note: "redacted 1 hit".into(),
+        };
+        let r = respond(&out, CliKind::Codex);
+        assert_eq!(
+            r.exit_code, 0,
+            "block is a JSON decision, never an exit code"
+        );
+        let body: Value = serde_json::from_str(r.stdout.as_deref().unwrap()).unwrap();
+        assert_eq!(body["decision"], "block");
+        let reason = body["reason"].as_str().unwrap();
+        assert!(reason.starts_with("redacted 1 hit"), "{reason}");
+        assert!(
+            reason.contains("GITHUB_TOKEN=[REDACTED github_token]"),
+            "{reason}"
+        );
+        assert!(
+            body.get("hookSpecificOutput").is_none(),
+            "no Claude-only fields"
+        );
+        assert_eq!(r.stderr.as_deref(), Some("redacted 1 hit"));
+        // 结构化结果 → compact JSON;超长 → 截断标注
+        let big = HookOutcome::RedactOutput {
+            updated_output: json!({ "stdout": "x".repeat(CODEX_BLOCK_REASON_MAX_BYTES + 10) }),
+            note: "n".into(),
+        };
+        let r = respond(&big, CliKind::Codex);
+        let body: Value = serde_json::from_str(r.stdout.as_deref().unwrap()).unwrap();
+        let reason = body["reason"].as_str().unwrap();
+        assert!(reason.ends_with("[Vigil: redacted result truncated]"));
+        assert!(reason.len() < CODEX_BLOCK_REASON_MAX_BYTES + 512);
+    }
+
+    #[test]
+    fn codex_real_post_tool_use_shape_secret_is_blocked_with_redacted_reason() {
+        // 2026-09-10 真机抓包(codex 0.154.0):tool_response 是**字符串**,不带 --redact-results 的
+        // 注册命令(hook 定义字节稳定)也必须默认守门。此前该路径 pass-through,裸 token 原样进模型。
+        let tok = "ghp_canary0123456789abcdefABCDEF01234567";
+        let raw = json!({
+            "session_id": "01a08bfe-9ca9-7a83-ad42-b05138a20637",
+            "turn_id": "01a08bfe-9cd6-7090-8a95-5b6912d8b8c6",
+            "cwd": "/work",
+            "hook_event_name": "PostToolUse",
+            "model": "glm-5.3",
+            "permission_mode": "bypassPermissions",
+            "tool_name": "Bash",
+            "tool_input": { "command": "cat /work/secret.env" },
+            "tool_response": format!("GITHUB_TOKEN={tok}\n"),
+            "tool_use_id": "call_f37d9c466fba46668392c646"
+        });
+        let args = HookArgs {
+            cli: CliKind::Codex,
+            ..HookArgs::default()
+        };
+        assert!(
+            !args.redact_results,
+            "fixture: codex registration carries no --redact-results"
+        );
+        let mut cur = std::io::Cursor::new(raw.to_string());
+        let out = run(&args, &mut cur);
+        let HookOutcome::RedactOutput { updated_output, .. } = &out else {
+            panic!("codex PostToolUse with a bare token must be redacted, got {out:?}");
+        };
+        assert!(
+            !updated_output.to_string().contains(tok),
+            "raw token must be gone"
+        );
+        let r = respond(&out, CliKind::Codex);
+        assert!(
+            !r.stdout.as_deref().unwrap().contains(tok),
+            "block reason must not leak the token"
+        );
+        assert!(r
+            .stdout
+            .as_deref()
+            .unwrap()
+            .contains("\"decision\":\"block\""));
+        // Gemini 仍 pass-through(契约未核实,不臆造)
+        let gargs = HookArgs {
+            cli: CliKind::Gemini,
+            ..HookArgs::default()
+        };
+        let mut cur = std::io::Cursor::new(raw.to_string());
+        assert_eq!(run(&gargs, &mut cur), HookOutcome::Allow);
+    }
+
+    #[test]
+    fn respond_gemini_redact_stays_silent_and_cursor_allows() {
+        // 防御性:Gemini / Cursor 的结果面契约未核实 → 不输出改写、不阻断。
         let mk = || HookOutcome::RedactOutput {
             updated_output: json!({ "x": 1 }),
             note: "n".into(),
         };
-        for cli in [CliKind::Codex, CliKind::Gemini] {
-            let r = respond(&mk(), cli);
-            assert_eq!(r.exit_code, 0);
-            assert_eq!(r.stdout, None, "{cli:?} must not emit updatedToolOutput");
-            assert_eq!(r.stderr, None);
-        }
+        let r = respond(&mk(), CliKind::Gemini);
+        assert_eq!(r.exit_code, 0);
+        assert_eq!(r.stdout, None, "gemini must not emit a rewrite");
+        assert_eq!(r.stderr, None);
         let r = respond(&mk(), CliKind::Cursor);
         assert_eq!(r.exit_code, 0);
         let body: Value = serde_json::from_str(r.stdout.as_deref().unwrap()).unwrap();

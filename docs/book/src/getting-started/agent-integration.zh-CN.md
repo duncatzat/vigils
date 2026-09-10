@@ -54,7 +54,8 @@ vigil-hub setup --all
 `setup --all` 同时接入**两层**:
 
 1. **原生工具输入侧守门** —— `PreToolUse` hook,于是每次工具调用(Bash、Edit、Write、Read、MCP
-   工具……)执行前都先被检查:真实凭据流*入*工具会被 fail-closed 拦截并审计。
+   工具……)执行前都先被检查:真实凭据流*入*工具会被 fail-closed 拦截并审计。Claude Code 与 Codex 还会注册
+   `UserPromptSubmit` hook,贴进对话框的裸凭据在进模型前就被拦下。
 2. **MCP 网关** —— 把你每个 stdio MCP server 改写为经 Vigils 路由,工具**结果**里的 secret 在模型看到
    之前被脱敏,每次调用都被审计。默认 **monitor** 姿态(你的 server 保持可用;裸 secret 拦截、结果脱敏、
    审计照常)。加 `--enforce` 升级 default-deny 硬拦。
@@ -72,7 +73,7 @@ vigil-hub setup --all --uninstall # 移除全部(配置逐字节还原)
 | Agent | Hook（原生工具守门） | MCP wrap（server 网关） | 涉及配置 |
 |---|---|---|---|
 | Claude Code | ✅ | ✅（user + local scope） | `~/.claude/settings.json` + `~/.claude.json` |
-| Codex CLI | ✅（需在 Codex 内一次性 `/hooks` 批准 —— 批准前如实显示 **pending trust**） | ✅（尊重 `$CODEX_HOME`） | `$CODEX_HOME/hooks.json` + `config.toml` |
+| Codex CLI | ✅（需在 Codex 内一次性 `/hooks` 批准 —— 批准前如实显示 **pending trust**；CI / headless 自动化可用 Codex 0.154+ 的 `codex exec --dangerously-bypass-hook-trust`，仅限已审核 hook 来源的环境） | ✅（尊重 `$CODEX_HOME`） | `$CODEX_HOME/hooks.json` + `config.toml` |
 | Gemini CLI | ✅ | —（MCP 嵌在共享 `settings.json`，留后续增量） | `~/.gemini/settings.json` |
 | Cursor | ✅ | ✅ | `~/.cursor/hooks.json` + `mcp.json` |
 | Windsurf | — | ✅ | `~/.codeium/windsurf/mcp_config.json` |

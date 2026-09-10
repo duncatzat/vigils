@@ -29,6 +29,7 @@
 # Operations
 
 - [Auto-Update](./ops/auto-update.md)
+- [Daily Update Check](./ops/update-check.md)
 - [Multi-Platform Build](./ops/multi-platform-build.md)
 
 # Architecture Decision Records
@@ -44,3 +45,4 @@
 - [安装 Vigils](./getting-started/installation.zh-CN.md)
 - [验证你的下载](./getting-started/verifying-downloads.zh-CN.md)
 - [Agent 接入与测试指南](./getting-started/agent-integration.zh-CN.md)
+- [每日更新检查](./ops/update-check.zh-CN.md)

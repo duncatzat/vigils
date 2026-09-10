@@ -36,6 +36,8 @@ vigil-types = { path = "../../crates/vigil-types" }
 # ISS-008 Phase 2 T5:ServeError::PrivacyFilterInit 透传 EngineError;feature 注入走
 # vigil-firewall/ort,本依赖默认 0 features(--features ort 时由 vigil-firewall 透传打开)。
 vigil-redaction = { path = "../../crates/vigil-redaction" }
+# 每日更新检查策略层(P0-1,再评估 §9 D1):纯策略无网络;HTTP 走下方 reqwest。
+vigil-update-check = { path = "../../crates/vigil-update-check" }
 clap = { workspace = true }
 url = { workspace = true }
 oauth2 = { workspace = true }
@@ -44,6 +46,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 # command_guard:危险 shell 命令分类器(hook 路径破坏性/持久化/RCE 防线)。
 regex = { workspace = true }
+# 更新检查的阻塞 GET(rustls;与 vigil-http-transport 同一实例,不新增依赖树节点)。
+reqwest = { workspace = true }
 once_cell = { workspace = true }
 shlex = { workspace = true }
 # `vigil-hub demo` 零设置首次体验:驱动真 Hub 需 args 规范化哈希(scope 预批准走真 Allow 路径)+

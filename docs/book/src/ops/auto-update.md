@@ -2,6 +2,11 @@
 
 Installed desktop apps update over the Tauri auto-updater, using Ed25519 (minisign) signatures.
 
+> **Status (2026-09):** the shipped desktop app does not yet bundle the updater plugin, so no desktop client
+> polls this endpoint today. The only client-side poll is the CLI's daily [update check](./update-check.md)
+> (`serve` / `daemon start`), which reuses the same manifest URL. The manifests, signing flow and endpoint
+> below remain the release-side contract.
+
 ## Flow
 
 ```

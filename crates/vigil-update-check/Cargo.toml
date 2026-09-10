@@ -1,0 +1,19 @@
+[package]
+name = "vigil-update-check"
+publish = false  # 内部策略 crate(非 SDK publish set)— 不上 crates.io;cargo-deny path-dep wildcard 守门
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Daily update-check policy for Vigils (privacy invariants: no identifiers, one throttle file, three kill switches). No networking here."
+
+[lints]
+workspace = true
+
+[dependencies]
+# 只解析更新清单里的 `version` 字段;不含任何 HTTP 客户端 —— 调用方(CLI: reqwest / 桌面: ureq)自带。
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
