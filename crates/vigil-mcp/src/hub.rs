@@ -1589,15 +1589,26 @@ impl Hub {
                             Some(&redacted_summary),
                         );
                         if self.config.redact_tool_results {
-                            // in-band:命中后彻底脱敏整个 result 再返回。
-                            // ⚠️ `redact(&Value)` 只脱敏 object **值**、保留 **键** —— 若 secret 落在
-                            // key 位(如 `{"ghp_xxx": ...}`)会漏(Codex review NEEDS-FIX)。故对序列化串
-                            // (键+值全覆盖)做 `scrub_text` 后重解析;重解析失败则 **fail-closed** 整体
-                            // 占位,绝不把原文透传给 agent。`result_text` 即上面算出的序列化原文。
-                            let scrubbed = vigil_redaction::scrub_text(&result_text);
-                            result = serde_json::from_str(&scrubbed).unwrap_or_else(|_| {
-                                json!({ "vigil_redacted": "[REDACTED tool result contained secrets]" })
-                            });
+                            // in-band:命中后脱敏整个 result 再返回。在**解码后**的字符串叶子与 object
+                            // 键上逐个 scrub(键+值全覆盖,Codex review NEEDS-FIX),而非对序列化文本
+                            // scrub:tool result 的 `content[].text` 常是再序列化的 JSON(AURA
+                            // run_command 即如此),值模式在 JCS 文本上会吞掉 `\"` 的转义反斜杠 →
+                            // 重解析失败 → 旧实现落到 `{"vigil_redacted":…}` —— 那**不是合法
+                            // CallToolResult**,Codex 直接报 "Unexpected response type"(Vigil×AURA
+                            // 交叉测试 2026-09-11 实证)。脱敏后再序列化自检,仍残留则 fail-closed
+                            // 用**合法 MCP 形状**整体扣留,绝不把原文透传给 agent。
+                            let scrubbed = scrub_json_strings(&result);
+                            let clean = serde_jcs::to_string(&scrubbed)
+                                .map(|t| vigil_redaction::detect_hard_secret(&t).is_none())
+                                .unwrap_or(false);
+                            result = if clean {
+                                scrubbed
+                            } else {
+                                withheld_tool_result(
+                                    "[Vigil] The raw tool result was withheld: it contained \
+                                     credentials that could not be redacted in place.",
+                                )
+                            };
                         }
                     }
 
@@ -2267,11 +2278,57 @@ fn redact_injected_reflection(result: &mut Value, injected: &[(String, String)])
     // **无条件**自检(不被 reverse_hits 门控):value 位真值已逆替换、key 位真值仍在 → 检出残留。
     let fail_closed = value_contains_injected(result, injected);
     if fail_closed {
-        *result = json!({
-            "vigil_redacted": "[REDACTED: detokenized secret reflected in tool result]"
-        });
+        *result = withheld_tool_result(
+            "[Vigil] The raw tool result was withheld: a detokenized secret was reflected in it \
+             and could not be redacted in place.",
+        );
     }
     (reverse_hits, fail_closed)
+}
+
+/// 整体扣留 tool result 时返回的**合法** MCP `CallToolResult`(`content[]` + `isError:false`):
+/// 模型拿到一句说明继续工作,宿主不会因非法形状报协议错误(旧的 `{"vigil_redacted":…}` 裸对象
+/// 让 Codex 报 "Unexpected response type",等于把守门做成了工具故障)。`isError:false`:这是
+/// 治理决定而非工具失败,与 hook 面的 block+说明语义一致。
+fn withheld_tool_result(note: &str) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": note }],
+        "isError": false,
+    })
+}
+
+/// 对 JSON 树的每个字符串叶子与 object 键做硬指纹 scrub(`[REDACTED <rule>]` 占位),结构原样保留。
+/// 在解码后的字符串上逐个处理,不会碰到序列化转义(`\"`、`\r\n`)—— 见 in-band 脱敏处注释。
+fn scrub_json_strings(v: &Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(scrub_string_leaf(s)),
+        Value::Array(arr) => Value::Array(arr.iter().map(scrub_json_strings).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, val)| (vigil_redaction::scrub_text(k), scrub_json_strings(val)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// 单个字符串叶子的脱敏。叶子本身是 JSON 文本(server 把 JSON 塞进 `content[].text` 很常见,AURA
+/// 即如此)时,解析后递归脱敏再紧凑序列化:占位符落在正确的值位、内层 JSON 仍可解析 —— 直接对
+/// JSON 文本跑规则会让 `env_assignment` 的 KEY 吃掉 `\n` 的 `n`、留下悬空反斜杠(`\[REDACTED…]`)
+/// 把内层 JSON 打坏。非 JSON 文本走纯文本 scrub;内层无命中则**原样**返回(不改动格式)。
+fn scrub_string_leaf(s: &str) -> String {
+    if matches!(s.as_bytes().first(), Some(b'{' | b'[')) {
+        if let Ok(v) = serde_json::from_str::<Value>(s) {
+            let scrubbed = scrub_json_strings(&v);
+            if scrubbed == v {
+                return s.to_string();
+            }
+            if let Ok(t) = serde_json::to_string(&scrubbed) {
+                return t;
+            }
+        }
+    }
+    vigil_redaction::scrub_text(s)
 }
 
 /// 计算 stdio server argv 的规范化 hash(JCS 后 SHA-256 hex-lower)。
@@ -2405,14 +2462,88 @@ mod tests {
             "key 位真值必须触发 fail-closed(而非被 reverse_hits 门控漏过)"
         );
         assert_eq!(
-            result,
-            json!({ "vigil_redacted": "[REDACTED: detokenized secret reflected in tool result]" }),
-            "fail-closed 必须整体占位"
+            result["content"][0]["type"], "text",
+            "fail-closed 必须整体占位为合法 CallToolResult: {result}"
         );
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("withheld"),
+            "占位说明须告知结果被扣留: {result}"
+        );
+        assert_eq!(result["isError"], false);
         assert!(
             !value_contains_injected(&result, &injected),
             "占位后绝无残留真值"
         );
+    }
+
+    #[test]
+    fn scrub_json_strings_redacts_reserialized_json_text_and_keeps_mcp_shape() {
+        // Vigil×AURA 交叉测试 2026-09-11:AURA run_command 的 content[].text 是再序列化的 JSON
+        // (含 \r\n 转义),旧实现对 JCS 文本 scrub 吞掉转义反斜杠 → 重解析失败 → 非法占位对象
+        // → Codex "Unexpected response type"。现在必须:结构不变、token 消失、占位符在、可通过复扫。
+        let tok = "ghp_canary0123456789abcdefABCDEF01234567";
+        let inner = format!(
+            "{{\"data\":{{\"exit_code\":0,\"stdout\":\"[github]\\r\\ntoken={tok}\\r\\nregion=us-east-1\\r\\n\"}},\"ok\":true}}"
+        );
+        let result = json!({
+            "content": [{ "type": "text", "text": inner }],
+            "structuredContent": { "data": { "stdout": format!("[github]\r\ntoken={tok}\r\nregion=us-east-1\r\n") } },
+            "isError": false,
+        });
+        let scrubbed = scrub_json_strings(&result);
+        let s = serde_json::to_string(&scrubbed).unwrap();
+        assert!(!s.contains(tok), "token must be gone: {s}");
+        assert!(s.contains("[REDACTED"), "placeholder expected: {s}");
+        assert_eq!(scrubbed["content"][0]["type"], "text");
+        let text = scrubbed["content"][0]["text"].as_str().unwrap();
+        assert!(
+            serde_json::from_str::<Value>(text).is_ok(),
+            "the re-serialized inner JSON must still parse after scrubbing: {text}"
+        );
+        assert!(scrubbed["structuredContent"]["data"]["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED"));
+        assert!(
+            vigil_redaction::detect_hard_secret(&s).is_none(),
+            "scrubbed result must pass the in-band re-scan (else it is withheld wholesale): {s}"
+        );
+    }
+
+    #[test]
+    fn scrub_string_leaf_keeps_clean_json_text_byte_identical() {
+        let pretty = "{ \"a\": 1,  \"b\": [\"x\"] }";
+        assert_eq!(
+            scrub_string_leaf(pretty),
+            pretty,
+            "no hit → untouched formatting"
+        );
+        assert_eq!(scrub_string_leaf("plain text"), "plain text");
+    }
+
+    #[test]
+    fn scrub_json_strings_covers_object_keys_and_arrays() {
+        let tok = "ghp_canary0123456789abcdefABCDEF01234567";
+        let v = json!({ tok: "v", "k": { "nested": [tok, 1, null] } });
+        let s = serde_json::to_string(&scrub_json_strings(&v)).unwrap();
+        assert!(
+            !s.contains(tok),
+            "key + array positions must be scrubbed: {s}"
+        );
+        assert!(s.contains("\"k\""), "untouched keys stay: {s}");
+    }
+
+    #[test]
+    fn withheld_tool_result_is_a_valid_call_tool_result() {
+        let v = withheld_tool_result("[Vigil] withheld");
+        assert_eq!(v["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][0]["text"], "[Vigil] withheld");
+        assert_eq!(v["isError"], false);
+        assert!(v.get("vigil_redacted").is_none());
     }
 
     #[test]

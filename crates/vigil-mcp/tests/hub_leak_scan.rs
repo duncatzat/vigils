@@ -320,3 +320,52 @@ fn post_exec_leak_redacts_secret_in_object_key_when_flag_on() {
     );
     assert_eq!(hub.leak_detected_count(), 1);
 }
+
+/// Vigil×AURA 交叉测试(2026-09-11)回归:真实 MCP server 的 tool result 是 `content[].text` 里
+/// **再序列化**的 JSON(含 `\r\n` 转义;AURA `run_command` 即如此)。旧实现对 JCS 文本 scrub 吞掉
+/// 转义反斜杠 → 重解析失败 → 返回 `{"vigil_redacted":…}` 裸对象 —— 不是合法 CallToolResult,
+/// Codex 报 "Unexpected response type",守门变成了工具故障。现在:返给 agent 的 result 必须仍是
+/// `content[]` 形状、内层 JSON 仍可解析、token 消失、占位符在、不是协议错误。
+#[test]
+fn post_exec_leak_redaction_keeps_call_tool_result_shape_for_reserialized_json() {
+    let raw = "ghp_1234567890abcdef1234567890abcdef12345678";
+    let inner = format!(
+        "{{\"data\":{{\"exit_code\":0,\"stdout\":\"[github]\\r\\ntoken={raw}\\r\\nregion=us-east-1\\r\\n\"}},\"ok\":true}}"
+    );
+    let canned = json!({
+        "content": [{ "type": "text", "text": inner }],
+        "structuredContent": { "data": { "stdout": format!("[github]\r\ntoken={raw}\r\n") } },
+        "isError": false
+    });
+    let (_l, hub, _sid) = setup_with_mock_cfg(canned, true);
+    let resp = call_tool(&hub);
+    assert!(
+        resp.error.is_none(),
+        "a governance redaction must not surface as a protocol error"
+    );
+    let result = resp.result.as_ref().unwrap();
+    let result_str = serde_json::to_string(result).unwrap();
+    assert!(
+        !result_str.contains(raw),
+        "token must not reach the agent: {result_str}"
+    );
+    assert!(
+        result.get("vigil_redacted").is_none(),
+        "no bare placeholder object: {result_str}"
+    );
+    let content = result["content"]
+        .as_array()
+        .expect("content[] must survive redaction");
+    assert_eq!(content[0]["type"], "text");
+    let text = content[0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("[REDACTED"),
+        "placeholder inside the text: {text}"
+    );
+    assert!(
+        serde_json::from_str::<Value>(text).is_ok(),
+        "inner JSON must still parse after in-place scrubbing: {text}"
+    );
+    assert_eq!(result["isError"], false);
+    assert_eq!(hub.leak_detected_count(), 1);
+}

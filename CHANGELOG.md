@@ -107,6 +107,15 @@ All notable changes to Vigils are documented here. The format follows
   `env_assignment` heuristic** (`KEY|TOKEN|SECRET|PASSWORD|AUTH=value`), so reading an `.env.example`
   or a CI YAML with placeholder values is also withheld-and-redacted (the model still receives the full
   placeholder text; only a one-line note is added).
+- **MCP gateway result redaction returned an invalid `CallToolResult`.** Real MCP servers often put
+  re-serialized JSON into `content[].text` (AURA's `run_command` does). In-band redaction scrubbed the
+  canonical JSON *text*, which ate escape backslashes, failed to re-parse and fell back to a bare
+  `{"vigil_redacted": ...}` object -- not a valid tool result, so Codex reported
+  `Unexpected response type`: the secret never leaked, but the guard turned into a tool failure. The hub
+  now scrubs decoded string leaves and object keys in place (string leaves that are JSON text are parsed,
+  scrubbed recursively and re-serialized, so nested JSON stays parseable) and, if anything still remains,
+  withholds the whole result in a valid `content[]` shape. The detokenized-secret fail-closed placeholder
+  uses the same valid shape. Found by a Vigil x AURA cross-test with a real agent.
 - **Oversized or malformed hook events failed open on Codex `PostToolUse` / `UserPromptSubmit`.**
   The 16 MiB stdin cap, a stdin read error and malformed JSON all answered with the `PreToolUse`
   deny shape (`hookSpecificOutput.permissionDecision`), which Codex ignores on the other two events,

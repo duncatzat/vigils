@@ -85,6 +85,13 @@ Vigils 的所有重要变更记录于此。格式遵循
   保持稳定。Gemini / Cursor 不变。
   诚实边界:触发条件与 Claude 面同一套硬指纹规则,**含 `env_assignment`(`KEY|TOKEN|SECRET|PASSWORD|AUTH=值`)启发式**,
   读 `.env.example` / CI YAML 之类占位值也会被 withheld-and-redacted(模型仍拿到占位符版全文,只多一行说明)。
+- **MCP 网关结果脱敏返回了非法 `CallToolResult`。** 真实 MCP server 常把再序列化的 JSON 放进
+  `content[].text`(AURA 的 `run_command` 即如此)。in-band 脱敏对规范化 JSON *文本* scrub 会吞掉转义
+  反斜杠,重解析失败后退化成 `{"vigil_redacted": ...}` 裸对象 —— 不是合法工具结果,Codex 报
+  `Unexpected response type`:secret 没泄漏,但守门变成了工具故障。现在 hub 在解码后的字符串叶子与
+  object 键上就地 scrub(叶子本身是 JSON 文本时解析后递归脱敏再序列化,内层 JSON 保持可解析);仍有
+  残留则用合法 `content[]` 形状整体扣留。注入真值回吐的 fail-closed 占位同样改为合法形状。由 Vigil × AURA
+  真 agent 交叉测试发现。
 - **超界 / 畸形 hook 事件在 Codex `PostToolUse` / `UserPromptSubmit` 上 fail-open。** 16 MiB stdin 上限、
   stdin 读失败与 JSON 畸形此前一律回 `PreToolUse` 形状的 deny(`hookSpecificOutput.permissionDecision`),
   Codex 在另外两个事件上会忽略它,超大工具结果或 prompt 未经扫描就进了模型。现在 hook 从缓冲区窥视
