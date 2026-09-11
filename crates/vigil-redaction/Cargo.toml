@@ -29,6 +29,8 @@ once_cell = { workspace = true }
 thiserror = { workspace = true }
 # P0 注入防护 Slice 1 T2:nonce sentinel 128-bit CSPRNG(与 vigil-token 同源 RNG)
 getrandom = { workspace = true }
+# base64 载荷里的硬指纹(file_push.content_base64 之类绕过明文指纹,Vigil×AURA 交叉测试 2026-09-11)
+base64 = { workspace = true }
 
 # ISS-008 Phase 1: ORT 1.24 q4f16 推理(feature gated;默认 build 0 ort 痕迹)
 # 钉死 =2.0.0-rc.12 避免 rc ABI 漂;load-dynamic 让 build 不依赖 onnxruntime.dll(运行时从 PATH 加载)

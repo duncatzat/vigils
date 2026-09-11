@@ -61,6 +61,24 @@ pub enum UpstreamError {
     /// 其它内部错(不变量违反)
     #[error("internal: {0}")]
     Internal(&'static str),
+    /// 上游 `initialize` 协商回了不在支持集内的协议版本(按 MCP spec 客户端应断开 → fail-closed)。
+    /// `negotiated` 在构造处已经 `safe_protocol_version` 净化(不可信上游输入)。
+    #[error("protocol version {negotiated} negotiated by upstream is not supported by this Vigil build (supports {supported})")]
+    ProtocolVersionUnsupported {
+        /// 上游回的版本(已净化)
+        negotiated: String,
+        /// 本端支持集(逗号分隔,构造处填)
+        supported: String,
+    },
+    /// 现代专属上游(2026-07-28+ 只认 `server/discover` 开场):`initialize` 被拒且探针成功。
+    /// `supported` 是上游宣告的版本列表(已截断 + 逐条净化)。
+    #[error("upstream speaks only MCP 2026-07-28+ (advertised: {supported}); this Vigil build talks up to {latest} — upgrade Vigil or pin the server to a legacy protocol")]
+    ModernOnlyUpstream {
+        /// 上游 `supportedVersions`(已净化,逗号分隔;空 = "no version list")
+        supported: String,
+        /// 本端最高支持版本
+        latest: &'static str,
+    },
 }
 
 /// Hub 上游抽象。

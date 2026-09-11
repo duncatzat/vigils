@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -1339,51 +1339,49 @@ fn attach_http_upstream(
         Arc::new(ReqwestHttpClient::new().map_err(|_| invalid("failed to build https client"))?);
     // OAuth upstream 额外带出 token scope 快照(attach 进 Hub,让 `ScopeNotInAllowList`
     // 在出站调用上生效);Bearer / None 无 OAuth scope 语义 → None(评估走 NonOauth)。
-    let (upstream, oauth_scopes): (Arc<dyn vigil_mcp::McpUpstream>, Option<Vec<String>>) =
-        match auth {
-            HttpAuth::Bearer { source } => {
-                // 启动期读真值(env:/keyring:);token 只活内存 SecretValue,绝不入审计/错误。
-                let token = resolve_secret_source(name, source)?;
-                (
-                    Arc::new(StreamableHttpUpstream::with_bearer(
-                        name, parsed, token, sender,
-                    )),
-                    None,
-                )
-            }
-            HttpAuth::OAuth {
+    let (upstream, oauth_scopes): (Arc<StreamableHttpUpstream>, Option<Vec<String>>) = match auth {
+        HttpAuth::Bearer { source } => {
+            // 启动期读真值(env:/keyring:);token 只活内存 SecretValue,绝不入审计/错误。
+            let token = resolve_secret_source(name, source)?;
+            (
+                Arc::new(StreamableHttpUpstream::with_bearer(
+                    name, parsed, token, sender,
+                )),
+                None,
+            )
+        }
+        HttpAuth::OAuth {
+            resource,
+            client_id,
+        } => {
+            // OAuth serve 期接线:从 `add-remote-mcp` 已落库 token metadata 重建 ExpectedBinding
+            // (含 JWKS 验证器),经 AS re-discovery 拿 jwks_uri ——**无需浏览器**(token 已在库)。
+            // prod deps:一个 ReqwestHttpClient 同时充当 discovery HttpClient 与 sealed
+            // AuthorizedSender;keyring service "vigil"(与 add_remote.rs 落库一致)。DI seam =
+            // [`build_oauth_upstream`](供 mock-AS 单测验 positive / issuer-drift 安全分支)。
+            let client = Arc::new(
+                ReqwestHttpClient::new().map_err(|_| invalid("failed to build https client"))?,
+            );
+            let http: Arc<dyn vigil_http_auth::HttpClient> = client.clone();
+            let oauth_sender: Arc<dyn vigil_http_auth::AuthorizedSender> = client;
+            let secret_store: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new("vigil"));
+            let (up, scopes) = build_oauth_upstream(
+                ledger,
+                name,
+                parsed,
                 resource,
                 client_id,
-            } => {
-                // OAuth serve 期接线:从 `add-remote-mcp` 已落库 token metadata 重建 ExpectedBinding
-                // (含 JWKS 验证器),经 AS re-discovery 拿 jwks_uri ——**无需浏览器**(token 已在库)。
-                // prod deps:一个 ReqwestHttpClient 同时充当 discovery HttpClient 与 sealed
-                // AuthorizedSender;keyring service "vigil"(与 add_remote.rs 落库一致)。DI seam =
-                // [`build_oauth_upstream`](供 mock-AS 单测验 positive / issuer-drift 安全分支)。
-                let client = Arc::new(
-                    ReqwestHttpClient::new()
-                        .map_err(|_| invalid("failed to build https client"))?,
-                );
-                let http: Arc<dyn vigil_http_auth::HttpClient> = client.clone();
-                let oauth_sender: Arc<dyn vigil_http_auth::AuthorizedSender> = client;
-                let secret_store: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new("vigil"));
-                let (up, scopes) = build_oauth_upstream(
-                    ledger,
-                    name,
-                    parsed,
-                    resource,
-                    client_id,
-                    http,
-                    secret_store,
-                    oauth_sender,
-                )?;
-                (up, Some(scopes))
-            }
-            HttpAuth::None => (
-                Arc::new(StreamableHttpUpstream::with_none(name, parsed, sender)),
-                None,
-            ),
-        };
+                http,
+                secret_store,
+                oauth_sender,
+            )?;
+            (up, Some(scopes))
+        }
+        HttpAuth::None => (
+            Arc::new(StreamableHttpUpstream::with_none(name, parsed, sender)),
+            None,
+        ),
+    };
 
     // 3. register(幂等)→ approve(Limited)→ attach(HTTP 无 argv → 空 argv,drift gate no-op)。
     let now = SystemTime::now()
@@ -1403,11 +1401,41 @@ fn attach_http_upstream(
     };
     ledger.register_server(&profile)?;
     ledger.approve_server(name, TrustLevel::Limited)?;
+    // MCP 客户端生命周期握手(initialize → initialized),与 stdio 路径对齐:有状态 Streamable HTTP
+    // 服务器在握手前拒绝一切请求(此前 HTTP 上游从不握手,Vigil×AURA 交叉测试 2026-09-11)。
+    // **非致命**:握手失败记 stderr 仍 attach —— 其 tools/list 同样会失败并在 stderr 说明。
+    if let Err(e) = upstream.initialize_handshake(HTTP_HANDSHAKE_TIMEOUT) {
+        let safe = vigil_redaction::scrub_text(&e.to_string());
+        eprintln!(
+            "[vigil-hub] upstream '{name}' MCP initialize handshake failed: {safe} \
+             (attached anyway; its tools will be unavailable until it initializes)"
+        );
+    }
+    eprintln!(
+        "vigil-hub serve: upstream '{name}' attached over http ({})",
+        upstream_origin_for_log(url)
+    );
+    let upstream: Arc<dyn vigil_mcp::McpUpstream> = upstream;
     match oauth_scopes {
         Some(scopes) => hub.attach_upstream_with_oauth_scopes(name, &[], upstream, scopes)?,
         None => hub.attach_upstream(name, &[], upstream)?,
     }
     Ok(())
+}
+
+/// HTTP 上游握手超时(与 `HubConfig::default().upstream_call_timeout` 同量级)。
+const HTTP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 日志里只打 scheme + host(+port),不带 path / query(query 可能携带凭据)。
+fn upstream_origin_for_log(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(u) => match (u.host_str(), u.port()) {
+            (Some(h), Some(p)) => format!("{}://{h}:{p}", u.scheme()),
+            (Some(h), None) => format!("{}://{h}", u.scheme()),
+            _ => u.scheme().to_string(),
+        },
+        Err(_) => "<unparsable url>".to_string(),
+    }
 }
 
 /// 构造 OAuth `StreamableHttpUpstream`(DI seam —— `http`=discovery+JWKS client、`secret_store`=
@@ -1435,7 +1463,7 @@ fn build_oauth_upstream(
     http: Arc<dyn vigil_http_auth::HttpClient>,
     secret_store: Arc<dyn SecretStore>,
     sender: Arc<dyn vigil_http_auth::AuthorizedSender>,
-) -> Result<(Arc<dyn vigil_mcp::McpUpstream>, Vec<String>), ServeError> {
+) -> Result<(Arc<StreamableHttpUpstream>, Vec<String>), ServeError> {
     let invalid = |reason: &'static str| ServeError::InvalidUpstream {
         name: name.to_string(),
         reason,
@@ -1956,7 +1984,7 @@ mod tests {
         jwks_uri: &str,
         stored_issuer: &str,
         discovered_issuer: &str,
-    ) -> Result<(Arc<dyn vigil_mcp::McpUpstream>, Vec<String>), ServeError> {
+    ) -> Result<(Arc<StreamableHttpUpstream>, Vec<String>), ServeError> {
         use vigil_http_auth::{
             token_ref_for_access, HttpMethod, HttpResponse, MockHttpClient, OAuthTokenMetadata,
             TokenKind, TokenStore,
@@ -2017,6 +2045,7 @@ mod tests {
     /// SSRF gate(loopback)→ 构造成功的 HTTP 上游(`transport()=Http`)。证 wiring 真打通。
     #[test]
     fn build_oauth_upstream_succeeds_when_onboarded_and_as_matches() {
+        use vigil_mcp::McpUpstream as _;
         let (up, scopes) = onboard_and_build_oauth(
             "https://127.0.0.1:8765",
             "https://127.0.0.1:8765/jwks",

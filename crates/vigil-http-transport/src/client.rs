@@ -13,6 +13,7 @@ use std::time::Duration;
 use reqwest::blocking::{Client, ClientBuilder};
 use vigil_http_auth::{
     AuthorizedSender, HttpAuthError, HttpClient, HttpMethod, HttpRequest, HttpResponse,
+    HttpResponseFull,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -95,6 +96,10 @@ impl HttpClient for ReqwestHttpClient {
             req.body.as_deref(),
             None,
         )
+        .map(|r| HttpResponse {
+            status: r.status,
+            body: r.body,
+        })
     }
 }
 
@@ -114,6 +119,10 @@ impl AuthorizedSender for ReqwestHttpClient {
             req.body(),
             None,
         )
+        .map(|r| HttpResponse {
+            status: r.status,
+            body: r.body,
+        })
     }
 
     fn send_authorized_with_timeout(
@@ -122,6 +131,25 @@ impl AuthorizedSender for ReqwestHttpClient {
         timeout: Duration,
     ) -> Result<HttpResponse, HttpAuthError> {
         // I10b-α2 代码 R1 MUST-FIX 1:per-call timeout 透传到 reqwest RequestBuilder
+        send_inner(
+            &self.inner,
+            req.method(),
+            req.url().as_str(),
+            req.headers(),
+            req.body(),
+            Some(timeout),
+        )
+        .map(|r| HttpResponse {
+            status: r.status,
+            body: r.body,
+        })
+    }
+
+    fn send_authorized_full_with_timeout(
+        &self,
+        req: &vigil_http_auth::AuthorizedHttpRequest,
+        timeout: Duration,
+    ) -> Result<HttpResponseFull, HttpAuthError> {
         send_inner(
             &self.inner,
             req.method(),
@@ -141,7 +169,7 @@ fn send_inner(
     body: Option<&[u8]>,
     // I10b-α2 代码 R1 MUST-FIX 1:Some(d) 覆盖 Client 默认 30s 总超时(per-call)
     per_call_timeout: Option<Duration>,
-) -> Result<HttpResponse, HttpAuthError> {
+) -> Result<HttpResponseFull, HttpAuthError> {
     let mut builder = match method {
         HttpMethod::Get => client.get(url),
         HttpMethod::PostForm => client
@@ -154,6 +182,11 @@ fn send_inner(
         _ => return Err(HttpAuthError::Internal("unsupported_http_method")),
     };
     for (k, v) in headers {
+        // Content-Type 已按 method 由上面设定;调用方再传一份会变成重复头(Vigil×AURA 交叉测试
+        // 2026-09-11 线上抓到两条 `content-type: application/json`),此处去重。
+        if k.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
         builder = builder.header(k.as_str(), v.as_str());
     }
     if let Some(b) = body {
@@ -164,12 +197,22 @@ fn send_inner(
     }
     let resp = builder.send().map_err(|e| map_reqwest_error(&e))?;
     let status = resp.status().as_u16();
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_string(), v.to_string()))
+        })
+        .collect();
     let bytes = resp
         .bytes()
         .map_err(|_| HttpAuthError::HttpError("reqwest_body_read_failed"))?;
-    Ok(HttpResponse {
+    Ok(HttpResponseFull {
         status,
         body: bytes.to_vec(),
+        headers,
     })
 }
 

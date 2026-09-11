@@ -98,7 +98,7 @@ pub enum StdioError {
 /// 安全字符集**刻意排除字母**:合法 MCP protocolVersion 是纯数字日期串(`2025-06-18`),而绝大多数
 /// secret 含字母 —— 故只放行「短 + 仅数字/`-`/`.`」者原样显示,其余(含任何字母/异常字符/超长)一律
 /// 指纹化。即便一个 ≤20 位纯数字串理论上可能是 secret,渲染纯数字 token 的泄漏价值也极低(Codex R2)。
-fn safe_protocol_version(negotiated: &str) -> String {
+pub fn safe_protocol_version(negotiated: &str) -> String {
     let safe = !negotiated.is_empty()
         && negotiated.len() <= 20
         && negotiated
@@ -145,19 +145,19 @@ type PendingTable = Arc<Mutex<HashMap<String, Sender<Value>>>>;
 /// (`ProtocolVersionUnsupported`)。
 ///
 /// 版本来源:MCP spec 历次修订(modelcontextprotocol.io/specification)。新增协议修订时在此登记。
-const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// `server/discover` 探针携带的现代时代版本(2026-07-28 为首个「无握手、按请求 `_meta` 协商」修订)。
 /// 仅用于**判别上游时代**,vigil-hub 尚未实现现代时代客户端语义(Phase 1 第二刀)。
-const MODERN_PROBE_VERSION: &str = "2026-07-28";
+pub const MODERN_PROBE_VERSION: &str = "2026-07-28";
 
 /// 2026-07-28 `UnsupportedProtocolVersionError` 的错误码:现代服务器对未支持版本的**确定性**回答
 /// (spec:收到它的客户端应从 `supported` 列表重选版本重试,**不得**回退 `initialize`)。
-const UNSUPPORTED_PROTOCOL_VERSION_CODE: i32 = -32022;
+pub const UNSUPPORTED_PROTOCOL_VERSION_CODE: i32 = -32022;
 
 /// 采集上游 `supportedVersions` 的上限(不可信输入:防恶意上游塞超长列表撑爆诊断/日志)。
-const MAX_SUPPORTED_LISTED: usize = 8;
+pub const MAX_SUPPORTED_LISTED: usize = 8;
 
 /// 2026-07-28 stdio「Backward Compatibility」三分支裁决(纯函数,无 I/O):
 /// - 探针得到 `DiscoverResult`(含 `supportedVersions`)→ 现代专属上游(`ModernOnlyUpstream`);

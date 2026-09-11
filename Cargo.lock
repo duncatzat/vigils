@@ -6289,8 +6289,8 @@ dependencies = [
  "vigil-redaction",
  "vigil-runner",
  "vigil-types",
- "vigil-update-check",
  "vigil-ui-protocol",
+ "vigil-update-check",
 ]
 
 [[package]]
@@ -6365,6 +6365,7 @@ dependencies = [
 name = "vigil-redaction"
 version = "0.7.0-beta.2"
 dependencies = [
+ "base64 0.22.1",
  "criterion",
  "dirs 5.0.1",
  "getrandom 0.2.17",

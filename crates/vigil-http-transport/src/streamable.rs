@@ -9,7 +9,8 @@
 //! plain Bearer 与 OAuth **统一**走同一 planner 路径(Bearer 本地造 `ResolvedAccessToken`)。
 //! 上游 `error.message` sha256 折叠(MF#5b),token 只活内存非-Debug `SecretValue`。
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -20,13 +21,16 @@ use vigil_http_auth::{
     plan_authorized_request, plan_unauthorized_request, AuthorizedSender, ExpectedBinding,
     HttpMethod, ResolvedAccessToken, TokenStore,
 };
-use vigil_mcp::{McpUpstream, UpstreamError};
+use vigil_mcp::{
+    safe_protocol_version, McpUpstream, UpstreamError, MAX_SUPPORTED_LISTED, MODERN_PROBE_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS, UNSUPPORTED_PROTOCOL_VERSION_CODE,
+};
 use vigil_types::TransportKind;
 
 use crate::upstream::{map_auth_error, now_unix_secs};
 
-/// MCP 协议版本头(Streamable HTTP,2025-03-26)。
-const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
+/// `Mcp-Session-Id` 的接受上限(spec:visible ASCII;上游不可信,再钳长度)。
+const MAX_SESSION_ID_LEN: usize = 256;
 
 /// `StreamableHttpUpstream` 的鉴权来源(ADR 0021 §3.3)。两种均经 sealed planner 注入
 /// `Authorization: Bearer`,**不可 passthrough**。(`HttpAuth::None` 的无鉴权 public 上游留后续。)
@@ -53,6 +57,12 @@ pub struct StreamableHttpUpstream {
     mcp_url: Url,
     auth: StreamableAuth,
     sender: Arc<dyn AuthorizedSender>,
+    /// `initialize` 响应头 `Mcp-Session-Id`(有状态服务器要求后续请求回带;无状态服务器不发)。
+    session_id: Mutex<Option<String>>,
+    /// 协商到的协议版本(`MCP-Protocol-Version` 请求头);握手前用本端最高支持版本。
+    protocol_version: Mutex<String>,
+    /// JSON-RPC 请求 id 单调递增(此前恒为 1)。
+    next_id: AtomicU64,
 }
 
 impl std::fmt::Debug for StreamableHttpUpstream {
@@ -77,6 +87,9 @@ impl StreamableHttpUpstream {
             mcp_url,
             auth: StreamableAuth::None,
             sender,
+            session_id: Mutex::new(None),
+            protocol_version: Mutex::new(SUPPORTED_PROTOCOL_VERSIONS[0].to_string()),
+            next_id: AtomicU64::new(1),
         }
     }
 
@@ -92,6 +105,9 @@ impl StreamableHttpUpstream {
             mcp_url,
             auth: StreamableAuth::Bearer { token },
             sender,
+            session_id: Mutex::new(None),
+            protocol_version: Mutex::new(SUPPORTED_PROTOCOL_VERSIONS[0].to_string()),
+            next_id: AtomicU64::new(1),
         }
     }
 
@@ -113,37 +129,43 @@ impl StreamableHttpUpstream {
                 expected,
             })),
             sender,
+            session_id: Mutex::new(None),
+            protocol_version: Mutex::new(SUPPORTED_PROTOCOL_VERSIONS[0].to_string()),
+            next_id: AtomicU64::new(1),
         }
     }
 
-    fn call_once(
+    /// 发送一条 JSON-RPC 消息(请求或通知)并带回完整响应。Streamable HTTP 头:`Accept`、
+    /// 协商到的 `MCP-Protocol-Version`、握手拿到的 `Mcp-Session-Id`(有则带)。`Content-Type`
+    /// 由 sender 按 method 设置(此前这里再传一份造成重复头)。
+    fn send_rpc(
         &self,
-        method: &str,
-        params: Option<Value>,
+        rpc: &Value,
         timeout: Duration,
-    ) -> Result<Value, UpstreamError> {
-        let rpc = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params,
-        });
+    ) -> Result<vigil_http_auth::HttpResponseFull, UpstreamError> {
         let body =
-            serde_json::to_vec(&rpc).map_err(|_| UpstreamError::Internal("rpc_encode_failed"))?;
-
-        // Streamable HTTP 头经 planner `incoming_headers` 注入(均不在 STRIPPED 集 → 被 keep);
-        // 鉴权时 planner 另追加 `Authorization: Bearer <token>`(sealed,无 passthrough)。
-        let incoming = [
-            ("Content-Type".to_string(), "application/json".to_string()),
+            serde_json::to_vec(rpc).map_err(|_| UpstreamError::Internal("rpc_encode_failed"))?;
+        let mut incoming: Vec<(String, String)> = vec![
             (
                 "Accept".to_string(),
                 "application/json, text/event-stream".to_string(),
             ),
             (
                 "MCP-Protocol-Version".to_string(),
-                MCP_PROTOCOL_VERSION.to_string(),
+                self.protocol_version
+                    .lock()
+                    .map_err(|_| UpstreamError::Internal("lock_poisoned"))?
+                    .clone(),
             ),
         ];
+        if let Some(sid) = self
+            .session_id
+            .lock()
+            .map_err(|_| UpstreamError::Internal("lock_poisoned"))?
+            .as_ref()
+        {
+            incoming.push(("Mcp-Session-Id".to_string(), sid.clone()));
+        }
         // None → plan_unauthorized(无 Authorization);Bearer 本地造 ResolvedAccessToken;OAuth 经
         // sealed TokenStore resolve。三者均产 sealed AuthorizedHttpRequest(no passthrough)。
         let (authorized, _report) = match &self.auth {
@@ -184,20 +206,169 @@ impl StreamableHttpUpstream {
                 .map_err(map_auth_error)?
             }
         };
-
         // per-call timeout 生效;sealed request → 类型上只能是已鉴权请求。
-        let resp = self
-            .sender
-            .send_authorized_with_timeout(&authorized, timeout)
-            .map_err(map_auth_error)?;
+        self.sender
+            .send_authorized_full_with_timeout(&authorized, timeout)
+            .map_err(map_auth_error)
+    }
 
+    /// 单条请求(带递增 id)→ `result`。状态码分流:200 解析;202/204 = 通知已接受(空结果);
+    /// 401/403 映射;404 且持有会话 = 会话过期(清会话,下次握手重建)。
+    fn call_once(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, UpstreamError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let rpc = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let resp = self.send_rpc(&rpc, timeout)?;
+        self.map_status(resp)
+    }
+
+    fn map_status(&self, resp: vigil_http_auth::HttpResponseFull) -> Result<Value, UpstreamError> {
         match resp.status {
             200 => parse_json_rpc_result(&resp.body),
+            202 | 204 => Ok(Value::Null),
             401 => Err(UpstreamError::Unauthorized {
                 reason_code: "upstream_401",
             }),
             403 => Err(UpstreamError::Forbidden),
+            404 => {
+                let had_session = self
+                    .session_id
+                    .lock()
+                    .map(|mut g| g.take().is_some())
+                    .unwrap_or(false);
+                Err(UpstreamError::TransportIo(if had_session {
+                    "upstream_session_expired"
+                } else {
+                    "upstream_non_2xx"
+                }))
+            }
             _ => Err(UpstreamError::TransportIo("upstream_non_2xx")),
+        }
+    }
+
+    /// MCP 客户端生命周期握手:`initialize` → 校验协商版本 → 记 `Mcp-Session-Id` → `notifications/initialized`。
+    ///
+    /// 此前 HTTP 上游**从不握手**(直接 tools/list,id 恒 1,协议头写死 2025-03-26):无状态服务器
+    /// (AURA / rmcp stateless)侥幸可用,有状态 Streamable HTTP 服务器(要求 `Mcp-Session-Id`)会
+    /// 对每个请求回 400/404 —— Vigil×AURA 交叉测试 2026-09-11 线上抓到。与 stdio 路径同一套
+    /// 版本白名单与 2026-07-28 现代专属判别(`server/discover` 探针)。
+    pub fn initialize_handshake(&self, timeout: Duration) -> Result<(), UpstreamError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let rpc = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0],
+                "capabilities": {},
+                "clientInfo": { "name": "vigil-hub", "version": env!("CARGO_PKG_VERSION") },
+            },
+        });
+        let resp = self.send_rpc(&rpc, timeout)?;
+        // 会话 id:spec 要求 visible ASCII;上游不可信,钳长度 + 字符集,不合格当作没有。
+        let sid = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"))
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| {
+                !v.is_empty()
+                    && v.len() <= MAX_SESSION_ID_LEN
+                    && v.bytes().all(|b| (0x21..=0x7e).contains(&b))
+            });
+        let result = match self.map_status(resp) {
+            Ok(v) => v,
+            // 上游以 JSON-RPC error 拒绝 initialize:可能是现代专属服务器(2026-07-28+ 无此方法)。
+            // 用 server/discover 探针确定性判别(探针超时收紧:上游已证明在线会应答)。
+            Err(orig @ UpstreamError::JsonRpc { .. }) => {
+                return Err(
+                    self.classify_initialize_rejection(orig, timeout.min(Duration::from_secs(5)))
+                );
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(neg) = result.get("protocolVersion").and_then(Value::as_str) {
+            if !SUPPORTED_PROTOCOL_VERSIONS.contains(&neg) {
+                return Err(UpstreamError::ProtocolVersionUnsupported {
+                    negotiated: safe_protocol_version(neg),
+                    supported: SUPPORTED_PROTOCOL_VERSIONS.join(", "),
+                });
+            }
+            *self
+                .protocol_version
+                .lock()
+                .map_err(|_| UpstreamError::Internal("lock_poisoned"))? = neg.to_string();
+        }
+        if let Ok(mut g) = self.session_id.lock() {
+            *g = sid;
+        }
+        let notif = serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        let r = self.send_rpc(&notif, timeout)?;
+        if !(200..300).contains(&r.status) {
+            return Err(UpstreamError::TransportIo(
+                "initialized_notification_rejected",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 与 stdio 路径同源的 2026-07-28「Backward Compatibility」三分支裁决:探针成功 → 现代专属;
+    /// 探针回 -32022 → 同样是现代服务器;其它 → 保留原 initialize 错误。
+    fn classify_initialize_rejection(
+        &self,
+        orig: UpstreamError,
+        probe_timeout: Duration,
+    ) -> UpstreamError {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_PROBE_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "vigil-hub",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            }
+        });
+        match self.call_once("server/discover", Some(params), probe_timeout) {
+            Ok(result) => {
+                let listed: Vec<String> = result
+                    .get("supportedVersions")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .take(MAX_SUPPORTED_LISTED)
+                            .map(safe_protocol_version)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                UpstreamError::ModernOnlyUpstream {
+                    supported: if listed.is_empty() {
+                        "no version list".to_string()
+                    } else {
+                        listed.join(", ")
+                    },
+                    latest: SUPPORTED_PROTOCOL_VERSIONS[0],
+                }
+            }
+            Err(UpstreamError::JsonRpc { code, .. })
+                if code == i64::from(UNSUPPORTED_PROTOCOL_VERSION_CODE) =>
+            {
+                UpstreamError::ModernOnlyUpstream {
+                    supported: "no version list".to_string(),
+                    latest: SUPPORTED_PROTOCOL_VERSIONS[0],
+                }
+            }
+            Err(_) => orig,
         }
     }
 }
@@ -369,6 +540,255 @@ mod tests {
         "https://mcp.example.com/rpc".parse().unwrap()
     }
 
+    /// 一条预录响应:(status, body, headers)。
+    type Scripted = (u16, Vec<u8>, Vec<(String, String)>);
+    /// 一次捕获的请求:(headers, JSON body)。
+    type Captured = (Vec<(String, String)>, Value);
+    /// 测试脚本里的一条预录响应(借用形态)。
+    type ScriptedIn<'a> = (u16, &'a str, Vec<(&'a str, &'a str)>);
+
+    /// 按序回放响应并记录每次请求的 (headers, body) 的 sender。
+    struct ScriptedSender {
+        responses: Mutex<std::collections::VecDeque<Scripted>>,
+        requests: Mutex<Vec<Captured>>,
+    }
+    impl ScriptedSender {
+        fn new(responses: Vec<ScriptedIn<'_>>) -> Self {
+            Self {
+                responses: Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(|(s, b, h)| {
+                            (
+                                s,
+                                b.as_bytes().to_vec(),
+                                h.into_iter()
+                                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                ),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+        fn requests(&self) -> Vec<Captured> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+    impl std::fmt::Debug for ScriptedSender {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ScriptedSender").finish_non_exhaustive()
+        }
+    }
+    impl AuthorizedSender for ScriptedSender {
+        fn send_authorized(
+            &self,
+            req: &AuthorizedHttpRequest,
+        ) -> Result<HttpResponse, HttpAuthError> {
+            let full = self.send_authorized_full_with_timeout(req, Duration::from_secs(1))?;
+            Ok(HttpResponse {
+                status: full.status,
+                body: full.body,
+            })
+        }
+        fn send_authorized_full_with_timeout(
+            &self,
+            req: &AuthorizedHttpRequest,
+            _timeout: Duration,
+        ) -> Result<vigil_http_auth::HttpResponseFull, HttpAuthError> {
+            let body: Value =
+                serde_json::from_slice(req.body().unwrap_or(&[])).unwrap_or(Value::Null);
+            self.requests
+                .lock()
+                .unwrap()
+                .push((req.headers().to_vec(), body));
+            let (status, body, headers) = self.responses.lock().unwrap().pop_front().unwrap_or((
+                500,
+                b"unscripted".to_vec(),
+                Vec::new(),
+            ));
+            Ok(vigil_http_auth::HttpResponseFull {
+                status,
+                body,
+                headers,
+            })
+        }
+    }
+    fn hdr<'a>(hdrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        hdrs.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn handshake_negotiates_version_and_carries_session_id() {
+        // Vigil×AURA 交叉测试 2026-09-11:此前 HTTP 上游不握手、id 恒 1、协议头写死 2025-03-26。
+        let sender = Arc::new(ScriptedSender::new(vec![
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"s","version":"1"}}}"#,
+                vec![("Mcp-Session-Id", "sess-abc")],
+            ),
+            (202, "", vec![]),
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#,
+                vec![],
+            ),
+        ]));
+        let up = StreamableHttpUpstream::with_none("s", url(), sender.clone());
+        up.initialize_handshake(Duration::from_secs(5)).unwrap();
+        let r = up.call("tools/list", None, Duration::from_secs(5)).unwrap();
+        assert_eq!(r, serde_json::json!({"tools": []}));
+        let reqs = sender.requests();
+        assert_eq!(reqs.len(), 3, "{reqs:?}");
+        // 1) initialize:提议本端最高版本,带 clientInfo
+        assert_eq!(reqs[0].1["method"], "initialize");
+        assert_eq!(
+            reqs[0].1["params"]["protocolVersion"],
+            SUPPORTED_PROTOCOL_VERSIONS[0]
+        );
+        assert_eq!(reqs[0].1["params"]["clientInfo"]["name"], "vigil-hub");
+        assert!(hdr(&reqs[0].0, "mcp-session-id").is_none());
+        // 2) initialized 通知:无 id;已带协商后的版本头 + 会话
+        assert_eq!(reqs[1].1["method"], "notifications/initialized");
+        assert!(reqs[1].1.get("id").is_none());
+        assert_eq!(hdr(&reqs[1].0, "mcp-protocol-version"), Some("2025-06-18"));
+        assert_eq!(hdr(&reqs[1].0, "mcp-session-id"), Some("sess-abc"));
+        // 3) tools/list:id 递增(initialize 用了 1)、头同上
+        assert_eq!(reqs[2].1["id"], 2);
+        assert_eq!(hdr(&reqs[2].0, "mcp-protocol-version"), Some("2025-06-18"));
+        assert_eq!(hdr(&reqs[2].0, "mcp-session-id"), Some("sess-abc"));
+    }
+
+    #[test]
+    fn handshake_rejects_unsupported_negotiated_version() {
+        let sender = Arc::new(ScriptedSender::new(vec![(
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1999-01-01"}}"#,
+            vec![],
+        )]));
+        let up = StreamableHttpUpstream::with_none("s", url(), sender);
+        let err = up.initialize_handshake(Duration::from_secs(5)).unwrap_err();
+        assert!(
+            matches!(err, UpstreamError::ProtocolVersionUnsupported { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("1999-01-01"), "{err}");
+    }
+
+    #[test]
+    fn handshake_classifies_modern_only_upstream_via_discover_probe() {
+        let sender = Arc::new(ScriptedSender::new(vec![
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"initialize"}}"#,
+                vec![],
+            ),
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"supportedVersions":["2026-07-28","<script>"]}}"#,
+                vec![],
+            ),
+        ]));
+        let up = StreamableHttpUpstream::with_none("s", url(), sender.clone());
+        let err = up.initialize_handshake(Duration::from_secs(5)).unwrap_err();
+        match &err {
+            UpstreamError::ModernOnlyUpstream { supported, latest } => {
+                assert!(supported.contains("2026-07-28"), "{supported}");
+                assert!(
+                    !supported.contains("<script>"),
+                    "untrusted list must be sanitized: {supported}"
+                );
+                assert_eq!(*latest, SUPPORTED_PROTOCOL_VERSIONS[0]);
+            }
+            other => panic!("expected ModernOnlyUpstream, got {other:?}"),
+        }
+        let reqs = sender.requests();
+        assert_eq!(reqs[1].1["method"], "server/discover");
+    }
+
+    #[test]
+    fn plain_initialize_error_is_kept_when_probe_fails() {
+        let sender = Arc::new(ScriptedSender::new(vec![
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"nope"}}"#,
+                vec![],
+            ),
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"server/discover"}}"#,
+                vec![],
+            ),
+        ]));
+        let up = StreamableHttpUpstream::with_none("s", url(), sender);
+        let err = up.initialize_handshake(Duration::from_secs(5)).unwrap_err();
+        assert!(
+            matches!(err, UpstreamError::JsonRpc { code: -32000, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn session_404_clears_session_and_reports_expiry() {
+        let sender = Arc::new(ScriptedSender::new(vec![
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#,
+                vec![("mcp-session-id", "S1")],
+            ),
+            (202, "", vec![]),
+            (404, "", vec![]),
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"ok":true}}"#,
+                vec![],
+            ),
+        ]));
+        let up = StreamableHttpUpstream::with_none("s", url(), sender.clone());
+        up.initialize_handshake(Duration::from_secs(5)).unwrap();
+        let err = up
+            .call("tools/list", None, Duration::from_secs(5))
+            .unwrap_err();
+        assert!(
+            matches!(err, UpstreamError::TransportIo("upstream_session_expired")),
+            "{err:?}"
+        );
+        // 会话已清:下一次请求不再带 Mcp-Session-Id
+        let _ = up.call("tools/list", None, Duration::from_secs(5)).unwrap();
+        let reqs = sender.requests();
+        assert_eq!(hdr(&reqs[2].0, "mcp-session-id"), Some("S1"));
+        assert!(
+            hdr(&reqs[3].0, "mcp-session-id").is_none(),
+            "{:?}",
+            reqs[3].0
+        );
+    }
+
+    #[test]
+    fn stateless_server_without_session_header_works_and_bad_session_ids_are_ignored() {
+        let sender = Arc::new(ScriptedSender::new(vec![
+            (
+                200,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#,
+                vec![("Mcp-Session-Id", "bad id with spaces")],
+            ),
+            (200, "", vec![]),
+            (200, r#"{"jsonrpc":"2.0","id":2,"result":{}}"#, vec![]),
+        ]));
+        let up = StreamableHttpUpstream::with_none("s", url(), sender.clone());
+        up.initialize_handshake(Duration::from_secs(5)).unwrap();
+        let _ = up.call("ping", None, Duration::from_secs(5)).unwrap();
+        let reqs = sender.requests();
+        assert!(
+            hdr(&reqs[2].0, "mcp-session-id").is_none(),
+            "{:?}",
+            reqs[2].0
+        );
+    }
+
     #[test]
     fn bearer_happy_path_returns_result_and_injects_streamable_headers() {
         let sender = Arc::new(CannedSender::ok(
@@ -393,9 +813,13 @@ mod tests {
         assert!(hdrs
             .iter()
             .any(|(k, v)| k == "Accept" && v.contains("text/event-stream")));
-        assert!(hdrs
-            .iter()
-            .any(|(k, v)| k == "Content-Type" && v == "application/json"));
+        // Content-Type 由 sender 按 method 设置,本层**不再**注入(此前重复发两份)。
+        assert!(
+            !hdrs
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type")),
+            "planner headers must not carry Content-Type (sender sets exactly one): {hdrs:?}"
+        );
     }
 
     #[test]

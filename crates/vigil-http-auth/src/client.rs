@@ -55,6 +55,18 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+/// 带响应头的 HTTP 响应。Streamable HTTP MCP 客户端需要读 `Mcp-Session-Id`(initialize 响应头,
+/// 有状态服务器要求后续请求回带)。头名保持发送方原样(消费方按大小写不敏感匹配)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpResponseFull {
+    /// HTTP status code(100-599)
+    pub status: u16,
+    /// response body 原始字节
+    pub body: Vec<u8>,
+    /// 响应头(name, value);多值头按出现顺序各占一项
+    pub headers: Vec<(String, String)>,
+}
+
 /// HTTP 客户端 trait —— 通用发送面(发现路径用 PRM / AS metadata / JWKS)。
 ///
 /// I10a 只测 mock;I10b-α2 接 reqwest。**不**允许 `HttpUpstream` 持有这个 trait;
@@ -87,6 +99,22 @@ pub trait AuthorizedSender: Send + Sync + std::fmt::Debug {
         _timeout: std::time::Duration,
     ) -> Result<HttpResponse, HttpAuthError> {
         self.send_authorized(req)
+    }
+
+    /// 同 [`send_authorized_with_timeout`](Self::send_authorized_with_timeout),但带回响应头
+    /// (Streamable HTTP 握手要读 `Mcp-Session-Id`)。默认实现回落到无头版本、headers 为空 ——
+    /// 既有 mock 零改动;真实装(`ReqwestHttpClient`)覆盖之。
+    fn send_authorized_full_with_timeout(
+        &self,
+        req: &AuthorizedHttpRequest,
+        timeout: std::time::Duration,
+    ) -> Result<HttpResponseFull, HttpAuthError> {
+        let r = self.send_authorized_with_timeout(req, timeout)?;
+        Ok(HttpResponseFull {
+            status: r.status,
+            body: r.body,
+            headers: Vec::new(),
+        })
     }
 }
 

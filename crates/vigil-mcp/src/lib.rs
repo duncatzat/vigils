@@ -25,6 +25,10 @@ pub use hub::{
 pub use namespace::{NamespaceError, ToolRoute, ToolRouter};
 pub use oracle::RegistryDescriptorOracle;
 pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+pub use stdio::{
+    safe_protocol_version, MAX_SUPPORTED_LISTED, MODERN_PROBE_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    UNSUPPORTED_PROTOCOL_VERSION_CODE,
+};
 pub use upstream::{McpUpstream, UpstreamError};
 
 /// 当前迭代号。

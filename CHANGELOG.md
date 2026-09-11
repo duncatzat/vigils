@@ -107,6 +107,31 @@ All notable changes to Vigils are documented here. The format follows
   `env_assignment` heuristic** (`KEY|TOKEN|SECRET|PASSWORD|AUTH=value`), so reading an `.env.example`
   or a CI YAML with placeholder values is also withheld-and-redacted (the model still receives the full
   placeholder text; only a one-line note is added).
+- **HTTP (Streamable) upstreams now perform the MCP handshake.** `--upstream-config` http
+  upstreams never sent `initialize`: they went straight to `tools/list` with a constant request id,
+  a hard-coded `MCP-Protocol-Version: 2025-03-26` and a duplicated `Content-Type`. Stateless servers
+  happened to work; stateful Streamable HTTP servers (which require `Mcp-Session-Id`) rejected every
+  call. The hub now runs `initialize` -> negotiated-version check (same allow-list as stdio) ->
+  `Mcp-Session-Id` capture -> `notifications/initialized` before attaching, sends the negotiated version
+  and session on every request with incrementing ids, treats 404 as session expiry, and classifies
+  modern-only (2026-07-28) servers with the `server/discover` probe like the stdio path. A failed
+  handshake is reported on stderr and the upstream is still attached.
+- **`tools/list` no longer fails silently.** First-seen tool descriptors are untrusted by default and
+  hidden; a fresh upstream therefore looked like "0 tools" with no explanation. The hub now prints how
+  many tools are pending approval and how to approve them, and prints upstream `tools/list` failures
+  (stable reason codes / hashes only).
+- **Alias path keys no longer turn non-path values into file effects.** Values such as
+  `output: "json"` or `target: "node-1"` were treated as project paths by the L2.1 heuristic, so a remote
+  screenshot tool was classified as a repo read and allowed by `allow-repo-read`. Alias keys
+  (`src/source/dst/dest/destination/target/input/output`) now count only when the value looks like a path;
+  keys that name a path (`path`, `file`, `dir`, ...) are unchanged.
+- **Hard fingerprints inside base64 payloads.** A token wrapped in base64 (for example
+  `file_push.content_base64`) was invisible to the plain-text fingerprint scan, so it was allowed into a
+  tool call and landed on disk (`file_pull` is the mirror image). `detect_hard_secret`, `scrub_text` and
+  `scan_hard_findings` now decode base64 / base64url runs of 40+ characters that decode to text and scan
+  them; a matching run is replaced wholesale by `[REDACTED base64_payload]`. Binary payloads (screenshots)
+  fail the text check and are skipped. Applies to the hook path, the MCP gateway and the ledger's
+  fail-closed self-check alike.
 - **MCP gateway result redaction returned an invalid `CallToolResult`.** Real MCP servers often put
   re-serialized JSON into `content[].text` (AURA's `run_command` does). In-band redaction scrubbed the
   canonical JSON *text*, which ate escape backslashes, failed to re-parse and fell back to a bare

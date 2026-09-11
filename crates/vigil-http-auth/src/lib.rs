@@ -36,7 +36,8 @@ pub use audit::{
     EVENT_TOKEN_REJECTED_WRONG_RESOURCE, EVENT_TOKEN_STORED,
 };
 pub use client::{
-    AuthorizedSender, HttpClient, HttpMethod, HttpRequest, HttpResponse, MockHttpClient,
+    AuthorizedSender, HttpClient, HttpMethod, HttpRequest, HttpResponse, HttpResponseFull,
+    MockHttpClient,
 };
 pub use error::HttpAuthError;
 pub use jwks::{Jwk, JwkSet, JwksSource, MockJwksSource};

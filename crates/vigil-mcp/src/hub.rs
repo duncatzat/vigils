@@ -398,6 +398,9 @@ pub struct Hub {
     /// 未来 feedback loop(lease 收敛)的最小可观察性前置 —— 当前版本只产生审计事件
     /// + 本计数器;真正"命中 N 次自动 revoke lease"延至 Hub 集成 SecretBroker 后实装。
     leak_detected_count: AtomicU64,
+    /// tools/list 诊断去重:server_id → 上次打到 stderr 的提示。同一状态不重复打印(客户端会
+    /// 反复 tools/list),状态变化(新的隐藏计数 / 新的错误)才再打。
+    tools_list_notices: Mutex<HashMap<String, String>>,
     /// P0 注入防护 Slice C(T7):DeBERTa 序列分类器(serve 路径 warm session)。
     /// `None` = 未启用(默认 / flag off / 无 `--features ort`)。`Some` = serve 启动时
     /// warm-load 一次,descriptor/result 软信号扫描复用此常驻 session(避免每次推理重载 738MB)。
@@ -471,6 +474,7 @@ impl Hub {
             session_id: Mutex::new(None),
             secret_aliases,
             leak_detected_count: AtomicU64::new(0),
+            tools_list_notices: Mutex::new(HashMap::new()),
             #[cfg(feature = "ort")]
             injection_classifier: None,
         }
@@ -493,6 +497,21 @@ impl Hub {
     /// 累计次数。未来做真租约收敛时,此计数器将作为触发阈值的输入。
     pub fn leak_detected_count(&self) -> u64 {
         self.leak_detected_count.load(Ordering::Relaxed)
+    }
+
+    /// tools/list 诊断(stderr,去重):`msg` 为空 = 恢复正常,只清状态不打印。
+    fn note_tools_list(&self, server_id: &str, msg: &str) {
+        let Ok(mut g) = self.tools_list_notices.lock() else {
+            return;
+        };
+        let prev = g.get(server_id).map(String::as_str).unwrap_or("");
+        if prev == msg {
+            return;
+        }
+        if !msg.is_empty() {
+            eprintln!("[vigil-hub] upstream '{server_id}': {msg}");
+        }
+        g.insert(server_id.to_string(), msg.to_string());
     }
 
     /// ISS-019 Phase 2:暴露 approval_wait 配置(单测守门用)。
@@ -963,12 +982,19 @@ impl Hub {
             };
             let result = match up.call("tools/list", None, self.config.upstream_list_timeout) {
                 Ok(v) => v,
-                Err(_) => continue, // 不可达的上游不影响其它;I10 做重试
+                // 不可达的上游不影响其它,但**不能静默**:agent 只会看到 0 个工具,运维需要在 stderr
+                // 看到原因(Vigil×AURA 交叉测试 2026-09-11:HTTP 上游失败时零诊断)。`e` 的 Display
+                // 只含稳定 reason code / sha256,不带上游明文。
+                Err(e) => {
+                    self.note_tools_list(&server.server_id, &format!("tools/list failed: {e}"));
+                    continue;
+                }
             };
             let Some(tools) = result.get("tools").and_then(Value::as_array) else {
                 continue;
             };
             let mut hashes: Vec<String> = Vec::new();
+            let mut pending_approval = 0usize;
             for t in tools {
                 let Some(tool_name) = t.get("name").and_then(Value::as_str) else {
                     continue;
@@ -1043,6 +1069,7 @@ impl Hub {
                     .get_pinned_tool_hash(&server.server_id, tool_name)?
                     .is_none()
                 {
+                    pending_approval += 1;
                     continue;
                 }
                 hashes.push(hash.clone());
@@ -1057,6 +1084,20 @@ impl Hub {
                 public_tools.push(exposed);
             }
             // 聚合 server 的 descriptor_hash:对所有工具 hash 再过一层 SHA-256
+            // 首见描述符默认不信任 → 不进 tools/list。此前对外零诊断,新上游看起来就是"0 个工具"
+            // (Vigil×AURA 交叉测试 2026-09-11)。在 stderr 说清楚等待批准的数量与出路。
+            if pending_approval > 0 {
+                self.note_tools_list(
+                    &server.server_id,
+                    &format!(
+                        "{pending_approval} tool(s) discovered but hidden until approved \
+                         (first-seen descriptors are untrusted by default; approve them in the \
+                         Vigil desktop app, or start with --auto-approve-first-seen for development)"
+                    ),
+                );
+            } else {
+                self.note_tools_list(&server.server_id, "");
+            }
             let mut agg = Sha256::new();
             for h in &hashes {
                 agg.update(h.as_bytes());

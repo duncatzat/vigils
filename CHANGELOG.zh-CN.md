@@ -85,6 +85,22 @@ Vigils 的所有重要变更记录于此。格式遵循
   保持稳定。Gemini / Cursor 不变。
   诚实边界:触发条件与 Claude 面同一套硬指纹规则,**含 `env_assignment`(`KEY|TOKEN|SECRET|PASSWORD|AUTH=值`)启发式**,
   读 `.env.example` / CI YAML 之类占位值也会被 withheld-and-redacted(模型仍拿到占位符版全文,只多一行说明)。
+- **HTTP(Streamable)上游补齐 MCP 握手。** `--upstream-config` 的 http 上游此前从不 `initialize`:
+  直接 `tools/list`、请求 id 恒定、`MCP-Protocol-Version` 头写死 2025-03-26、`Content-Type` 重复发两份。
+  无状态服务器侥幸可用,要求 `Mcp-Session-Id` 的有状态 Streamable HTTP 服务器会拒绝一切请求。现在 attach
+  前做 initialize → 协商版本校验(与 stdio 同一白名单)→ 记 `Mcp-Session-Id` → `notifications/initialized`;
+  后续请求带协商版本与会话、id 递增;404 判会话过期;initialize 被拒时用 `server/discover` 探针做 2026-07-28
+  现代专属判别(与 stdio 同源)。握手失败在 stderr 说明后仍 attach。
+- **`tools/list` 不再静默失败。** 首见工具描述符默认不信任而被隐藏,新上游看起来就是「0 个工具」且无解释。
+  现在 stderr 说明有多少工具待批准与出路;上游 `tools/list` 失败也会打出(只含稳定 reason code / 哈希)。
+- **别名路径键的非路径值不再产生文件效应。** `output: "json"`、`target: "node-1"` 之类曾被 L2.1 启发式当成
+  项目内路径,远程截图工具因此被判成仓库读并由 `allow-repo-read` 放行。别名键(`src/source/dst/dest/
+  destination/target/input/output`)只在值长得像路径时计入;`path`、`file`、`dir` 等键名即路径的字段不变。
+- **base64 载荷里的硬指纹。** 装进 base64 的 token(如 `file_push.content_base64`)对明文指纹扫描不可见,
+  因此被放行进工具调用并落盘(`file_pull` 是反向同理)。`detect_hard_secret` / `scrub_text` /
+  `scan_hard_findings` 现在对 ≥40 字符、能解成文本的 base64 / base64url 段解码后再扫;命中的段整段替换为
+  `[REDACTED base64_payload]`。二进制载荷(截图)过不了文本检查、直接跳过。hook 路径、MCP 网关与账本的
+  fail-closed 自检同时受益。
 - **MCP 网关结果脱敏返回了非法 `CallToolResult`。** 真实 MCP server 常把再序列化的 JSON 放进
   `content[].text`(AURA 的 `run_command` 即如此)。in-band 脱敏对规范化 JSON *文本* scrub 会吞掉转义
   反斜杠,重解析失败后退化成 `{"vigil_redacted": ...}` 裸对象 —— 不是合法工具结果,Codex 报

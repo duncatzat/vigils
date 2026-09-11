@@ -182,6 +182,25 @@ pub fn scrub_text_with_spans(text: &str) -> (String, Vec<(usize, usize)>) {
 /// 与 `scrub_text` 的关系:`scan_hard_findings` 在**未**脱敏原文上扫 HARD_RULES;
 /// `scrub_text` 的输出不应再被 scan(占位符会被误识别)。
 pub fn scan_hard_findings(text: &str) -> Vec<&'static str> {
+    let mut out = scan_hard_findings_plain(text);
+    // base64 载荷里的命中(只解一层,内层再扫明文规则)。
+    for (i, m) in BASE64_RUN.find_iter(text).enumerate() {
+        if i >= BASE64_MAX_RUNS {
+            break;
+        }
+        if let Some(decoded) = decode_base64_text(m.as_str()) {
+            for r in scan_hard_findings_plain(&decoded) {
+                if !out.contains(&r) {
+                    out.push(r);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 只扫明文(不解 base64)的 [`scan_hard_findings`]。
+fn scan_hard_findings_plain(text: &str) -> Vec<&'static str> {
     // 与 detect_hard_secret 同源:先剥占位符,再扫 HARD_RULES
     let stripped = KNOWN_REDACTED_MARKER.replace_all(text, "");
     let mut out: Vec<&'static str> = Vec::new();
@@ -207,6 +226,11 @@ pub fn scan_hard_findings(text: &str) -> Vec<&'static str> {
 /// `[REDACTED DATABASE_PASSWORD=hunter2]` 等不满足上述形态,将**保留在扫描文本里**,
 /// 被硬指纹规则识别并拒绝写入。
 pub fn detect_hard_secret(text: &str) -> Option<&'static str> {
+    detect_hard_secret_plain(text).or_else(|| detect_hard_secret_in_base64(text))
+}
+
+/// 只扫明文(不解 base64)。[`detect_hard_secret_in_base64`] 对解码后的文本用它,避免递归解码。
+fn detect_hard_secret_plain(text: &str) -> Option<&'static str> {
     let stripped = KNOWN_REDACTED_MARKER.replace_all(text, "");
     for r in HARD_RULES.iter() {
         if r.pattern.is_match(&stripped) {
@@ -214,6 +238,103 @@ pub fn detect_hard_secret(text: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// 长度 ≥ 40 的 base64 / base64url 连续段(可带 `=` 填充)。40 ≈ 最短硬指纹(40 位 github_token)
+/// 编码后的长度下限,更短的段装不下一个完整硬指纹。
+static BASE64_RUN: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"[A-Za-z0-9+/_\-]{40,}={0,2}").expect("regex"));
+/// 单段解码上限(防恶意超长段拖慢)与每段文本最多检查的段数。
+const BASE64_MAX_RUN_BYTES: usize = 4 * 1024 * 1024;
+const BASE64_MAX_RUNS: usize = 256;
+/// base64 载荷占位符的规则名(须匹配 `KNOWN_REDACTED_MARKER` 的 `[a-z_]+` 形态)。
+const BASE64_PAYLOAD_RULE: &str = "base64_payload";
+
+/// 把一个 base64 段解成**文本**:标准 / URL-safe 字母表各试一次(填充剥掉后按 NO_PAD 解),
+/// 非 UTF-8 或含控制字符(二进制:截图 WebP、压缩包)→ `None`,一解即弃、不再扫描。
+fn decode_base64_text(run: &str) -> Option<String> {
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+    use base64::Engine as _;
+    if run.len() > BASE64_MAX_RUN_BYTES {
+        return None;
+    }
+    let trimmed = run.trim_end_matches('=');
+    for eng in [&STANDARD_NO_PAD, &URL_SAFE_NO_PAD] {
+        if let Ok(bytes) = eng.decode(trimmed) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                if text
+                    .chars()
+                    .all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+                {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// base64 载荷里的硬指纹。Vigil×AURA 交叉测试(2026-09-11):`file_push.content_base64` 把 token
+/// 装进 base64,明文指纹看不见 → token 落盘;`file_pull` 反向同理。只对"长得像 base64 且解出来
+/// 是文本"的段扫描,解码后只扫明文规则(不递归解码)。
+pub fn detect_hard_secret_in_base64(text: &str) -> Option<&'static str> {
+    for (i, m) in BASE64_RUN.find_iter(text).enumerate() {
+        if i >= BASE64_MAX_RUNS {
+            break;
+        }
+        if let Some(decoded) = decode_base64_text(m.as_str()) {
+            if let Some(rule) = detect_hard_secret_plain(&decoded) {
+                return Some(rule);
+            }
+        }
+    }
+    None
+}
+
+/// 一次 base64 段替换的位置记录:旧串区间 → 新串区间(占位符)。
+struct Base64Edit {
+    old: (usize, usize),
+    new: (usize, usize),
+}
+
+/// 把含硬指纹的 base64 段整段替换为 `[REDACTED base64_payload]`(载荷是不透明整体,不做局部
+/// 改写再重编码 —— 重编码会让接收方以为拿到了完整原件)。返回新串 + 每次替换的旧/新区间 +
+/// 内层命中的规则名进 `findings`。无命中 → 原串字节不变、edits 为空。
+fn scrub_base64_runs(text: &str, findings: &mut Vec<String>) -> (String, Vec<Base64Edit>) {
+    let mut out = String::with_capacity(text.len());
+    let mut edits = Vec::new();
+    let mut last = 0usize;
+    for (i, m) in BASE64_RUN.find_iter(text).enumerate() {
+        if i >= BASE64_MAX_RUNS {
+            break;
+        }
+        let Some(decoded) = decode_base64_text(m.as_str()) else {
+            continue;
+        };
+        let inner = scan_hard_findings_plain(&decoded);
+        if inner.is_empty() {
+            continue;
+        }
+        for r in inner {
+            findings.push(r.to_string());
+        }
+        findings.push(BASE64_PAYLOAD_RULE.to_string());
+        out.push_str(&text[last..m.start()]);
+        let start = out.len();
+        out.push_str("[REDACTED ");
+        out.push_str(BASE64_PAYLOAD_RULE);
+        out.push(']');
+        edits.push(Base64Edit {
+            old: (m.start(), m.end()),
+            new: (start, out.len()),
+        });
+        last = m.end();
+    }
+    if edits.is_empty() {
+        return (text.to_string(), edits);
+    }
+    out.push_str(&text[last..]);
+    (out, edits)
 }
 
 // ---------------- 内部 ----------------
@@ -271,6 +392,33 @@ fn redact_string(s: &str, findings: &mut Vec<String>) -> String {
     redact_string_with_spans(s, findings).0
 }
 
+/// [`redact_string_with_spans`] 的第二遍:对规则替换后的输出再做 base64 载荷替换。规则占位符含
+/// `[` / 空格,不可能落在 base64 段内,故两类区间互不相交;既有区间只需按其**前方**替换造成的
+/// 长度变化平移,再并入新占位符区间。
+fn apply_base64_pass(
+    text: String,
+    spans: Vec<(usize, usize)>,
+    findings: &mut Vec<String>,
+) -> (String, Vec<(usize, usize)>) {
+    let (out, edits) = scrub_base64_runs(&text, findings);
+    if edits.is_empty() {
+        return (text, spans);
+    }
+    let map = |pos: usize| -> usize {
+        let mut shift: isize = 0;
+        for e in &edits {
+            if e.old.1 <= pos {
+                shift += (e.new.1 - e.new.0) as isize - (e.old.1 - e.old.0) as isize;
+            }
+        }
+        (pos as isize + shift) as usize
+    };
+    let mut mapped: Vec<(usize, usize)> = spans.iter().map(|&(a, b)| (map(a), map(b))).collect();
+    mapped.extend(edits.iter().map(|e| e.new));
+    mapped.sort_unstable();
+    (out, mapped)
+}
+
 /// 同 [`redact_string`],但额外返回本函数**新插入**的 `[REDACTED …]` 占位符在**输出串**中的
 /// 字节区间(升序、互不重叠)。供 hook PostToolUse ML 再脱敏把这些区间作为"受保护区"——后续
 /// daemon ML span 命中这些区间时做减法,避免把已脱敏的占位符切碎成破碎嵌套(VIGIL-SEC-OVERLAP-PH)。
@@ -312,7 +460,8 @@ fn redact_string_with_spans(s: &str, findings: &mut Vec<String>) -> (String, Vec
         }
     }
     if hits.is_empty() {
-        return (s.to_string(), Vec::new());
+        // 明文规则无命中也要走 base64 载荷这一遍(否则纯 base64 文本里的 token 直接漏过)。
+        return apply_base64_pass(s.to_string(), Vec::new(), findings);
     }
 
     // findings 契约:每条命中规则名至多记一次(caller 再 sort+dedup,顺序无关)。
@@ -364,7 +513,7 @@ fn redact_string_with_spans(s: &str, findings: &mut Vec<String>) -> (String, Vec
         cursor = *end;
     }
     out.push_str(&s[cursor..]);
-    (out, spans)
+    apply_base64_pass(out, spans, findings)
 }
 
 fn collect_strings(v: &Value) -> String {
@@ -634,6 +783,63 @@ static KEY_HINT: Lazy<Regex> =
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn base64_payload_with_token_is_detected_and_scrubbed() {
+        // Vigil×AURA 交叉测试 2026-09-11:file_push.content_base64 装 token 绕过明文指纹。
+        use base64::Engine as _;
+        let tok = "ghp_1234567890abcdef1234567890abcdef12345678";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(format!("GITHUB_TOKEN={tok}\n"));
+        assert_eq!(detect_hard_secret(&b64), Some("github_token"));
+        assert!(scan_hard_findings(&b64).contains(&"github_token"));
+        let out = scrub_text(&format!("payload: {b64} end"));
+        assert!(!out.contains(&b64), "run must be replaced: {out}");
+        assert!(out.contains("[REDACTED base64_payload]"), "{out}");
+        assert!(out.ends_with(" end"), "{out}");
+        assert!(
+            detect_hard_secret(&out).is_none(),
+            "placeholder must not re-trigger: {out}"
+        );
+        // URL-safe 无填充也覆盖
+        let b64u = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("x={tok}"));
+        assert_eq!(detect_hard_secret(&b64u), Some("github_token"));
+    }
+
+    #[test]
+    fn base64_binary_and_clean_text_stay_untouched() {
+        use base64::Engine as _;
+        // 二进制(非 UTF-8,如截图)一解即弃,原样保留
+        let bin =
+            base64::engine::general_purpose::STANDARD.encode([0xffu8, 0xfe, 0x80, 0x00].repeat(20));
+        assert_eq!(scrub_text(&bin), bin);
+        assert!(detect_hard_secret(&bin).is_none());
+        // 干净文本的 base64 原样保留(不重编码、字节不变)
+        let clean = base64::engine::general_purpose::STANDARD
+            .encode("hello world, nothing secret here at all 1234567890");
+        assert_eq!(scrub_text(&clean), clean);
+        assert!(detect_hard_secret(&clean).is_none());
+        // 短段(< 40)不解码
+        assert!(detect_hard_secret("QUJDREVGR0g=").is_none());
+    }
+
+    #[test]
+    fn spans_stay_aligned_after_base64_replacement() {
+        use base64::Engine as _;
+        let tok = "ghp_1234567890abcdef1234567890abcdef12345678";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(format!("k={tok}"));
+        let text = format!("a={tok} b64={b64} tail");
+        let (out, spans) = scrub_text_with_spans(&text);
+        assert!(!out.contains(tok) && !out.contains(&b64), "{out}");
+        assert_eq!(spans.len(), 2, "{spans:?} / {out}");
+        for (a, b) in &spans {
+            let seg = &out[*a..*b];
+            assert!(
+                seg.starts_with("[REDACTED ") && seg.ends_with(']'),
+                "misaligned span {seg:?} in {out}"
+            );
+        }
+        assert!(out.ends_with(" tail"), "{out}");
+    }
 
     #[test]
     fn crate_iteration_is_i01() {

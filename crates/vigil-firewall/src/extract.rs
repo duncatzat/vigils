@@ -48,39 +48,52 @@ impl PathExtractor {
 
     fn collect_paths(&self, args: &Value) -> Vec<String> {
         let mut out = Vec::new();
-        const KEYS: &[&str] = &[
-            // L2.1 强化:扩展常见路径字段别名,让用非标准字段名的陌生工具也能被识别
-            // 出 FsRead/FsWrite(否则提取不到 path → 落 default-deny floor → 缺口)。
+        // 键名本身就宣告"这是路径"的字段:值照单全收(`path: "json"` 仍按路径处理,宁严勿松)。
+        const PATH_KEYS: &[&str] = &[
             "path",
             "paths",
             "file",
             "files",
             "filename",
             "filepath",
+            "dir",
+            "directory",
+            "folder",
+        ];
+        // L2.1 强化:扩展常见路径字段别名,让用非标准字段名的陌生工具也能被识别
+        // 出 FsRead/FsWrite(否则提取不到 path → 落 default-deny floor → 缺口)。
+        // 但这些别名键的值常常**不是路径**(格式选择器 `output:"json"`、节点 id、主机名),
+        // 一律当路径会把陌生工具误判成项目内 FsRead → 被 allow-repo-read 放行 = 方向错误的
+        // 松动(Vigil×AURA 交叉测试 2026-09-11:远程截图 `output:"json"` 被当成仓库读放行)。
+        // 故只有长得像路径的值才计入,见 [`looks_like_path`]。
+        const ALIAS_KEYS: &[&str] = &[
             "src",
             "source",
             "dst",
             "dest",
             "destination",
             "target",
-            "dir",
-            "directory",
-            "folder",
             "input",
             "output",
         ];
-        for k in KEYS {
-            match args.get(*k) {
-                Some(Value::String(s)) => out.push(s.clone()),
-                Some(Value::Array(a)) => {
-                    for v in a {
-                        if let Value::String(s) = v {
+        let mut push = |k: &str, strict: bool| match args.get(k) {
+            Some(Value::String(s)) if strict || looks_like_path(s) => out.push(s.clone()),
+            Some(Value::Array(a)) => {
+                for v in a {
+                    if let Value::String(s) = v {
+                        if strict || looks_like_path(s) {
                             out.push(s.clone());
                         }
                     }
                 }
-                _ => {}
             }
+            _ => {}
+        };
+        for k in PATH_KEYS {
+            push(k, true);
+        }
+        for k in ALIAS_KEYS {
+            push(k, false);
         }
         out
     }
@@ -97,6 +110,28 @@ impl PathExtractor {
         // 先尝试真实解析 —— 若文件存在,解出符号链接 / `..`;不存在时退回手工 `..` 展开
         let normalized = dunce::canonicalize(&abs).unwrap_or_else(|_| manual_normalize(&abs));
         to_posix(&normalized)
+    }
+}
+
+/// 别名键(`output` / `target` / `source` …)的值是否**长得像路径**:含路径分隔符、以 `.` / `~`
+/// 开头、或是带字母扩展名的裸文件名(`report.txt`)。含 `://` 的是 URL(交给 UrlExtractor);
+/// 纯词(`json`)、id(`node-1`)、版本号(`1.5`)都不是路径。
+fn looks_like_path(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.contains("://") || s.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if s.contains('/') || s.contains('\\') || s.starts_with('.') || s.starts_with('~') {
+        return true;
+    }
+    match s.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && (1..=8).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                && ext.chars().any(|c| c.is_ascii_alphabetic())
+        }
+        None => false,
     }
 }
 
@@ -615,6 +650,74 @@ mod tests {
             ev.effects.contains(&EffectKind::ExecNative),
             "cmd 字段 → ExecNative"
         );
+    }
+
+    #[test]
+    fn alias_keys_only_count_when_value_looks_like_a_path() {
+        // Vigil×AURA 交叉测试 2026-09-11:远程截图工具 `screenshot { output: "json" }` 曾被当成
+        // 项目内 FsRead 而被 allow-repo-read 放行。别名键的非路径值不得产生 Fs 效应。
+        let ex = PathExtractor::new(vec![PathBuf::from("/proj")]);
+        let mut ev = EffectVector::default();
+        ex.extract(
+            &mk_call("screenshot", json!({"output": "json", "max_dim": 640})),
+            &mut ev,
+        );
+        assert!(
+            ev.effects.is_empty(),
+            "format selector is not a path: {:?}",
+            ev.effects
+        );
+        let mut ev = EffectVector::default();
+        ex.extract(
+            &mk_call("deploy", json!({"target": "node-1", "source": "v1.5"})),
+            &mut ev,
+        );
+        assert!(ev.effects.is_empty(), "ids / versions are not paths");
+        // 长得像路径的别名值仍然计入(读 / 写按工具名启发式)。
+        let mut ev = EffectVector::default();
+        ex.extract(
+            &mk_call("export", json!({"output": "out/report.json"})),
+            &mut ev,
+        );
+        assert!(ev.effects.contains(&EffectKind::FsRead));
+        assert!(ev.paths_read.iter().any(|p| p.ends_with("out/report.json")));
+        let mut ev = EffectVector::default();
+        ex.extract(
+            &mk_call("write_notes", json!({"dest": "notes.txt"})),
+            &mut ev,
+        );
+        assert!(ev.effects.contains(&EffectKind::FsWrite));
+        // 键名即路径的字段不过滤:`path: "json"` 仍按路径处理(宁严勿松)。
+        let mut ev = EffectVector::default();
+        ex.extract(&mk_call("read", json!({"path": "json"})), &mut ev);
+        assert!(ev.effects.contains(&EffectKind::FsRead));
+    }
+
+    #[test]
+    fn looks_like_path_classifier() {
+        for yes in [
+            "a/b",
+            "C:\\x\\y",
+            "./x",
+            "~/x",
+            "report.txt",
+            "archive.tar.gz",
+            "..",
+            "/",
+        ] {
+            assert!(looks_like_path(yes), "{yes}");
+        }
+        for no in [
+            "json",
+            "node-1",
+            "1.5",
+            "https://x.example/mcp",
+            "",
+            "hello world",
+            "v2",
+        ] {
+            assert!(!looks_like_path(no), "{no}");
+        }
     }
 
     #[test]
