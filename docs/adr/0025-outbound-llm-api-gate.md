@@ -89,6 +89,14 @@ Vigil 既有两条腿都在**入口**:hook 看 agent 的工具调用,MCP 网关�
   **第 9 条 ignored 是刻意的**:`cargo test -p vigil-outbound --test gate_e2e -- --ignored` 当前
   **确实红**(`left: 200, right: 422`)—— 这条缺口因此是**可见且可复现**的,而不是被默认为已覆盖;
   修好 base64 预算口径当天删掉 `#[ignore]` 即转绿。
+- **上面这条「远端全绿」有一个发版移植时才暴露的边界:远端编译机的 clippy 是 `1.96`,而公开 CI 用
+  `dtolnay/rust-toolchain@stable`(实测 `1.98`)。** 同一条 `clippy --workspace --all-targets -D warnings`,
+  远端 `exit 0`,CI 却在 `crates/vigil-outbound/src/route.rs:100` 判 `clippy::question_mark`
+  (if-else-if 链尾 + `else { return None }`)。`rust-toolchain.toml` 两边同写 `channel = "stable"`,
+  但 rustup **不会**自动把本地 stable 升到最新,于是「同一个 stable」实际差两个小版本。
+  **即:`-D warnings` 的结论只有 CI 有资格给出;远端门禁能证明的是「能编译 / fmt 干净 / 测试通过」。**
+  已修(公开 `f79e57a` / 内部 `8c025da`,两仓同文):改用 `?` 收敛,与原 `else { return None; }`
+  语义等价(未知前缀仍返回 `None` → 404),`route::tests` 四条全过。
 - **评审(两路,均为 REQUEST-CHANGES)**:第一路 Codex(`gpt-5.5`,只读)**11 条**;第二路本地敌意子代理
   **去重后新增 7 条**。逐条复核与处置见 §5。该子代理的 LOW 段经再次索取后已补齐(**4 条,全部在改后的树上复现**,
   见 §5.2 的「LOW 段」);另有 2 条 SUSPECTED 随截断丢失后补回,列入 §6 追踪。
@@ -241,6 +249,8 @@ LOW 加两条 SUSPECTED 均已修复并经其在源码上逐条复核。
 **但必须原样记下它自述的边界:它没有 cargo / rustc,「1451 通过 / 9 ignored / clippy 与 fmt 干净」
 全部是本轮实现者的结论,评审方只核了源码形态,能独立确认的是结构性质、不是执行结果。**
 两条独立性因此是非对称的:缺陷判断双路交叉,**执行结果单路**。记在此处,不把它读成双路验证。
+
+**补记(同日,发版移植时暴露):那条「单路」不仅是单路,还比发版门禁更弱。** 它跑的 clippy 是 `1.96`,对公开 CI(`stable` = `1.98`)判红的 `clippy::question_mark` 是盲的,于是本轮带着「clippy 与 fmt 干净」的结论开了 PR,而 CI 一次就红。该结论当时是真诚的,但**不足以支撑它所宣称的范围**。**本 ADR 中一切 `-D warnings` 口径,一律以公开 CI 为准。**
 
 #### 两路盲区不重叠(本轮实证)
 

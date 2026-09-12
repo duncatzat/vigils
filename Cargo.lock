@@ -6095,7 +6095,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vigil-audit"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "criterion",
  "hex",
@@ -6115,7 +6115,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-browser"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "once_cell",
  "regex",
@@ -6128,7 +6128,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-daemon-ipc"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "dirs 6.0.0",
  "interprocess",
@@ -6141,7 +6141,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-desktop"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -6178,7 +6178,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-firewall"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "dunce",
  "hex",
@@ -6202,7 +6202,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-http-auth"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -6219,7 +6219,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-http-transport"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -6253,7 +6253,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-hub-cli"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "clap",
  "dirs 6.0.0",
@@ -6296,7 +6296,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-lease"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "hex",
  "keyring",
@@ -6314,7 +6314,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-mcp"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "hex",
  "once_cell",
@@ -6339,7 +6339,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-native-host"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "clap",
  "dirs 6.0.0",
@@ -6354,7 +6354,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-outbound"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "futures-util",
  "http-body-util",
@@ -6371,7 +6371,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-policy"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -6381,7 +6381,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-redaction"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "base64 0.22.1",
  "criterion",
@@ -6404,7 +6404,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-runner"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "cap-std 3.4.5",
  "dunce",
@@ -6425,7 +6425,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-runner-types"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "dunce",
  "serde",
@@ -6434,7 +6434,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-sandbox-linux"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "landlock",
  "libc",
@@ -6444,7 +6444,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-sdk"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "serde_json",
  "uuid",
@@ -6458,7 +6458,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-types"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -6466,7 +6466,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-ui-protocol"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -6479,7 +6479,7 @@ dependencies = [
 
 [[package]]
 name = "vigil-update-check"
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 dependencies = [
  "serde_json",
  "tempfile",

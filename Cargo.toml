@@ -25,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0-beta.2"
+version = "0.8.0-beta.1"
 edition = "2021"
 # MSRV:1.95 -- wasmtime 44(RUSTSEC-2026-0114 fix)要求 rustc 1.95.1+(见下方
 # wasmtime-wasi 注释)。此前声明的 1.80 已失效:依赖树实际编译不了,声明只会让旧

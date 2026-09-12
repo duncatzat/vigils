@@ -8,7 +8,7 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
-## [Unreleased] - outbound LLM-API gate (opt-in) + supply-chain gates
+## [v0.8.0-beta.1] — 2026-09-12 — the outbound LLM-API gate, MCP 2026-07-28 interop, and hardened fingerprints
 
 ### Added
 
