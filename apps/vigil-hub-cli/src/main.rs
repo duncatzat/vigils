@@ -15,6 +15,7 @@ use vigil_hub_cli::hook::{self, HookArgs};
 use vigil_hub_cli::i18n::{self, Lang};
 use vigil_hub_cli::inspect::{self, InspectArgs};
 use vigil_hub_cli::model;
+use vigil_hub_cli::outbound;
 use vigil_hub_cli::posture;
 use vigil_hub_cli::quickstart;
 use vigil_hub_cli::serve::{self, ServeArgs};
@@ -107,6 +108,10 @@ enum Command {
     /// 只从 `serve` / `daemon start` 发,`hook` 永不出站。
     /// 关闭:`vigil-hub version-ping off` / `VIGIL_NO_VERSION_PING=1` / `DO_NOT_TRACK=1`。
     VersionPing(CliVersionPingArgs),
+    /// 出站 LLM-API 闸门(opt-in):把 Claude Code / Codex 的模型请求经本机环回代理转发,请求体里的
+    /// 裸凭据在离开本机前换成占位符;响应原样直通(SSE 不缓冲)。`on` 写 agent 配置并落盘,`off` 还原。
+    /// 闸门本体随 `daemon start` 启动(或 `outbound serve` 前台跑);未运行时指向它的 agent fail-closed。
+    Outbound(CliOutboundArgs),
     /// 安装 / 查 ML 模型(隐私 PII + 注入分类器,各 ~700MB)。turnkey:`model install` →
     /// `daemon start`(暖载)→ `engine set ml` → hook 走 ML。ort-gated(非 ML 变体报错指向变体)。
     /// 用法:`vigil-hub model install` / `vigil-hub model status`。
@@ -175,6 +180,37 @@ enum VersionPingCommand {
     Off,
     /// 立刻检查一次并打印结果(含失败原因;仍尊重关闭开关)。
     Check,
+}
+
+#[derive(clap::Args, Debug)]
+struct CliOutboundArgs {
+    /// 省略子命令 = `status`(同 version-ping;F-11)。
+    #[command(subcommand)]
+    command: Option<OutboundCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum OutboundCommand {
+    /// 开关状态、闸门是否在监听、各 agent 是否已指向闸门。
+    Status {
+        /// 机器可读 JSON 输出(schema 稳定、与界面语言无关;供脚本/GUI 断言)
+        #[arg(long)]
+        json: bool,
+    },
+    /// 开启:落盘 + 把 Claude Code(settings.json `env`)/ Codex(config.toml provider)指到闸门。
+    On {
+        /// 监听地址(须环回;默认 127.0.0.1:8445)
+        #[arg(long)]
+        listen: Option<String>,
+    },
+    /// 关闭:还原 agent 配置(只动我们写的键)+ 落盘关闭。
+    Off,
+    /// 前台运行闸门(不经 daemon;调试或没有 daemon 的机器)。
+    Serve {
+        /// 监听地址覆盖(须环回)
+        #[arg(long)]
+        listen: Option<String>,
+    },
 }
 
 #[derive(clap::Args, Debug)]
@@ -737,6 +773,7 @@ fn main() -> std::process::ExitCode {
         Some(Command::Engine(args)) => run_engine(lang, args),
         Some(Command::Daemon(args)) => run_daemon(lang, args),
         Some(Command::VersionPing(args)) => run_version_ping(lang, args),
+        Some(Command::Outbound(args)) => run_outbound(lang, args),
         Some(Command::Model(args)) => run_model(lang, args),
     }
 }
@@ -857,6 +894,24 @@ fn run_version_ping(lang: Lang, args: CliVersionPingArgs) -> std::process::ExitC
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => fail_cmd(lang, "version-ping", e),
+    }
+}
+
+/// `vigil-hub outbound status|on|off|serve`:出站闸门的开关 / 状态 / 前台运行。逻辑在 [`outbound`];
+/// 本处只做分发 + ExitCode 映射。
+fn run_outbound(lang: Lang, args: CliOutboundArgs) -> std::process::ExitCode {
+    let result = match args
+        .command
+        .unwrap_or(OutboundCommand::Status { json: false })
+    {
+        OutboundCommand::Status { json } => outbound::run_status(lang, json),
+        OutboundCommand::On { listen } => outbound::run_on(lang, listen),
+        OutboundCommand::Off => outbound::run_off(lang),
+        OutboundCommand::Serve { listen } => outbound::run_serve(lang, listen),
+    };
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => fail_cmd(lang, "outbound", e),
     }
 }
 

@@ -174,6 +174,86 @@ pub fn scrub_text_with_spans(text: &str) -> (String, Vec<(usize, usize)>) {
     redact_string_with_spans(text, &mut sink)
 }
 
+/// 硬指纹在**原文**上的一个命中区间(字节偏移,`[start, end)`,落在 char 边界)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HardSpan {
+    /// 区间起点(含)
+    pub start: usize,
+    /// 区间终点(不含)
+    pub end: usize,
+    /// 代表规则名(HARD_RULES 名 / `pem_private_key` / `base64_payload`)
+    pub kind: &'static str,
+}
+
+/// 硬指纹在原文上的全部命中区间:升序、并集合并、互不重叠。
+///
+/// 供出站闸门(`vigil-outbound`)把模型请求体里的裸凭据**就地换成别名**:[`scrub_text`] 只能给出
+/// `[REDACTED …]` 占位符串,而出站改写需要知道「哪一段字节是凭据」才能换成可在执行边界脱别名的
+/// `secret://…`。规则子集与 [`detect_hard_secret`] 同源(HARD_RULES + PEM + base64 载荷),但
+/// **两者不是等价谓词**:`detect_hard_secret` 先剥掉 `[REDACTED …]` 占位符再匹配,本函数不剥
+/// (区间必须对应原文字节,剥离后偏移即失效)。于是存在「`detect` 命中而本函数返空」的输入,例如
+/// 明文被占位符从中截断的那种。调用方**不能**把「本函数返空」当成「账本自检会放行」——出站闸门
+/// 对此的处置是在**待发字节**上再跑一次 `detect_hard_secret`,仍命中即拒绝转发
+/// (敌意评审 2026-09-12 MEDIUM-3)。
+///
+/// - PEM 块:整串一个区间(与 [`scrub_text`] 契约相同,PEM 不与其它规则叠加);
+/// - base64 载荷:解出文本含硬指纹的段**整段**一个区间,kind = `base64_payload`;
+/// - 重叠区间并集合并(leak-safe),代表 kind 取 start 最小 / 最长 / 声明序最前者;
+/// - 不剥 `[REDACTED …]` 占位符:区间必须对应原文字节,占位符本身不会被硬规则命中。
+pub fn hard_secret_spans(text: &str) -> Vec<HardSpan> {
+    if PEM_RE.is_match(text) {
+        return vec![HardSpan {
+            start: 0,
+            end: text.len(),
+            kind: "pem_private_key",
+        }];
+    }
+    // (start, end, 声明序, kind)
+    let mut hits: Vec<(usize, usize, usize, &'static str)> = Vec::new();
+    for (order, rule) in HARD_RULES.iter().enumerate() {
+        for (start, end) in rule.hit_spans(text) {
+            if end > start {
+                hits.push((start, end, order, rule.name));
+            }
+        }
+    }
+    // base64 段:**先跳过已被明文规则整段覆盖的段,再计预算**。明文 token 本身也落在 base64
+    // 字符集内,若让它们吃配额,一串明文就能把尾部真正的 base64 载荷挤出扫描范围。`scrub_text`
+    // 不会踩到是因为它先替换明文、再在结果上扫 base64 —— 两侧口径必须一致,否则「detect 命中而
+    // spans 漏盖」就是一次静默泄漏(Codex 审计 2026-09-12 第 4 条)。
+    let mut examined = 0usize;
+    for m in BASE64_RUN.find_iter(text) {
+        if examined >= BASE64_MAX_RUNS {
+            break;
+        }
+        if hits
+            .iter()
+            .any(|(s, e, _, _)| *s <= m.start() && m.end() <= *e)
+        {
+            continue;
+        }
+        examined += 1;
+        if let Some(decoded) = decode_base64_text(m.as_str()) {
+            if detect_hard_secret_plain(&decoded).is_some() {
+                hits.push((m.start(), m.end(), HARD_RULES.len(), BASE64_PAYLOAD_RULE));
+            }
+        }
+    }
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+    let mut merged: Vec<HardSpan> = Vec::new();
+    for (start, end, _, kind) in hits {
+        match merged.last_mut() {
+            Some(last) if start < last.end => {
+                if end > last.end {
+                    last.end = end;
+                }
+            }
+            _ => merged.push(HardSpan { start, end, kind }),
+        }
+    }
+    merged
+}
+
 /// 扫描文本,返回**所有**命中的硬指纹规则名(去重,保留 HARD_RULES 声明顺序)。
 ///
 /// I09 `vigil-browser` classifier 需要完整的 finding 列表(不是只返首个命中),
@@ -1502,6 +1582,92 @@ mod tests {
             secret_value_min_chars("access_token"),
             SECRET_VALUE_MIN_CHARS
         );
+    }
+
+    /// 明文 token 自身也落在 base64 字符集里。若让它们吃掉扫描配额,一串明文就能把尾部真正的
+    /// base64 载荷挤出扫描范围 —— 而 `scrub_text` 先替换明文再扫 base64,不会踩到。两侧口径
+    /// 不一致就是一次静默泄漏(Codex 审计 2026-09-12 第 4 条)。
+    #[test]
+    fn base64_scan_budget_is_not_consumed_by_plaintext_hits() {
+        let gh = "ghp_1234567890abcdef1234567890abcdef12345678";
+        // "GITHUB_TOKEN=ghp_…" 的 base64
+        let encoded =
+            "R0lUSFVCX1RPS0VOPWdocF8xMjM0NTY3ODkwYWJjZGVmMTIzNDU2Nzg5MGFiY2RlZjEyMzQ1Njc4";
+        let mut parts: Vec<&str> = vec![gh; 300]; // 远超 BASE64_MAX_RUNS(256)
+        parts.push(encoded);
+        let text = parts.join(" ");
+
+        let spans = hard_secret_spans(&text);
+        let last = spans.last().expect("至少要命中一处");
+        assert_eq!(
+            &text[last.start..last.end],
+            encoded,
+            "尾部 base64 载荷必须被覆盖,不能被前面的明文挤掉"
+        );
+        assert_eq!(last.kind, "base64_payload");
+        // 与 scrub_text 同口径:按区间替换后不得残留任何原文
+        let mut out = text.clone();
+        for s in spans.iter().rev() {
+            out.replace_range(s.start..s.end, &format!("[REDACTED {}]", s.kind));
+        }
+        assert!(!out.contains(gh));
+        assert!(!out.contains(encoded));
+    }
+
+    /// 出站闸门用的区间 API:只脱值的分支给值区间,自由文本整段,PEM 整串,base64 载荷整段,
+    /// 重叠并集合并;区间与 `scrub_text` 的替换范围一致(同一份规则、同一份值组表)。
+    #[test]
+    fn hard_secret_spans_match_scrub_boundaries() {
+        let gh = "ghp_1234567890abcdef1234567890abcdef12345678";
+        let text = format!("token {gh} end");
+        let spans = hard_secret_spans(&text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&text[spans[0].start..spans[0].end], gh);
+        assert_eq!(spans[0].kind, "github_token");
+
+        // 引号键名:只圈值
+        let json = r#"{"password": "hunter2000"}"#;
+        let spans = hard_secret_spans(json);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&json[spans[0].start..spans[0].end], "hunter2000");
+
+        // 自由文本 KEY=value 与内层 token 重叠 → 并集,代表 kind 取 start 最小者
+        let text = format!("API_TOKEN={gh}");
+        let spans = hard_secret_spans(&text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start, spans[0].end), (0, text.len()));
+        assert_eq!(spans[0].kind, "env_assignment");
+
+        // PEM 整串
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----";
+        assert_eq!(
+            hard_secret_spans(pem),
+            vec![HardSpan {
+                start: 0,
+                end: pem.len(),
+                kind: "pem_private_key"
+            }]
+        );
+
+        // base64 载荷整段(GITHUB_TOKEN=ghp_… 编码后)
+        let b64 = "R0lUSFVCX1RPS0VOPWdocF8xMjM0NTY3ODkwYWJjZGVmMTIzNDU2Nzg5MGFiY2RlZjEyMzQ1Njc4";
+        let text = format!("blob {b64} tail");
+        let spans = hard_secret_spans(&text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&text[spans[0].start..spans[0].end], b64);
+        assert_eq!(spans[0].kind, "base64_payload");
+
+        // 无命中 → 空;占位符不会被再次圈中
+        assert!(hard_secret_spans("nothing here").is_empty());
+        assert!(hard_secret_spans("[REDACTED github_token]").is_empty());
+
+        // 与 scrub_text 的一致性:按区间替换应得到同样的占位符串
+        let text = format!("a {gh} b sk-ant-0123456789abcdefghijKLMNOPQR c");
+        let mut out = text.clone();
+        for s in hard_secret_spans(&text).iter().rev() {
+            out.replace_range(s.start..s.end, &format!("[REDACTED {}]", s.kind));
+        }
+        assert_eq!(out, scrub_text(&text));
     }
 
     /// GitHub 细粒度 PAT(`github_pat_…`,现默认形态)此前整串漏检;经典形态未回归。

@@ -38,6 +38,8 @@ vigil-types = { path = "../../crates/vigil-types" }
 vigil-redaction = { path = "../../crates/vigil-redaction" }
 # 每日更新检查策略层(P0-1,再评估 §9 D1):纯策略无网络;HTTP 走下方 reqwest。
 vigil-update-check = { path = "../../crates/vigil-update-check" }
+# 出站 LLM-API 闸门(opt-in):环回代理引擎;CLI 面(配置 / agent 适配 / daemon 内启动)在 src/outbound.rs
+vigil-outbound = { path = "../../crates/vigil-outbound" }
 clap = { workspace = true }
 url = { workspace = true }
 oauth2 = { workspace = true }

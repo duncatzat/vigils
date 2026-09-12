@@ -8,9 +8,22 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ---
 
-## [Unreleased] - 供应链门禁:cargo-deny + 诚实的 MSRV
+## [Unreleased] - 出站 LLM-API 闸门(可选开启)+ 供应链门禁
 
 ### Added
+
+- **出站 LLM-API 闸门(可选开启,默认关闭)。** 面向模型 API 本身的环回 HTTP 代理。
+  把 Claude Code 与 Codex 指向它,每个请求体都会用与 hook 同一套硬指纹规则扫一遍,
+  命中段在**离开本机之前**换成 `[REDACTED <kind>]`。响应按块直通,SSE 不缓冲也不解析;
+  订阅登录照常工作 —— 鉴权头逐字节透传且不进任何日志。
+  这补的是**结构性盲区**,不是锦上添花。hook 与 MCP 网关都在**入口**,看不到
+  `@文件` 直接内联、`CLAUDE.md` 等记忆文件、压缩摘要、以及模型自己复述出来的凭据;
+  而上下文是 append-only —— 密钥进去一次,**该会话此后每一次**模型调用都带着它。
+  闸门是唯一看得见「真正离开本机的字节」的那一层。
+  用 `vigil-hub outbound on|off|status|serve`,或桌面版设置页的同一个开关;闸门本体随守护进程运行。
+  接线可逆、只动 Vigils 写进去的键;你原本的自家网关会被**串在闸门后面**而不是覆盖。
+  它**不是**可逆脱敏代理:命中不还原,本机也不存任何明文映射表。没盖到的部分全写在
+  `docs/user-guide/outbound-gate.md` 里,包括一个**已知、可构造**的缺口 —— 直接点名,不含糊过去。
 
 - **四个厂商固定前缀凭据 kind(`RULE_PROFILE_VERSION` v5 → v6,FindingKind 13 → 17)。** 阿里云
   AccessKey ID `LTAI…`、腾讯云 SecretId `AKID…`(定长 36)、Slack token `xox[baprs]-…`、Hugging Face

@@ -22,9 +22,10 @@
 
 /// Tauri `#[tauri::command]` 真白名单 —— 构建期与运行期 ACL 的 SSOT。
 ///
-/// **顺序不重要**(内部按 slugified 生成 permission);共 **36** 条
+/// **顺序不重要**(内部按 slugified 生成 permission);共 **38** 条
 /// (α1=1 + α2=3 + α3=3 + α4=10 + α5=2 + ISS-017=1 + ISS-018=1 + D19=1 + P1.3=2 + ③引擎=2 + R3 Settings=3
-/// + R3 Phase2 daemon=3 + R3 Phase2 model=2 + R3 Phase2.5 ml-engine=1 + ext-Phase2 browser-guard=1)。
+/// + R3 Phase2 daemon=3 + R3 Phase2 model=2 + R3 Phase2.5 ml-engine=1 + ext-Phase2 browser-guard=1
+/// + 出站闸门=2)。
 pub const INVOKE_COMMANDS: &[&str] = &[
     // α1(Sessions smoke)
     "list_sessions",
@@ -79,6 +80,9 @@ pub const INVOKE_COMMANDS: &[&str] = &[
     "browser_guard_status",
     // Settings:手动锚定审计检查点(公开版既有功能 —— 1 write)
     "anchor_checkpoint",
+    // 出站 LLM-API 闸门(opt-in;Settings 卡 —— 1 read + 1 write)
+    "outbound_status",
+    "outbound_set",
 ];
 
 #[cfg(test)]
@@ -94,7 +98,7 @@ mod tests {
     fn invoke_commands_count_in_sync() {
         assert_eq!(
             INVOKE_COMMANDS.len(),
-            37,
+            39,
             "INVOKE_COMMANDS 漂移 —— 新增/删除 handler 时必须同步:\n\
              1) 本文件 `apps/desktop/src/commands.rs`\n\
              2) `apps/desktop/src/bin/vigils.rs` 的 `tauri::generate_handler!` 列表\n\

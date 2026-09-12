@@ -758,6 +758,23 @@ async fn anchor_checkpoint(state: State<'_, AppState>) -> Result<Option<i64>, St
 /// `invoke('browser_guard_status')` → 只读:浏览器防线状态(扩展体系 Phase 2「策略+观测」)。
 /// native host 注册态(manifest + Windows 注册表,复用 host 自身路径推导)+ 最近 24h
 /// 守门统计(ledger 纯读,整数计数不携带内容)。
+/// `invoke('outbound_status')` → 只读:出站闸门开关 / 存活 / 各 agent 接线(`outbound status --json`)。
+#[tauri::command]
+async fn outbound_status(
+    app: tauri::AppHandle,
+) -> Result<vigil_desktop::guardian::OutboundStatus, String> {
+    vigil_desktop::guardian::outbound_status(&app)
+}
+
+/// `invoke('outbound_set', { enabled })` → **Write**:开 / 关出站闸门(写 agent 配置并落盘)。
+#[tauri::command]
+async fn outbound_set(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<vigil_desktop::guardian::OutboundStatus, String> {
+    vigil_desktop::guardian::outbound_set(&app, enabled)
+}
+
 #[tauri::command]
 async fn browser_guard_status(
     state: State<'_, AppState>,
@@ -908,6 +925,9 @@ fn main() {
             browser_guard_status,
             // Settings:手动锚定审计检查点(公开版既有功能 —— 1 write)
             anchor_checkpoint,
+            // 出站闸门(opt-in;Settings 卡 —— 1 read + 1 write)
+            outbound_status,
+            outbound_set,
         ])
         .setup(move |app| {
             let _main_window = app.get_webview_window("main");

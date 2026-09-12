@@ -17,6 +17,7 @@ pub mod hook;
 pub mod i18n;
 pub mod inspect;
 pub mod model;
+pub mod outbound;
 pub mod posture;
 pub mod quickstart;
 pub mod serve;

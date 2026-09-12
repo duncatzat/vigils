@@ -1,0 +1,28 @@
+[package]
+name = "vigil-outbound"
+publish = false  # 内部功能 crate(非 SDK publish set)— 不上 crates.io;cargo-deny path-dep wildcard 守门
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Opt-in outbound LLM-API gate: loopback HTTP proxy that rewrites raw hard secrets in model requests and streams responses through untouched."
+
+[lints]
+workspace = true
+
+[dependencies]
+vigil-redaction = { path = "../vigil-redaction" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# 环回 HTTP/1.1 服务端(hyper 1)+ tokio 运行时;上游用 reqwest(rustls)流式转发
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]

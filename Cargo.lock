@@ -6285,6 +6285,7 @@ dependencies = [
  "vigil-lease",
  "vigil-mcp",
  "vigil-native-host",
+ "vigil-outbound",
  "vigil-policy",
  "vigil-redaction",
  "vigil-runner",
@@ -6349,6 +6350,23 @@ dependencies = [
  "vigil-daemon-ipc",
  "vigil-redaction",
  "winreg",
+]
+
+[[package]]
+name = "vigil-outbound"
+version = "0.7.0-beta.2"
+dependencies = [
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "vigil-redaction",
 ]
 
 [[package]]

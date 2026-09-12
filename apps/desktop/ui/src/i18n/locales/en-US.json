@@ -149,6 +149,25 @@
       "start": "Start daemon",
       "stop": "Stop daemon"
     },
+    "outbound": {
+      "title": "Outbound gate (opt-in)",
+      "subtitle": "Routes Claude Code and Codex model API calls through a local proxy that replaces raw secrets with placeholders before they leave this machine. Responses stream through untouched; nothing is stored in plaintext. The gate itself runs inside the daemon.",
+      "status_off": "OFF",
+      "status_on": "ON · GATE UP",
+      "status_on_down": "ON · GATE DOWN",
+      "status_on_degraded": "ON · AGENT NOT WIRED",
+      "turn_on": "Turn on",
+      "turn_off": "Turn off",
+      "hint_down": "The gate is not listening: start the daemon above. Until then, agents pointed at the gate fail closed (their API calls are refused, nothing leaks).",
+      "hint_restart": "Restart open agent sessions after switching — the base URL is read at startup.",
+      "agent_active": "routed through the gate",
+      "agent_not_installed": "not installed",
+      "agent_not_configured": "not configured",
+      "agent_stale": "stale — turn the gate off and on again",
+      "agent_foreign": "own gateway (will be chained behind the gate)",
+      "agent_unsupported": "unsupported",
+      "agent_error": "error"
+    },
     "checkpoint": {
       "title": "Audit checkpoint anchor",
       "note": "Append the current chain head to the local checkpoint sidecar - a later verify can prove this prefix was not rewritten.",

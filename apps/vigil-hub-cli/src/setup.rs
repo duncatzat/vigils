@@ -220,7 +220,7 @@ impl std::error::Error for SetupError {}
 // ─────────────────────────── 纯函数(DI:home/exe/ledger 参数化,便于测试)───────────────
 
 /// Claude Code 用户级配置文件路径 `~/.claude/settings.json`。
-fn claude_settings_path(home: &Path) -> PathBuf {
+pub(crate) fn claude_settings_path(home: &Path) -> PathBuf {
     home.join(CLAUDE_DIR).join(SETTINGS_FILE)
 }
 
@@ -267,7 +267,7 @@ pub(crate) fn agent_installed(config_dir: &Path, binary: Option<&str>) -> bool {
 /// wrap,hook 步却判"未检测到"而跳过,最终仍打印 "Protected" —— 而 Claude 的原生工具 secret
 /// 守门 hook 实际缺失(虚假保护承诺)。`~/.claude.json` 是 Claude Code 用户级配置(MCP / projects
 /// / oauth),其存在即 Claude Code 在场 → hook 应安装(install 路径会按需创建 `~/.claude/`)。
-fn claude_detected(home: &Path) -> bool {
+pub(crate) fn claude_detected(home: &Path) -> bool {
     agent_installed(&home.join(CLAUDE_DIR), Some("claude")) || home.join(".claude.json").is_file()
 }
 

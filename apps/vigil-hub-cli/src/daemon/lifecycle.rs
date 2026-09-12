@@ -144,6 +144,9 @@ pub fn run_start(lang: Lang) -> Result<(), String> {
     // 每日更新检查(再评估 §9 D1 已决):daemon 是长驻入口之一。此处已在 warm-load 之后
     //(set_var 早已结束),spawn 后台线程不触碰上面的并发不变量;best-effort,失败静默。
     let _update_check = crate::update_check::spawn_daily(lang);
+    // 出站 LLM-API 闸门(opt-in):`outbound.json` 开启才起;独立线程 + 自带 tokio 运行时,
+    // 同样在 warm-load 之后 spawn。句柄活到 daemon 退出(丢弃即关停)。端口被占只报 stderr。
+    let _outbound_gate = crate::outbound::spawn_for_daemon(lang, ledger.clone());
     let caps = DaemonCaps {
         token,
         scanner,

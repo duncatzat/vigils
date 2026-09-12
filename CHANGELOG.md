@@ -8,9 +8,28 @@ All notable changes to Vigils are documented here. The format follows
 
 ---
 
-## [Unreleased] - supply-chain gates: cargo-deny + honest MSRV
+## [Unreleased] - outbound LLM-API gate (opt-in) + supply-chain gates
 
 ### Added
+
+- **Outbound LLM-API gate (opt-in, off by default).** A loopback HTTP proxy for the model API
+  itself. Point Claude Code and Codex at it and every request body is scanned for the same hard
+  credential fingerprints the hook already uses, with hits replaced by `[REDACTED <kind>]` before
+  the request leaves the machine. Responses stream through chunk by chunk, so SSE is never
+  buffered or parsed, and subscription logins keep working: auth headers are forwarded byte for
+  byte and never logged.
+  This closes a structural blind spot rather than adding a nicety. The hook and the MCP gateway
+  both sit at the *entrance* and cannot see `@file` inlining, memory files such as `CLAUDE.md`,
+  compaction summaries, or a credential the model repeats back — and because the context is
+  append-only, a secret that got in once is re-sent on every later call in that session. The gate
+  is the only layer that sees the bytes actually leaving the machine.
+  Use `vigil-hub outbound on|off|status|serve`, or the switch on the desktop Settings page; the
+  gate itself runs inside the daemon. Wiring is reversible and touches only the keys Vigils
+  wrote, and an existing gateway of your own is chained behind the gate rather than overwritten.
+  It is **not** a reversible masking proxy: hits are never restored and no plaintext mapping
+  table is kept anywhere. Everything that is not covered is written down in
+  `docs/user-guide/outbound-gate.md`, including one known, constructible gap that is named
+  rather than glossed over.
 
 - **Four vendor-prefix credential kinds (`RULE_PROFILE_VERSION` v5 → v6, FindingKind 13 → 17).**
   Aliyun AccessKey ID `LTAI…`, Tencent Cloud SecretId `AKID…` (fixed 36 chars), Slack tokens

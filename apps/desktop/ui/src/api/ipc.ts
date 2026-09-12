@@ -746,6 +746,48 @@ export async function downloadMlEngine(): Promise<ModelStatus> {
   return await invoke<ModelStatus>("download_ml_engine");
 }
 
+// ─────────────── 出站 LLM-API 闸门（opt-in；`vigil-hub outbound`）───────────────
+
+/** 对应 Rust `vigil_desktop::guardian::OutboundAgent`。 */
+export interface OutboundAgent {
+  /** "claude" | "codex" | "gemini" */
+  agent: string;
+  /** active | not_installed | not_configured | stale | foreign | unsupported | error */
+  state: string;
+  /** 自家网关地址 / 不支持原因（仅 foreign / unsupported / error） */
+  detail: string | null;
+}
+
+/** 对应 Rust `vigil_desktop::guardian::OutboundStatus`。 */
+export interface OutboundStatus {
+  /** 开关（outbound.json） */
+  enabled: boolean;
+  /** 监听地址（host:port） */
+  listen: string;
+  /** 闸门此刻是否在监听（随 daemon 运行） */
+  gate_up: boolean;
+  /** 自启动以来收到的请求数 */
+  requests: number;
+  /** 改写过请求体的请求数 */
+  rewritten: number;
+  /** 被闸门拒绝的请求数 */
+  blocked: number;
+  /** 各 agent 接线 */
+  agents: OutboundAgent[];
+  /** 引擎二进制是否就位（false → 卡片只读） */
+  engine_present: boolean;
+}
+
+/** 出站闸门：只读状态。 */
+export async function outboundStatus(): Promise<OutboundStatus> {
+  return await invoke<OutboundStatus>("outbound_status");
+}
+
+/** 出站闸门：开 / 关（Write；写 Claude Code / Codex 配置并落盘，闸门本体随 daemon 运行）。 */
+export async function outboundSet(enabled: boolean): Promise<OutboundStatus> {
+  return await invoke<OutboundStatus>("outbound_set", { enabled });
+}
+
 /** 对应 Rust `vigil_desktop::guardian::BrowserGuardStatus`（扩展体系 Phase 2「策略+观测」）。 */
 export interface BrowserGuardStatus {
   /** Chrome native messaging host manifest 是否在位 */

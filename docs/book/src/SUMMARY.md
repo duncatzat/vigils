@@ -17,6 +17,7 @@
 - [Action Firewall](./concepts/firewall.md)
 - [Audit Ledger](./concepts/audit-ledger.md)
 - [Privacy Filter](./concepts/privacy-filter.md)
+- [Outbound Gate](./concepts/outbound-gate.md)
 - [MCP Hub](./concepts/mcp-hub.md)
 - [Approval Queue](./concepts/approval-queue.md)
 

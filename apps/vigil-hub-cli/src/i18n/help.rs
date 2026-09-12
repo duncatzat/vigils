@@ -93,6 +93,91 @@ pub fn localize(cmd: Command, lang: Lang) -> Command {
         .mut_subcommand("daemon", |c| localize_daemon(c, lang))
         .mut_subcommand("model", |c| localize_model(c, lang))
         .mut_subcommand("inspect", |c| localize_inspect(c, lang))
+        .mut_subcommand("outbound", |c| localize_outbound(c, lang))
+}
+
+fn localize_outbound(c: Command, lang: Lang) -> Command {
+    let c = c
+        .about(s(
+            lang,
+            "Opt-in outbound gate: route agents' model API calls through a local proxy that redacts raw secrets",
+            "可选的出站闸门:让 agent 的模型 API 调用经本机代理,离开本机前把裸凭据换成占位符",
+        ))
+        .long_about(s(
+            lang,
+            concat!(
+                "A loopback HTTP proxy for the model API itself. Claude Code and Codex are pointed at\n",
+                "it (settings.json `env` / config.toml provider); every request body is scanned for hard\n",
+                "secret fingerprints and hits are replaced with [REDACTED ...] before the request leaves\n",
+                "your machine. Responses stream through untouched. Nothing is stored in plaintext.\n",
+                "  status  show the switch, whether the gate is listening, and each agent's wiring\n",
+                "  on      enable: write the agent configs and persist the switch\n",
+                "  off     disable: restore the agent configs (only keys Vigil wrote) and persist\n",
+                "  serve   run the gate in the foreground (otherwise `daemon start` runs it)\n",
+                "Honest boundary: Bedrock / Vertex / Foundry modes and custom Codex providers are refused;\n",
+                "Gemini CLI is not wired yet. While the gate is down, agents pointed at it fail closed.",
+            ),
+            concat!(
+                "面向模型 API 本身的环回 HTTP 代理。Claude Code 与 Codex 被指向它(settings.json `env` /\n",
+                "config.toml provider);每个请求体都扫硬指纹,命中在离开本机前换成 [REDACTED ...]。\n",
+                "响应原样直通,不落任何明文。\n",
+                "  status  看开关、闸门是否在监听、各 agent 的接线\n",
+                "  on      开启:写 agent 配置并落盘\n",
+                "  off     关闭:还原 agent 配置(只动 Vigil 写的键)并落盘\n",
+                "  serve   前台运行闸门(否则由 `daemon start` 运行)\n",
+                "诚实边界:Bedrock / Vertex / Foundry 模式与自定义 Codex provider 会被拒绝;Gemini CLI\n",
+                "尚未接线。闸门未运行时,指向它的 agent 会 fail-closed。",
+            ),
+        ));
+    let c = c.mut_subcommand("status", |sc| {
+        sc.about(s(
+            lang,
+            "Show the switch, gate liveness and per-agent wiring",
+            "查看开关、闸门存活与各 agent 接线",
+        ))
+        .mut_arg("json", |a| {
+            a.help(s(
+                lang,
+                "Machine-readable JSON (stable schema, locale-independent; for scripts/GUI)",
+                "机器可读 JSON(schema 稳定、与界面语言无关;供脚本/GUI 断言)",
+            ))
+        })
+    });
+    let c = c.mut_subcommand("on", |sc| {
+        sc.about(s(
+            lang,
+            "Enable: point Claude Code / Codex at the gate and persist the switch",
+            "开启:把 Claude Code / Codex 指到闸门并落盘",
+        ))
+        .mut_arg("listen", |a| {
+            a.help(s(
+                lang,
+                "Listen address (loopback only; default 127.0.0.1:8445)",
+                "监听地址(仅环回;默认 127.0.0.1:8445)",
+            ))
+        })
+    });
+    let c = c.mut_subcommand("off", |sc| {
+        sc.about(s(
+            lang,
+            "Disable: restore the agent configs (only keys Vigil wrote) and persist",
+            "关闭:还原 agent 配置(只动 Vigil 写的键)并落盘",
+        ))
+    });
+    c.mut_subcommand("serve", |sc| {
+        sc.about(s(
+            lang,
+            "Run the gate in the foreground (without the daemon)",
+            "前台运行闸门(不经 daemon)",
+        ))
+        .mut_arg("listen", |a| {
+            a.help(s(
+                lang,
+                "Override the listen address (loopback only)",
+                "覆盖监听地址(仅环回)",
+            ))
+        })
+    })
 }
 
 /// `inspect`(只读审计查看;公开仓独有命令)。仅本地化顶层 about / long_about —— 子命令
@@ -1028,6 +1113,10 @@ mod tests {
             #[command(subcommand)]
             command: MirrorModel,
         },
+        Outbound {
+            #[command(subcommand)]
+            command: MirrorOutbound,
+        },
         Inspect,
     }
 
@@ -1057,6 +1146,22 @@ mod tests {
             json: bool,
         },
         Stop,
+    }
+    #[derive(Subcommand, Debug)]
+    enum MirrorOutbound {
+        Status {
+            #[arg(long)]
+            json: bool,
+        },
+        On {
+            #[arg(long)]
+            listen: Option<String>,
+        },
+        Off,
+        Serve {
+            #[arg(long)]
+            listen: Option<String>,
+        },
     }
     #[derive(Subcommand, Debug)]
     enum MirrorModel {

@@ -25,3 +25,9 @@ implementation were reviewed before merge.
 | [0017](https://github.com/duncatzat/vigils/blob/main/docs/adr/0017-model-descriptor-design.md) | Model descriptor design |
 | [0018](https://github.com/duncatzat/vigils/blob/main/docs/adr/0018-vigil-runner-types-split.md) | `vigil-runner-types` split |
 | [0019](https://github.com/duncatzat/vigils/blob/main/docs/adr/0019-audit-advisories-policy.md) | Audit advisories policy |
+| [0020](https://github.com/duncatzat/vigils/blob/main/docs/adr/0020-audit-checkpoint-anchor.md) | Audit checkpoint anchor |
+| [0021](https://github.com/duncatzat/vigils/blob/main/docs/adr/0021-http-sse-mcp-upstream.md) | HTTP/SSE MCP upstream |
+| [0022](https://github.com/duncatzat/vigils/blob/main/docs/adr/0022-engine-selection-and-degradation.md) | Engine selection + degradation |
+| [0023](https://github.com/duncatzat/vigils/blob/main/docs/adr/0023-async-injection-preflight.md) | Async injection preflight |
+| [0024](https://github.com/duncatzat/vigils/blob/main/docs/adr/0024-resident-daemon-ml-hook.md) | Resident daemon + hook ML |
+| [0025](https://github.com/duncatzat/vigils/blob/main/docs/adr/0025-outbound-llm-api-gate.md) | Outbound LLM-API gate (opt-in) |

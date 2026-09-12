@@ -18,6 +18,7 @@ members = [
     "crates/vigil-sandbox-linux",
     "crates/vigil-sdk",
     "crates/vigil-update-check",
+    "crates/vigil-outbound",
     "apps/desktop",
     "apps/native-host",
     "apps/vigil-hub-cli",
@@ -121,6 +122,10 @@ ndarray = "0.15"
 # - 禁 `cookies` / `gzip` / `brotli` / `deflate`(远程 MCP 不需要)
 # - 启 `http2` / `json` / `blocking`(配合同步 Hub 模型)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "blocking"] }
+# 出站闸门:StreamBody 需要的 Stream 组合子(依赖树里本就有,不引入新 crate)。
+# 注:**不**开 reqwest 的 `stream` feature —— 它会拉进 wasm32-only 的 wasm-streams(licenses 不在白名单)
+# 且触碰 deny.toml 的 reqwest feature 显式白名单;响应直通改用 `Response::chunk()` + `stream::unfold`。
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # webpki-roots 是冻结版本的 Mozilla CA bundle;**每季度** release checklist 对照更新差异
 webpki-roots = "0.26"
 
@@ -146,6 +151,6 @@ criterion = { version = "0.5", default-features = false, features = ["html_repor
 
 # 这些依赖后续迭代会用到,workspace 中预声明可避免 I02+ 的版本分裂
 anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "process", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

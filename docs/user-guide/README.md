@@ -7,7 +7,8 @@
 1. **[Installation](installation.md)** — 装三平台 binary + Chrome 扩展
 2. **[Getting Started](getting-started.md)** — 5 分钟跑通 3 个核心场景
 3. **[Agent Integration](agent-integration.md)** — ★ Claude Code / Codex / OpenCode / Cursor / Zed 接入 vigil-hub
-4. **[Troubleshooting](troubleshooting.md)** — 常见问题
+4. **[Outbound Gate](outbound-gate.md)** — 可选开启:模型 API 请求离开本机前脱敏裸凭据
+5. **[Troubleshooting](troubleshooting.md)** — 常见问题
 
 ## 产品能力速览
 
@@ -28,7 +29,7 @@ Vigil 的定位是**纵深防御**:大幅降低**意外**泄密、给每个动�
 
 | 类别 | 说明 |
 |---|---|
-| **明文凭据意外泄漏** | 13 类硬指纹(AWS key / GitHub token / Google API key / Slack webhook / Stripe key / 私钥 PEM / 含密 DB URL 等)以**原文**出现在 tool call、浏览器粘贴、工具结果里 → 拦截 / 脱敏 |
+| **明文凭据意外泄漏** | 17 类硬指纹(AWS / 阿里云 / 腾讯云 key、GitHub / GitLab / HuggingFace token、Google API key、Slack webhook 与 token、Stripe key、私钥 PEM、含密 DB URL 等)以**原文**出现在 tool call、浏览器粘贴、工具结果、[出站模型请求](outbound-gate.md)里 → 拦截 / 脱敏 |
 | **可逆脱敏往返** | 远端只见 `secret://<alias>` 占位符,真值只在**本地执行边界**注入;模型 / 日志 / 审计永不见明文 |
 | **防篡改审计** | 每次 tool call / 粘贴写 SQLite 账本(SHA256 hash-chain),`vigil-hub verify` 可证伪 |
 | **越权动作审批** | 高风险工具先进 Approval Queue,人批准后放行 |
@@ -44,9 +45,14 @@ Vigil 的定位是**纵深防御**:大幅降低**意外**泄密、给每个动�
 
 Vigil 会**抬高门槛**并**留下审计痕迹**,但**不保证**拦住一个蓄意外泄的 agent。**不要**把"接了 Vigil"当成"可以放心让不可信 agent 直接接触真凭据"的理由。
 
-### 🛣️ 完整堵法(路线图)
+### 🛣️ 出站侧补强(部分落地)
 
-输入侧检测的根本补全是**出站代理(egress proxy)**:中介 agent 的**所有**外发网络 / 数据流、在出口侧检测 —— 这样编码 / 分段也能在"真值离开机器前"被发现。这是后续版本方向,**当前版本尚未提供**。在它落地前,请把 Vigil 当作**审计 + 意外泄漏防护 + 可逆脱敏**,而非密封的外泄屏障。
+输入侧检测的根本补全是在**出口**看数据。现已落地**一条腿**:[出站闸门](outbound-gate.md)(可选开启)——
+Claude Code / Codex 发往模型 API 的请求体,在离开本机前扫硬指纹并脱敏,覆盖 hook 看不到的
+`@文件` 内联、记忆文件、压缩摘要与模型复述。这也堵住了 base64 编码后的凭据(载荷会被整段替换)。
+
+**仍未覆盖**:模型 API 之外的出网(工具直连别的主机)、hex / 字符码等其它编码变形、跨多次调用分段外泄、
+语义 PII、以及云端会话。所以结论不变:Vigil 是**审计 + 意外泄漏防护 + 可逆脱敏**,不是密封的外泄屏障。
 
 ## 本发行版(v0.2)交付
 

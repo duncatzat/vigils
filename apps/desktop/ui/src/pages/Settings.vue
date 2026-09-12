@@ -10,7 +10,7 @@
  *
  * 安全契约:文案经 i18n 纯 {named} 插值(CSP-safe),禁 v-html;写入值后端 whitelist 校验。
  */
-import { onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { NButton } from "naive-ui";
 import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
@@ -27,9 +27,13 @@ import {
   downloadMlEngine,
   guardianStatus,
   anchorCheckpoint,
+  outboundStatus,
+  outboundSet,
   type SettingsStatus,
   type DaemonStatus,
   type ModelStatus,
+  type OutboundStatus,
+  type OutboundAgent,
 } from "@/api/ipc";
 import WindowCard from "@/components/WindowCard.vue";
 import StatusPill from "@/components/StatusPill.vue";
@@ -43,6 +47,7 @@ const POSTURES = ["low", "medium", "high"] as const;
 const settings = ref<SettingsStatus | null>(null);
 const daemon = ref<DaemonStatus | null>(null);
 const model = ref<ModelStatus | null>(null);
+const outbound = ref<OutboundStatus | null>(null);
 const loading = ref(false);
 const busy = ref<string | null>(null); // 正在写入的项 key(防并发点击)
 const error = ref<string | null>(null);
@@ -65,6 +70,12 @@ async function refresh(): Promise<void> {
     // 账本路径来自 guardian 聚合状态;best-effort,失败不阻塞设置页主体。
     try {
       ledgerPath.value = (await guardianStatus()).ledger;
+    } catch {
+      /* 保持上次值 */
+    }
+    // 出站闸门状态(opt-in 功能;单独 try,探活失败不连坐其它卡)。
+    try {
+      outbound.value = await outboundStatus();
     } catch {
       /* 保持上次值 */
     }
@@ -154,6 +165,34 @@ async function stopDaemon(): Promise<void> {
   } finally {
     busy.value = null;
   }
+}
+
+// 出站闸门开关:`outbound on` 写 Claude Code / Codex 配置并落盘,闸门本体随 daemon 运行;
+// 切换后重新拉 daemon 状态(闸门 up/down 取决于 daemon 是否在跑)。
+async function toggleOutbound(): Promise<void> {
+  if (busy.value || !outbound.value) return;
+  busy.value = "outbound";
+  error.value = null;
+  try {
+    outbound.value = await outboundSet(!outbound.value.enabled);
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = null;
+  }
+}
+
+/**
+ * 有 agent 接线失败 / 陈旧 → 闸门开着也**不许**亮全绿:那条链路此刻完全不过闸门,绿灯是假绿
+ * (敌意评审 2026-09-12 MEDIUM-2)。`unsupported`(如 gemini)是已知边界,不算降级。
+ */
+const outboundDegraded = computed(() =>
+  (outbound.value?.agents ?? []).some((a) => a.state === "error" || a.state === "stale"),
+);
+
+function agentStateLabel(a: OutboundAgent): string {
+  const base = t(`settings.outbound.agent_${a.state}`);
+  return a.detail ? `${base} · ${a.detail}` : base;
 }
 
 async function installModel(): Promise<void> {
@@ -386,6 +425,58 @@ onMounted(() => {
             @click="stopDaemon()"
           >
             {{ t("settings.daemon.stop") }}
+          </NButton>
+        </div>
+      </div>
+    </WindowCard>
+
+    <!-- 出站闸门(opt-in):模型 API 请求离开本机前脱敏裸凭据;随 daemon 运行 -->
+    <WindowCard title="outbound · gate" class="block" data-testid="settings-outbound-card">
+      <div class="row first">
+        <div>
+          <div class="s-title">{{ t("settings.outbound.title") }}</div>
+          <div class="s-sub">{{ t("settings.outbound.subtitle") }}</div>
+          <div v-if="outbound && outbound.agents.length" class="about-facts">
+            <div v-for="a in outbound.agents" :key="a.agent">
+              <span class="af-label">{{ a.agent }}</span>
+              <span class="af-val" :data-testid="`outbound-agent-${a.agent}`">{{ agentStateLabel(a) }}</span>
+            </div>
+          </div>
+          <div v-if="outbound?.enabled && !outbound?.gate_up" class="s-sub">
+            {{ t("settings.outbound.hint_down") }}
+          </div>
+          <div v-if="outbound?.enabled" class="s-sub">{{ t("settings.outbound.hint_restart") }}</div>
+        </div>
+        <div class="ctl">
+          <StatusPill
+            v-if="outbound?.enabled && outbound?.gate_up && !outboundDegraded"
+            tone="green"
+            data-testid="outbound-state"
+          >
+            {{ t("settings.outbound.status_on") }}
+          </StatusPill>
+          <StatusPill
+            v-else-if="outbound?.enabled && outbound?.gate_up"
+            tone="yellow"
+            data-testid="outbound-state"
+          >
+            {{ t("settings.outbound.status_on_degraded") }}
+          </StatusPill>
+          <StatusPill v-else-if="outbound?.enabled" tone="yellow" data-testid="outbound-state">
+            {{ t("settings.outbound.status_on_down") }}
+          </StatusPill>
+          <StatusPill v-else tone="yellow" data-testid="outbound-state">
+            {{ t("settings.outbound.status_off") }}
+          </StatusPill>
+          <NButton
+            size="small"
+            :type="outbound?.enabled ? 'default' : 'primary'"
+            :loading="busy === 'outbound'"
+            :disabled="!!busy || loading || !settings?.engine_present || !outbound"
+            data-testid="outbound-toggle"
+            @click="toggleOutbound()"
+          >
+            {{ outbound?.enabled ? t("settings.outbound.turn_off") : t("settings.outbound.turn_on") }}
           </NButton>
         </div>
       </div>

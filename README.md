@@ -50,6 +50,11 @@ Four guarantees, enforced locally:
 - **🙈 Secret & PII redaction** — hard-fingerprint detection for 17+ credential classes
   (GitHub PAT, Stripe keys, Google/GitLab tokens, DB URLs, …) plus an optional multilingual
   ML ensemble; a fail-closed merge layer decides what to mask.
+- **🚪 Outbound LLM-API gate** *(opt-in, off by default)* — a loopback proxy for the model
+  API itself: Claude Code / Codex request bodies are scanned and raw credentials replaced
+  *before the bytes leave your machine*, covering what an entrance-side hook cannot see
+  (`@file` inlining, memory files, compaction summaries, the model repeating a secret back).
+  Responses stream through untouched; nothing is stored in plaintext.
 - **🎟️ Secret lease broker** — short-lived credential leases injected only into the child
   process that needs them; plaintext is never persisted.
 - **📦 Sandbox runner** — one-shot tool execution in Wasm (Wasmtime) or native processes,

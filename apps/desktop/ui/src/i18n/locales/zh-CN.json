@@ -149,6 +149,25 @@
       "start": "启动守护",
       "stop": "停止守护"
     },
+    "outbound": {
+      "title": "出站闸门(可选开启)",
+      "subtitle": "把 Claude Code 与 Codex 的模型 API 调用经本机代理转发,请求离开本机前先把裸凭据换成占位符。响应原样直通,不落任何明文。闸门本体随守护进程运行。",
+      "status_off": "关闭",
+      "status_on": "开启 · 闸门运行中",
+      "status_on_down": "开启 · 闸门未运行",
+      "status_on_degraded": "已开启 · agent 未接上",
+      "turn_on": "开启",
+      "turn_off": "关闭",
+      "hint_down": "闸门没有在监听:先启动上方的守护进程。在此之前指向闸门的 agent 会 fail-closed(API 调用被拒,不会泄漏)。",
+      "hint_restart": "切换后请重启已打开的 agent 会话 —— base URL 在启动时读取。",
+      "agent_active": "已经闸门",
+      "agent_not_installed": "未安装",
+      "agent_not_configured": "未配置",
+      "agent_stale": "陈旧 —— 关闭再开启一次闸门",
+      "agent_foreign": "自家网关(开启后闸门会串在它前面)",
+      "agent_unsupported": "不支持",
+      "agent_error": "错误"
+    },
     "checkpoint": {
       "title": "审计检查点锚定",
       "note": "把当前链头追加到本地检查点 sidecar——之后的 verify 可证明该前缀未被重写。",

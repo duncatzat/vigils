@@ -666,6 +666,97 @@ pub fn daemon_stop(app: &AppHandle) -> Result<DaemonStatus, String> {
     daemon_status(app)
 }
 
+// ── 出站 LLM-API 闸门(opt-in;`vigil-hub outbound`)──────────────────────────────────────
+// GUI 只做开关 + 展示:`outbound on|off` 写 agent 配置并落盘,闸门本体随 daemon 运行。
+// 解析 `outbound status --json`(schema 稳定、与界面语言无关);字段缺失一律按保守值(关 / 未运行)。
+
+/// 单个 agent 的接线状态(`state` 字面量:active / not_installed / not_configured / stale /
+/// foreign / unsupported / error;`detail` 只在 foreign / unsupported / error 时有值)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundAgent {
+    /// `claude` / `codex` / `gemini`
+    pub agent: String,
+    /// 稳定字面量
+    pub state: String,
+    /// 补充说明(自家网关地址 / 不支持原因)
+    pub detail: Option<String>,
+}
+
+/// 出站闸门状态(GUI 设置卡)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboundStatus {
+    /// 开关(outbound.json)
+    pub enabled: bool,
+    /// 监听地址
+    pub listen: String,
+    /// 闸门此刻是否在监听(healthz 探活)
+    pub gate_up: bool,
+    /// 自启动以来收到 / 改写 / 拒绝的请求数(闸门未运行时为 0)
+    pub requests: u64,
+    /// 改写过请求体的请求数
+    pub rewritten: u64,
+    /// 被闸门拒绝的请求数
+    pub blocked: u64,
+    /// 各 agent 接线
+    pub agents: Vec<OutboundAgent>,
+    /// 引擎二进制是否就位(false → 卡片只读)
+    pub engine_present: bool,
+}
+
+fn outbound_status_from_json(v: &serde_json::Value) -> OutboundStatus {
+    let gate = &v["gate"];
+    let agents = v["agents"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|a| OutboundAgent {
+                    agent: a["agent"].as_str().unwrap_or("").to_string(),
+                    state: a["state"].as_str().unwrap_or("error").to_string(),
+                    detail: a["detail"].as_str().map(str::to_string),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    OutboundStatus {
+        enabled: v["enabled"] == true,
+        listen: v["listen"].as_str().unwrap_or("").to_string(),
+        gate_up: gate["up"] == true,
+        requests: gate["requests"].as_u64().unwrap_or(0),
+        rewritten: gate["rewritten"].as_u64().unwrap_or(0),
+        blocked: gate["blocked"].as_u64().unwrap_or(0),
+        agents,
+        engine_present: true,
+    }
+}
+
+/// 只读:出站闸门状态。引擎缺失 → 关 + `engine_present=false`(不报错)。
+pub fn outbound_status(app: &AppHandle) -> Result<OutboundStatus, String> {
+    let Some(engine) = resolve_engine(app) else {
+        return Ok(OutboundStatus {
+            enabled: false,
+            listen: String::new(),
+            gate_up: false,
+            requests: 0,
+            rewritten: 0,
+            blocked: 0,
+            agents: Vec::new(),
+            engine_present: false,
+        });
+    };
+    let out = run_cli_capture(&engine, &["outbound", "status", "--json"])?;
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .map_err(|e| format!("vigil-hub outbound status returned non-JSON: {e}"))?;
+    Ok(outbound_status_from_json(&v))
+}
+
+/// 写:开 / 关出站闸门(`outbound on` / `outbound off`;bool 在 Rust 侧映射为固定 argv,无用户串进 argv)。
+pub fn outbound_set(app: &AppHandle, enabled: bool) -> Result<OutboundStatus, String> {
+    let engine = resolve_engine(app).ok_or_else(|| ENGINE_NOT_FOUND.to_string())?;
+    let verb = if enabled { "on" } else { "off" };
+    run_cli_capture(&engine, &["outbound", verb])?;
+    outbound_status(app)
+}
+
 /// 只读:ML 模型缓存状态。`vigil-hub model status`:非 ort 变体输出 `unsupported` → `ml_supported=false`;
 /// ort 变体逐行报 privacy / injection 是否 `installed`。引擎缺失 → 全 false。
 pub fn model_status(app: &AppHandle) -> Result<ModelStatus, String> {
