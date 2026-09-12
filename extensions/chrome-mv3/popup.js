@@ -135,6 +135,10 @@ import { normalizeCustomSiteInput } from "./custom-sites.js";
             jwt: "JWT",
             env_assignment: ".env 变量",
             database_url: "数据库连接串",
+            aliyun_access_key_id: "阿里云 AccessKey",
+            tencent_secret_id: "腾讯云 SecretId",
+            slack_token: "Slack Token",
+            huggingface_token: "HuggingFace Token",
             pem_private_key: "私钥",
         };
         return labels[kind] || String(kind || "风险内容");

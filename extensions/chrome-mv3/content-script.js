@@ -189,6 +189,10 @@
             jwt: "JWT",
             env_assignment: ".env 变量",
             database_url: "数据库连接串",
+            aliyun_access_key_id: "阿里云 AccessKey",
+            tencent_secret_id: "腾讯云 SecretId",
+            slack_token: "Slack token",
+            huggingface_token: "HuggingFace token",
             pem_private_key: "私钥",
         };
         return labels[kind] || String(kind || "未知风险");
@@ -1326,6 +1330,11 @@
             google_api_key: "Google API Key",
             gitlab_pat: "GitLab PAT",
             database_url: "数据库连接密钥",
+            aliyun_access_key_id: "阿里云 AccessKey",
+            aliyun_access_key: "阿里云 AccessKey",
+            tencent_secret_id: "腾讯云 SecretId",
+            slack_token: "Slack Token",
+            huggingface_token: "HuggingFace Token",
             email: "邮箱地址",
             internal_ipv4: "内网地址",
         };

@@ -450,10 +450,11 @@ fn redact_string_with_spans(s: &str, findings: &mut Vec<String>) -> (String, Vec
     }
     let mut hits: Vec<Hit> = Vec::new();
     for (order, rule) in ALL_RULES.iter().enumerate() {
-        for m in rule.pattern.find_iter(s) {
+        // hit_spans:默认整段;声明了值组的分支只取值(保 JSON 结构),见 Rule::hit_spans
+        for (start, end) in rule.hit_spans(s) {
             hits.push(Hit {
-                start: m.start(),
-                end: m.end(),
+                start,
+                end,
                 name: rule.name,
                 order,
             });
@@ -540,6 +541,199 @@ pub(crate) struct Rule {
     pub(crate) pattern: Regex,
 }
 
+impl Rule {
+    /// 本规则在 `text` 上的命中区间(字节偏移,按位置顺序)。
+    ///
+    /// 默认取**整段**匹配(既有契约:`KEY=value` 连键带值一起换成占位符)。仅当
+    /// [`rule_value_groups`] 为本规则声明了「值组」且本次匹配落在带值组的分支上时,只取该
+    /// 值组的区间 —— 引号键名的 JSON / PHP 形态与中文关键词赋值借此**只脱值、保结构**
+    /// (`{"password": "[REDACTED env_assignment]"}` 仍是合法 JSON;整段替换会把键名与冒号
+    /// 一起吃掉,hub 结果侧「序列化 scrub → 重解析」会因此整包 fail-closed 占位)。
+    ///
+    /// **安全纪律**:值组必须**显式声明**,绝不把任意捕获组当值组 —— `aws_access_key_id` 的
+    /// `(AKIA|ASIA)`、`database_url` 的 scheme 组都是语法分组,若被当成值组只会脱掉前缀、
+    /// 泄漏其余字节。声明表与 pattern 相邻定义,单测守其存在性与参与性。
+    pub(crate) fn hit_spans<'t>(
+        &'t self,
+        text: &'t str,
+    ) -> impl Iterator<Item = (usize, usize)> + 't {
+        let groups = rule_value_groups(self.name);
+        self.pattern.captures_iter(text).map(move |caps| {
+            let picked = groups.iter().find_map(|&g| caps.get(g));
+            let m = picked
+                .or_else(|| caps.get(0))
+                .expect("capture group 0 always participates");
+            (m.start(), m.end())
+        })
+    }
+}
+
+/// 各规则的「值组」声明(见 [`Rule::hit_spans`])。只有 `env_assignment` 的引号 / 中文分支
+/// 声明了值组;其余规则一律整段替换。新增带值组的分支时同步此表 + [`ENV_ASSIGNMENT_PATTERN`]。
+fn rule_value_groups(name: &str) -> &'static [usize] {
+    match name {
+        "env_assignment" => ENV_ASSIGNMENT_VALUE_GROUPS,
+        _ => &[],
+    }
+}
+
+/// `github_token` pattern(ALL_RULES / HARD_RULES 单源)。
+///
+/// - 经典 PAT / OAuth / App / refresh token:`gh[pousr]_` + 36 位以上字母数字;
+/// - **细粒度 PAT**(2022 GA,现为 GitHub 创建入口的默认形态):`github_pat_` + 22 位 + `_` +
+///   59 位,body 含下划线、前缀与经典形态不同 —— 旧 pattern 整串漏检(2026-09-12 maskit 竞品
+///   对照实测)。前缀极其独特,零误报;长度下限 50 挡掉形似标识符。
+const GITHUB_TOKEN_PATTERN: &str =
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{50,255})\b";
+
+/// JSON / PHP / 引号 YAML 形态下**视为凭据**的键名片段(`(?i)` 下使用;无锚点、无捕获组)。
+/// [`ENV_ASSIGNMENT_PATTERN`] 的引号分支与 [`is_secret_key_name`] 共用 —— 单一真源:硬指纹规则
+/// 与 MCP 网关的叶子脱敏同口径(否则网关「逐叶子 scrub 脱不掉、序列化自检却命中」→ 整包扣留)。
+///
+/// 只收「几乎必然是凭据」的名字,**不**收泛后缀 `*_token` / `*_key`:工具 I/O 里 `NextToken` /
+/// `pageToken` / `continuation_token`(分页游标)、`public_key` / `object_key` / `primary_key`
+/// (标识符)满地都是,泛后缀会让 hook 对分页请求 FINAL deny、让网关整包扣留结果(敌意评审
+/// 2026-09-12 实测)。`*secret` / `*password` 泛后缀可接受(`secret_name` 不以 secret 结尾)。
+/// 前缀允许 snake / kebab / camelCase / 点分(Spring `spring.datasource.password`)/ 数字开头
+/// (`2fa_secret`):`db_password` / `x-api-key` / `clientSecret` / `accessToken`;裸 `key` / `auth` /
+/// `pwd` 不收(JSON 通用键值对 / 鉴权方式 / 工作目录)。**键名必须从边界开始**(见
+/// [`SECRET_KEY_LEFT_BOUNDARY`]):裸 `token` 不能从 `x-amz-security-token` / `next-token` 的中间起匹配。
+/// 裸 `token` 单列在 [`BARE_TOKEN_KEY_NAME`]:它同时是 NLP 分词输出的普通词,值下限单独抬高。
+const SECRET_KEY_NAME_FRAGMENT: &str = concat!(
+    r"(?:[A-Z0-9][A-Z0-9_.-]*)?(?:secret|password|passwd|passphrase)",
+    r"|[A-Z0-9][A-Z0-9_.-]*pwd",
+    r"|(?:[A-Z0-9][A-Z0-9_.-]*)?(?:api|access|secret|private|signing|encryption|master|license|account|auth|app|session|shared|subscription|functions)[_-]?key",
+    r"|(?:[A-Z0-9][A-Z0-9_.-]*)?(?:access|refresh|id|auth|bearer|session|api|private|personal[_-]?access|bot|oauth|secret|app|deploy|vault|github|gitlab|slack|discord|telegram|npm|pypi|hf|huggingface)[_-]?token",
+);
+
+/// 裸 `token` 键名:是凭据语义(`{"token": "<opaque>"}` 是 OAuth / Vault / 会话令牌的常见形态),但
+/// 也是 NLP 分词、`{"token": "tokenization"}` 这类普通词的常客 —— 值下限单独抬到
+/// [`BARE_TOKEN_VALUE_MIN_CHARS`](不透明令牌几乎都 ≥ 16 字符,英文单词几乎都 < 16)。
+const BARE_TOKEN_KEY_NAME: &str = "token";
+
+/// 键名左边界:文本开头,或一个**不属于键名字符**的字符(引号 / 空白 / 花括号 …)。用「消费一个
+/// 字符」而非 `\b`:`\b` 把 `-` `.` 当边界,裸 `token` 会从 `x-amz-security-token` 的中间起匹配;
+/// 消费的那个字符不进值组,不影响只脱值。[`is_secret_key_name`] 用同一边界 + 行尾锚定,保证
+/// 「规则会在序列化文本上命中的键」与「网关按键名脱值的键」是同一集合。
+const SECRET_KEY_LEFT_BOUNDARY: &str = r"(?:^|[^A-Za-z0-9_.\-])";
+
+/// 中文凭据关键词(`密码：xxx` 形态;[`ENV_ASSIGNMENT_PATTERN`] 分支 3 与 [`is_secret_key_name`] 共用)。
+const CJK_SECRET_KEYWORD_FRAGMENT: &str =
+    "密码|口令|令牌|密钥|秘钥|密匙|凭据|凭证|私钥|授权码|访问密钥|接口密钥";
+
+/// `env_assignment` pattern(ALL_RULES / HARD_RULES 单源)。三个分支,`(?i)` 全局:
+///
+/// 1. **自由文本 / .env 形态**(原有):带前缀 key(`MY_TOKEN` / `OPENAI_API_KEY`)允许 `=` / `:`
+///    (及全角 `：` `＝`);**裸**敏感 key(`token` / `key` / `auth` …)**仅** `=` —— 不收 `:`,否则
+///    误吞 URI scheme(vigil-http-auth 内部 token_ref `token://oauth/...`)与 YAML 的 `token:`
+///    上下文(Codex / 全 workspace 测试发现的 false positive)。整段替换(键+值)。值以引号开头时
+///    吞到闭合引号(`DB_PASSWORD="my pass phrase"` / compose `POSTGRES_PASSWORD: "pass with space"`),
+///    否则只脱到首个空白、残段泄漏(敌意评审 R2 复现,改前既有)。
+/// 2. **凭据键名 + 引号值**(JSON / PHP 数组 `=>` / 引号值 YAML·JS / 转义进字符串的 JSON):
+///    `{"password": "…"}` / `"AWS_SECRET_ACCESS_KEY": "…"` / `'api_token' => '…'` /
+///    `password: "…"` / `\"db_password\": \"…\"`。旧 pattern 要求关键词后紧跟 `\s*[=:]`,键名的
+///    闭合引号把它断开 → 整类漏检(2026-09-12 maskit 竞品对照实测:粘贴整段 JSON / YAML 配置块
+///    正是最常见的泄漏面)。键名走 [`SECRET_KEY_NAME_FRAGMENT`] 白名单;**值必须带引号、≥ 6 字符、
+///    止于闭合引号**(值内允许空格 / 逗号 / 花括号,否则 `"correct horse battery staple"` 只脱
+///    首词、残段泄漏);值首字符排除 `<` `$` `%` `{`(`<your-password>` / `${VAR}` / `{{ x }}` 模板);
+///    引号前允许 0–3 个反斜杠(一至三层转义)。挡掉 tool schema 的 `"api_key": {"type": …}`、
+///    `"api_key": null` / `""`、以及 hook 剥离 `secret://` 别名后的 NUL 占位(值字符类排除 NUL,
+///    `"api_key":"Bearer secret://gh"` 剥离后值里带 NUL 也不命中)。值组 = 捕获组 1(只脱值、保
+///    结构,见 [`Rule::hit_spans`])。裸 `token` 键单列为分支 2b:同形态但值 ≥ 16 字符(捕获组 2)。
+/// 3. **中文凭据关键词赋值**(`密码：xxx` / `令牌: xxx`,半角全角分隔符皆可):面向中文用户的真实
+///    泄漏形态(maskit SHIELD-CRED-CJK-001 实测 5/7 场景整条上行)。值首字符须为字母数字
+///    (`密码：********` 掩码 / `私钥：~/.ssh/id_rsa` 路径不命中),值字符类不含汉字 →「密码：请联系
+///    管理员」「密码：8 位以上」这类散文不命中;≥ 6 字符、无上限(否则长值尾部泄漏);关键词后必须
+///    紧跟分隔符 →「密码本：…」不命中。值组 = 捕获组 3。口语分隔「是 / 为」(`密码是123456`)单列为
+///    分支 3b(捕获组 4):值首字符须为数字或符号 —— 否则「令牌是Bearer类型」这类散文会命中;代价是
+///    「密码是hunter2000」漏检(已知取舍)。
+///
+/// 值组序号与 [`ENV_ASSIGNMENT_VALUE_GROUPS`] 严格对应;分支 1 与键名片段均无捕获组。
+/// 分支 2 的值字符类排除反斜杠:序列化进 JSON 字符串的转义形态 `\"password\": \"x\"` 里,值必须
+/// 止于闭合引号前的 `\`,否则只脱值后会吞掉转义符、破坏外层 JSON。分支 1 的 `PWD` 只认裸 `PWD=`
+/// 与带下划线前缀的 `*_PWD=`(`MYSQL_PWD`):`OLDPWD=` 是每份 env dump 必带的工作目录,不是凭据。
+static ENV_ASSIGNMENT_PATTERN: Lazy<String> = Lazy::new(|| {
+    [
+        "(?i)",
+        // 1. 自由文本 / .env(整段替换;引号值吞到闭合引号,否则到首个空白 / 分隔符)
+        r#"(?:\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|APIKEY|API_KEY|AUTH|_PWD)\b\s*[=:：＝]|\b(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*=)\s*(?:["'][^"'\r\n]+["']|["']?[^\s"',;}\]]+)"#,
+        // 2. 凭据键名 + 引号值 → 组 1(左边界消费一个非键名字符,不进值组)
+        "|",
+        SECRET_KEY_LEFT_BOUNDARY,
+        "(?:",
+        SECRET_KEY_NAME_FRAGMENT,
+        r#")\\{0,3}["']?\s*(?:=>|[=:：＝])\s*\\{0,3}["']([^"'\\\r\n<$%{\x00][^"'\\\r\n\x00]{5,})\\{0,3}["']"#,
+        // 2b. 裸 token 键 + 引号值(≥ 16 字符)→ 组 2
+        "|",
+        SECRET_KEY_LEFT_BOUNDARY,
+        BARE_TOKEN_KEY_NAME,
+        r#"\\{0,3}["']?\s*(?:=>|[=:：＝])\s*\\{0,3}["']([^"'\\\r\n<$%{\x00][^"'\\\r\n\x00]{15,})\\{0,3}["']"#,
+        // 3. 中文凭据关键词 + 分隔符 → 组 3
+        "|(?:",
+        CJK_SECRET_KEYWORD_FRAGMENT,
+        r#")["'“”「」]?\s*[=:：＝]\s*["'“”「」]?([A-Za-z0-9][A-Za-z0-9!@#$%^&*_~+/.=\-]{5,})"#,
+        // 3b. 中文凭据关键词 + 「是 / 为」→ 组 4(值首字符须为数字 / 符号)
+        "|(?:",
+        CJK_SECRET_KEYWORD_FRAGMENT,
+        r#")\s*(?:是|为)\s*["'“”「」]?([0-9!@#$%^&*][A-Za-z0-9!@#$%^&*_~+/.=\-]{5,})"#,
+    ]
+    .concat()
+});
+
+/// `env_assignment` 的值组(分支 2 / 2b / 3 / 3b 各一个捕获组;见 [`ENV_ASSIGNMENT_PATTERN`])。
+const ENV_ASSIGNMENT_VALUE_GROUPS: &[usize] = &[1, 2, 3, 4];
+
+static SECRET_KEY_NAME_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        &[
+            "(?i)(?:",
+            SECRET_KEY_LEFT_BOUNDARY,
+            "(?:",
+            SECRET_KEY_NAME_FRAGMENT,
+            "|",
+            BARE_TOKEN_KEY_NAME,
+            ")|(?:",
+            CJK_SECRET_KEYWORD_FRAGMENT,
+            "))$",
+        ]
+        .concat(),
+    )
+    .expect("regex")
+});
+
+/// 键名是否具凭据语义(`password` / `db_password` / `x-api-key` / `clientSecret` / `accessToken` /
+/// `spring.datasource.password` / `密码` …)。
+///
+/// 与 `env_assignment` 规则的引号键名分支**同一份**白名单、同一左边界、同一中文关键词表
+/// (`SECRET_KEY_NAME_FRAGMENT` / `SECRET_KEY_LEFT_BOUNDARY` / `CJK_SECRET_KEYWORD_FRAGMENT`),按
+/// **后缀**语义匹配(键名必须以凭据名结尾,凭据名从边界开始),供按 JSON 树逐叶子脱敏的调用方
+/// (MCP 网关结果侧)判断「这个键下的字符串值该整段换占位符」:叶子看不到键名,而序列化自检看得到
+/// `"password":"…"`,两边口径不一致会让自检永远命中、整包扣留。
+/// `NextToken` / `pageToken` / `public_key` / `object_key` / `x-amz-security-token` 等分页游标与
+/// 标识符**不**算。
+pub fn is_secret_key_name(key: &str) -> bool {
+    SECRET_KEY_NAME_RE.is_match(key)
+}
+
+/// 凭据键名下的字符串值触发脱敏的默认最小字符数(与 `env_assignment` 引号分支的值下限一致;更短的
+/// 值规则本身也不命中,调用方保持同阈值即与序列化自检口径一致)。按键名取阈值请用
+/// [`secret_value_min_chars`](裸 `token` 更高)。
+pub const SECRET_VALUE_MIN_CHARS: usize = 6;
+
+/// 裸 `token` 键的值下限(见 [`BARE_TOKEN_KEY_NAME`])。
+const BARE_TOKEN_VALUE_MIN_CHARS: usize = 16;
+
+/// 该键名下的字符串值触发脱敏的最小字符数:裸 `token` 为 16,其余凭据键名为
+/// [`SECRET_VALUE_MIN_CHARS`]。网关按键名脱值时必须用本函数,才与规则的两条引号分支
+/// (普通键名 ≥ 6 / 裸 `token` ≥ 16)同口径。
+pub fn secret_value_min_chars(key: &str) -> usize {
+    if key.eq_ignore_ascii_case(BARE_TOKEN_KEY_NAME) {
+        BARE_TOKEN_VALUE_MIN_CHARS
+    } else {
+        SECRET_VALUE_MIN_CHARS
+    }
+}
+
 // NOTE: 规则**顺序仍语义敏感**,但实现已改为"原文单遍 span 收集 + 重叠并集合并"
 // (见 `redact_string`),不再逐条 replace_all。声明序在重叠时作占位符**代表名**的
 // tiebreak:同 start、同 end 的重叠 span,声明靠前者胜。因此 anthropic 必须**先于**
@@ -561,8 +755,8 @@ pub(crate) static ALL_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         },
         Rule {
             name: "github_token",
-            // Personal Access Token / Fine-grained PAT / App token
-            pattern: Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36,255}\b").expect("regex"),
+            // Personal Access Token / Fine-grained PAT(`github_pat_`)/ App token,见 GITHUB_TOKEN_PATTERN
+            pattern: Regex::new(GITHUB_TOKEN_PATTERN).expect("regex"),
         },
         // ---- 顺序强约束:anthropic 必须先于 openai ----
         Rule {
@@ -574,26 +768,20 @@ pub(crate) static ALL_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             // 故意宽松匹配 `sk-...`;anthropic 规则已在前面先替换,不会被本规则再吞。
             pattern: Regex::new(r"\bsk-[A-Za-z0-9_\-]{20,}\b").expect("regex"),
         },
-        // ---- 通用 .env 风格键值对:`SOMETHING_KEY/TOKEN/...=value` / `token=value` ----
+        // ---- 通用键值对凭据:`.env` 自由文本 / 引号键名 JSON·PHP / 中文关键词 ----
         //
-        // 覆盖"自由文本"里的键值对(区别于 JSON object-key 启发)。例如:
-        //   "OPENAI_API_KEY=sk-xxxx"
+        // 例如:
+        //   "OPENAI_API_KEY=sk-xxxx"                 ← 自由文本(整段替换)
         //   "DATABASE_PASSWORD=hunter2"
-        //   "SOME_SECRET: 'abc'"   ← 带前缀 key 允许 `:`
-        //   "token=sadqwdzcfqdqdwqdqdq"   ← 裸 key 仅 `=`
-        // key 部分允许大小写混合 + `_`;裸敏感 key 也算凭据上下文,但仅认 `=` 分隔
-        //(`:` 会与 URI scheme `token://` / YAML `token:` 撞,故裸 key 不收 `:`)。
-        // 值部分吞到空白/逗号/引号止。
+        //   "SOME_SECRET: 'abc'"                      ← 带前缀 key 允许 `:`
+        //   "token=sadqwdzcfqdqdwqdqdq"               ← 裸 key 仅 `=`
+        //   {"password": "hunter2000"}               ← 引号键名(只脱值)
+        //   'api_token' => 'abc123XYZ789'
+        //   数据库密码：Hunter2000!                   ← 中文关键词(只脱值)
+        // 各分支的取舍与误报边界见 ENV_ASSIGNMENT_PATTERN 注释。
         Rule {
             name: "env_assignment",
-            pattern: Regex::new(
-                // 带前缀的 key(`MY_TOKEN` / `OPENAI_API_KEY`)允许 `=` 或 `:` 分隔;
-                // **裸**敏感 key(`token` / `key` / `auth` …)**仅** `=` —— 不匹配 `:`,否则会误吞
-                // URI scheme(如 vigil-http-auth 内部 token_ref `token://oauth/...`)与 YAML/JSON
-                // 的 `token:` 上下文(Codex / 全 workspace 测试发现的 false positive)。
-                r#"(?i)(?:\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*[=:]|\b(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*=)\s*["']?[^\s"',;}\]]+"#,
-            )
-            .expect("regex"),
+            pattern: Regex::new(ENV_ASSIGNMENT_PATTERN.as_str()).expect("regex"),
         },
         Rule {
             name: "jwt",
@@ -660,6 +848,28 @@ pub(crate) static ALL_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
             )
             .expect("regex"),
         },
+        // 2026-09-12 maskit 竞品对照补洞:中国云厂商 / Slack / HuggingFace 固定前缀凭据。
+        // 形态固定、前缀独特(硬指纹纪律:零误报优先)。RULE_PROFILE_VERSION v5 → v6。
+        Rule {
+            name: "aliyun_access_key_id",
+            // 阿里云 AccessKey ID:`LTAI` + 12–20 位字母数字(老 16 位 / 新 24 位)
+            pattern: Regex::new(r"\bLTAI[A-Za-z0-9]{12,20}\b").expect("regex"),
+        },
+        Rule {
+            name: "tencent_secret_id",
+            // 腾讯云 SecretId:`AKID` + 恰 32 位字母数字(共 36),定长挡掉 `AKIDataProcessor…` 类标识符
+            pattern: Regex::new(r"\bAKID[A-Za-z0-9]{32}\b").expect("regex"),
+        },
+        Rule {
+            name: "slack_token",
+            // Slack bot / user / app / refresh token:`xox[baprs]-` + 10 位以上(区别于 slack_webhook URL)
+            pattern: Regex::new(r"\bxox[baprs]-[0-9A-Za-z-]{10,255}\b").expect("regex"),
+        },
+        Rule {
+            name: "huggingface_token",
+            // HuggingFace 用户 token:`hf_` + 30 位以上字母数字(实际 34)
+            pattern: Regex::new(r"\bhf_[A-Za-z0-9]{30,64}\b").expect("regex"),
+        },
         // v0.7-α3 R1a(E6a):generic HTTP/HTTPS URL — Phase 3 spike-3 R1 暴露的
         // production gap(原仅 internal_ipv4 → Url canonical,公网 URL 漏检)。
         // 路由到 PrivacyLabel::Url(label.rs::from_kind 加 "generic_url" 分支)。
@@ -687,7 +897,7 @@ pub(crate) static HARD_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         },
         Rule {
             name: "github_token",
-            pattern: Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{36,255}\b").expect("regex"),
+            pattern: Regex::new(GITHUB_TOKEN_PATTERN).expect("regex"),
         },
         Rule {
             name: "anthropic_api_key",
@@ -710,14 +920,8 @@ pub(crate) static HARD_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         },
         Rule {
             name: "env_assignment",
-            pattern: Regex::new(
-                // 带前缀的 key(`MY_TOKEN` / `OPENAI_API_KEY`)允许 `=` 或 `:` 分隔;
-                // **裸**敏感 key(`token` / `key` / `auth` …)**仅** `=` —— 不匹配 `:`,否则会误吞
-                // URI scheme(如 vigil-http-auth 内部 token_ref `token://oauth/...`)与 YAML/JSON
-                // 的 `token:` 上下文(Codex / 全 workspace 测试发现的 false positive)。
-                r#"(?i)(?:\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*[=:]|\b(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|APIKEY|API_KEY|AUTH)\b\s*=)\s*["']?[^\s"',;}\]]+"#,
-            )
-            .expect("regex"),
+            // 与 ALL_RULES 同源 pattern(引号键名 / 中文关键词分支只脱值,见 ENV_ASSIGNMENT_PATTERN)
+            pattern: Regex::new(ENV_ASSIGNMENT_PATTERN.as_str()).expect("regex"),
         },
         // I09c:hard-rule 镜像 ALL_RULES 新增的 slack_webhook / stripe_secret_key
         Rule {
@@ -747,6 +951,23 @@ pub(crate) static HARD_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
                 r"\b(postgresql|postgres|mysql|mongodb\+srv|mongodb|rediss|redis|amqps|amqp)://[^:/\s@]+:[^@/\s]+@[A-Za-z0-9.\-]+(:\d+)?(/[^\s]*)?",
             )
             .expect("regex"),
+        },
+        // 2026-09-12 v6:HARD_RULES 镜像 aliyun / tencent / slack_token / huggingface
+        Rule {
+            name: "aliyun_access_key_id",
+            pattern: Regex::new(r"\bLTAI[A-Za-z0-9]{12,20}\b").expect("regex"),
+        },
+        Rule {
+            name: "tencent_secret_id",
+            pattern: Regex::new(r"\bAKID[A-Za-z0-9]{32}\b").expect("regex"),
+        },
+        Rule {
+            name: "slack_token",
+            pattern: Regex::new(r"\bxox[baprs]-[0-9A-Za-z-]{10,255}\b").expect("regex"),
+        },
+        Rule {
+            name: "huggingface_token",
+            pattern: Regex::new(r"\bhf_[A-Za-z0-9]{30,64}\b").expect("regex"),
         },
         // 注:generic_url **不**加入 HARD_RULES(secret 类子集)。它在 ALL_RULES 是
         // url canonical 的兜底,通过 scan::collect_url_hard_findings 在
@@ -993,6 +1214,378 @@ mod tests {
             detect_hard_secret("SOME_SECRET: abcdef"),
             Some("env_assignment")
         );
+    }
+
+    /// maskit 竞品对照(2026-09-12)实测缺口:JSON / PHP 数组 / 引号 YAML 里**带引号的键名**整类漏检
+    /// —— 旧 pattern 要求关键词后紧跟 `\s*[=:]`,键名的闭合引号把它断开。粘贴整段配置块正是最常见
+    /// 的泄漏面,而 hook 的确定性 deny 只走硬规则。
+    #[test]
+    fn env_assignment_quoted_key_forms_are_hard_secrets() {
+        for (sample, note) in [
+            (r#"{"password": "hunter2000"}"#, "JSON 裸敏感 key"),
+            (r#""db_password": "hunter2000""#, "JSON 带前缀 key"),
+            (
+                r#""AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#,
+                "AWS SK 键值形态(值含 / 与 +)",
+            ),
+            (
+                r#"{"access_token":"ya29.a0AfH6SMB-example_token_value"}"#,
+                "无空格 + OAuth token",
+            ),
+            (r#"{"accessToken":"AbCdEf123456"}"#, "camelCase"),
+            (r#"{"clientSecret":"AbCdEf123456"}"#, "camelCase secret"),
+            (r#"{"api-key":"AbCdEf123456"}"#, "kebab-case(敌意评审 A1)"),
+            (r#""X-Api-Key": "AbCdEf123456""#, "HTTP 头风格键名"),
+            ("'api_token' => 'abc123XYZ789'", "PHP 数组"),
+            ("'password' => 'hunter2000'", "PHP 裸 key"),
+            (
+                r#"password: "hunter2000""#,
+                "YAML / JS 裸键 + 引号值(敌意评审 A2)",
+            ),
+            (r#""password":"x1y2z3""#, "6 字符下限"),
+            (
+                r#"{"command":"curl -d '{\"password\": \"hunter2000\"}'"}"#,
+                "转义进 JSON 字符串的形态(序列化 tool_input)",
+            ),
+            (
+                r#"{"cmd":"echo '{\\\"password\\\": \\\"hunter2000\\\"}'"}"#,
+                "二次转义(敌意评审 A4)",
+            ),
+        ] {
+            assert_eq!(
+                detect_hard_secret(sample),
+                Some("env_assignment"),
+                "{note}: {sample}"
+            );
+            let clean = scrub_text(sample);
+            assert!(
+                clean.contains("[REDACTED env_assignment]"),
+                "{note}: {clean}"
+            );
+        }
+        assert!(!scrub_text(r#"{"password": "hunter2000"}"#).contains("hunter2000"));
+        assert!(!scrub_text(
+            r#""AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#
+        )
+        .contains("wJalrXUtnFEMI"));
+        // 值锚定闭合引号:含空格 / 花括号的口令整段脱掉,不留残段(敌意评审 A3)
+        assert_eq!(
+            scrub_text(r#"{"password":"correct horse battery staple"}"#),
+            r#"{"password":"[REDACTED env_assignment]"}"#
+        );
+        assert_eq!(
+            scrub_text(r#"{"password":"p@ss{word}123"}"#),
+            r#"{"password":"[REDACTED env_assignment]"}"#
+        );
+        // 自由文本分支(带前缀 key)遇引号值也整段吞到闭合引号(敌意评审 R2:改前只脱首词)
+        assert_eq!(
+            scrub_text(r#"DB_PASSWORD: "correct horse battery staple""#),
+            "[REDACTED env_assignment]"
+        );
+        assert_eq!(
+            scrub_text(r#"DB_PASSWORD="my pass phrase""#),
+            "[REDACTED env_assignment]"
+        );
+        // 点分 / 中文键名(Spring 属性、中文 JSON)只脱值
+        assert_eq!(
+            scrub_text(r#"{"spring.datasource.password":"hunter2000"}"#),
+            r#"{"spring.datasource.password":"[REDACTED env_assignment]"}"#
+        );
+        assert_eq!(
+            scrub_text(r#"{"密码":"hunter2000"}"#),
+            r#"{"密码":"[REDACTED env_assignment]"}"#
+        );
+        assert_eq!(
+            detect_hard_secret(r#"{"2fa_secret":"JBSWY3DPEHPK3PXP"}"#),
+            Some("env_assignment")
+        );
+        assert_eq!(
+            detect_hard_secret(r#""Ocp-Apim-Subscription-Key": "AbCdEf123456""#),
+            Some("env_assignment")
+        );
+    }
+
+    /// 引号分支上线的误报守门:协议形状 / 分页游标 / 标识符 / 模板占位 / 散文 / URI / 别名剥离后的
+    /// NUL 占位不得命中。任一条误命中都会变成 hook 的 FINAL deny 或网关整包扣留结果,代价很高。
+    #[test]
+    fn env_assignment_quoted_forms_do_not_bite_protocol_shapes_or_prose() {
+        for sample in [
+            r#""token_type": "bearer""#, // 关键词不是键名结尾
+            r#""secret_name": "abc123def""#,
+            r#""key": "customer_id""#, // JSON 通用键值对(裸 key 不进引号分支)
+            r#""auth": "basic""#,      // 裸 auth 不进引号分支
+            r#"{"pwd": "/home/user/project"}"#, // pwd = 工作目录(裸 pwd 不进引号分支)
+            r#"{"token": "the", "pos": "DET"}"#, // NLP 分词输出(值 < 6)
+            r#""api_key": {"type": "string"}"#, // tool schema:值必须是引号串
+            r#""api_key": null"#,
+            r#""api_key": """#,
+            // 分页游标 / 标识符:泛后缀 *_token / *_key 不进白名单(敌意评审 B:hook 对分页 FINAL deny)
+            r#"{"NextToken":"AAAAB3NzaC1yc2EAAAADAQABAAABAQ"}"#,
+            r#"{"pageToken":"CiAKGjBpNDd2Nmk0bTV"}"#,
+            r#"{"continuation_token":"abcdef123456"}"#,
+            r#"{"public_key":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"}"#,
+            r#"{"object_key":"uploads/2026/report.pdf"}"#,
+            r#"{"primary_key":"user_id_column"}"#,
+            // kebab 键里的裸 token 不能从中间起匹配(左边界消费一个非键名字符,不是 \b)
+            r#"{"x-amz-security-token":"AbCdEf123456"}"#,
+            r#"{"x-csrf-token":"AbCdEf123456"}"#,
+            r#"{"next-token":"AbCdEf123456"}"#,
+            r#"{"密码提示":"abcdef"}"#, // 中文关键词后必须紧跟分隔符
+            // 模板占位值
+            r#""password":"<your-password>""#,
+            r#""password":"${DB_PASSWORD}""#,
+            r#""api_key":"{{ secrets.API_KEY }}""#,
+            "token://oauth/access/aaa/bbb", // URI scheme(既有回归门)
+            "token: abc",
+            "password: hunter2000", // 裸 YAML 键 + 裸值:有意豁免(与 token:// 同类)
+            "{\"token\":\"\u{0}\",\"api_key\":\"\u{0}\"}", // hook 剥离 secret:// 别名后的 NUL 占位
+        ] {
+            assert_eq!(
+                detect_hard_secret(sample),
+                None,
+                "must not match: {sample:?}"
+            );
+        }
+    }
+
+    /// 中文凭据关键词赋值(maskit SHIELD-CRED-CJK-001:中文用户写「密码：xxx」,英文关键词规则整条漏)。
+    /// 值字符类不含汉字,散文不命中;关键词后必须紧跟分隔符。
+    #[test]
+    fn env_assignment_cjk_credential_keywords_are_hard_secrets() {
+        for sample in [
+            "数据库密码：Hunter2000!",
+            "令牌: abc123XYZ789",
+            "密钥＝sk_test_abcdef",
+            "接口密钥: \"abcdef123456\"",
+            "Wi-Fi 密码：mywifi123",
+            "密码是123456", // 「是 / 为」也是口语分隔(敌意评审 A7)
+        ] {
+            assert_eq!(
+                detect_hard_secret(sample),
+                Some("env_assignment"),
+                "{sample}"
+            );
+        }
+        let clean = scrub_text("数据库密码：Hunter2000! 请勿外传");
+        assert_eq!(clean, "数据库密码：[REDACTED env_assignment] 请勿外传");
+        // 无上限:80 字符的值整段脱掉,不留尾巴(敌意评审 A7)
+        let long = "A1".repeat(40);
+        assert_eq!(
+            scrub_text(&format!("密码：{long}")),
+            "密码：[REDACTED env_assignment]"
+        );
+        for sample in [
+            "密码：请联系管理员",
+            "密码：8 位以上",
+            "密码本：abcdef",
+            "这是密码",
+            "口令：见附件",
+            "密码为空",
+            "密码：********",      // 掩码占位(值首字符须为字母数字)
+            "私钥：~/.ssh/id_rsa", // 路径不是密钥
+        ] {
+            assert_eq!(
+                detect_hard_secret(sample),
+                None,
+                "prose must not match: {sample}"
+            );
+        }
+    }
+
+    /// 值组纪律:只有显式声明的分支只脱值;带语法分组的既有规则(aws `(AKIA|ASIA)`、stripe、
+    /// database_url)仍整段替换 —— 否则只脱前缀、泄漏其余字节。
+    #[test]
+    fn value_groups_are_explicit_and_never_inferred_from_syntax_groups() {
+        assert_eq!(
+            scrub_text("AKIAIOSFODNN7EXAMPLE"),
+            "[REDACTED aws_access_key_id]"
+        );
+        assert_eq!(
+            scrub_text("sk_live_abcdef0123456789abcdef01"),
+            "[REDACTED stripe_secret_key]"
+        );
+        assert_eq!(
+            scrub_text("postgres://admin:s3cr3tpass@db.example.com:5432/app"),
+            "[REDACTED database_url]"
+        );
+        // 引号分支只脱值、保结构:仍是合法 JSON,键名保留,值不残留
+        let clean = scrub_text(r#"{"config": {"password": "hunter2000", "host": "db"}}"#);
+        assert_eq!(
+            clean,
+            r#"{"config": {"password": "[REDACTED env_assignment]", "host": "db"}}"#
+        );
+        assert!(serde_json::from_str::<Value>(&clean).is_ok());
+        // 转义进字符串的形态:值止于闭合引号的 `\` 前,外层 JSON 不破
+        let clean = scrub_text(r#"{"command":"curl -d '{\"password\": \"hunter2000\"}'"}"#);
+        assert_eq!(
+            clean,
+            r#"{"command":"curl -d '{\"password\": \"[REDACTED env_assignment]\"}'"}"#
+        );
+        assert!(serde_json::from_str::<Value>(&clean).is_ok());
+        // 自由文本分支维持整段替换契约
+        assert_eq!(
+            scrub_text("DATABASE_PASSWORD=hunter2"),
+            "[REDACTED env_assignment]"
+        );
+        // 每个声明的值组都真实存在于 pattern 里(防声明与 pattern 漂移)
+        let rx = Regex::new(ENV_ASSIGNMENT_PATTERN.as_str()).unwrap();
+        for g in ENV_ASSIGNMENT_VALUE_GROUPS {
+            assert!(
+                *g < rx.captures_len(),
+                "value group {g} missing from pattern"
+            );
+        }
+    }
+
+    /// 2026-09-12 maskit 竞品对照补洞:中国云厂商 / Slack / HuggingFace 固定前缀凭据(v6)。
+    /// 腾讯云 / Slack 样本字面量拆成两段:完整形态会被 GitHub push protection 当真凭据拦下推送。
+    #[test]
+    fn vendor_prefix_tokens_v6_are_hard_secrets() {
+        for (sample, kind) in [
+            ("LTAI5tAbCdEf12345678", "aliyun_access_key_id"),
+            (
+                concat!("AK", "IDaBcDeFgHiJkLmNoPqRsTuVwXyZ012345"),
+                "tencent_secret_id",
+            ),
+            (
+                concat!("xox", "b-1234567890-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"),
+                "slack_token",
+            ),
+            ("hf_AbCdEfGhIjKlMnOpQrStUvWxYz01234567", "huggingface_token"),
+        ] {
+            assert_eq!(detect_hard_secret(sample), Some(kind), "{sample}");
+            assert_eq!(
+                scrub_text(&format!("key {sample} end")),
+                format!("key [REDACTED {kind}] end")
+            );
+        }
+        // 形似但不够长 / 定长不符的标识符不命中
+        for sample in [
+            "AKIDataProcessor1",
+            "xoxb-short",
+            "hf_short_identifier",
+            "LTAI123",
+        ] {
+            assert_eq!(detect_hard_secret(sample), None, "{sample}");
+        }
+    }
+
+    /// 残余误报收口(2026-09-12 敌意评审建议):裸 `token` 值下限 16、`OLDPWD` 不是凭据、
+    /// 「是 / 为」口语分隔的值须以数字或符号开头、剥离别名后的 NUL 让整个值失效。
+    #[test]
+    fn residual_false_positives_are_closed() {
+        assert_eq!(detect_hard_secret(r#"{"token":"tokenization"}"#), None);
+        assert_eq!(
+            detect_hard_secret(r#"{"token":"0x1234567890abcdef"}"#),
+            Some("env_assignment")
+        );
+        assert_eq!(
+            scrub_text(r#"{"token":"0x1234567890abcdef"}"#),
+            r#"{"token":"[REDACTED env_assignment]"}"#
+        );
+        assert_eq!(detect_hard_secret("OLDPWD=/home/user/project"), None);
+        // hub 双评审用例依赖裸 `PWD=` 仍是凭据形态
+        assert_eq!(detect_hard_secret("PWD=hunter2"), Some("env_assignment"));
+        assert_eq!(
+            detect_hard_secret("MYSQL_PWD=hunter2000"),
+            Some("env_assignment")
+        );
+        assert_eq!(detect_hard_secret("令牌是Bearer类型"), None);
+        assert_eq!(detect_hard_secret("密码是123456"), Some("env_assignment"));
+        // 已知取舍:「是 / 为」后须数字 / 符号开头,字母开头的口令漏检
+        assert_eq!(detect_hard_secret("密码是hunter2000"), None);
+        assert_eq!(detect_hard_secret("{\"api_key\":\"Bearer \u{0}\"}"), None);
+        assert_eq!(secret_value_min_chars("token"), 16);
+        assert_eq!(secret_value_min_chars("TOKEN"), 16);
+        assert_eq!(secret_value_min_chars("password"), SECRET_VALUE_MIN_CHARS);
+        assert_eq!(
+            secret_value_min_chars("access_token"),
+            SECRET_VALUE_MIN_CHARS
+        );
+    }
+
+    /// GitHub 细粒度 PAT(`github_pat_…`,现默认形态)此前整串漏检;经典形态未回归。
+    #[test]
+    fn github_token_matches_fine_grained_pat() {
+        let fake = format!("github_pat_{}_{}", "11ABCDEFG0123456789ABC", "a".repeat(59));
+        assert_eq!(detect_hard_secret(&fake), Some("github_token"));
+        assert_eq!(
+            scrub_text(&format!("gh auth login --with-token {fake}")),
+            "gh auth login --with-token [REDACTED github_token]"
+        );
+        assert_eq!(detect_hard_secret("github_pat_short_identifier"), None);
+        assert_eq!(
+            detect_hard_secret("ghp_aBcD1234567890aBcD1234567890aBcD1234"),
+            Some("github_token")
+        );
+    }
+
+    /// [`is_secret_key_name`] 与 `env_assignment` 引号分支同一份白名单:网关按键名脱值时口径一致。
+    #[test]
+    fn secret_key_name_allowlist_contract() {
+        for k in [
+            "password",
+            "db_password",
+            "DB_PASSWORD",
+            "passwd",
+            "userPwd",
+            "secret",
+            "client_secret",
+            "clientSecret",
+            "api_key",
+            "apiKey",
+            "x-api-key",
+            "X-Api-Key",
+            "aws_secret_access_key",
+            "AWS_SECRET_ACCESS_KEY",
+            "private_key",
+            "access_token",
+            "accessToken",
+            "refresh_token",
+            "id_token",
+            "session_token",
+            "github_token",
+            "personal_access_token",
+            "token",
+            "spring.datasource.password", // 点分 / 数字开头 / Azure 头:与规则左边界同口径(敌意评审 R2)
+            "smtp.password",
+            "2fa_secret",
+            "Ocp-Apim-Subscription-Key",
+            "x-functions-key",
+            "密码",
+            "数据库密码",
+        ] {
+            assert!(is_secret_key_name(k), "{k} should be a secret key name");
+        }
+        for k in [
+            "NextToken",
+            "next_token",
+            "pageToken",
+            "continuation_token",
+            "device_token",
+            "csrf_token",
+            "public_key",
+            "object_key",
+            "primary_key",
+            "foreign_key",
+            "cache_key",
+            "s3_key",
+            "key",
+            "auth",
+            "pwd",
+            "cwd",
+            "token_type",
+            "secret_name",
+            "tokens",
+            "password_hash",
+            "username",
+            "x-amz-security-token", // kebab 中间的裸 token 不算
+            "x-csrf-token",
+            "next-token",
+            "密码提示",
+        ] {
+            assert!(!is_secret_key_name(k), "{k} must not be a secret key name");
+        }
     }
 
     #[test]

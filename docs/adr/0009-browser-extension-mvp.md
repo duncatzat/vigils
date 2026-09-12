@@ -271,6 +271,10 @@ pub enum FindingKind {
 | 第二批(R2 ACCEPT 2026-04-23) | `GoogleApiKey` | `\bAIza[A-Za-z0-9_\-]{35}\b`(AIza + 35 chars = 39 total) | Maps/YouTube/Gemini/Firebase 调用配额即金钱 |
 | 第二批 | `GitlabPat` | `\bglpat-[A-Za-z0-9_\-]{20,}\b`(glpat- + 20+ chars) | 仓库/CI/runner 全权限(较 GitHub PAT 更 opaque 无权限位检测) |
 | 第三批(R1 ACCEPT 2026-04-23 本 Revised) | `DatabaseUrl` | `\b(postgresql\|postgres\|mysql\|mongodb+srv\|mongodb\|rediss\|redis\|amqps\|amqp)://user:password@host[:port][/path]` | 含凭证 DB 连接串泄漏 = DB 全权限(读写删 schema) |
+| 第四批(2026-09-12 maskit 竞品对照) | `AliyunAccessKey` | `\bLTAI[A-Za-z0-9]{12,20}\b` | 阿里云 AccessKey ID,国内用户最常见的云凭据;`LTAI` 前缀唯一,配对 secret 常同段泄漏 |
+| 第四批 | `TencentSecretId` | `\bAKID[A-Za-z0-9]{32}\b`(定长 36) | 腾讯云 SecretId;定长挡掉 `AKIDataProcessor…` 类标识符 |
+| 第四批 | `SlackToken` | `\bxox[baprs]-[0-9A-Za-z-]{10,255}\b` | Slack bot / user / app / refresh token,与 `SlackWebhook` URL 形态互不重叠 |
+| 第四批 | `HuggingfaceToken` | `\bhf_[A-Za-z0-9]{30,64}\b` | HuggingFace 用户 token(模型下载 / 推理 API 计费面) |
 
 ### C2. `RULE_PROFILE_VERSION` 演化
 
@@ -280,6 +284,8 @@ pub enum FindingKind {
 | `v2` | I09c 第一批,+ slack_webhook + stripe_secret_key(10 kinds) | 回溯时可明确 v1 历史库无 Slack/Stripe,不是漏判 |
 | `v3` | I09c 第二批,+ google_api_key + gitlab_pat(12 kinds) | 同上,v1/v2 无 Google/GitLab 语义 → 非漏判 |
 | `v4` | I09c 第三批,+ database_url(**13 kinds**) | 同上,v1-v3 无 DB URL 语义 → 非漏判 |
+| `v5` | ISS-021 PrivacyLabel 维度对齐(无新 kind,仍 13) | 审计 payload 字段不变;跨 crate 短形 / 长形 alias 归一化守门(ADR 0013 Revised) |
+| `v6` | 2026-09-12 maskit 竞品对照第四批,+ aliyun_access_key + tencent_secret_id + slack_token + huggingface_token(**17 kinds**) | 同上,v1-v5 无中国云厂商 / Slack token / HuggingFace 语义 → 非漏判 |
 
 **审计不变量**:扩 FindingKind → bump `RULE_PROFILE_VERSION` 是 MUST(第一批 R1 教训);不 bump 会破坏"某条审计由哪一版规则产生"的追溯链。
 
@@ -392,7 +398,7 @@ pub enum FindingKind {
   B(fail-open 面)/C(坐标系)/D(资源)/E(审计白名单)/F(JS 层)/G(协议兼容)全 OK;
   0 CRITICAL/HIGH/MED;3 个 LOW/信息级非阻断(慢滴漏 ≤1 worker/60s 已文档化、daemon 可控
   label 字节入本地账本有界、JS 尺寸上限——第三项已当场加固)。
-- 远端(192.168.252.20,cargo 1.96)`fmt --check` / `clippy --workspace --all-targets
+- 远端编译机(cargo 1.96)`fmt --check` / `clippy --workspace --all-targets
   -D warnings` / `test --workspace` 全绿:**1270 passed / 0 failed**(基线 1260,+10:
   wire 13 全量随迁+2 补、native-host ml_augment 10、server e2e 4 随迁)。
 - 后续:Phase 2(posture→tier 统一 + GUI 观测)、Phase 3(setup 编排 + 文档一致性)。

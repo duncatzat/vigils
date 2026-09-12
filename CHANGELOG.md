@@ -12,6 +12,22 @@ All notable changes to Vigils are documented here. The format follows
 
 ### Added
 
+- **Four vendor-prefix credential kinds (`RULE_PROFILE_VERSION` v5 → v6, FindingKind 13 → 17).**
+  Aliyun AccessKey ID `LTAI…`, Tencent Cloud SecretId `AKID…` (fixed 36 chars), Slack tokens
+  `xox[baprs]-…`, and Hugging Face tokens `hf_…` are now hard fingerprints in the Rust rules, the
+  browser `FindingKind` / classifier, the Chrome extension's consumer-mode rules and labels, and
+  the docs — one batch, with the cross-crate sync guards (rule_sync / golden / merge counts)
+  updated alongside. Extension manifest 0.3.0 → 0.3.1.
+- **Two release gates as plain-Python scripts, wired into CI.** `scripts/check-workflows.py`
+  lints every workflow YAML (duplicate keys, dangling `needs`, `${{ github.event.* }}`
+  interpolated straight into `run:`, `pull_request_target` checking out the PR head, floating
+  branch refs; unpinned tags and `workflow_dispatch` inputs only warn) and
+  `scripts/audit-public-release.py` audits the tracked tree (credential-looking filenames,
+  runtime artifacts, ignored-but-tracked files, developer home paths, control characters fail;
+  symlinks, oversized files and — with `--public` — private IPs warn). Exceptions live in
+  `scripts/audit-public-release.allow`, each with a reason. First run on this repo caught two
+  maintainer home paths in plan documents (scrubbed) and the `acceptance.yml` tag-resolution
+  steps interpolating event fields into shell (moved to `env:`).
 - **MCP 2026-07-28 interop, first cut.** The gateway's protocol whitelist now includes
   `2025-11-25` (proposed first on `initialize`). When an upstream rejects `initialize`, the
   gateway sends the 2026-07-28 `server/discover` probe and reports *modern-era only* with the
@@ -91,6 +107,40 @@ All notable changes to Vigils are documented here. The format follows
 
 ### Fixed
 
+- **`env_assignment` missed quoted credential keys and Chinese keywords.** `{"password": "…"}`,
+  `"AWS_SECRET_ACCESS_KEY": "…"`, `'api_token' => '…'`, `password: "…"` (JSON / PHP / YAML / JS,
+  including escaped-into-string forms) and `数据库密码：…` went undetected as a class — and pasting
+  a whole config block is the most common leak shape, while the hook's deterministic `PreToolUse`
+  / `UserPromptSubmit` deny only runs the hard rules. Key names go through an explicit credential
+  allowlist (`*secret` / `*password` / `api_key` / `access_key` / `private_key` / `access_token` /
+  `refresh_token` / `token` …; snake / kebab / camelCase) — deliberately **not** generic
+  `*_token` / `*_key` suffixes, so `NextToken` / `pageToken` / `public_key` / `object_key`
+  pagination and schema fields never trip a FINAL deny. The new branches redact **only the value
+  and keep the structure** (`{"password": "[REDACTED env_assignment]"}` stays valid JSON; the
+  `.env` free-text form keeps its whole-segment contract); values must be quoted, ≥ 6 chars and
+  end at the closing quote. Template values (`<…>` / `${…}` / `{{…}}`), tool-schema objects,
+  `null`, `token://` URIs, bare YAML `password: x`, and Chinese prose / masks / paths
+  (`密码：请联系管理员` / `密码：********` / `私钥：~/.ssh/id_rsa`) do not match (guard tests).
+- **`github_token` now matches fine-grained PATs** (`github_pat_…`, GitHub's current default
+  shape; previously missed entirely).
+- **Hook raw-credential gate is alias-aware.** Prefix-anchored fingerprints are judged on the
+  **original** text (stripping `secret://` first would cut smuggled
+  `secret://https://hooks.slack.com/…` in half and let it through — found in hostile review);
+  only an `env_assignment` hit re-checks with placeholders stripped, so `secret://<alias>` itself
+  can never be mistaken for a raw credential (`{"token":"secret://github_pat"}` is standard MCP
+  alias usage), while a raw token smuggled inside an alias body is still always denied.
+  `UserPromptSubmit` gets the same treatment.
+- **MCP gateway result scrubbing shares the rule's key allowlist**
+  (`vigil_redaction::is_secret_key_name`): values under credential key names are replaced
+  whole during per-leaf scrubbing — otherwise "leaf can't scrub it but the serialized self-check
+  hits" withheld entire results that merely contained a `"password"` field; `NextToken`-style
+  cursors pass through untouched.
+- **Residual false positives closed** (hostile-review follow-ups): a bare `token` key needs a
+  16-char value (`{"token":"tokenization"}` no longer matches); `OLDPWD=/home/…` is not a
+  password (only `PWD` and `*_PWD`); Chinese `密码是 / 为 …` only matches values starting with a
+  digit or symbol (`令牌是 Bearer 类型` is prose; letter-initial passwords are a known trade-off);
+  a value left with a NUL after alias stripping is never a raw credential
+  (`{"api_key":"Bearer secret://gh"}` is not denied).
 - **Claude Code prompt guard was missing.** `setup` registered only `PreToolUse` /
   `PostToolUse` for Claude Code, so a bare credential pasted into the prompt went straight to
   the model (found by the real-agent canary). `setup` now also registers `UserPromptSubmit`

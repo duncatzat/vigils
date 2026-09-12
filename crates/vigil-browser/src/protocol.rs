@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 ///   归一化**才能互查;详见 ADR 0013 Revised "alias 漂移点" + ISS-021 跨 crate 不变量段。
 ///   ADR 0013 Revised 段把硬指纹层最终定位为 fast-path + fallback,跨 crate 矩阵
 ///   golden 守门;详见 `docs/adr/0013-hardfp-model-merge.md` "Revised — ISS-021" 段
-pub const RULE_PROFILE_VERSION: &str = "v5";
+/// - `v6`:2026-09-12 maskit 竞品对照补洞(+ aliyun_access_key / tencent_secret_id /
+///   slack_token / huggingface_token → 17 FindingKind)。固定前缀凭据,零误报优先;
+///   `aliyun_access_key` 短形 ↔ vigil-redaction `aliyun_access_key_id` 长形经 alias 归一化。
+pub const RULE_PROFILE_VERSION: &str = "v6";
 
 /// 浏览器事件:粘贴 / 手动输入 / 提交。`Ask` 交互延 I09c。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +86,14 @@ pub enum FindingKind {
     /// 含凭证的 database URL(`scheme://user:password@host[:port][/path]`);
     /// 白名单 scheme:postgres(ql)/ mysql / mongodb(+srv) / redis(s) / amqp(s)(I09c 第三批)
     DatabaseUrl,
+    /// 阿里云 AccessKey ID;`LTAI` 前缀 + 12–20 chars(v6,2026-09-12 maskit 对照)
+    AliyunAccessKey,
+    /// 腾讯云 SecretId;`AKID` 前缀 + 恰 32 chars(v6)
+    TencentSecretId,
+    /// Slack bot / user / app / refresh token;`xox[baprs]-` 前缀(v6;区别于 SlackWebhook URL)
+    SlackToken,
+    /// HuggingFace 用户 token;`hf_` 前缀 + 30+ chars(v6)
+    HuggingfaceToken,
 }
 
 impl FindingKind {
@@ -102,6 +113,10 @@ impl FindingKind {
             FindingKind::GoogleApiKey => "google_api_key",
             FindingKind::GitlabPat => "gitlab_pat",
             FindingKind::DatabaseUrl => "database_url",
+            FindingKind::AliyunAccessKey => "aliyun_access_key",
+            FindingKind::TencentSecretId => "tencent_secret_id",
+            FindingKind::SlackToken => "slack_token",
+            FindingKind::HuggingfaceToken => "huggingface_token",
         }
     }
 }

@@ -33,6 +33,38 @@ test("scanText detects and redacts common consumer secrets", () => {
     assert.equal(hasFindings(redacted), false);
 });
 
+test("vendor prefix tokens (v6: aliyun / tencent / slack token / huggingface) detect and redact", () => {
+    // 腾讯云 / Slack 样本字面量拆成两段:完整形态会被 GitHub push protection 当真凭据拦下推送
+    const tencentSample = "AK" + "IDaBcDeFgHiJkLmNoPqRsTuVwXyZ012345";
+    const slackSample = "xox" + "b-1234567890-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx";
+    const text = [
+        "ALIBABA_CLOUD_ACCESS_KEY_ID=LTAI5tAbCdEf12345678",
+        `secretId: ${tencentSample}`,
+        `SLACK_BOT_TOKEN=${slackSample}`,
+        "huggingface-cli login --token hf_AbCdEfGhIjKlMnOpQrStUvWxYz01234567",
+    ].join("\n");
+
+    const findings = scanText(text);
+    const kinds = findings.map((f) => f.kind);
+    for (const kind of ["aliyun_access_key_id", "tencent_secret_id", "slack_token", "huggingface_token"]) {
+        assert.equal(kinds.includes(kind), true, `missing ${kind} in ${kinds}`);
+    }
+
+    const redacted = redactText(text, findings);
+    for (const raw of [
+        "LTAI5tAbCdEf12345678",
+        tencentSample,
+        "AbCdEfGhIjKlMnOpQrStUvWx",
+        "hf_AbCdEfGhIjKlMnOpQrStUvWxYz01234567",
+    ]) {
+        assert.equal(redacted.includes(raw), false, `raw token survived redaction: ${raw}`);
+    }
+    assert.equal(hasFindings(redacted), false);
+
+    // 形似标识符不命中(硬指纹零误报纪律:定长 / 下限)
+    assert.deepEqual(scanText("AKIDataProcessor1 hf_short_identifier xoxb-short LTAI123"), []);
+});
+
 test("redactText only redacts the selected finding kinds", () => {
     const text = [
         "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyzABCDE1234567890",

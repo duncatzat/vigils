@@ -86,11 +86,23 @@ impl PrivacyLabel {
             // ─── Hard rules(`HARD_RULES.name`)→ Secret 大类 ───
             // 这些 kind 在 HARD_RULES 中都有对应 Regex 命中;新增 HARD_RULES 时
             // 请同步这里 + 单测(feedback_extend_enum_sync_tests)。
-            "aws_access_key_id" | "github_token" | "anthropic_api_key" | "openai_api_key"
-            | "jwt" | "pem_private_key" | "env_assignment" | "slack_webhook"
-            | "stripe_secret_key" | "google_api_key" | "gitlab_pat" | "database_url" | "secret" => {
-                Some(Self::Secret)
-            }
+            "aws_access_key_id"
+            | "github_token"
+            | "anthropic_api_key"
+            | "openai_api_key"
+            | "jwt"
+            | "pem_private_key"
+            | "env_assignment"
+            | "slack_webhook"
+            | "stripe_secret_key"
+            | "google_api_key"
+            | "gitlab_pat"
+            | "database_url"
+            | "aliyun_access_key_id"
+            | "tencent_secret_id"
+            | "slack_token"
+            | "huggingface_token"
+            | "secret" => Some(Self::Secret),
 
             // ─── Email:Hard `email` + Model `private_email` ───
             "email" | "private_email" => Some(Self::Email),

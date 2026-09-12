@@ -170,7 +170,8 @@ mod tests {
     ///
     /// HARD_RULES 声明顺序:aws_access_key_id → github_token → anthropic_api_key →
     /// openai_api_key → pem_private_key → jwt → env_assignment → slack_webhook →
-    /// stripe_secret_key → google_api_key → gitlab_pat → database_url
+    /// stripe_secret_key → google_api_key → gitlab_pat → database_url →
+    /// aliyun_access_key_id → tencent_secret_id → slack_token → huggingface_token(v6)
     ///
     /// 本测试故意选**互不交叉命中**的两条规则避免 `sk-*` 既命中 anthropic 又命中
     /// openai 的干扰:stdout=github_token,stderr=jwt →

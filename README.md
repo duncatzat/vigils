@@ -47,7 +47,7 @@ Four guarantees, enforced locally:
   OAuth scope allow-lists for remote MCP. Nothing runs unless allowed.
 - **✅ Human-in-the-loop approval** — risky effects (file writes, network, destructive ops)
   pause for review. Grants can be scoped (once / this-session).
-- **🙈 Secret & PII redaction** — hard-fingerprint detection for 13+ credential classes
+- **🙈 Secret & PII redaction** — hard-fingerprint detection for 17+ credential classes
   (GitHub PAT, Stripe keys, Google/GitLab tokens, DB URLs, …) plus an optional multilingual
   ML ensemble; a fail-closed merge layer decides what to mask.
 - **🎟️ Secret lease broker** — short-lived credential leases injected only into the child
@@ -129,7 +129,7 @@ Both CLI builds run the identical firewall / audit / approval core — they diff
 
 | Build | Release asset | Redaction | First-run cost |
 |---|---|---|---|
-| **Default** — hard-fingerprint | `vigils-cli-<plat>` | 13+ structured credential & PII classes via fixed-pattern rules — deterministic, instant, no model | none |
+| **Default** — hard-fingerprint | `vigils-cli-<plat>` | 17+ structured credential & PII classes via fixed-pattern rules — deterministic, instant, no model | none |
 | **ML** | `vigils-cli-ml-<plat>` | The above **plus** an OpenAI PII NER model + a DeBERTa prompt-injection classifier — broader, semantic PII (names, addresses, dates) and soft injection signals | bundles the ONNX Runtime dylib; fetches ~0.8–1.5 GB of models on first `--engine ml` run |
 
 The two **coexist** — the engine is chosen per launch, so a single ML build serves any mode:

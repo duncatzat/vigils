@@ -121,6 +121,11 @@ fn map_rule_name(rule: &str) -> Option<FindingKind> {
         "gitlab_pat" => Some(FindingKind::GitlabPat),
         // I09c 第三批
         "database_url" => Some(FindingKind::DatabaseUrl),
+        // v6(2026-09-12 maskit 对照):中国云厂商 / Slack / HuggingFace 固定前缀
+        "aliyun_access_key_id" => Some(FindingKind::AliyunAccessKey),
+        "tencent_secret_id" => Some(FindingKind::TencentSecretId),
+        "slack_token" => Some(FindingKind::SlackToken),
+        "huggingface_token" => Some(FindingKind::HuggingfaceToken),
         _ => None,
     }
 }
@@ -324,6 +329,50 @@ mod tests {
             !redacted.contains("SuperSecret123"),
             "redacted_text 不得保留 mongodb password: {redacted}"
         );
+    }
+
+    #[test]
+    fn classifier_vendor_prefix_v6_redacts() {
+        // v6(2026-09-12 maskit 对照):阿里云 / 腾讯云 / Slack token / HuggingFace。
+        // 腾讯云 / Slack 样本字面量拆成两段:完整形态会被 GitHub push protection 当真凭据拦下推送。
+        for (text, kind, signature) in [
+            (
+                "ALIBABA_CLOUD_ACCESS_KEY_ID: LTAI5tAbCdEf12345678",
+                FindingKind::AliyunAccessKey,
+                "LTAI5tAbCdEf",
+            ),
+            (
+                concat!("secretId AK", "IDaBcDeFgHiJkLmNoPqRsTuVwXyZ012345"),
+                FindingKind::TencentSecretId,
+                "AKIDaBcDeFgH",
+            ),
+            (
+                concat!(
+                    "SLACK_BOT_TOKEN: xox",
+                    "b-1234567890-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"
+                ),
+                FindingKind::SlackToken,
+                "AbCdEfGhIjKlMnOpQrStUvWx",
+            ),
+            (
+                "huggingface-cli login --token hf_AbCdEfGhIjKlMnOpQrStUvWxYz01234567",
+                FindingKind::HuggingfaceToken,
+                "hf_AbCdEfGhIjKl",
+            ),
+        ] {
+            let r = resp(classify(&req(text)));
+            assert_eq!(r.action, BrowserAction::Redact, "{text}");
+            assert!(
+                r.findings.contains(&kind),
+                "{text} 应触发 {kind:?} findings={:?}",
+                r.findings
+            );
+            let redacted = r.redacted_text.unwrap();
+            assert!(
+                !redacted.contains(signature),
+                "redacted_text 不得保留原文片段 {signature}: {redacted}"
+            );
+        }
     }
 
     #[test]

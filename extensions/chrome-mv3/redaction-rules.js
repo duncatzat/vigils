@@ -65,6 +65,32 @@ const RULES = Object.freeze([
         redactable: true,
         pattern: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqp|amqps):\/\/[^:\s/@]+:[^@\s]+@[^\s]+/gi,
     },
+    // v6(2026-09-12 maskit 对照):中国云厂商 / Slack token / HuggingFace 固定前缀,
+    // 与 vigil-redaction HARD_RULES 同 pattern。
+    {
+        kind: "aliyun_access_key_id",
+        severity: "medium",
+        redactable: true,
+        pattern: /\bLTAI[A-Za-z0-9]{12,20}\b/g,
+    },
+    {
+        kind: "tencent_secret_id",
+        severity: "medium",
+        redactable: true,
+        pattern: /\bAKID[A-Za-z0-9]{32}\b/g,
+    },
+    {
+        kind: "slack_token",
+        severity: "medium",
+        redactable: true,
+        pattern: /\bxox[baprs]-[0-9A-Za-z-]{10,255}\b/g,
+    },
+    {
+        kind: "huggingface_token",
+        severity: "medium",
+        redactable: true,
+        pattern: /\bhf_[A-Za-z0-9]{30,64}\b/g,
+    },
     {
         kind: "env_assignment",
         severity: "medium",

@@ -27,6 +27,11 @@ fn finding_kind_as_str_golden() {
     assert_eq!(FindingKind::GitlabPat.as_str(), "gitlab_pat");
     // I09c 第三批
     assert_eq!(FindingKind::DatabaseUrl.as_str(), "database_url");
+    // v6(2026-09-12 maskit 对照)
+    assert_eq!(FindingKind::AliyunAccessKey.as_str(), "aliyun_access_key");
+    assert_eq!(FindingKind::TencentSecretId.as_str(), "tencent_secret_id");
+    assert_eq!(FindingKind::SlackToken.as_str(), "slack_token");
+    assert_eq!(FindingKind::HuggingfaceToken.as_str(), "huggingface_token");
 
     // variant 计数 guard:穷举 match;新增 variant → 编译错误提示更新 golden
     fn count(v: FindingKind) -> u8 {
@@ -44,9 +49,13 @@ fn finding_kind_as_str_golden() {
             FindingKind::GoogleApiKey => 11,
             FindingKind::GitlabPat => 12,
             FindingKind::DatabaseUrl => 13,
+            FindingKind::AliyunAccessKey => 14,
+            FindingKind::TencentSecretId => 15,
+            FindingKind::SlackToken => 16,
+            FindingKind::HuggingfaceToken => 17,
         }
     }
-    assert_eq!(count(FindingKind::DatabaseUrl), 13);
+    assert_eq!(count(FindingKind::HuggingfaceToken), 17);
 }
 
 #[test]

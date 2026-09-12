@@ -698,10 +698,12 @@ pub fn run<R: Read>(args: &HookArgs, stdin: &mut R) -> HookOutcome {
     };
 
     // 5) 扫描序列化后的 tool_input(对**所有**工具,含 `mcp__*` —— 裸 secret 在任何工具调用都要拦)。
-    //    - 裸硬指纹 secret:复用 vigil-redaction 的 detect_hard_secret(返回 FindingKind 名,非真值)。
+    //    - 裸硬指纹 secret:复用 vigil-redaction 的 detect_hard_secret(返回 FindingKind 名,非真值),
+    //      经 detect_raw_secret_alias_aware **别名感知**:`secret://<alias>` 占位符本身不算裸 secret
+    //      (否则 `{"token":"secret://x"}` 会被 env_assignment 引号键名分支误判),alias body 走私仍 deny。
     //    - Vigil 自有占位符:`secret://`(Slice 2 alias)/ `vigil://redact/`(Tier-B 动态 token)。
     let serialized = input.tool_input.to_string();
-    let raw_finding = vigil_redaction::detect_hard_secret(&serialized);
+    let raw_finding = detect_raw_secret_alias_aware(&serialized);
     let has_placeholder =
         serialized.contains("secret://") || serialized.contains("vigil://redact/");
     // 路由判断用**原始** tool_name(必须精确);回显/审计才用 sanitize 后的安全名(见 safe_tool_name)。
@@ -1229,6 +1231,61 @@ fn scan_secret_aliases(s: &str) -> Vec<AliasToken> {
     out
 }
 
+/// 别名感知的裸凭据检测(hook 版;与 MCP 网关 hub.rs 的 `strip_aliases` + `RawSecretInAlias` 同源
+/// 思路,但**只对 `env_assignment` 做剥离**)。
+///
+/// 1. 每个 `secret://<alias>` 的 **body** 先单独、无条件查硬指纹:`secret://ghp_REAL…` 走私仍 deny。
+///    必须无条件 —— body 是 base64 载荷(`secret://<b64(GITHUB_TOKEN=ghp_…)>`)时,原文扫描里的 base64
+///    游程会把 `//` 吸进去导致解码错位而不命中,若 body 扫描被「原文先命中」门控就漏了(敌意评审 R2
+///    复现)。
+/// 2. 全部硬规则在**原文**上扫:除 `env_assignment` 外的 11 条都是前缀锚定指纹(`ghp_` / `AKIA` /
+///    `https://hooks.slack.com/` / `postgres://user:pw@` / PEM 头…),`secret://` 占位符不会误触
+///    它们;反过来,先剥离再扫会把 `curl secret://https://hooks.slack.com/services/…` 切成 alias body
+///    `https` + 残段 `://hooks.slack.com/…`,两半都不再匹配 → 剥离前整串扫能拦的走私漏过(敌意评审
+///    2026-09-12 已复现,slack / database_url / PEM 三类)。所以任何非 env 命中直接 deny。
+/// 3. 只有 `env_assignment` 命中时才需要复核:它是唯一会被占位符误触的规则(引号键名分支把
+///    `{"token":"secret://github_pat"}` 的值当口令)。把 alias token 整段换 NUL 后只看 env_assignment
+///    是否仍命中:仍命中 = 真裸赋值在别处(`{"token":"secret://ok","password":"hunter2000"}`)→ deny;
+///    不再命中 = 命中全落在占位符上 → 不是裸凭据。NUL 保留断词边界;引号分支要求值 ≥ 6 字符,
+///    单个 NUL 不会再命中。`KEY=secret://x` 自由文本形态剥离后是 `KEY=<NUL>`,仍按赋值命中 —— 与
+///    hub 一致,行为不变。
+///
+/// `vigil://redact/<id>` 是 Vigil 自 mint 的 Tier-B token,id 形态不含硬指纹,原样参与扫描即可。
+/// 无别名时退化为纯硬指纹判定(零行为差异)。
+fn detect_raw_secret_alias_aware(text: &str) -> Option<&'static str> {
+    let aliases = scan_secret_aliases(text);
+    if let Some(kind) = aliases
+        .iter()
+        .find_map(|t| vigil_redaction::detect_hard_secret(&t.alias))
+    {
+        return Some(kind);
+    }
+    let hits = vigil_redaction::scan_hard_findings(text);
+    if let Some(kind) = hits.iter().copied().find(|k| *k != "env_assignment") {
+        return Some(kind);
+    }
+    if !hits.contains(&"env_assignment") {
+        return None;
+    }
+    let mut stripped = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for t in &aliases {
+        stripped.push_str(&text[cursor..t.start]);
+        stripped.push('\0');
+        cursor = t.end;
+    }
+    stripped.push_str(&text[cursor..]);
+    // 空 body 的 `secret://`(scan_secret_aliases 不收)同样是占位符形态,一并换 NUL:
+    // `{"token":"secret://"}` 不该被当成 9 字符的裸口令 deny。
+    let stripped = stripped.replace(SECRET_ALIAS_PREFIX, "\0");
+    if stripped == text {
+        return Some("env_assignment");
+    }
+    vigil_redaction::scan_hard_findings(&stripped)
+        .contains(&"env_assignment")
+        .then_some("env_assignment")
+}
+
 /// alias 名安全显示(回显 / 审计用)。alias 来自命令(可被攻击者构造),防御性 sanitize:
 /// 截断 64 + 仅保留 ASCII 字母数字与 `_-./`(alias 文法字符),其余替换 `?`,保证纯 ASCII。
 fn safe_alias(alias: &str) -> String {
@@ -1516,7 +1573,9 @@ fn handle_user_prompt_submit(args: &HookArgs, raw: &Value) -> HookOutcome {
         );
         return HookOutcome::Allow;
     };
-    let Some(kind) = vigil_redaction::detect_hard_secret(prompt) else {
+    // 别名感知(同 PreToolUse 第 5 步):用户在 prompt 里写 `secret://<alias>` 是被鼓励的用法,
+    // 不得被 env_assignment 的引号 / 中文分支判成裸凭据;alias body 走私的裸 token 仍 block。
+    let Some(kind) = detect_raw_secret_alias_aware(prompt) else {
         return HookOutcome::Allow;
     };
     // best-effort 审计(不落 prompt 原文,只落 sha256 + FindingKind 名);失败不改变决策。
@@ -3304,6 +3363,162 @@ mod tests {
             matches!(out, HookOutcome::Deny(_)),
             "raw secret must be denied even in MCP tools (defense in depth)"
         );
+    }
+
+    /// 2026-09-12 maskit 竞品对照实测缺口:引号键名的 JSON 形态(`{"password": "…"}`)此前整类
+    /// 漏检 —— 粘贴整段配置块是最常见的泄漏面。现在在**任何**工具(含 MCP)都按裸凭据 deny。
+    #[test]
+    fn quoted_json_password_in_tool_input_is_denied_as_raw_secret() {
+        for tool in ["Bash", "mcp__db__connect"] {
+            let out = run_json(json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool,
+                "tool_input": { "config": { "password": "hunter2000" }, "command": "deploy" }
+            }));
+            assert!(
+                matches!(&out, HookOutcome::Deny(r) if r.contains("raw env_assignment credential")),
+                "{tool}: {out:?}"
+            );
+        }
+    }
+
+    /// 别名感知 raw 门:`secret://` 占位符本身不是裸凭据。JSON 字段里的标准别名用法不得被
+    /// env_assignment 的引号键名分支误判为裸 secret(否则 MCP pass-through 与 α2 全断)。
+    #[test]
+    fn secret_alias_in_quoted_json_field_is_not_a_raw_secret() {
+        // MCP 工具:占位符 → 网关 pass-through(Allow),即便 High 档
+        let out = run_json_posture(
+            json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "mcp__github__create_issue",
+                "tool_input": { "api_key": "secret://openai", "token": "secret://github_pat" }
+            }),
+            CliKind::Claude,
+            Some(PostureProfile::High),
+        );
+        assert_eq!(
+            out,
+            HookOutcome::Allow,
+            "alias placeholders in MCP tool input pass through"
+        );
+        // 原生工具:落回占位符姿态区(Low=Allow),而非裸凭据 deny
+        let out = run_json_posture(
+            json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": { "command": "deploy", "env": { "password": "secret://db" } }
+            }),
+            CliKind::Claude,
+            Some(PostureProfile::Low),
+        );
+        assert_eq!(
+            out,
+            HookOutcome::Allow,
+            "placeholder × native at Low posture is Allow, not raw deny"
+        );
+    }
+
+    /// 剥离别名后仍必须抓住 alias body 里走私的裸 token(hub.rs `RawSecretInAlias` 同构)。
+    #[test]
+    fn raw_secret_smuggled_in_alias_body_is_still_denied() {
+        let out = run_json(json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__github__create_issue",
+            "tool_input": { "token": format!("secret://{FAKE_GH_TOKEN}") }
+        }));
+        assert!(
+            matches!(&out, HookOutcome::Deny(r) if r.contains("raw github_token credential")),
+            "{out:?}"
+        );
+    }
+
+    /// `detect_raw_secret_alias_aware` 单元契约:无别名 = detect_hard_secret;有别名 → body 查指纹
+    /// + NUL 剥离后查;`KEY=secret://x` 自由文本形态维持既有 deny(与 hub 一致,NUL 仍是赋值 value)。
+    #[test]
+    fn detect_raw_secret_alias_aware_contract() {
+        assert_eq!(detect_raw_secret_alias_aware("plain text"), None);
+        assert_eq!(
+            detect_raw_secret_alias_aware(FAKE_GH_TOKEN),
+            Some("github_token")
+        );
+        assert_eq!(
+            detect_raw_secret_alias_aware(r#"{"token":"secret://github_pat"}"#),
+            None
+        );
+        assert_eq!(
+            detect_raw_secret_alias_aware("--token secret://github_pat"),
+            None
+        );
+        assert_eq!(
+            detect_raw_secret_alias_aware(&format!("secret://{FAKE_GH_TOKEN}")),
+            Some("github_token")
+        );
+        assert_eq!(
+            detect_raw_secret_alias_aware(r#"{"token":"secret://ok","password":"hunter2000"}"#),
+            Some("env_assignment")
+        );
+        assert_eq!(
+            detect_raw_secret_alias_aware("MY_TOKEN=secret://alias"),
+            Some("env_assignment")
+        );
+        // 前缀锚定指纹紧贴 secret:// 走私:必须在原文判定(剥离会切成两半漏过)
+        assert_eq!(
+            detect_raw_secret_alias_aware(
+                "secret://https://hooks.slack.com/services/T0123456789/B0123456789/abcdefghijklmnopqrstuvwxyz"
+            ),
+            Some("slack_webhook")
+        );
+        assert_eq!(
+            detect_raw_secret_alias_aware("secret://-----BEGIN RSA PRIVATE KEY-----\nMIIE"),
+            Some("pem_private_key")
+        );
+        // 别名只是值的一部分 / 空 body 占位符:剥离后值里带 NUL(值类排除 NUL)→ 不是裸凭据
+        assert_eq!(
+            detect_raw_secret_alias_aware(r#"{"api_key":"Bearer secret://gh"}"#),
+            None
+        );
+        assert_eq!(
+            detect_raw_secret_alias_aware(r#"{"token":"secret://"}"#),
+            None
+        );
+        // alias body 是 base64 载荷(`GITHUB_TOKEN=ghp_…` 编码后):原文的 base64 游程被 `//` 吸入
+        // 而解码错位,只有 body 单独解码才命中 → body 扫描必须无条件前置(敌意评审 R2)
+        assert_eq!(
+            detect_raw_secret_alias_aware(
+                "deploy secret://R0lUSFVCX1RPS0VOPWdocF8wMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM"
+            ),
+            Some("github_token")
+        );
+    }
+
+    /// 敌意评审 2026-09-12(D):前缀锚定指纹紧贴 `secret://` 走私(`secret://https://hooks.slack…`)
+    /// 剥离后会被切成两半漏过 —— 非 env 规则必须在原文判定。Low 档原生工具此前会放行。
+    #[test]
+    fn raw_secret_glued_after_alias_prefix_is_still_denied() {
+        for (cmd, kind) in [
+            (
+                "curl secret://https://hooks.slack.com/services/T0123456789/B0123456789/abcdefghijklmnopqrstuvwxyz",
+                "slack_webhook",
+            ),
+            (
+                "psql secret://postgres://admin:s3cr3tpass@db.example.com:5432/app",
+                "database_url",
+            ),
+        ] {
+            let out = run_json_posture(
+                json!({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": { "command": cmd }
+                }),
+                CliKind::Claude,
+                Some(PostureProfile::Low),
+            );
+            assert!(
+                matches!(&out, HookOutcome::Deny(r) if r.contains(&format!("raw {kind} credential"))),
+                "{kind}: {out:?}"
+            );
+        }
     }
 
     #[test]

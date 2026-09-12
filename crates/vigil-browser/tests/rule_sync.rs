@@ -67,6 +67,21 @@ const SAMPLES: &[(FindingKind, &str)] = &[
         FindingKind::DatabaseUrl,
         "postgres://admin:s3cr3tpass@db.example.com:5432/app",
     ),
+    // v6(2026-09-12 maskit 对照):中国云厂商 / Slack token / HuggingFace 固定前缀。
+    // 腾讯云 / Slack 样本字面量拆成两段:完整形态会被 GitHub push protection 当真凭据拦下推送。
+    (FindingKind::AliyunAccessKey, "LTAI5tAbCdEf12345678"),
+    (
+        FindingKind::TencentSecretId,
+        concat!("AK", "IDaBcDeFgHiJkLmNoPqRsTuVwXyZ012345"),
+    ),
+    (
+        FindingKind::SlackToken,
+        concat!("xox", "b-1234567890-1234567890123-AbCdEfGhIjKlMnOpQrStUvWx"),
+    ),
+    (
+        FindingKind::HuggingfaceToken,
+        "hf_AbCdEfGhIjKlMnOpQrStUvWxYz01234567",
+    ),
 ];
 
 fn mk_request(text: &str) -> BrowserCheckRequest {
@@ -132,6 +147,11 @@ fn finding_kind_enum_exhaustive() {
         FindingKind::GitlabPat,
         // I09c 第三批
         FindingKind::DatabaseUrl,
+        // v6
+        FindingKind::AliyunAccessKey,
+        FindingKind::TencentSecretId,
+        FindingKind::SlackToken,
+        FindingKind::HuggingfaceToken,
     ];
     // 若未来新增,`all_kinds` 数组必须同步扩(enum 本身**不是** `#[non_exhaustive]`,
     // workspace 内 match 是 fail-closed 穷举);用 SAMPLES 覆盖 + 断言长度一致,
@@ -171,6 +191,11 @@ fn finding_kind_stable_rule_name_strings() {
         (FindingKind::GitlabPat, "gitlab_pat"),
         // I09c 第三批
         (FindingKind::DatabaseUrl, "database_url"),
+        // v6
+        (FindingKind::AliyunAccessKey, "aliyun_access_key"),
+        (FindingKind::TencentSecretId, "tencent_secret_id"),
+        (FindingKind::SlackToken, "slack_token"),
+        (FindingKind::HuggingfaceToken, "huggingface_token"),
     ];
     // 长度守门(Codex R1 NICE-TO-HAVE):contract 必须覆盖所有 FindingKind。
     // 链式不变量:contract.len() == SAMPLES.len() == all_kinds.len()(后者由
@@ -233,6 +258,11 @@ fn iss_021_finding_kind_maps_to_privacy_label_via_alias() {
         ("google_api_key", "google_api_key"),
         ("gitlab_pat", "gitlab_pat"),
         ("database_url", "database_url"),
+        // v6:aliyun 长短不一致(短形 → 长形 `_id`,与 aws 同构);其余同名
+        ("aliyun_access_key", "aliyun_access_key_id"),
+        ("tencent_secret_id", "tencent_secret_id"),
+        ("slack_token", "slack_token"),
+        ("huggingface_token", "huggingface_token"),
     ]
     .into_iter()
     .collect();
@@ -275,16 +305,17 @@ fn iss_021_finding_kind_maps_to_privacy_label_via_alias() {
 /// email / internal_ipv4)。
 #[test]
 fn iss_021_finding_kind_count_matches_redaction_hard_rules() {
-    // vigil-redaction `HARD_RULES`(crates/vigil-redaction/src/lib.rs)有 12 条
+    // vigil-redaction `HARD_RULES`(crates/vigil-redaction/src/lib.rs)有 16 条
     // secret-类:github / openai / anthropic / aws / jwt / pem / env_assignment /
-    // slack / stripe / google / gitlab / database_url。注:email / internal_ipv4
+    // slack / stripe / google / gitlab / database_url + v6 的 aliyun / tencent /
+    // slack_token / huggingface。注:email / internal_ipv4
     // 在 ALL_RULES 但**不在** HARD_RULES(后者是 audit fail-closed 自检子集,
     // 见 lib.rs `HARD_RULES` 上方注释),且 vigil-browser 也没把它们暴露给扩展。
-    let browser_kinds = SAMPLES.len() - LOCAL_ONLY.len(); // 13 - 1 = 12
+    let browser_kinds = SAMPLES.len() - LOCAL_ONLY.len(); // 17 - 1 = 16
     assert_eq!(
-        browser_kinds, 12,
-        "vigil-browser FindingKind 非 LOCAL_ONLY 应 12 项,与 vigil-redaction \
-         HARD_RULES secret-类 12 条对齐;若改变需同步:\
+        browser_kinds, 16,
+        "vigil-browser FindingKind 非 LOCAL_ONLY 应 16 项,与 vigil-redaction \
+         HARD_RULES secret-类 16 条对齐;若改变需同步:\
          (1) 本断言数字 \
          (2) ADR 0013 Revised 版本史 \
          (3) RULE_PROFILE_VERSION 新版本注释"

@@ -348,6 +348,7 @@ secret-类 + email + internal_ipv4 共 14 条;对应 `vigil_browser::FindingKind
 | v3 | + google / gitlab → 12 | I09c 第二批 |
 | v4 | + database_url → 13 | I09c 第三批 |
 | **v5** | + PrivacyLabel 维度对齐(无新 FindingKind) | **ISS-021** |
+| **v6** | + aliyun_access_key / tencent_secret_id / slack_token / huggingface_token → 17(`aliyun_access_key` 短形 ↔ `aliyun_access_key_id` 长形,alias 表新增一行) | maskit 竞品对照(2026-09-12) |
 
 ### 后续(超出本 ISS 范围)
 

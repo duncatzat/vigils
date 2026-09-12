@@ -12,6 +12,18 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ### Added
 
+- **四个厂商固定前缀凭据 kind(`RULE_PROFILE_VERSION` v5 → v6,FindingKind 13 → 17)。** 阿里云
+  AccessKey ID `LTAI…`、腾讯云 SecretId `AKID…`(定长 36)、Slack token `xox[baprs]-…`、Hugging Face
+  token `hf_…` 进入硬指纹:Rust 规则、浏览器 `FindingKind` / classifier、Chrome 扩展普通模式规则与
+  标签表、文档一批同步,跨 crate 守门(rule_sync / golden / merge 计数)随之调整。扩展 manifest
+  0.3.0 → 0.3.1。
+- **两道纯 Python 发布门禁,已接进 CI。** `scripts/check-workflows.py` 静态校验所有 workflow YAML
+  (重复键、`needs` 悬空、`${{ github.event.* }}` 直接内插进 `run:`、`pull_request_target` 检出 PR 头、
+  浮动分支引用;tag 未 SHA 钉扎与 `workflow_dispatch` 输入仅警告);`scripts/audit-public-release.py`
+  审计已跟踪文件树(凭据类文件名、运行时产物、被忽略却已跟踪、开发者本机路径、控制字符为 FAIL;
+  符号链接、超大文件与 `--public` 下的内网地址为 WARN)。例外写在 `scripts/audit-public-release.allow`,
+  逐条写明理由。本仓首跑就抓到计划文档里两处维护者本机路径(已清)和 `acceptance.yml` 解析 tag 的
+  步骤把事件字段直接内插进 shell(改走 `env:`)。
 - **MCP 2026-07-28 互通第一刀。** 网关协议白名单纳入 `2025-11-25`(`initialize` 优先提议)。上游拒绝
   `initialize` 时,网关按 2026-07-28 规范发 `server/discover` 探针,在 `serve` 日志与 `doctor --probe`
   里点名双方版本地报出「仅现代时代」,而非笼统协议错误。Hub 自身对 `server/discover` 回 `-32601`
@@ -74,6 +86,28 @@ Vigils 的所有重要变更记录于此。格式遵循
 
 ### Fixed
 
+- **`env_assignment` 漏检引号键名与中文关键词。** `{"password": "…"}` / `"AWS_SECRET_ACCESS_KEY": "…"` /
+  `'api_token' => '…'` / `password: "…"`(JSON / PHP / YAML / JS,含转义进字符串的形态)与「数据库密码：…」
+  整类漏检,而粘贴整段配置块正是最常见的泄漏面;hook 的 `PreToolUse` / `UserPromptSubmit` 确定性 deny
+  只走硬规则,此前拦不住。键名走**显式凭据白名单**(`*secret` / `*password` / `api_key` / `access_key` /
+  `private_key` / `access_token` / `refresh_token` / `token` …,支持 snake / kebab / camelCase),
+  **不**收泛后缀 `*_token` / `*_key`(`NextToken` / `pageToken` / `public_key` / `object_key` 满地都是,
+  泛后缀会让分页请求被 FINAL deny)。新分支**只脱值、保结构**(`{"password": "[REDACTED env_assignment]"}`
+  仍是合法 JSON;`.env` 自由文本形态维持整段替换契约),值须带引号、≥ 6 字符、止于闭合引号。模板值
+  (`<…>` / `${…}` / `{{…}}`)、tool schema 对象、`null`、`token://` URI、裸 YAML `password: x`、中文散文 /
+  掩码 / 路径(「密码：请联系管理员」/「密码：********」/「私钥：~/.ssh/id_rsa」)均不命中(守门测试固化)。
+- **`github_token` 认细粒度 PAT** `github_pat_…`(GitHub 现默认形态,此前整串漏检)。
+- **hook raw 门改为别名感知。** 前缀锚定指纹一律在**原文**判定(先剥离 `secret://` 再扫会把
+  `secret://https://hooks.slack.com/…` 这类走私切成两半漏过,敌意评审复现);只有 `env_assignment` 命中时才
+  剥离占位符复核,`secret://<alias>` 本身不再可能被判成裸凭据(`{"token":"secret://github_pat"}` 是标准 MCP
+  别名用法),alias body 走私的裸 token 仍恒 deny;`UserPromptSubmit` 同样处理。
+- **MCP 网关结果脱敏与规则同口径**(`vigil_redaction::is_secret_key_name`):逐叶子 scrub 时凭据键名下的值
+  整段换占位符 —— 否则「叶子脱不掉、序列化自检却命中」会让只是含 `"password"` 字段的结果整包扣留;
+  `NextToken` 等分页游标原样保留。
+- **残余误报收口**(敌意评审建议):裸 `token` 键的值下限 16 字符(`{"token":"tokenization"}` 不再命中);
+  `OLDPWD=/home/…` 不再当口令(只认 `PWD` 与 `*_PWD`);中文「密码是 / 为 …」只在值以数字或符号开头时命中
+  (「令牌是 Bearer 类型」是散文;字母开头口令为已知取舍);剥离占位符后残留 NUL 的值一律不算裸凭据
+  (`{"api_key":"Bearer secret://gh"}` 不误 deny)。
 - **Claude Code 缺 prompt 守门。** `setup` 此前只为 Claude Code 注册 `PreToolUse` / `PostToolUse`,
   贴进对话框的裸凭据会直接进模型(真 agent 金丝雀发现)。现在同时注册 `UserPromptSubmit`(无
   `matcher`;exit 2 阻止 prompt 进模型并展示原因,绝不含 secret)。已安装用户在重跑 `vigil-hub setup`

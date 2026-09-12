@@ -9,15 +9,20 @@ instant startup:
 
 | Kind | Pattern |
 |---|---|
-| github_token | `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` + 36 |
+| github_token | `ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` + 36; `github_pat_` + 50 (fine-grained PAT) |
+| env_assignment | `KEY=value` free text (whole segment); `"password": "…"` / `'api_token' => '…'` quoted credential keys (JSON / PHP / YAML / JS, value-only redaction); `密码：…` Chinese keywords |
 | slack_webhook | `hooks.slack.com/services/T...` |
+| slack_token | `xox[baprs]-` + 10+ (v6) |
 | stripe_secret | `sk_live_` / `sk_test_` |
 | google_api_key | `AIza` + 35 |
 | gitlab_pat | `glpat-` + 20 |
 | aws_access_key | `AKIA` + 16 uppercase |
+| aliyun_access_key_id | `LTAI` + 12–20 (Alibaba Cloud AccessKey ID, v6) |
+| tencent_secret_id | `AKID` + 32 (Tencent Cloud SecretId, v6) |
+| huggingface_token | `hf_` + 30+ (v6) |
 | database_url | `<scheme>://user:password@host/db` |
 | private_key | PEM block |
-| ... | 13 kinds total |
+| ... | 17 kinds total |
 
 ## Layer 2 — ONNX model (opt-in: the ML release build, or `--features ort`)
 

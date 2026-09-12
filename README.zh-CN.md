@@ -48,7 +48,7 @@ API、往网页里粘贴。这种能力很有用 —— 也有风险。**Vigils 
   scope 白名单。未经允许什么都不会执行。
 - **✅ 人在回路审批** —— 高风险副作用(写文件、联网、破坏性操作)暂停审核。授权可范围化
   (本次 / 本会话)。
-- **🙈 密钥与 PII 脱敏** —— 对 13+ 类凭据做硬指纹检测(GitHub PAT、Stripe key、Google/GitLab
+- **🙈 密钥与 PII 脱敏** —— 对 17+ 类凭据做硬指纹检测(GitHub PAT、Stripe key、Google/GitLab
   token、数据库 URL …),外加可选的多语言 ML 集成;由 fail-closed 合并层决定遮蔽什么。
 - **🎟️ 凭据租约 broker** —— 短时凭据租约只注入到真正需要它的子进程;明文永不落盘。
 - **📦 沙箱 runner** —— 在 Wasm(Wasmtime)或 native 进程中一次性执行工具,配 **Linux Landlock
@@ -125,7 +125,7 @@ Linux** 的预构建安装包与二进制:
 
 | 构建 | Release 资产 | 脱敏 | 首跑成本 |
 |---|---|---|---|
-| **默认** —— 硬指纹 | `vigils-cli-<plat>` | 13+ 类结构化凭据与 PII,固定模式规则 —— 确定性、即时、零模型 | 无 |
+| **默认** —— 硬指纹 | `vigils-cli-<plat>` | 17+ 类结构化凭据与 PII,固定模式规则 —— 确定性、即时、零模型 | 无 |
 | **ML** | `vigils-cli-ml-<plat>` | 在上述基础上**外加** OpenAI PII NER 模型 + DeBERTa 提示注入分类器 —— 更广的语义 PII(人名、地址、日期)与软注入信号 | 捆 ONNX Runtime dylib;首次 `--engine ml` 运行按需下载 ~0.8–1.5 GB 模型 |
 
 二者**并存** —— 引擎按启动选择,单个 ML 构建即可服务任意模式:

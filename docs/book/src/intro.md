@@ -29,7 +29,7 @@ Vigils is **defense in depth**, not an airtight barrier. Being honest about the 
 
 **Reliably catches**
 
-- **Plaintext credential leaks** — 13 hard-fingerprint classes (AWS keys, GitHub / GitLab tokens, Google API keys, Slack webhooks, Stripe keys, private-key PEM blocks, credential-bearing DB URLs, …) appearing verbatim in tool calls, browser pastes, or tool results.
+- **Plaintext credential leaks** — 17 hard-fingerprint classes (AWS / Alibaba Cloud / Tencent Cloud keys, GitHub / GitLab / Hugging Face tokens, Google API keys, Slack webhooks and tokens, Stripe keys, private-key PEM blocks, credential-bearing DB URLs, …) appearing verbatim in tool calls, browser pastes, or tool results.
 - **Reversible redaction round-trip** — the model / logs / audit see only `secret://<alias>` placeholders; the real value is injected only at the local execution boundary.
 - **Tamper-evident audit** (SHA-256 chain, falsifiable via `vigil-hub verify`), **approval gating**, and **sandbox isolation**.
 

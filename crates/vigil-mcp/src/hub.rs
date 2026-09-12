@@ -2346,10 +2346,32 @@ fn scrub_json_strings(v: &Value) -> Value {
         Value::Array(arr) => Value::Array(arr.iter().map(scrub_json_strings).collect()),
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, val)| (vigil_redaction::scrub_text(k), scrub_json_strings(val)))
+                .map(|(k, val)| (vigil_redaction::scrub_text(k), scrub_object_value(k, val)))
                 .collect(),
         ),
         other => other.clone(),
+    }
+}
+
+/// object 值的脱敏:先按叶子规则 scrub;若叶子本身没命中、但**键名具凭据语义**(`password` /
+/// `api_key` / `accessToken` …,与 `env_assignment` 引号分支同一份白名单)且值 ≥ 阈值,整段换占位符。
+/// 叶子看不到键名,而上层序列化自检看得到 `"password":"hunter2000"`(`env_assignment` 的 JSON
+/// 分支)—— 口径不一致会让自检永远命中、整包扣留(敌意评审 2026-09-12)。`NextToken` / `public_key`
+/// 等不在白名单,原样保留(分页游标被换掉 agent 就翻不了页)。叶子自身命中的规则名(如
+/// `github_token`)更精确,优先保留。
+fn scrub_object_value(key: &str, val: &Value) -> Value {
+    match val {
+        Value::String(s) => {
+            let leaf = scrub_string_leaf(s);
+            if leaf == *s
+                && vigil_redaction::is_secret_key_name(key)
+                && s.chars().count() >= vigil_redaction::secret_value_min_chars(key)
+            {
+                return Value::String("[REDACTED env_assignment]".to_string());
+            }
+            Value::String(leaf)
+        }
+        other => scrub_json_strings(other),
     }
 }
 
@@ -2551,6 +2573,65 @@ mod tests {
         assert!(
             vigil_redaction::detect_hard_secret(&s).is_none(),
             "scrubbed result must pass the in-band re-scan (else it is withheld wholesale): {s}"
+        );
+    }
+
+    #[test]
+    fn scrub_json_strings_redacts_values_under_secret_key_names_in_place() {
+        // 敌意评审 2026-09-12(B):`env_assignment` 的 JSON 分支在序列化文本上命中 `"password":"…"`,
+        // 而逐叶子 scrub 看不到键名 → 自检永远命中 → 整包扣留。现在键名具凭据语义时整段换占位符,
+        // 分页游标 `NextToken` 原样保留,结果不再被扣留。
+        let inner = r#"{"password":"hunter2000","NextToken":"AAAAB3NzaC1yc2EAAAADAQABAAABAQ"}"#;
+        let result = json!({
+            "content": [{ "type": "text", "text": inner }],
+            "structuredContent": {
+                "password": "hunter2000",
+                "NextToken": "AAAAB3NzaC1yc2EAAAADAQABAAABAQ",
+                "token": "ghp_canary0123456789abcdefABCDEF01234567",
+                // 点分 / 中文键名:规则会在序列化文本上命中,键名判定必须同口径(敌意评审 R2)
+                "spring.datasource.password": "hunter2000",
+                "密码": "hunter2000",
+                "x-amz-security-token": "AbCdEf123456"
+            },
+            "isError": false,
+        });
+        let scrubbed = scrub_json_strings(&result);
+        let s = serde_jcs::to_string(&scrubbed).unwrap();
+        assert!(
+            !s.contains("hunter2000"),
+            "password value must be gone: {s}"
+        );
+        assert!(
+            s.contains("AAAAB3NzaC1yc2EAAAADAQABAAABAQ"),
+            "pagination token must survive: {s}"
+        );
+        assert_eq!(
+            scrubbed["structuredContent"]["password"],
+            "[REDACTED env_assignment]"
+        );
+        // 叶子自身命中的规则名优先(更精确),不被键名兜底覆盖
+        assert_eq!(
+            scrubbed["structuredContent"]["token"],
+            "[REDACTED github_token]"
+        );
+        assert_eq!(
+            scrubbed["structuredContent"]["spring.datasource.password"],
+            "[REDACTED env_assignment]"
+        );
+        assert_eq!(
+            scrubbed["structuredContent"]["密码"],
+            "[REDACTED env_assignment]"
+        );
+        assert_eq!(
+            scrubbed["structuredContent"]["x-amz-security-token"], "AbCdEf123456",
+            "kebab key with a bare `token` in the middle is not a secret key name"
+        );
+        let text = scrubbed["content"][0]["text"].as_str().unwrap();
+        let inner_v: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(inner_v["password"], "[REDACTED env_assignment]");
+        assert!(
+            vigil_redaction::detect_hard_secret(&s).is_none(),
+            "must pass the in-band re-scan instead of being withheld: {s}"
         );
     }
 

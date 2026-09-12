@@ -14,7 +14,7 @@ Enabled:
 
 Disabled (default):
 
-- 13 hard fingerprint rules.
+- 17 hard fingerprint rules.
 - A `NoopEngine` placeholder.
 - No ONNX dependency; sub-second startup.
 

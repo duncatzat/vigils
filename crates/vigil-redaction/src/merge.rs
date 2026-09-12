@@ -393,9 +393,14 @@ mod tests {
     // ADR 0013 Revised(D-final-1 / D-final-2)要求把"D3 一刀切"细化为
     // "每条 Hard rule 的具体 merge 行为 + PrivacyLabel 映射"都锁死。
     //
-    // 14 个 Hard kind 字面量(与 `vigil-redaction::lib.rs::ALL_RULES.name` 对齐;
-    // 12 secret-类 + email + internal_ipv4)+ 期望 PrivacyLabel:
+    // 18 个 Hard kind 字面量(与 `vigil-redaction::lib.rs::ALL_RULES.name` 对齐;
+    // 16 secret-类 + email + internal_ipv4)+ 期望 PrivacyLabel:
     const HARD_KIND_TO_LABEL: &[(&str, crate::PrivacyLabel)] = &[
+        // 2026-09-12 v6:中国云厂商 / Slack / HuggingFace 固定前缀
+        ("aliyun_access_key_id", crate::PrivacyLabel::Secret),
+        ("tencent_secret_id", crate::PrivacyLabel::Secret),
+        ("slack_token", crate::PrivacyLabel::Secret),
+        ("huggingface_token", crate::PrivacyLabel::Secret),
         ("aws_access_key_id", crate::PrivacyLabel::Secret),
         ("github_token", crate::PrivacyLabel::Secret),
         ("anthropic_api_key", crate::PrivacyLabel::Secret),
@@ -510,7 +515,7 @@ mod tests {
         // 本表的 kinds
         let golden_kinds: BTreeSet<&str> = HARD_KIND_TO_LABEL.iter().map(|(k, _)| *k).collect();
 
-        // 真实 HARD_RULES.name 集合(12 secret-类)+ ALL_RULES 独有的 2 项
+        // 真实 HARD_RULES.name 集合(16 secret-类)+ ALL_RULES 独有的 2 项
         let mut expected_kinds: BTreeSet<&'static str> =
             crate::HARD_RULES.iter().map(|r| r.name).collect();
         expected_kinds.insert("email");
@@ -525,8 +530,8 @@ mod tests {
              ADR 0013 Revised 版本史)"
         );
 
-        // 兜底:精确数量 14(R1 原守门保留,语义冗余但便于回归 triage)
-        assert_eq!(golden_kinds.len(), 14);
+        // 兜底:精确数量 18(R1 原守门保留,语义冗余但便于回归 triage;v6 +4)
+        assert_eq!(golden_kinds.len(), 18);
     }
 
     // ─────────── P0 注入防护 Slice 1 T1 — 元指令软信号守门 ───────────

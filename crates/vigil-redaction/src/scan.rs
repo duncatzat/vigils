@@ -92,7 +92,7 @@ pub enum ScanError {
 ///
 /// | 可产出 | label 对应 kind(HARD_RULES name) |
 /// |--|--|
-/// | [`PrivacyLabel::Secret`] | aws_access_key_id / github_token / anthropic_api_key / openai_api_key / jwt / pem_private_key / env_assignment / slack_webhook / stripe_secret_key / google_api_key / gitlab_pat / database_url |
+/// | [`PrivacyLabel::Secret`] | aws_access_key_id / github_token / anthropic_api_key / openai_api_key / jwt / pem_private_key / env_assignment / slack_webhook / stripe_secret_key / google_api_key / gitlab_pat / database_url / aliyun_access_key_id / tencent_secret_id / slack_token / huggingface_token(v6) |
 /// | [`PrivacyLabel::Email`]  | email(**注**:v0.3 HARD_RULES 的 `email` 规则在 `ALL_RULES` 里,但 **不在 `HARD_RULES` 里**,因此当前 Stage 1 `scan_text` 实际**也不会产出 Email finding**。见下文"Stage 1 实测覆盖") |
 /// | [`PrivacyLabel::Url`]    | internal_ipv4(同上,`internal_ipv4` 不在 `HARD_RULES`,Stage 1 也不产出) |
 ///
@@ -316,12 +316,9 @@ pub fn scan_text_with_engine_budgeted(
 fn collect_hard_findings(text: &str) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::new();
     for rule in HARD_RULES.iter() {
-        for m in rule.pattern.find_iter(text) {
-            out.push(Finding::hard(
-                rule.name,
-                (m.start(), m.end()),
-                risk_of(rule.name),
-            ));
+        // hit_spans:默认整段;声明了值组的分支只取值(与 lib.rs redact 路径同源),见 Rule::hit_spans
+        for span in rule.hit_spans(text) {
+            out.push(Finding::hard(rule.name, span, risk_of(rule.name)));
         }
     }
     out
@@ -345,12 +342,8 @@ fn collect_url_hard_findings(text: &str) -> Vec<Finding> {
         // 只挑 url canonical 类(generic_url + internal_ipv4);其他 ALL_RULES 命中
         // 应仍由 HARD_RULES 走默认路径(避免 email 等被加进 hard 路径破 v0.3 期望)
         if rule.name == "generic_url" || rule.name == "internal_ipv4" {
-            for m in rule.pattern.find_iter(text) {
-                out.push(Finding::hard(
-                    rule.name,
-                    (m.start(), m.end()),
-                    risk_of(rule.name),
-                ));
+            for span in rule.hit_spans(text) {
+                out.push(Finding::hard(rule.name, span, risk_of(rule.name)));
             }
         }
     }
