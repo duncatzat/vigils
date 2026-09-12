@@ -97,15 +97,17 @@ impl Routes {
             (RouteKind::Openai, self.openai.as_str(), rest)
         } else if let Some(rest) = strip_prefix(path_and_query, "/gemini") {
             (RouteKind::Gemini, self.gemini.as_str(), rest)
-        } else if let Some(rest) = strip_prefix(path_and_query, "/codex") {
+        } else {
+            // 链尾用 `?` 收敛:未知前缀时 `strip_prefix` 返回 None,整个 `resolve` 即 None(404),
+            // 与此前 `else { return None; }` 等价。写成 `?` 是 clippy::question_mark 的要求
+            // (`-D warnings`);链尾的 if-let + `else { return None }` 一律会被它点名。
+            let rest = strip_prefix(path_and_query, "/codex")?;
             let base = if is_chatgpt_auth(headers) {
                 self.codex_chatgpt.as_str()
             } else {
                 self.openai.as_str()
             };
             (RouteKind::Codex, base, rest)
-        } else {
-            return None;
         };
         Some(Resolved {
             kind,
