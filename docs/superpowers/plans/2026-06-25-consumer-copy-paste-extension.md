@@ -1520,7 +1520,7 @@ Expected: only README and any intended documentation files are modified before c
 Load unpacked extension from:
 
 ```text
-/Users/wengzhenqi/code/vigils/.worktrees/chrome-consumer-copy-paste-extension/extensions/chrome-mv3
+~/code/vigils/.worktrees/chrome-consumer-copy-paste-extension/extensions/chrome-mv3
 ```
 
 Manual scenarios:

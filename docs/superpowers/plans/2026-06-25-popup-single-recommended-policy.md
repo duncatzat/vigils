@@ -507,7 +507,7 @@ all extension tests pass
 
 Manual Chrome smoke test is optional but recommended:
 
-1. Load unpacked extension from `/Users/wengzhenqi/code/vigils/.worktrees/chrome-consumer-copy-paste-extension/extensions/chrome-mv3`.
+1. Load unpacked extension from `~/code/vigils/.worktrees/chrome-consumer-copy-paste-extension/extensions/chrome-mv3`.
 2. Open popup.
 3. Expected: no `strict / balanced / recall-first` controls.
 4. Paste `OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyzABCDE1234567890` into a protected AI site.

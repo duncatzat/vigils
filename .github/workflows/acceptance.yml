@@ -63,13 +63,18 @@ jobs:
       - name: Resolve tag
         id: tag
         shell: bash
+        # 事件字段先落 env 再进 shell —— 不在 run 里直接内插表达式(scripts/check-workflows.py 守门)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          elif [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "$EVENT_NAME" = "schedule" ]; then
             TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
           else
-            TAG="${{ github.event.workflow_run.head_branch }}"
+            TAG="$RUN_HEAD_BRANCH"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Testing published release: $TAG"
@@ -160,13 +165,18 @@ jobs:
       - name: Resolve tag
         id: tag
         shell: bash
+        # 事件字段先落 env 再进 shell —— 不在 run 里直接内插表达式(scripts/check-workflows.py 守门)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          elif [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "$EVENT_NAME" = "schedule" ]; then
             TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
           else
-            TAG="${{ github.event.workflow_run.head_branch }}"
+            TAG="$RUN_HEAD_BRANCH"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - name: Install signature-verify deps
@@ -202,13 +212,18 @@ jobs:
       - name: Resolve tag
         id: tag
         shell: bash
+        # 事件字段先落 env 再进 shell —— 不在 run 里直接内插表达式(scripts/check-workflows.py 守门)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          elif [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "$EVENT_NAME" = "schedule" ]; then
             TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
           else
-            TAG="${{ github.event.workflow_run.head_branch }}"
+            TAG="$RUN_HEAD_BRANCH"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
@@ -286,13 +301,18 @@ jobs:
       - name: Resolve tag
         id: tag
         shell: bash
+        # 事件字段先落 env 再进 shell —— 不在 run 里直接内插表达式(scripts/check-workflows.py 守门)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          elif [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "$EVENT_NAME" = "schedule" ]; then
             TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
           else
-            TAG="${{ github.event.workflow_run.head_branch }}"
+            TAG="$RUN_HEAD_BRANCH"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"
@@ -338,13 +358,18 @@ jobs:
       - name: Resolve tag
         id: tag
         shell: bash
+        # 事件字段先落 env 再进 shell —— 不在 run 里直接内插表达式(scripts/check-workflows.py 守门)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-          elif [ "${{ github.event_name }}" = "schedule" ]; then
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          elif [ "$EVENT_NAME" = "schedule" ]; then
             TAG="$(gh release view --json tagName --jq .tagName)"   # weekly: re-test Latest
           else
-            TAG="${{ github.event.workflow_run.head_branch }}"
+            TAG="$RUN_HEAD_BRANCH"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "ver=${TAG#v}" >> "$GITHUB_OUTPUT"

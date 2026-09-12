@@ -1,0 +1,5 @@
+# 发布静态审计例外(scripts/audit-public-release.py)。格式:<rule> <glob>,glob 匹配仓库相对路径。
+# 纪律:每条例外写清楚为什么;不是"让门禁闭嘴",而是给知道自己在干什么的既有事实留门。
+
+# vigil-update-check 的单测字面量故意含 ESC(验证终端转义序列不会污染日志输出)。
+control-char crates/vigil-update-check/src/lib.rs

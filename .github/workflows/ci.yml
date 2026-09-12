@@ -109,6 +109,24 @@ jobs:
       - name: Test
         run: node --test extensions/chrome-mv3/tests/*.test.mjs
 
+  # 两道纯 python 发布门禁(秒级,不需要 Rust):workflow 静态校验(重复键 / needs 悬空 /
+  # run 内插事件字段 / pull_request_target 检出 PR 头 / 浮动引用)+ 发布静态审计(凭据类文件 /
+  # 运行时产物 / 开发者本机路径 / 控制字符;--public 另查内网地址)。例外见 scripts/audit-public-release.allow。
+  release-gates:
+    name: Release gates (workflow lint / public-tree audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PyYAML (workflow lint)
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Check workflows
+        run: python3 scripts/check-workflows.py
+
+      - name: Audit public release tree
+        run: python3 scripts/audit-public-release.py --public
+
   # 依赖供应链防线(deny.toml):advisories(RUSTSEC)/licenses/bans/sources。
   # 与 rust job 分开跑--cargo-deny 不编译,1-2 分钟出结果,不用等冷编译。
   # 漏洞披露不跟发版节奏走,周跑 cron 另见 deny-advisories.yml。
