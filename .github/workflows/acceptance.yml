@@ -133,6 +133,11 @@ jobs:
         run: |
           HUB="$PWD/bin/${{ matrix.bin }}" node tests/acceptance/http-e2e.mjs | tee http.out
 
+      - name: "Outbound-gate e2e (on-disk config -> published binary -> real upstream)"
+        shell: bash
+        run: |
+          HUB="$PWD/bin/${{ matrix.bin }}" node tests/acceptance/outbound-e2e.mjs | tee outb.out
+
       - name: "Agent-integration protocol compat (Claude/Codex/Gemini/Cursor hooks)"
         shell: bash
         run: |
@@ -145,7 +150,7 @@ jobs:
           {
             echo "## ${{ matrix.os }} — ${{ steps.tag.outputs.tag }}"
             echo '```'
-            grep -E "SUMMARY|FAIL " usim.out sweep.out core.out compat.out 2>/dev/null || true
+            grep -E "SUMMARY|FAIL " usim.out sweep.out core.out http.out outb.out compat.out 2>/dev/null || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
