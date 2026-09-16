@@ -20,7 +20,7 @@
 /// Finding 来源分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingSource {
-    /// 正则 / 结构化硬指纹(v0.3 HARD_RULES 14 项)—— 高 precision,<1ms
+    /// 正则 / 结构化硬指纹(`lib.rs::HARD_RULES`,条数以该表为准)—— 高 precision,<1ms
     Hard,
     /// OpenAI Privacy Filter 模型输出(8 类标签)—— 高 recall,400-630 ms CPU
     Model,
@@ -496,16 +496,18 @@ mod tests {
     /// 集合守门(R1 NICE 强化):HARD_KIND_TO_LABEL 必须**精确等于**
     /// `crate::HARD_RULES.name` 集合 + ALL_RULES 独有的 email/internal_ipv4。
     ///
-    /// 比单纯 `len == 14` 守门**更强**:Codex R1 NICE 指出 len 守门不能抓"加新
+    /// 比单纯的 `len ==` 计数守门**更强**:Codex R1 NICE 指出 len 守门不能抓"加新
     /// HARD_RULES 但忘了同步 HARD_KIND_TO_LABEL"或"删了某个 HARD_RULES.name 但
     /// 这里残留"两类漂移。本测试做集合双向 diff,任一侧漂移即指出具体差异。
     ///
-    /// **覆盖关系**:
-    /// - `HARD_RULES`(crate::pub(crate) 静态)= 12 secret-类 hard rule
-    /// - `ALL_RULES` 独有 = `email` + `internal_ipv4`(redact 路径用,**故意不进**
-    ///   `HARD_RULES` 因为可能误报正常业务文本;但 PrivacyLabel::from_kind 必须
-    ///   认它们,否则 Model 侧产 private_email/private_url 后映射会落空)
-    /// - 总和 = 14,与 vigil-browser FindingKind 12 (LOCAL_ONLY 除外) 的关系由
+    /// **覆盖关系**(条数一律以真表为准,本注释不复述数字):
+    /// - `HARD_RULES`(crate::pub(crate) 静态)= 全部 secret-类 hard rule
+    /// - 本表另收 `ALL_RULES` 独有的 `email` + `internal_ipv4`(redact 路径用,**故意
+    ///   不进** `HARD_RULES` 因为可能误报正常业务文本;但 `PrivacyLabel::from_kind`
+    ///   必须认它们,否则 Model 侧产 private_email/private_url 后映射会落空)
+    /// - `ALL_RULES` 独有的第三条 `generic_url` **不**进本表 —— 它由
+    ///   `scan::collect_url_hard_findings` 走另一条路径产出,不参与 merge 决策矩阵
+    /// - 与 vigil-browser FindingKind(LOCAL_ONLY 除外)的对齐由
     ///   `vigil-browser/tests/rule_sync.rs::iss_021_*` 守门(详见 ADR 0013 Revised
     ///   跨 crate 不变量表)
     #[test]
