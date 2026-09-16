@@ -1051,8 +1051,8 @@ pub(crate) static HARD_RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         },
         // 注:generic_url **不**加入 HARD_RULES(secret 类子集)。它在 ALL_RULES 是
         // url canonical 的兜底,通过 scan::collect_url_hard_findings 在
-        // scan_text_with_engine 路径补充,**不**破坏 vigil-browser rule_sync 12 项
-        // secret 守门数字(ISS-021 RULE_PROFILE_VERSION v5 兼容)。
+        // scan_text_with_engine 路径补充,**不**进 vigil-browser rule_sync 的 secret
+        // 对齐计数(该计数以 rule_sync.rs 的断言为准,此处不复述数字)。
     ]
 });
 

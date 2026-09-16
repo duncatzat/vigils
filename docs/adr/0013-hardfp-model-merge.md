@@ -307,9 +307,12 @@ secret-类 + email + internal_ipv4 共 14 条;对应 `vigil_browser::FindingKind
   (`iss_021_merge_overlap_hard_wins_for_each_kind` /
   `iss_021_merge_no_overlap_both_kept_for_each_kind`),把"D3 一刀切"细化为
   "每条 Hard rule 的具体行为锁死"。
-- **D-final-2**:`PrivacyLabel::from_kind` 是**封闭映射**(14 Hard kind +
-  `private_*` 8 项 + 8 裸 label)→ 8 PrivacyLabel;未识别 kind 返 `None`,
-  caller fail-closed(ADR 0013 D6 派生)。
+- **D-final-2**:`PrivacyLabel::from_kind` 是**封闭映射**(`HARD_RULES` 全部规则名
+  + `ALL_RULES` 独有的 `email` / `internal_ipv4` / `generic_url` + `private_*` 前缀
+  与裸 label)→ 8 PrivacyLabel;未识别 kind 返 `None`,caller fail-closed
+  (ADR 0013 D6 派生)。各集合的**条数不在此冻结**,由
+  `merge.rs::iss_021_hard_kind_to_privacy_label_golden` 与
+  `iss_021_hard_kind_set_size_matches_redaction_rules` 两条守门测试持有。
 - **D-final-3(审计语义)**:`RULE_PROFILE_VERSION` v5 起,审计 payload 的
   finding 同时承载两个维度 —— 规则名(`Finding.kind`,与 HARD_RULES 一一对应,
   可追溯到 regex)和业务标签(经 `PrivacyLabel::from_kind` 映射,8 类聚合视角)。
@@ -317,11 +320,16 @@ secret-类 + email + internal_ipv4 共 14 条;对应 `vigil_browser::FindingKind
 
 ### 跨 crate 不变量(v5 起)
 
-| 维度 | 关系 | 守门测试 |
+> **条数不在本表冻结**(feedback_ssot_drift_guard):下列每条关系的具体数字都由
+> 「守门测试」列里的断言持有,真源是 `vigil-redaction/src/lib.rs::HARD_RULES` 与
+> `vigil-browser` 的 `SAMPLES` / `LOCAL_ONLY`。本表此前停在 v5,v6 扩的 4 条
+> (aliyun / tencent / slack_token / huggingface)从未同步过来 —— 故改为只述关系。
+
+| 维度 | 关系 | 守门测试(数字由它持有) |
 |---|---|---|
-| `vigil_browser::FindingKind`(13 项)| ↔ `vigil_redaction::HARD_RULES`(14 项) | rule_sync.rs `iss_021_finding_kind_count_matches_redaction_hard_rules` |
-| `FindingKind::as_str()` 短形(12 项,排除 `localhost_url`) | ↔ HARD_RULES 长形(`aws_access_key_id` / `anthropic_api_key` / `openai_api_key`)| rule_sync.rs `iss_021_finding_kind_maps_to_privacy_label_via_alias`(显式 alias 表) |
-| Hard kind 字面量 → `PrivacyLabel` | 封闭映射,14 → 8 | merge.rs `iss_021_hard_kind_to_privacy_label_golden` + `iss_021_hard_kind_set_size_matches_redaction_rules` |
+| `vigil_browser::FindingKind`(非 `LOCAL_ONLY` 部分)| ↔ `vigil_redaction::HARD_RULES` 全集,**等势** | rule_sync.rs `iss_021_finding_kind_count_matches_redaction_hard_rules` |
+| `FindingKind::as_str()` 短形(排除 `localhost_url`) | ↔ HARD_RULES 长形(`aws_access_key_id` / `anthropic_api_key` / `openai_api_key` / `aliyun_access_key_id`)| rule_sync.rs `iss_021_finding_kind_maps_to_privacy_label_via_alias`(显式 alias 表) |
+| Hard kind 字面量 → `PrivacyLabel` | 封闭映射,**多对 8**(HARD_RULES 全集 + `ALL_RULES` 独有的 `email` / `internal_ipv4`)| merge.rs `iss_021_hard_kind_to_privacy_label_golden` + `iss_021_hard_kind_set_size_matches_redaction_rules` |
 
 注:vigil-browser `FindingKind::LocalhostUrl` 是**本地规则**(扩展层用于 `Block`
 特权 origin 的本地 URL),vigil-redaction 不识别(`scan_hard_findings` 不命中),
@@ -334,7 +342,8 @@ secret-类 + email + internal_ipv4 共 14 条;对应 `vigil_browser::FindingKind
 | `aws_access_key` | `aws_access_key_id` | 历史漂移,本 ISS 加 alias 表绑死 |
 | `anthropic_key` | `anthropic_api_key` | 同上 |
 | `openai_key` | `openai_api_key` | 同上 |
-| 其余 9 项 | 同名 | 一致 |
+| `aliyun_access_key` | `aliyun_access_key_id` | v6(2026-09-12)新增,与 aws 同构 |
+| 其余各项 | 同名 | 一致 |
 
 任一侧改名都需要同步 `crates/vigil-browser/tests/rule_sync.rs::alias` 表;改了不
 同步会让本 ISS 加的两条新测立即失败,把 SSOT drift 抓在 PR 提交前。

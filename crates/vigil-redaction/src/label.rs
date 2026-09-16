@@ -1,10 +1,15 @@
 //! ISS-005:Stage 2 T0 标签化枚举(ADR 0013 + `docs/design/vigil-redaction-selection.md`)。
 //!
 //! 8 个业务标签,聚合两层来源:
-//! - **v0.3 硬指纹规则**(`HARD_RULES` 12 项):aws / github / anthropic / openai / jwt /
-//!   pem / stripe / google / gitlab / slack / env_assignment / database_url / email /
-//!   internal_ipv4
+//! - **正则规则名**:`lib.rs::HARD_RULES` 的**全部**规则(一律归 `Secret`)+ `ALL_RULES`
+//!   独有的 `email` / `internal_ipv4` / `generic_url`(这三条**故意不进** `HARD_RULES`,
+//!   理由见 `lib.rs` HARD_RULES 上方注释「可能是合法上下文」)
 //! - **Privacy Filter 33-class id2label**(Stage 2 模型,`private_*` 前缀)
+//!
+//! **本文件不复述规则名单与条数**(feedback_ssot_drift_guard):唯一真源是
+//! `lib.rs::HARD_RULES`;`from_kind` 与它的一致性已由 `merge.rs` 的两条测试闭合守门 ——
+//! `iss_021_hard_kind_to_privacy_label_golden`(逐条 `assert_eq!` 到确切 label)+
+//! `iss_021_hard_kind_set_size_matches_redaction_rules`(与真表集合**双向 diff**)。
 //!
 //! 标签体系是"业务视角"的归并 —— caller 在 UI / 审计 / 风险累加时看到的是 8 类;
 //! 原始 `Finding.kind` 字面量保留在 `Finding` 上以便调试与规则名反查。
@@ -18,13 +23,12 @@
 /// Stage 2 T0 业务标签枚举(ADR 0013)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PrivacyLabel {
-    /// 服务 API 密钥 / 凭证类:aws / github / anthropic / openai / jwt / pem /
-    /// stripe / google / gitlab / slack / env_assignment / database_url。泄漏即越权,
-    /// caller 应走 fail-closed。
+    /// 服务 API 密钥 / 凭证类:`HARD_RULES` 的**全部**规则名 + 模型侧裸 `secret`。
+    /// 泄漏即越权,caller 应走 fail-closed。
     Secret,
     /// 账户号码类(Privacy Filter `private_account_number` 等):银行卡 / 社保号等。
     AccountNumber,
-    /// 邮箱:Hard `email` + Model `private_email`。
+    /// 邮箱:正则 `email`(**仅**在 `ALL_RULES`)+ Model `private_email`。
     Email,
     /// 电话号码:Model `private_phone`。
     Phone,
@@ -34,7 +38,8 @@ pub enum PrivacyLabel {
     Address,
     /// 日期(可能是 PII 生日 / 关键事件日):Model `private_date`。
     Date,
-    /// URL / IP 类:Hard `internal_ipv4` + Model `private_url`。
+    /// URL / IP 类:正则 `internal_ipv4` / `generic_url`(**均仅**在 `ALL_RULES`),
+    /// Model 侧 `private_url`。
     /// 注:内网 IP 归入此类(可能是拓扑信息);公网 URL 也可能含凭证(如 Slack webhook),
     /// 但 Slack webhook 的完整结构由 `Secret` 承担,`Url` 仅承担通用 URL/IP 场景。
     Url,
@@ -73,9 +78,8 @@ impl PrivacyLabel {
     /// 从 `Finding.kind` 字面量反查标签。
     ///
     /// 覆盖两层来源:
-    /// - Hard(`HARD_RULES.name`):aws / github / anthropic / openai / jwt / pem /
-    ///   env_assignment / slack / stripe / google / gitlab / database_url / email /
-    ///   internal_ipv4
+    /// - 正则规则名:`HARD_RULES` 全部 → `Secret`;`ALL_RULES` 独有的 `email` → `Email`、
+    ///   `internal_ipv4` / `generic_url` → `Url`
     /// - Model(Privacy Filter):`private_*` 前缀 8 类 + 裸 `secret` / `account_number`
     ///
     /// 返回 `None` 表示 kind 不在封闭集合中 —— caller 可选择:
@@ -84,8 +88,10 @@ impl PrivacyLabel {
     pub fn from_kind(kind: &str) -> Option<Self> {
         match kind {
             // ─── Hard rules(`HARD_RULES.name`)→ Secret 大类 ───
-            // 这些 kind 在 HARD_RULES 中都有对应 Regex 命中;新增 HARD_RULES 时
-            // 请同步这里 + 单测(feedback_extend_enum_sync_tests)。
+            // 本臂除裸 `secret`(模型侧标签,不是规则名)外,必须与 `lib.rs::HARD_RULES`
+            // 的规则名**逐一对应**。新增 / 删除 HARD_RULES 时漏改这里,会被
+            // `merge.rs::iss_021_hard_kind_set_size_matches_redaction_rules` 的集合
+            // 双向 diff 抓住(feedback_extend_enum_sync_tests)。
             "aws_access_key_id"
             | "github_token"
             | "anthropic_api_key"
