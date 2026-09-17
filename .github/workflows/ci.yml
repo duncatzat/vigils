@@ -47,8 +47,13 @@ jobs:
       # `load-dynamic` 意味着编译期不需要 onnxruntime dylib(运行期才 dlopen),所以这里
       # 只编译、不下载任何模型(1.5GB),成本约 3-5 min。真模型 E2E 归 nightly 工作流
       # (待建,见 #94 follow-up:下载真模型跑 7 个 --ignored 测试)。
+      # 2026-09-17 扩容:原先只盖 redaction / firewall / mcp 三个包,而 vigil-sdk 与
+      # vigil-hub-cli **各自都有 ort feature**(sdk 暴露 ort_ensemble_scanner_arc_from_env;
+      # hub-cli 透传 vigil-firewall/ort + vigil-mcp/ort 并激活注入分类器),且 release.yml
+      # 的 ML 变体正是 `--bin vigil-hub -p vigil-hub-cli --features ort` —— 也就是说
+      # **发货的那个二进制,从未在该 feature 下被 clippy / test 过**。两个包一并纳入。
       - name: Clippy (ort feature)
-        run: cargo clippy -p vigil-redaction -p vigil-firewall -p vigil-mcp --features ort --all-targets -- -D warnings
+        run: cargo clippy -p vigil-redaction -p vigil-firewall -p vigil-mcp -p vigil-sdk -p vigil-hub-cli --features ort --all-targets -- -D warnings
 
       # wasm feature 默认关(同 ort)—— Wasm 沙箱 runner 同样此前从未在 CI 编译过
       # (vigil-runner 的 feature 注释一直写着「CI 必须启用」,但没有任何 workflow 真启用;
@@ -67,7 +72,7 @@ jobs:
       # 那 7 个要真模型,归 nightly 工作流(待建,同上);且 L1(fail-closed 门控)之后,
       # 已 opt-in 而无模型会直接 panic,在主 CI 里跑必红。
       - name: Test (ort feature, non-ignored)
-        run: cargo test -p vigil-redaction -p vigil-firewall -p vigil-mcp --features ort
+        run: cargo test -p vigil-redaction -p vigil-firewall -p vigil-mcp -p vigil-sdk -p vigil-hub-cli --features ort
 
       - name: Test (wasm feature)
         run: cargo test -p vigil-runner --features wasm

@@ -61,6 +61,18 @@ ignore = [
   { id = "RUSTSEC-2025-0081", reason = "unmaintained-class; unicode data tables via tauri-utils; remove when tauri-utils migrates" },
   { id = "RUSTSEC-2025-0098", reason = "unmaintained-class; unicode data tables via tauri-utils; remove when tauri-utils migrates" },
   { id = "RUSTSEC-2025-0100", reason = "unmaintained-class; unicode data tables via tauri-utils; remove when tauri-utils migrates" },
+
+  # ★★ glib unsoundness —— 与上面各条性质不同,这是**有效的** advisory,不是
+  # unmaintained 类。glib 0.18.5 在本仓图中(Cargo.lock 实测),正落在受影响
+  # 区间 >=0.15.0,<0.20.0 内;patched >= 0.20.0。UB 内容:VariantStrIter 把 &p
+  # 当出参传给 C 变参函数,优化后写入被丢弃 -> CStr::from_ptr 收到 NULL -> 崩溃。
+  #
+  # ★ cargo-deny 可能把本条报成 `warning[advisory-not-detected]` —— 那个警告
+  # **不能**当作「可以删」的依据:该 advisory 带 affected.functions 的函数级
+  # 限定,匹配器在版本命中的情况下仍可能不判定,属工具匹配粒度问题,不是
+  # advisory 失效。删掉它不会让 CI 变红(它本来就匹配不到),**错误完全静默**。
+  # 解禁条件:glib 升到 >= 0.20.0(受 Tauri 2 的 GTK3 栈牵制,upstream-driven)。
+  { id = "RUSTSEC-2024-0429", reason = "glib 0.18.5 VariantStrIter unsoundness (UB, affects >=0.15.0,<0.20.0; patched >=0.20.0) - still ACTIVE upstream, we are in range via Tauri 2 GTK3 stack; cargo-deny may report advisory-not-detected only because of the advisory's function-level scoping. Do NOT drop this entry on the strength of that warning." },
 ]
 
 # ---------------------------------------------------------------- licenses
@@ -93,6 +105,83 @@ highlight = "all"
 # 内部 path 依赖未带 version 字段会被判 wildcard(全部 8 处均为 workspace 内部
 # 引用,无外部 wildcard)。后续给 path 依赖补 version 后可升回 deny。
 wildcards = "warn"
+
+# ── TLS 栈与 cookie jar 禁令 ──────────────────────────────────────────────
+# rustls-only:除 rustls 外的 TLS 后端一律不得进入依赖树。
+# 判据按本仓 Cargo.lock(740 个 package)逆向依赖实测:native-tls / openssl /
+# openssl-sys / schannel / cookie_store / hyper-tls / tokio-native-tls 七者
+# **当前均不在图中**,故这几条是**纯棘轮** —— 挡的是将来某次依赖升级把它们
+# 悄悄带进来,而不是现在有东西要清理(所以加上它们不会改变 CI 当前的绿)。
+#
+# 注:security-framework / -sys **不**在此列 —— 它由 keyring(macOS keychain
+# 后端)拉取,用途是 keychain **而非 TLS**;rustls-only 由下列真 TLS 后端守门。
+deny = [
+    { crate = "native-tls", reason = "Vigil: only rustls + webpki-roots allowed as the TLS stack" },
+    { crate = "openssl", reason = "Vigil: only rustls allowed as the TLS stack" },
+    { crate = "openssl-sys", reason = "Vigil: only rustls allowed as the TLS stack" },
+    { crate = "schannel", reason = "Vigil: only rustls allowed as the TLS stack" },
+    # cookie 0.18.1 **确实在本仓依赖图内**,由 tauri 2 的 WebView 栈带入
+    # (Cargo.lock 逆向依赖实测:tauri / tauri-runtime / wry 三者引用它)。
+    # 那是 WebView 自身的 cookie 处理,与本禁令针对的「HTTP 客户端 cookie jar」
+    # 不是一回事。故用 wrappers 做**精确豁免**:只放行这三条链路,任何**其它**
+    # 引入者仍然一票否决 —— 将来 reqwest 侧真冒出 cookie,照样红。
+    # 整条删掉禁令才是把门打开,这里没有。
+    { crate = "cookie", wrappers = ["tauri", "tauri-runtime", "wry"], reason = "HTTP-client cookie jars stay banned; tauri/wry WebView cookie handling is a different concern and is the only path into this tree (verified via Cargo.lock reverse deps)" },
+    { crate = "cookie_store", reason = "Vigil: the HTTP clients here do not need a cookie jar" },
+]
+
+# ── reqwest feature 政策(按版本分治)────────────────────────────────────
+# 本仓图里有两个 reqwest:0.12.28(vigil-http-transport / vigil-hub-cli /
+# vigil-outbound / vigil-redaction 自用)与 0.13.4(tauri 自带)。
+# 两者的 TLS feature 语义**相反**,共用一份白名单必然写错,故拆成两块。
+#
+# ★ cargo-deny 的 `allow` 语义:准了 X 就连带准了 X **传递启用**的一切。
+#   故 allow 里有 `rustls-tls` / `http2` 即覆盖 `__rustls` / `__tls` / `h2` /
+#   `rustls-tls-webpki-roots*`,不必也不应把闭包成员逐个抄进来。
+#
+# 0.12.28 的 TLS 语义:
+#   default-tls = [hyper-tls, native-tls-crate, __tls, tokio-native-tls] <- 它**就是** native-tls 实现
+#   native-tls = [default-tls];native-tls-alpn / native-tls-vendored 亦经由它
+#   rustls-tls -> rustls-tls-webpki-roots -> __rustls-ring -> __rustls -> __tls
+# 故禁 `default-tls` 即封死整个 native-tls 家族;显式列出别名只为可读。
+[[bans.features]]
+crate = "reqwest@0.12"
+allow = ["rustls-tls", "http2", "json", "blocking"]
+deny = [
+    "default",
+    "default-tls",
+    "native-tls",
+    "native-tls-alpn",
+    "native-tls-vendored",
+    "cookies",
+    "gzip",
+    "brotli",
+    "deflate",
+    "trust-dns",
+]
+
+# tauri 自带的 reqwest 0.13.4:同样拒掉 TLS 后端替换与 cookies ——
+# rustls-only 与 no-cookie-jar 这两条政策对整棵树一视同仁。
+#
+# 0.13 的 TLS 语义与 0.12 **相反**(不是笔误):
+#   default-tls = [rustls]   <- 0.13 里它**就是** rustls,禁它等于禁掉我们要的东西
+#   __native-tls = [hyper-tls, native-tls-crate, __tls, tokio-native-tls] <- 真正的 native-tls 实现
+#   native-tls / native-tls-no-alpn / native-tls-vendored /
+#     native-tls-vendored-no-alpn 四个变体**全部**并入 `__native-tls`,
+#     其中两个 -no-alpn 变体**不经过** `native-tls`。
+# => 总闸是 `__native-tls`,只列别名必漏。0.13 也**没有** `rustls-tls`
+#   (它叫 `rustls`),把 0.12 的名字抄过来会变成哑弹。
+[[bans.features]]
+crate = "reqwest@0.13"
+allow = ["json", "stream", "charset", "http2", "rustls", "system-proxy"]
+deny = [
+    "__native-tls",
+    "native-tls",
+    "native-tls-no-alpn",
+    "native-tls-vendored",
+    "native-tls-vendored-no-alpn",
+    "cookies",
+]
 
 # ---------------------------------------------------------------- sources
 [sources]
